@@ -37,6 +37,7 @@ type cronTaskWrapper struct {
 	rawSchedule string
 	cronSpec    string
 	jobFunc     func() error
+	task        gsuite_cron.ScheduledTask
 	entryID     gsuite_cron.EntryID
 
 	mu         sync.RWMutex
@@ -55,7 +56,12 @@ func (w *cronTaskWrapper) Execute(ctx context.Context) error {
 
 	log.Printf("[SCHEDULER] Menjalankan task %q ...", w.name)
 	t0 := time.Now()
-	err := w.jobFunc()
+	var err error
+	if w.task != nil {
+		err = w.task.Execute(ctx)
+	} else if w.jobFunc != nil {
+		err = w.jobFunc()
+	}
 
 	w.mu.Lock()
 	if err != nil {
@@ -70,10 +76,18 @@ func (w *cronTaskWrapper) Execute(ctx context.Context) error {
 }
 
 func (w *cronTaskWrapper) OnError(ctx context.Context, err error) {
+	if w.task != nil {
+		w.task.OnError(ctx, err)
+		return
+	}
 	log.Printf("[SCHEDULER] Task %q recoverable error: %v", w.name, err)
 }
 
 func (w *cronTaskWrapper) OnFail(ctx context.Context, err error) {
+	if w.task != nil {
+		w.task.OnFail(ctx, err)
+		return
+	}
 	log.Printf("[SCHEDULER] Task %q critical failure: %v", w.name, err)
 }
 
@@ -192,6 +206,36 @@ func (s *InternalScheduler) Register(name, schedule string, job func() error) er
 
 	s.tasks[name] = wrapper
 	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q, entry: %d)", name, schedule, cronSpec, entryID)
+	return nil
+}
+
+// RegisterTask binds a top-global ScheduledTask conforming to gsuite_cron.ScheduledTask
+func (s *InternalScheduler) RegisterTask(name string, task gsuite_cron.ScheduledTask) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rawSchedule := task.Schedule()
+	cronSpec, err := NormalizeSchedule(rawSchedule)
+	if err != nil {
+		return fmt.Errorf("failed to parse schedule for %q: %w", name, err)
+	}
+
+	wrapper := &cronTaskWrapper{
+		name:        name,
+		rawSchedule: rawSchedule,
+		cronSpec:    cronSpec,
+		task:        task,
+	}
+
+	runner := gsuite_cron.NewTaskRunner(wrapper)
+	entryID, err := s.cronSched.AddJob(cronSpec, runner)
+	if err != nil {
+		return fmt.Errorf("failed to register cron task %q: %w", name, err)
+	}
+	wrapper.entryID = entryID
+
+	s.tasks[name] = wrapper
+	log.Printf("[SCHEDULER] Top-global cron task %q terdaftar dengan jadwal %q (spec: %q, entry: %d)", name, rawSchedule, cronSpec, entryID)
 	return nil
 }
 

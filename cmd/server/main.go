@@ -98,75 +98,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		startTime:   time.Now(),
 	}
 
-	// Register auto-partitioning task if cron is enabled
+	// Register top-global scheduled tasks if cron is enabled
 	if cfg.CronEnabled {
-		_ = s.scheduler.Register("auto_partition_maintenance", cfg.PartitionSchedule, func() error {
-			log.Printf("[SCHEDULER] Menjalankan partisi otomatis (arsip data > %.0f hari)...", cfg.RetentionDays)
-			s.mu.RLock()
-			var loaded []string
-			for m := range s.models {
-				loaded = append(loaded, m)
-			}
-			s.mu.RUnlock()
+		if cfg.PartitionSchedule != "" {
+			_ = s.scheduler.RegisterTask("auto_partition_maintenance", NewAutoPartitionCronTask(s, cfg.PartitionSchedule, cfg.RetentionDays))
+		}
 
-			for _, m := range loaded {
-				modelName := m
-				// Dispatch heavy archival execution to worker pool
-				_ = s.worker.Dispatch(context.Background(), "cron_partition_"+modelName, func(ctx context.Context) error {
-					db, err := s.getModel(modelName)
-					if err != nil {
-						return err
-					}
-					partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
-						ModelName:     modelName,
-						DateField:     "tanggal",
-						RetentionDays: cfg.RetentionDays,
-						Sink:          partition.NewLocalDiskSink(filepath.Join(s.dataDir, "partitions")),
-						FileFormat:    "{date}_{uuid}.anchordb",
-						PruneHotDB:    true,
-					})
-					if err == nil && partRes.ArchivedCount > 0 {
-						log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
-							modelName, partRes.ArchivedCount, partRes.TargetLocation)
-						if s.queue != nil {
-							_ = s.queue.Publish(ctx, queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
-								Model:          modelName,
-								ArchivedCount:  partRes.ArchivedCount,
-								TargetLocation: partRes.TargetLocation,
-								CutoffDate:     partRes.CutoffDate,
-								Timestamp:      partRes.ExecutionTime,
-							})
-						}
-					}
-					return err
-				})
-			}
-			return nil
-		})
-
-		// Register periodic background disk sync via worker engine
 		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
-			_ = s.scheduler.Register("periodic_background_sync", cfg.SyncInterval, func() error {
-				return s.worker.Dispatch(context.Background(), "periodic_disk_sync", func(ctx context.Context) error {
-					s.mu.RLock()
-					var dbs []*storage.AnchorDB
-					for _, d := range s.models {
-						dbs = append(dbs, d)
-					}
-					s.mu.RUnlock()
-
-					var synced int
-					for _, d := range dbs {
-						if err := d.Sync(); err == nil {
-							synced++
-						}
-					}
-					if synced > 0 {
-						log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk", synced)
-					}
-					return nil
-				})
-			})
+			_ = s.scheduler.RegisterTask("periodic_background_sync", NewPeriodicSyncCronTask(s, cfg.SyncInterval))
 		}
 
 		s.scheduler.Start()
@@ -209,6 +148,116 @@ func (s *Server) registerQueueHandlers() {
 		log.Printf("[CDC] Partition archived: model=%s archived=%d location=%s", evt.Model, evt.ArchivedCount, evt.TargetLocation)
 		return nil
 	})
+}
+
+// --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
+
+// AutoPartitionCronTask is the top-global handler for automated database partitioning.
+type AutoPartitionCronTask struct {
+	server        *Server
+	schedule      string
+	retentionDays float32
+}
+
+func NewAutoPartitionCronTask(s *Server, schedule string, retentionDays float32) *AutoPartitionCronTask {
+	return &AutoPartitionCronTask{
+		server:        s,
+		schedule:      schedule,
+		retentionDays: retentionDays,
+	}
+}
+
+func (t *AutoPartitionCronTask) Schedule() string {
+	return t.schedule
+}
+
+func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
+	log.Printf("[SCHEDULER] Menjalankan partisi otomatis (arsip data > %.0f hari)...", t.retentionDays)
+	t.server.mu.RLock()
+	var loaded []string
+	for m := range t.server.models {
+		loaded = append(loaded, m)
+	}
+	t.server.mu.RUnlock()
+
+	for _, m := range loaded {
+		modelName := m
+		_ = t.server.worker.Dispatch(ctx, "cron_partition_"+modelName, func(wCtx context.Context) error {
+			db, err := t.server.getModel(modelName)
+			if err != nil {
+				return err
+			}
+			partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
+				ModelName:     modelName,
+				DateField:     "tanggal",
+				RetentionDays: t.retentionDays,
+				Sink:          partition.NewLocalDiskSink(filepath.Join(t.server.dataDir, "partitions")),
+				FileFormat:    "{date}_{uuid}.anchordb",
+				PruneHotDB:    true,
+			})
+			if err == nil && partRes.ArchivedCount > 0 {
+				log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
+					modelName, partRes.ArchivedCount, partRes.TargetLocation)
+			}
+			return err
+		})
+	}
+	return nil
+}
+
+func (t *AutoPartitionCronTask) OnError(ctx context.Context, err error) {
+	log.Printf("[SCHEDULER] AutoPartitionCronTask recoverable error: %v", err)
+}
+
+func (t *AutoPartitionCronTask) OnFail(ctx context.Context, err error) {
+	log.Printf("[SCHEDULER] AutoPartitionCronTask fatal failure: %v", err)
+}
+
+// PeriodicSyncCronTask is the top-global handler for periodic background disk flushing.
+type PeriodicSyncCronTask struct {
+	server   *Server
+	schedule string
+}
+
+func NewPeriodicSyncCronTask(s *Server, schedule string) *PeriodicSyncCronTask {
+	return &PeriodicSyncCronTask{
+		server:   s,
+		schedule: schedule,
+	}
+}
+
+func (t *PeriodicSyncCronTask) Schedule() string {
+	return t.schedule
+}
+
+func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
+	return t.server.worker.Dispatch(ctx, "periodic_disk_sync", func(wCtx context.Context) error {
+		t.server.mu.RLock()
+		var dbs []*storage.AnchorDB
+		for _, d := range t.server.models {
+			dbs = append(dbs, d)
+		}
+		t.server.mu.RUnlock()
+
+		var synced int
+		for _, d := range dbs {
+			if err := d.Sync(); err == nil {
+				synced++
+			}
+		}
+		if synced > 0 {
+			log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk", synced)
+		}
+		return nil
+	})
+}
+
+func (t *PeriodicSyncCronTask) OnError(ctx context.Context, err error) {
+	log.Printf("[SCHEDULER] PeriodicSyncCronTask recoverable error: %v", err)
+}
+
+func (t *PeriodicSyncCronTask) OnFail(ctx context.Context, err error) {
+	log.Printf("[SCHEDULER] PeriodicSyncCronTask fatal failure: %v", err)
 }
 
 // sanitizeModelName enforces alphanumeric model names, max length, and prevents path traversal
