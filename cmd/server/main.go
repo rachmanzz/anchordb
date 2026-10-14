@@ -454,18 +454,6 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish mutation event to queue broker
-	if s.queue != nil {
-		if err := s.queue.Publish(r.Context(), queue.TopicRecordSaved, queue.RecordSavedEvent{
-			Model:     req.Model,
-			Name:      effectiveName,
-			Count:     1,
-			Timestamp: time.Now(),
-		}); err != nil {
-			log.Printf("[QUEUE] Warning: failed to publish record.saved event: %v", err)
-		}
-	}
-
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"name":    effectiveName,
@@ -613,18 +601,6 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
-	}
-
-	// Publish mutation event to queue broker
-	if s.queue != nil && count > 0 {
-		if err := s.queue.Publish(r.Context(), queue.TopicRecordUpdated, queue.RecordUpdatedEvent{
-			Model:         req.Model,
-			Names:         req.In,
-			ModifiedCount: count,
-			Timestamp:     time.Now(),
-		}); err != nil {
-			log.Printf("[QUEUE] Warning: failed to publish record.updated event: %v", err)
-		}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
