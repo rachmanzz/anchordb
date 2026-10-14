@@ -134,12 +134,13 @@ func main() {
 ### Run via Docker / Podman
 
 ```bash
-# Build & run directly
+# Run with optional IP Whitelisting & Scheduling
 podman run -d \
   --name anchordb \
   -p 7447:7447 \
   -v ./data:/data:Z \
   -e ANCHORDB_PORT=7447 \
+  -e ANCHORDB_IP_WHITELIST="127.0.0.1,::1,192.168.1.0/24,10.0.0.1-10.0.0.50" \
   -e ANCHORDB_PARTITION_SCHEDULE="23:00" \
   localhost/anchordb:latest
 ```
@@ -148,6 +149,17 @@ Or using Docker Compose:
 ```bash
 docker compose up -d
 ```
+
+### Security & IP Whitelisting
+
+AnchorDB includes a built-in network firewall gateway. Set `ANCHORDB_IP_WHITELIST` to restrict connections:
+
+- **Single Exact IPs**: `127.0.0.1`, `::1`, `203.0.113.15`
+- **CIDR Subnet Blocks**: `192.168.1.0/24`, `10.0.0.0/16`
+- **Explicit IP Ranges**: `172.16.0.10-172.16.0.50`
+- **Behind Proxy / Load Balancer**: Set `ANCHORDB_TRUST_PROXY=true` to validate `X-Forwarded-For` and `X-Real-IP`.
+
+If client IP is not in the whitelist, AnchorDB immediately rejects with `HTTP 403 Forbidden` before consuming CPU or locks.
 
 ### REST API Reference
 

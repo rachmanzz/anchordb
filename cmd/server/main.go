@@ -15,6 +15,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/driver"
 	"github.com/rachmanzz/anchordb/pkg/partition"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
+	"github.com/rachmanzz/anchordb/pkg/security"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
@@ -25,16 +26,25 @@ type Server struct {
 	authToken string
 	models    map[string]*storage.AnchorDB
 	scheduler *scheduler.InternalScheduler
+	ipFilter  *security.IPFilter
 	startTime time.Time
 }
 
 func NewServer(dataDir, authToken string) *Server {
 	_ = os.MkdirAll(dataDir, 0755)
+	whitelistRule := os.Getenv("ANCHORDB_IP_WHITELIST")
+	trustProxy := os.Getenv("ANCHORDB_TRUST_PROXY") == "true" || os.Getenv("ANCHORDB_TRUST_PROXY") == "1"
+	ipFilter, err := security.NewIPFilter(whitelistRule, trustProxy)
+	if err != nil {
+		log.Fatalf("Fatal: Invalid ANCHORDB_IP_WHITELIST %q: %v", whitelistRule, err)
+	}
+
 	s := &Server{
 		dataDir:   dataDir,
 		authToken: authToken,
 		models:    make(map[string]*storage.AnchorDB),
 		scheduler: scheduler.NewInternalScheduler(),
+		ipFilter:  ipFilter,
 		startTime: time.Now(),
 	}
 
@@ -653,12 +663,18 @@ func main() {
 	fmt.Println("             All Commercial Rights Reserved               ")
 	fmt.Printf("   Port Dedicated : %s\n", portStr)
 	fmt.Printf("   Data Directory : %s\n", dataDir)
+	if server.ipFilter.IsEmpty() {
+		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
+	} else {
+		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", os.Getenv("ANCHORDB_IP_WHITELIST"))
+	}
 	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
 	fmt.Println("==========================================================")
 
 	addr := ":" + portStr
 	log.Printf("[READY] AnchorDB Server mendengarkan di %s ...", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	handler := server.ipFilter.Middleware(mux)
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }
