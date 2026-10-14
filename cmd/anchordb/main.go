@@ -158,9 +158,9 @@ func main() {
 	fmt.Println(">>> KUERI 5: LIST + WHERE + COMPUTE + PAGING (KONSTAN O(Limit))")
 	fmt.Println("Filter jarak >= 50, hitung kecepatan, filter kecepatan > 50, Limit 2 per halaman")
 
-	_ = client.Save("trip_jakarta_bandung", map[string]float32{"jarak": 150, "waktu": 2}) // v = 75
+	_ = client.Save("trip_jakarta_bandung", map[string]float32{"jarak": 150, "waktu": 2})  // v = 75
 	_ = client.Save("trip_surabaya_malang", map[string]float32{"jarak": 90, "waktu": 1.5}) // v = 60
-	_ = client.Save("trip_keliling_komplek", map[string]float32{"jarak": 10, "waktu": 1})   // v = 10 (ditolak filter)
+	_ = client.Save("trip_keliling_komplek", map[string]float32{"jarak": 10, "waktu": 1})  // v = 10 (ditolak filter)
 	_ = client.Save("trip_tol_trans_jawa", map[string]float32{"jarak": 400, "waktu": 4})   // v = 100
 
 	// Halaman 1

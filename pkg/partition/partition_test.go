@@ -133,3 +133,41 @@ func TestScheduler_CalculateNextRun_2300(t *testing.T) {
 	}
 	t.Logf("[OK] Jadwal Internal '23:00' Terverifikasi Akurat!")
 }
+
+func TestPartition_S3Sink_FailSafe(t *testing.T) {
+	tmpDir := t.TempDir()
+	hotDBPath := filepath.Join(tmpDir, "hot_logs.anchordb")
+
+	db, err := storage.Open(hotDBPath)
+	if err != nil {
+		t.Fatalf("failed to open hot db: %v", err)
+	}
+	defer db.Close()
+
+	nowDays := float32(time.Now().Unix() / 86400)
+	_ = db.SaveRecord("old_record_1", map[string]float32{"tanggal": nowDays - 300})
+	_ = db.SaveRecord("old_record_2", map[string]float32{"tanggal": nowDays - 250})
+	_ = db.Sync()
+
+	// S3 Sink pointing to unreachable address so upload fails
+	s3Sink := NewS3Sink("http://127.0.0.1:54321", "non-existent-bucket", "prefix", "key", "secret")
+
+	// Execute partition with PruneHotDB: true
+	_, err = ExecutePartition(db, PartitionPolicy{
+		ModelName:     "hot_logs",
+		DateField:     "tanggal",
+		RetentionDays: 180,
+		Sink:          s3Sink,
+		PruneHotDB:    true,
+	})
+
+	if err == nil {
+		t.Fatalf("expected partition to fail on unreachable S3, got nil")
+	}
+
+	// CRITICAL VERIFICATION: Hot DB must NOT be pruned when sink fails!
+	if len(db.EntityStore) != 2 {
+		t.Fatalf("CRITICAL FAIL-SAFE VIOLATION: Hot DB was pruned despite S3 upload failure! Remaining records: %d", len(db.EntityStore))
+	}
+	t.Logf("[OK] Fail-safe verified! Hot DB preserved (count=%d) when S3 upload fails.", len(db.EntityStore))
+}

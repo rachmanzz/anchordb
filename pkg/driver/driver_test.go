@@ -829,8 +829,3 @@ func TestDriver_HighConcurrencyParallelConnections(t *testing.T) {
 	t.Logf("[PARALEL] Sukses mengeksekusi %d request paralel campuran (Read/Write) dari %d goroutine dalam %v (%.0f ops/detik)",
 		totalReqs, numGoroutines, duration, opsPerSec)
 }
-
-
-
-
-

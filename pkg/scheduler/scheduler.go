@@ -9,12 +9,12 @@ import (
 
 // ScheduledTask defines a background maintenance job
 type ScheduledTask struct {
-	Name         string
-	Schedule     string // e.g. "23:00" (daily at 23:00) or "@hourly" or "10m"
-	JobFunc      func() error
-	LastRun      time.Time
-	LastStatus   string
-	NextRun      time.Time
+	Name       string
+	Schedule   string // e.g. "23:00" (daily at 23:00) or "@hourly" or "10m"
+	JobFunc    func() error
+	LastRun    time.Time
+	LastStatus string
+	NextRun    time.Time
 }
 
 // InternalScheduler provides daemon scheduling inside AnchorDB without external cron

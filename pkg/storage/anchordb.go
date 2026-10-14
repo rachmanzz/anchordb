@@ -249,7 +249,7 @@ func (op OpAssign) Apply(props map[string]float32) (float32, error) {
 // FilterCondition defines a field comparison in Where clauses
 type FilterCondition struct {
 	Field     string
-	Operator  string  // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
+	Operator  string // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
 	Value     float32
 	ValueHigh float32 // Used for "BETWEEN" range [Value, ValueHigh]
 }
@@ -417,6 +417,13 @@ func (db *AnchorDB) initEmptyFile(filePath string) error {
 func (db *AnchorDB) buildIndex() error {
 	nodeCount := int(db.Header.NodeCount)
 	db.rawRecords = make([]BinaryNodeRecord, nodeCount)
+
+	// Reconstruct string pool buffer from mmap so reopen preserves words and AppendNode can append cleanly
+	if db.Header.EntityOffset > db.Header.StringOffset && int(db.Header.EntityOffset) <= len(db.mmapData) {
+		poolSlice := db.mmapData[db.Header.StringOffset:db.Header.EntityOffset]
+		db.stringPool = make([]byte, len(poolSlice))
+		copy(db.stringPool, poolSlice)
+	}
 
 	for i := 0; i < nodeCount; i++ {
 		offset := int(db.Header.NodesOffset) + i*RecordSize
@@ -783,12 +790,16 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				continue
 			}
 
-			// Apply in-place mathematical mutations
+			// Apply in-place mathematical mutations based on snapshot
+			pending := make(map[string]float32, len(opts.Mutations))
 			for field, op := range opts.Mutations {
 				newVal, err := op.Apply(props)
 				if err == nil {
-					props[field] = newVal
+					pending[field] = newVal
 				}
+			}
+			for k, v := range pending {
+				props[k] = v
 			}
 			updatedCount++
 		}
@@ -827,12 +838,16 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			continue
 		}
 
-		// Apply in-place mathematical mutations (e.g. jarak = jarak + 10)
+		// Apply in-place mathematical mutations based on snapshot
+		pending := make(map[string]float32, len(opts.Mutations))
 		for field, op := range opts.Mutations {
 			newVal, err := op.Apply(props)
 			if err == nil {
-				props[field] = newVal
+				pending[field] = newVal
 			}
+		}
+		for k, v := range pending {
+			props[k] = v
 		}
 		updatedCount++
 	}
@@ -840,7 +855,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	return updatedCount, nil
 }
 
-// DeleteRecords removes specified entity names from EntityStore and EntityOrder (for partition pruning).
+// DeleteRecords removes specified entity names from EntityStore, EntityOrder, and graph index.
 func (db *AnchorDB) DeleteRecords(names []string) int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -849,6 +864,14 @@ func (db *AnchorDB) DeleteRecords(names []string) int {
 	for _, n := range names {
 		toDelete[n] = true
 		delete(db.EntityStore, n)
+
+		// Clean up from graph index if present
+		if nodeIdx, exists := db.Lexicon[n]; exists {
+			delete(db.Lexicon, n)
+			if int(nodeIdx) < len(db.rawRecords) {
+				db.rawRecords[nodeIdx].ID = 0 // mark as tombstone/deleted
+			}
+		}
 	}
 
 	newOrder := make([]string, 0, len(db.EntityOrder)-len(toDelete))
@@ -1043,6 +1066,9 @@ func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, 
 			visitedNodes[nodeIdx] = true
 
 			rec := db.rawRecords[nodeIdx]
+			if rec.ID == 0 {
+				continue // tombstone / deleted node
+			}
 			targetCoord := spatial.Point2D{X: rec.X, Y: rec.Y}
 
 			// In-register Pythagoras
@@ -1076,40 +1102,49 @@ func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, 
 
 		// Early Termination condition:
 		// If we've found sufficient high-scoring candidates in nearby cells, stop!
-		if len(candidates) >= limitK*3 {
+		if len(candidates) >= limitK*5 {
 			return false // BREAK TRAVERSAL! WAKTU KONSTAN TERCAPAI!
 		}
 		return true
 	})
 
-	// Sort top-K according to selected OrderByMode
+	// Sort top-K according to selected OrderByMode with strict transitive comparison
 	switch order {
 	case OrderByDistanceAsc:
 		slices.SortFunc(candidates, func(a, b GraphQueryResult) int {
 			if a.T < b.T {
 				return -1
 			}
-			return 1
+			if a.T > b.T {
+				return 1
+			}
+			return 0
 		})
 	case OrderByScoreDesc:
 		slices.SortFunc(candidates, func(a, b GraphQueryResult) int {
 			if a.Score > b.Score {
 				return -1
 			}
-			return 1
+			if a.Score < b.Score {
+				return 1
+			}
+			return 0
 		})
-	default: // OrderByCompositeDesc
+	default: // OrderByCompositeDesc: prioritize highest score, then closest distance
 		slices.SortFunc(candidates, func(a, b GraphQueryResult) int {
-			if a.Score > b.Score*1.05 {
+			if a.Score > b.Score {
 				return -1
 			}
-			if b.Score > a.Score*1.05 {
+			if a.Score < b.Score {
 				return 1
 			}
 			if a.T < b.T {
 				return -1
 			}
-			return 1
+			if a.T > b.T {
+				return 1
+			}
+			return 0
 		})
 	}
 
@@ -1236,7 +1271,7 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 
 	// Scan through nodes
 	for idx, rec := range db.rawRecords {
-		if uint32(idx) == targetIdx {
+		if uint32(idx) == targetIdx || rec.ID == 0 {
 			continue
 		}
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
@@ -1256,7 +1291,10 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 		if a.T < b.T {
 			return -1
 		}
-		return 1
+		if a.T > b.T {
+			return 1
+		}
+		return 0
 	})
 
 	if limitK > len(results) {
@@ -1268,6 +1306,11 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 func (db *AnchorDB) getWord(offset uint32, length uint16) string {
 	if int(offset)+int(length) <= len(db.stringPool) {
 		return string(db.stringPool[offset : offset+uint32(length)])
+	}
+	// Fallback directly to mmap memory if stringPool slice is not yet initialized
+	absOffset := int(db.Header.StringOffset) + int(offset)
+	if absOffset+int(length) <= len(db.mmapData) {
+		return string(db.mmapData[absOffset : absOffset+int(length)])
 	}
 	return ""
 }

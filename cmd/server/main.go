@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
@@ -24,13 +28,14 @@ type Server struct {
 	mu        sync.RWMutex
 	dataDir   string
 	authToken string
+	port      string
 	models    map[string]*storage.AnchorDB
 	scheduler *scheduler.InternalScheduler
 	ipFilter  *security.IPFilter
 	startTime time.Time
 }
 
-func NewServer(dataDir, authToken string) *Server {
+func NewServer(dataDir, authToken, portStr string) *Server {
 	_ = os.MkdirAll(dataDir, 0755)
 	whitelistRule := os.Getenv("ANCHORDB_IP_WHITELIST")
 	trustProxy := os.Getenv("ANCHORDB_TRUST_PROXY") == "true" || os.Getenv("ANCHORDB_TRUST_PROXY") == "1"
@@ -42,6 +47,7 @@ func NewServer(dataDir, authToken string) *Server {
 	s := &Server{
 		dataDir:   dataDir,
 		authToken: authToken,
+		port:      portStr,
 		models:    make(map[string]*storage.AnchorDB),
 		scheduler: scheduler.NewInternalScheduler(),
 		ipFilter:  ipFilter,
@@ -95,11 +101,14 @@ func NewServer(dataDir, authToken string) *Server {
 	return s
 }
 
-// sanitizeModelName enforces alphanumeric model names and prevents path traversal
+// sanitizeModelName enforces alphanumeric model names, max length, and prevents path traversal
 func sanitizeModelName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "default", nil
+	}
+	if len(name) > 64 {
+		return "", fmt.Errorf("model name too long (max 64 characters): %q", name)
 	}
 	cleanName := filepath.Base(name)
 	if cleanName != name || strings.Contains(name, "..") || strings.Contains(name, "/") || strings.Contains(name, "\\") {
@@ -149,6 +158,12 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 		return db, nil
 	}
 
+	// Prevent unbounded model creation from exhausting file descriptors and memory
+	const maxLoadedModels = 500
+	if len(s.models) >= maxLoadedModels {
+		return nil, fmt.Errorf("maximum loaded models limit reached (%d)", maxLoadedModels)
+	}
+
 	dbPath := filepath.Join(s.dataDir, modelName+".anchordb")
 	newDB, err := storage.Open(dbPath)
 	if err != nil {
@@ -162,10 +177,13 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Enforce maximum body size (10 MB) to protect against memory exhaustion Slowloris / DoS
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+
 		if s.authToken != "" {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token != s.authToken {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) != 1 {
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
@@ -188,8 +206,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":         "ok",
 		"engine":         "AnchorDB",
 		"uptime_seconds": time.Since(s.startTime).Seconds(),
-		"port":           7447,
-		"data_dir":       s.dataDir,
+		"port":           s.port,
 		"loaded_models":  loadedModels,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
@@ -209,21 +226,21 @@ type GetRequest struct {
 	Computations map[string]string `json:"computations"` // e.g. {"kecepatan": "jarak / waktu"}
 }
 
+type FilterDTO struct {
+	Field     string `json:"field"`
+	Operator  string `json:"operator"` // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
+	Value     string `json:"value"`
+	ValueHigh string `json:"value_high"` // For "BETWEEN"
+}
+
 type ListRequest struct {
 	Model        string            `json:"model"`
 	Select       []string          `json:"select"`
 	Filters      []FilterDTO       `json:"filters"`
 	Computations map[string]string `json:"computations"`
-	Page         int               `json:"page"`
 	Limit        int               `json:"limit"`
 	Offset       int               `json:"offset"`
-}
-
-type FilterDTO struct {
-	Field     string  `json:"field"`
-	Operator  string  `json:"operator"` // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
-	Value     string  `json:"value"`    // supports number or "YYYY-MM-DD" date
-	ValueHigh string  `json:"value_high"`
+	Page         int               `json:"page"`
 }
 
 type UpdateRequest struct {
@@ -241,53 +258,55 @@ type GraphRequest struct {
 	LimitK   int      `json:"limit_k"`
 }
 
-// parseComputeOp converts a string like "jarak / waktu" or "jarak + 10" to ComputeOp
+// parseComputeOp converts a string expression like "jarak / waktu", "jarak + 10", "0", or "-5" to ComputeOp
 func parseComputeOp(expr string) (storage.ComputeOp, error) {
 	expr = strings.TrimSpace(expr)
-	var parts []string
-	var op string
-
-	if strings.Contains(expr, "/") {
-		parts = strings.Split(expr, "/")
-		op = "/"
-	} else if strings.Contains(expr, "*") {
-		parts = strings.Split(expr, "*")
-		op = "*"
-	} else if strings.Contains(expr, "+") {
-		parts = strings.Split(expr, "+")
-		op = "+"
-	} else if strings.Contains(expr, "-") {
-		parts = strings.Split(expr, "-")
-		op = "-"
-	} else {
-		return nil, fmt.Errorf("unsupported operator in expression %q", expr)
+	if expr == "" {
+		return nil, fmt.Errorf("empty compute expression")
 	}
 
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("malformed expression %q", expr)
+	// 1. Check for single literal assignment (e.g. "0", "-5", "100.5") or direct field alias
+	if _, err := strconv.ParseFloat(expr, 32); err == nil {
+		return storage.OpAssign{Value: expr}, nil
+	}
+	if isValidIdentifier(expr) {
+		return storage.OpAssign{Value: expr}, nil
 	}
 
-	fieldA := strings.TrimSpace(parts[0])
-	fieldB := strings.TrimSpace(parts[1])
+	// 2. Binary operations: check for binary operators not at index 0 (allowing unary negative fieldA)
+	var opIdx = -1
+	var opChar = ""
+	for _, op := range []string{"/", "*", "+", "-"} {
+		idx := strings.Index(expr, op)
+		if idx > 0 {
+			opIdx = idx
+			opChar = op
+			break
+		}
+	}
 
-	if !isValidIdentifier(fieldA) {
-		return nil, fmt.Errorf("invalid identifier in field A: %q", fieldA)
-	}
-	if !isValidIdentifier(fieldB) {
-		return nil, fmt.Errorf("invalid identifier in field B: %q", fieldB)
+	if opIdx != -1 {
+		fieldA := strings.TrimSpace(expr[:opIdx])
+		fieldB := strings.TrimSpace(expr[opIdx+1:])
+		if !isValidIdentifier(fieldA) {
+			return nil, fmt.Errorf("invalid identifier in field A: %q", fieldA)
+		}
+		if !isValidIdentifier(fieldB) {
+			return nil, fmt.Errorf("invalid identifier in field B: %q", fieldB)
+		}
+		switch opChar {
+		case "/":
+			return driver.Divide(fieldA, fieldB), nil
+		case "*":
+			return driver.Multiply(fieldA, fieldB), nil
+		case "+":
+			return driver.Add(fieldA, fieldB), nil
+		case "-":
+			return driver.Subtract(fieldA, fieldB), nil
+		}
 	}
 
-	switch op {
-	case "/":
-		return driver.Divide(fieldA, fieldB), nil
-	case "*":
-		return driver.Multiply(fieldA, fieldB), nil
-	case "+":
-		return driver.Add(fieldA, fieldB), nil
-	case "-":
-		return driver.Subtract(fieldA, fieldB), nil
-	}
-	return nil, fmt.Errorf("invalid op")
+	return nil, fmt.Errorf("unsupported or malformed expression %q", expr)
 }
 
 func parseVal(str string) float32 {
@@ -320,8 +339,8 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"model":   req.Model,
 		"name":    req.Name,
+		"message": "record saved",
 	})
 }
 
@@ -341,9 +360,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	computations := make(map[string]storage.ComputeOp)
 	for outField, expr := range req.Computations {
 		op, err := parseComputeOp(expr)
-		if err == nil {
-			computations[outField] = op
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid computation %q for field %q: %s"}`, expr, outField, err.Error()), http.StatusBadRequest)
+			return
 		}
+		computations[outField] = op
 	}
 
 	props, err := db.GetRecordWithCompute(req.Name, computations, req.Select...)
@@ -375,9 +396,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	computations := make(map[string]storage.ComputeOp)
 	for outField, expr := range req.Computations {
 		op, err := parseComputeOp(expr)
-		if err == nil {
-			computations[outField] = op
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid computation %q for field %q: %s"}`, expr, outField, err.Error()), http.StatusBadRequest)
+			return
 		}
+		computations[outField] = op
 	}
 
 	var filters []storage.FilterCondition
@@ -435,9 +458,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	mutations := make(map[string]storage.ComputeOp)
 	for field, expr := range req.Mutations {
 		op, err := parseComputeOp(expr)
-		if err == nil {
-			mutations[field] = op
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid mutation %q for field %q: %s"}`, expr, field, err.Error()), http.StatusBadRequest)
+			return
 		}
+		mutations[field] = op
 	}
 
 	var filters []storage.FilterCondition
@@ -480,12 +505,12 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limitK := req.LimitK
-	if limitK <= 0 {
-		limitK = 5
+	limit := req.LimitK
+	if limit <= 0 {
+		limit = 5
 	}
 
-	results, anchor, err := db.ExecuteGraphStep(req.Inputs, req.Relation, limitK)
+	results, anchor, err := db.ExecuteGraphStep(req.Inputs, req.Relation, limit)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -575,6 +600,16 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		targetDir := req.TargetPath
 		if targetDir == "" {
 			targetDir = filepath.Join(s.dataDir, "partitions")
+		} else {
+			// Enforce path containment within s.dataDir to prevent arbitrary directory write vulnerability
+			cleanTarget := filepath.Clean(targetDir)
+			absDataDir, err1 := filepath.Abs(s.dataDir)
+			absTarget, err2 := filepath.Abs(cleanTarget)
+			if err1 != nil || err2 != nil || !strings.HasPrefix(absTarget, absDataDir) {
+				http.Error(w, fmt.Sprintf(`{"error":"Invalid target_path: must reside inside data directory %s"}`, s.dataDir), http.StatusBadRequest)
+				return
+			}
+			targetDir = absTarget
 		}
 		sink = partition.NewLocalDiskSink(targetDir)
 	}
@@ -644,7 +679,7 @@ func main() {
 
 	authToken := os.Getenv("ANCHORDB_AUTH_TOKEN")
 
-	server := NewServer(dataDir, authToken)
+	server := NewServer(dataDir, authToken, portStr)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
@@ -662,7 +697,6 @@ func main() {
 	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
 	fmt.Println("             All Commercial Rights Reserved               ")
 	fmt.Printf("   Port Dedicated : %s\n", portStr)
-	fmt.Printf("   Data Directory : %s\n", dataDir)
 	if server.ipFilter.IsEmpty() {
 		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
 	} else {
@@ -672,9 +706,42 @@ func main() {
 	fmt.Println("==========================================================")
 
 	addr := ":" + portStr
-	log.Printf("[READY] AnchorDB Server mendengarkan di %s ...", addr)
-	handler := server.ipFilter.Middleware(mux)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("Server error: %v", err)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           server.ipFilter.Middleware(mux),
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	// Graceful shutdown handling
+	stopSignal := make(chan os.Signal, 1)
+	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("[READY] AnchorDB Server mendengarkan di %s ...", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	<-stopSignal
+	log.Println("[SHUTDOWN] Menghentikan server & menyimpan semua database ke disk...")
+	server.scheduler.Stop()
+
+	// Sync all active models cleanly to disk before exit
+	server.mu.Lock()
+	for name, db := range server.models {
+		if err := db.Sync(); err != nil {
+			log.Printf("[WARN] Gagal sync model %s saat shutdown: %v", name, err)
+		}
+		_ = db.Close()
+	}
+	server.mu.Unlock()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+	log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
 }

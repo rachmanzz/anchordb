@@ -10,7 +10,7 @@ import (
 
 // GraphResponse holds results returned to the client application
 type GraphResponse struct {
-	Anchor  spatial.Point2D          `json:"anchor"`
+	Anchor  spatial.Point2D            `json:"anchor"`
 	Results []storage.GraphQueryResult `json:"results"`
 }
 

@@ -19,3 +19,6 @@ data/partitions/
 .env
 .DS_Store
 Thumbs.db
+
+# Local knowledge base
+.knowledges

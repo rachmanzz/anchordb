@@ -211,6 +211,59 @@ func BenchmarkAnchorDB_Paging10k_From_100k(b *testing.B) {
 	}
 }
 
+func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "reopen_test.anchordb")
+
+	// Phase 1: Open, populate nodes, and sync to disk
+	db1, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	_, _ = db1.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db1.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db1.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
+
+	if err := db1.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	_ = db1.Close()
+
+	// Phase 2: REOPEN from disk!
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	// CRITICAL CHECK: ExecuteGraphStep must return non-empty word string "anak", not ""!
+	results, _, err := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "keturunan", 5)
+	if err != nil {
+		t.Fatalf("ExecuteGraphStep after reopen failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected at least 1 result after reopen, got 0")
+	}
+	if results[0].Word != "anak" {
+		t.Fatalf("CRITICAL BUG: word lost after reopen! expected 'anak', got %q", results[0].Word)
+	}
+	t.Logf("[OK] Reopen graph query succeeded! Top-1 word preserved: %q (Score: %f)", results[0].Word, results[0].Score)
+
+	// Phase 3: Append new node to reopened DB and sync again
+	_, _ = db2.AppendNode("sekolah", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}, 1)
+	if err := db2.Sync(); err != nil {
+		t.Fatalf("Sync after append on reopened db failed: %v", err)
+	}
+
+	// Verify all words still intact
+	resAfterAppend, _, _ := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "keturunan", 5)
+	if len(resAfterAppend) == 0 || resAfterAppend[0].Word != "anak" {
+		t.Fatalf("Word corrupted after appending to reopened db! got %q", resAfterAppend[0].Word)
+	}
+	t.Logf("[OK] String pool remains intact after subsequent append + sync on reopened db!")
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)
