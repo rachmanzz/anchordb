@@ -1,4 +1,4 @@
-# Multi-stage production build for AnchorDB (Zero CGO, 100% CPU, non-root, < 15 MB)
+# Multi-stage production build for AnchorDB (Minimal Dependencies, Zero CGO, 100% CPU, non-root, < 15 MB)
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /src

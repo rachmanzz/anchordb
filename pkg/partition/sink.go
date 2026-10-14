@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// GenerateUUID generates a standard RFC4122 v4 UUID without external dependencies
+// GenerateUUID generates a standard RFC4122 v4 UUID with a minimal-dependency implementation
 func GenerateUUID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])

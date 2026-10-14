@@ -3,6 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.27.1-blue.svg)](https://golang.org)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20amd64-green.svg)]()
 [![Hardware](https://img.shields.io/badge/Hardware-100%25%20CPU%20%7C%20Zero%20GPU-orange.svg)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Minimal%20Dependencies%20%7C%20Zero%20Bloat-brightgreen.svg)]()
 [![Dedicated Port](https://img.shields.io/badge/Port-7447-red.svg)]()
 [![License](https://img.shields.io/badge/License-Commercial%20Proprietary-red.svg)](LICENSE)
 
@@ -14,10 +15,12 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 
 ## Key Highlights
 
-- **100% CPU, Zero GPU**: Operates on standard CPU registers and memory-mapped files (`mmap(MAP_SHARED)`) without expensive CUDA/GPU hardware or external CGO dependencies.
-- **Ultra-Compact Binary Layout**:
-  - **Header**: 64-byte fixed memory layout.
-  - **Record**: 40-byte fixed binary nodes (ID, 2D coordinates, 4 semantic role floats, domain tag, word offset).
+- **100% CPU, Zero GPU**: Operates on standard CPU registers and memory-mapped files (`mmap(MAP_SHARED)`) without expensive CUDA/GPU hardware or CGO.
+- **Minimal Dependencies Architecture**: We reject dogmatic "zero-dependencies" purism in favor of **pragmatic, minimal, strictly-vetted dependencies**. The engine maintains zero bloat, zero heavy frameworks, zero ORMs, and a minimal attack surface while allowing targeted, best-of-breed primitives where they enhance correctness and throughput.
+- **Ultra-Compact Memory & Binary Layout**:
+  - **Zero-Copy Node Decoding**: Historical nodes read directly from mmap without heap duplication.
+  - **CompactRecord & String Interning**: Key-value entity attributes stored in contiguous slices with shared interned key pointers, slashing RAM footprint by ~70% (~80B/entity).
+  - **Binary Header**: 64-byte fixed layout; **Record**: 40-byte fixed nodes.
 - **Constant-Time Bound $O(K)$**: Whether querying or updating 10,000 records out of 100,000+, AnchorDB guarantees early termination and execution within 1 to 3 milliseconds.
 - **In-Storage Mathematics & Projections**:
   - Arithmetic operators (`+`, `-`, `*`, `/`) executed inside storage without SQL overhead.
@@ -267,6 +270,15 @@ Measured on standard CPU (Intel Core i7-1165G7 @ 2.80GHz):
 | **Ray Convergence Calculation** | 3.7 microseconds / op |
 | **Internal Scheduler Task Execution** | 6.0 to 14.1 microseconds |
 | **Container Size** | **14.4 MB** (Alpine) |
+
+---
+
+## Documentation & Architecture
+
+For deeper technical deep-dives and engineering specifications:
+- [Design Philosophy: Minimal Dependencies & Zero Bloat](docs/philosophy.md)
+- [Architectural Specification & Memory Layout](docs/architecture.md)
+- [REST API Reference](#rest-api-reference)
 
 ---
 
