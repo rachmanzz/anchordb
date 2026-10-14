@@ -21,26 +21,16 @@ services:
       - ANCHORDB_CRON_ENABLED=true
       - ANCHORDB_PARTITION_SCHEDULE=23:00
       - ANCHORDB_PARTITION_RETENTION_DAYS=180
+      - ANCHORDB_SYNC_INTERVAL=5m
 
       # Worker Engine (gosuite/v3/worker)
       - ANCHORDB_WORKER_ENABLED=true
       - ANCHORDB_WORKER_CONCURRENCY=8
       - ANCHORDB_WORKER_QUEUE_SIZE=1000
 
-      # Queue Broker (gosuite/v3/queue: memory, redis, or nats)
+      # Queue Broker (gosuite/v3/queue: in-memory, pure Go)
       - ANCHORDB_QUEUE_ENABLED=true
-      - ANCHORDB_QUEUE_DRIVER=memory # Change to 'redis' or 'nats' if using external brokers
       - ANCHORDB_QUEUE_CONSUMER_ENABLED=true
-
-      # Optional Redis Configuration (if ANCHORDB_QUEUE_DRIVER=redis)
-      # - ANCHORDB_REDIS_ADDR=redis:6379
-      # - ANCHORDB_REDIS_PASSWORD=""
-      # - ANCHORDB_REDIS_DB=0
-      # - ANCHORDB_REDIS_PREFIX=anchordb:queue:
-
-      # Optional NATS Configuration (if ANCHORDB_QUEUE_DRIVER=nats)
-      # - ANCHORDB_NATS_URL=nats://nats:4222
-      # - ANCHORDB_NATS_STREAM=anchordb_stream
     volumes:
       - ./data:/data:Z
     deploy:
@@ -48,22 +38,3 @@ services:
         limits:
           cpus: '2.0'
           memory: 1G # Container hard limit: 512M, 1G, 5G
-
-  # Optional Redis service for distributed queue adapter
-  redis:
-    image: redis:7-alpine
-    container_name: anchordb-redis
-    restart: unless-stopped
-    profiles: ["redis"]
-    ports:
-      - "6379:6379"
-
-  # Optional NATS service with JetStream enabled for message streaming adapter
-  nats:
-    image: nats:2.10-alpine
-    container_name: anchordb-nats
-    restart: unless-stopped
-    profiles: ["nats"]
-    command: ["-js"]
-    ports:
-      - "4222:4222"

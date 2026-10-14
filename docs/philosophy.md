@@ -23,9 +23,9 @@ Setiap dependensi yang masuk ke dalam AnchorDB harus memenuhi 5 aturan emas (*Th
 |---|---|---|
 | **1** | **Zero CGO** | Dependensi harus 100% pure Go. Tidak boleh ada dependensi C/C++ yang membutuhkan toolchain CGO, glibc version locking, atau kompilasi silang yang rumit. |
 | **2** | **No Transitive Tree Explosion** | Dependensi yang membawa puluhan sub-dependensi lain (dependency graph raksasa) **dilarang keras**. Dependensi yang diterima adalah yang berdiri sendiri (*self-contained* atau zero transitive dependencies). |
-| **3** | **High Impact to Lines of Code Ratio** | Dependensi hanya diterima jika ia memberikan peningkatan keamanan, keandalan, atau throughput yang signifikan dibanding jika ditulis sendiri. |
+| **3** | **Zero External Daemons** | Engine AnchorDB harus berdiri sendiri secara mandiri tanpa mewajibkan broker eksternal (tidak bergantung pada Redis, NATS, Kafka, atau RabbitMQ). |
 | **4** | **Production-Grade & Battle-Tested** | Pustaka harus aktif dipelihara, memiliki cakupan pengujian (*test coverage*) tinggi, dan terbukti stabil di sistem berbeban tinggi. |
-| **5** | **Tiny Binary Impact** | Binary final AnchorDB harus tetap ringkas (< 20 MB) dan waktu kompilasi `go build` harus tetap berada di bawah 2–3 detik. |
+| **5** | **Tiny Binary Impact** | Binary final AnchorDB harus tetap ringkas (< 15 MB) dan waktu kompilasi `go build` harus tetap berada di bawah 2 detik. |
 
 ---
 
@@ -35,12 +35,12 @@ Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB mengintegrasikan s
 
 1. **`cron` (`v3/cron`)**:
    - Menghadirkan penjadwal tingkat produksi dengan proteksi *skip-if-still-running*, panic recovery, dan graceful shutdown berbatas waktu.
-   - Menggantikan loop manual tanpa menambah dependensi berat.
+   - Mengotomatiskan partisi harian dan pemicu sync berkala ke disk.
 2. **`worker` (`v3/worker`)**:
-   - Mengorkestrasi pool goroutine pekerja dan sub-worker fan-out untuk proses partisi disk dan upload S3 yang berat tanpa memblokir HTTP latency.
+   - Menjalankan **Async Partitioning** (`POST /v1/partition/run?async=true`) sehingga request HTTP langsung dijawab dalam hitungan milidetik, sementara kompresi berkas dan upload S3 diselesaikan oleh worker di latar belakang.
+   - Menjalankan **Periodic Background Disk Sync** (`db.Sync()`) secara kontinu tanpa mengunci query pembacaan data.
 3. **`queue` (`v3/queue`)**:
-   - Antrean asinkron untuk Change Data Capture (CDC) mutasi data (`record.saved`, `partition.archived`).
-   - Beroperasi secara mandiri dengan driver in-memory (tanpa dependensi eksternal), namun siap dihubungkan ke adapter **Redis** (`queue-redis`) atau **NATS JetStream** (`queue-nats`) melalui konfigurasi env/flags.
+   - Antrean in-memory berkinerja tinggi untuk Change Data Capture (CDC) mutasi data (`record.saved`, `record.updated`, `partition.archived`) tanpa membutuhkan server eksternal seperti Redis.
 
 ---
 
@@ -48,5 +48,5 @@ Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB mengintegrasikan s
 
 1. **Keamanan Maksimal**: Audit keamanan menjadi mudah karena *surface attack* kecil dan kode mudah diperiksa secara menyeluruh.
 2. **Kompilasi Cepat**: `go build` berlangsung instan dalam hitungan detik, baik di mesin lokal pengembang maupun di pipeline CI/CD.
-3. **Container Super Ringan**: Image Docker/Podman berbasis Alpine tetap berukuran sangat ramping (**~18 MB**).
-4. **Stabilitas Produksi**: Bebas dari ketergantungan framework web berat (seperti Gin/Fiber) yang sering memaksakan breaking changes antar-versi.
+3. **Container Super Ringan**: Image Docker/Podman berbasis Alpine tetap berukuran sangat ramping (**~14–15 MB**).
+4. **Kemudahan Operasional**: Cukup 1 binary atau 1 container independen tanpa perlu memasang cluster Redis atau broker eksternal lainnya.

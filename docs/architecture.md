@@ -45,32 +45,29 @@ Unlike traditional databases that transfer raw records to the application layer 
 
 ## 3. Background Pipeline Engine (`gosuite/v3`)
 
-AnchorDB incorporates production-grade background capabilities with zero framework bloat:
+AnchorDB incorporates production-grade background capabilities with zero external broker daemons (no Redis, no Kafka):
 
 ```
 +--------------------+        +--------------------+        +--------------------+
-|  Cron Scheduler    | -----> |   Worker Engine    | -----> |    Queue Broker    |
+|  Cron Scheduler    | -----> |   Worker Engine    | -----> |  In-Memory Queue   |
 | (gosuite/v3/cron)  |        | (gosuite/v3/worker)|        | (gosuite/v3/queue) |
 +--------------------+        +--------------------+        +--------------------+
           |                             |                             |
-    Auto-Partition              Async S3 Uploads              CDC Event Bus
-  Schedule: 23:00 / Cron         Worker Goroutines         Memory / Redis / NATS
+    Auto-Partition              Async Partition               CDC Event Bus
+ & Periodic Sync (5m)          & Background Sync           Zero External Broker
 ```
 
 1. **Cron Scheduler (`pkg/scheduler`)**:
    - Backed by `github.com/rachmanzz/gosuite/v3/cron`.
    - Built-in overlap prevention (`skip-if-still-running`), panic recovery, and standard 5-field cron or human-friendly `HH:MM` syntax.
-   - Triggers automated partition archiving for records older than `ANCHORDB_PARTITION_RETENTION_DAYS`.
+   - Triggers automated partition archiving and periodic background disk flushes (`@every 5m`).
 2. **Worker Pool (`pkg/worker`)**:
    - Backed by `github.com/rachmanzz/gosuite/v3/worker`.
-   - Offloads heavy CPU-intensive partition serialization and cloud storage uploads (S3/MinIO) out of HTTP request paths.
-   - Throttles concurrency based on host CPU cores.
-3. **Queue Broker & CDC (`pkg/queue`)**:
+   - **Async Partition**: `POST /v1/partition/run?async=true` offloads heavy serialization and cloud S3 uploads to worker goroutines, responding with HTTP 202 immediately.
+   - **Background Disk Sync**: Flushes memory-mapped models to disk periodically without blocking client query latencies.
+3. **In-Memory Queue Broker & CDC (`pkg/queue`)**:
    - Backed by `github.com/rachmanzz/gosuite/v3/queue`.
-   - Zero-dependency **in-memory driver** by default.
-   - Optional enterprise adapters:
-     - **Redis (`queue-redis`)**: Priority ZSet and delayed scheduling.
-     - **NATS JetStream (`queue-nats`)**: Streaming deduplication and distributed pull subscribers.
+   - High-throughput pure Go in-memory queue.
    - Emits events on mutations: `anchordb.record.saved`, `anchordb.record.updated`, `anchordb.partition.archived`.
 
 ---

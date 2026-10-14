@@ -38,10 +38,11 @@ type ServerConfig struct {
 	TrustProxy    bool
 	MemorySummary string
 
-	// Background subsystems
+	// Background subsystems (Minimal Dependencies: pure Go, zero external broker)
 	CronEnabled       bool
 	PartitionSchedule string
 	RetentionDays     float32
+	SyncInterval      string
 
 	WorkerConfig worker.Config
 	QueueConfig  queue.Config
@@ -73,7 +74,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	workerPool := worker.NewPool(cfg.WorkerConfig)
 	workerPool.Start()
 
-	// 2. Initialize Queue Manager
+	// 2. Initialize In-Memory Queue Manager
 	queueMgr, err := queue.NewQueueManager(cfg.QueueConfig, workerPool.Dispatcher())
 	if err != nil {
 		_ = workerPool.Shutdown()
@@ -111,7 +112,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			for _, m := range loaded {
 				modelName := m
 				// Dispatch heavy archival execution to worker pool
-				_ = s.worker.Dispatch(context.Background(), "partition_"+modelName, func(ctx context.Context) error {
+				_ = s.worker.Dispatch(context.Background(), "cron_partition_"+modelName, func(ctx context.Context) error {
 					db, err := s.getModel(modelName)
 					if err != nil {
 						return err
@@ -125,7 +126,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 						PruneHotDB:    true,
 					})
 					if err == nil && partRes.ArchivedCount > 0 {
-						log.Printf("[SCHEDULER] Model %q terpartisi: %d record diarsipkan ke %s",
+						log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
 							modelName, partRes.ArchivedCount, partRes.TargetLocation)
 						if s.queue != nil {
 							_ = s.queue.Publish(ctx, queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
@@ -142,6 +143,32 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			}
 			return nil
 		})
+
+		// Register periodic background disk sync via worker engine
+		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
+			_ = s.scheduler.Register("periodic_background_sync", cfg.SyncInterval, func() error {
+				return s.worker.Dispatch(context.Background(), "periodic_disk_sync", func(ctx context.Context) error {
+					s.mu.RLock()
+					var dbs []*storage.AnchorDB
+					for _, d := range s.models {
+						dbs = append(dbs, d)
+					}
+					s.mu.RUnlock()
+
+					var synced int
+					for _, d := range dbs {
+						if err := d.Sync(); err == nil {
+							synced++
+						}
+					}
+					if synced > 0 {
+						log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk", synced)
+					}
+					return nil
+				})
+			})
+		}
+
 		s.scheduler.Start()
 	}
 
@@ -607,6 +634,20 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If async requested, offload to worker pool and return immediately
+	if r.URL.Query().Get("async") == "true" {
+		_ = s.worker.Dispatch(context.Background(), "sync_"+modelName, func(ctx context.Context) error {
+			return db.Sync()
+		})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"async":   true,
+			"status":  "queued",
+			"message": fmt.Sprintf("Sync for model %q queued to background worker engine", modelName),
+		})
+		return
+	}
+
 	if err := db.Sync(); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -630,6 +671,7 @@ type PartitionRunRequest struct {
 	S3AccessKey   string   `json:"s3_access_key"`
 	S3SecretKey   string   `json:"s3_secret_key"`
 	PruneHotDB    *bool    `json:"prune_hot_db"`
+	Async         bool     `json:"async"` // If true, offloads to worker pool (returns HTTP 202)
 }
 
 func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +741,58 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 	}
 
+	isAsync := req.Async || r.URL.Query().Get("async") == "true"
+
+	// 1. Asynchronous execution via Worker Engine
+	if isAsync {
+		err := s.worker.Dispatch(context.Background(), "partition_run_async", func(ctx context.Context) error {
+			for _, m := range targetModels {
+				db, err := s.getModel(m)
+				if err != nil {
+					continue
+				}
+				res, err := partition.ExecutePartition(db, partition.PartitionPolicy{
+					ModelName:     m,
+					DateField:     dateField,
+					RetentionDays: retentionDays,
+					Sink:          sink,
+					FileFormat:    "{date}_{uuid}.anchordb",
+					PruneHotDB:    prune,
+				})
+				if err == nil && res.ArchivedCount > 0 {
+					log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
+						m, res.ArchivedCount, res.TargetLocation)
+					if s.queue != nil {
+						_ = s.queue.Publish(ctx, queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
+							Model:          res.ModelName,
+							ArchivedCount:  res.ArchivedCount,
+							TargetLocation: res.TargetLocation,
+							CutoffDate:     res.CutoffDate,
+							Timestamp:      res.ExecutionTime,
+						})
+					}
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch partition to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"async":   true,
+			"status":  "queued",
+			"message": "Partition task dispatched to background worker pool",
+			"targets": targetModels,
+		})
+		return
+	}
+
+	// 2. Synchronous execution
 	var results []*partition.PartitionResult
 	for _, m := range targetModels {
 		db, err := s.getModel(m)
@@ -820,26 +914,16 @@ func main() {
 	flagCronEnabled := flag.Bool("cron-enabled", true, "Enable background cron scheduler (overrides ANCHORDB_CRON_ENABLED)")
 	flagPartitionSchedule := flag.String("partition-schedule", "", "Partition cron schedule or HH:MM e.g. 23:00 (overrides ANCHORDB_PARTITION_SCHEDULE)")
 	flagRetentionDays := flag.Float64("retention-days", 0, "Default partition archival retention days (overrides ANCHORDB_PARTITION_RETENTION_DAYS)")
+	flagSyncInterval := flag.String("sync-interval", "", "Interval for periodic background disk sync e.g. 5m (overrides ANCHORDB_SYNC_INTERVAL)")
 
 	// 3. Worker Pool Flags
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
 	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
 
-	// 4. Queue Broker Flags
+	// 4. Queue Broker Flags (In-Memory)
 	flagQueueEnabled := flag.Bool("queue-enabled", true, "Enable async queue broker (overrides ANCHORDB_QUEUE_ENABLED)")
-	flagQueueDriver := flag.String("queue-driver", "", "Queue broker driver: memory, redis, nats (overrides ANCHORDB_QUEUE_DRIVER)")
 	flagQueueConsumer := flag.Bool("queue-consumer", true, "Enable background queue consumer (overrides ANCHORDB_QUEUE_CONSUMER_ENABLED)")
-
-	// 5. Redis Adapter Flags (Optional)
-	flagRedisAddr := flag.String("redis-addr", "", "Redis server address e.g. localhost:6379 (overrides ANCHORDB_REDIS_ADDR)")
-	flagRedisPassword := flag.String("redis-password", "", "Redis password (overrides ANCHORDB_REDIS_PASSWORD)")
-	flagRedisDB := flag.Int("redis-db", 0, "Redis DB index (overrides ANCHORDB_REDIS_DB)")
-	flagRedisPrefix := flag.String("redis-prefix", "", "Redis queue key prefix (overrides ANCHORDB_REDIS_PREFIX)")
-
-	// 6. NATS Adapter Flags (Optional)
-	flagNATSURL := flag.String("nats-url", "", "NATS server URL e.g. nats://localhost:4222 (overrides ANCHORDB_NATS_URL)")
-	flagNATSStream := flag.String("nats-stream", "", "NATS JetStream stream name (overrides ANCHORDB_NATS_STREAM)")
 
 	flag.Parse()
 
@@ -896,6 +980,11 @@ func main() {
 		retentionDays = float32(getEnvFloat("ANCHORDB_PARTITION_RETENTION_DAYS", 180))
 	}
 
+	syncInterval := *flagSyncInterval
+	if syncInterval == "" {
+		syncInterval = getEnv("ANCHORDB_SYNC_INTERVAL", "5m")
+	}
+
 	// Resolve Worker Parameters
 	workerEnabled := *flagWorkerEnabled
 	if !workerEnabled || !flagPassed("worker-enabled") {
@@ -915,62 +1004,15 @@ func main() {
 		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
 	}
 
-	// Resolve Queue Parameters
+	// Resolve Queue Parameters (In-Memory)
 	queueEnabled := *flagQueueEnabled
 	if !queueEnabled || !flagPassed("queue-enabled") {
 		queueEnabled = getEnvBool("ANCHORDB_QUEUE_ENABLED", true)
 	}
 
-	queueDriverStr := *flagQueueDriver
-	if queueDriverStr == "" {
-		queueDriverStr = getEnv("ANCHORDB_QUEUE_DRIVER", "")
-	}
-
 	queueConsumer := *flagQueueConsumer
 	if !queueConsumer || !flagPassed("queue-consumer") {
 		queueConsumer = getEnvBool("ANCHORDB_QUEUE_CONSUMER_ENABLED", true)
-	}
-
-	redisAddr := *flagRedisAddr
-	if redisAddr == "" {
-		redisAddr = getEnv("ANCHORDB_REDIS_ADDR", "")
-	}
-
-	redisPassword := *flagRedisPassword
-	if redisPassword == "" {
-		redisPassword = getEnv("ANCHORDB_REDIS_PASSWORD", "")
-	}
-
-	redisDB := *flagRedisDB
-	if redisDB == 0 {
-		redisDB = getEnvInt("ANCHORDB_REDIS_DB", 0)
-	}
-
-	redisPrefix := *flagRedisPrefix
-	if redisPrefix == "" {
-		redisPrefix = getEnv("ANCHORDB_REDIS_PREFIX", "anchordb:queue:")
-	}
-
-	natsURL := *flagNATSURL
-	if natsURL == "" {
-		natsURL = getEnv("ANCHORDB_NATS_URL", "")
-	}
-
-	natsStream := *flagNATSStream
-	if natsStream == "" {
-		natsStream = getEnv("ANCHORDB_NATS_STREAM", "anchordb_stream")
-	}
-
-	// Auto-select queue driver if not explicitly passed
-	driverType := queue.DriverType(strings.ToLower(queueDriverStr))
-	if driverType == "" {
-		if redisAddr != "" {
-			driverType = queue.DriverRedis
-		} else if natsURL != "" {
-			driverType = queue.DriverNATS
-		} else {
-			driverType = queue.DriverMemory
-		}
 	}
 
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
@@ -990,6 +1032,7 @@ func main() {
 		CronEnabled:       cronEnabled,
 		PartitionSchedule: partitionSched,
 		RetentionDays:     retentionDays,
+		SyncInterval:      syncInterval,
 		WorkerConfig: worker.Config{
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,
@@ -998,16 +1041,9 @@ func main() {
 		},
 		QueueConfig: queue.Config{
 			Enabled:         queueEnabled,
-			Driver:          driverType,
 			ConsumerEnabled: queueConsumer,
-			PollInterval:    50 * time.Millisecond,
-			BatchSize:       10,
-			RedisAddr:       redisAddr,
-			RedisPassword:   redisPassword,
-			RedisDB:         redisDB,
-			RedisPrefix:     redisPrefix,
-			NATSURL:         natsURL,
-			NATSStream:      natsStream,
+			PollInterval:    20 * time.Millisecond,
+			BatchSize:       20,
 		},
 	}
 
@@ -1041,7 +1077,8 @@ func main() {
 		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", ipWhitelist)
 	}
 	if cronEnabled {
-		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd)\n", partitionSched, retentionDays)
+		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd, Sync: %s)\n",
+			partitionSched, retentionDays, syncInterval)
 	} else {
 		fmt.Println("   Cron Engine    : DISABLED")
 	}
@@ -1051,19 +1088,11 @@ func main() {
 		fmt.Println("   Worker Pool    : DISABLED")
 	}
 	if queueEnabled {
-		var driverDetail string
-		switch driverType {
-		case queue.DriverRedis:
-			driverDetail = fmt.Sprintf("redis @ %s", redisAddr)
-		case queue.DriverNATS:
-			driverDetail = fmt.Sprintf("nats @ %s", natsURL)
-		default:
-			driverDetail = "in-memory (zero-external)"
-		}
-		fmt.Printf("   Queue Broker   : ENABLED (%s, consumer: %t)\n", driverDetail, queueConsumer)
+		fmt.Printf("   Queue Broker   : ENABLED (In-Memory, Consumer: %t)\n", queueConsumer)
 	} else {
 		fmt.Println("   Queue Broker   : DISABLED")
 	}
+	fmt.Println("   Architecture   : Minimal Dependencies (Pure Go, Zero External Broker)")
 	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
 	fmt.Println("==========================================================")
 
@@ -1095,7 +1124,7 @@ func main() {
 		server.scheduler.Stop()
 	}
 
-	// 2. Stop Queue Consumer & Broker Connections
+	// 2. Stop Queue Consumer
 	if server.queue != nil {
 		_ = server.queue.Close()
 	}

@@ -16,7 +16,7 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 ## Key Highlights
 
 - **100% CPU, Zero GPU**: Operates on standard CPU registers and memory-mapped files (`mmap(MAP_SHARED)`) without expensive CUDA/GPU hardware or CGO.
-- **Minimal Dependencies Architecture**: We reject dogmatic "zero-dependencies" purism in favor of **pragmatic, minimal, strictly-vetted dependencies**. The engine maintains zero bloat, zero heavy frameworks, zero ORMs, and a minimal attack surface while allowing targeted, best-of-breed primitives where they enhance correctness and throughput.
+- **Minimal Dependencies Architecture**: We reject dogmatic "zero-dependencies" purism in favor of **pragmatic, minimal, strictly-vetted dependencies**. The engine maintains zero bloat, zero heavy frameworks, zero external broker daemons (no Redis, no Kafka, no RabbitMQ), and a minimal attack surface.
 - **Ultra-Compact Memory & Binary Layout**:
   - **Zero-Copy Node Decoding**: Historical nodes read directly from mmap without heap duplication.
   - **CompactRecord & String Interning**: Key-value entity attributes stored in contiguous slices with shared interned key pointers, slashing RAM footprint by ~70% (~80B/entity).
@@ -28,8 +28,10 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
   - Selective column projection (`.Select("jarak", "waktu", "kecepatan")`).
 - **Resilient Background Pipeline (`gosuite/v3`)**:
   - **Production Cron (`gosuite/v3/cron`)**: Automated partition archiving with panic recovery, overlap prevention, and graceful shutdown.
-  - **Worker Engine (`gosuite/v3/worker`)**: Non-blocking asynchronous task execution and sub-worker fan-out pools.
-  - **Event Broker & Queue (`gosuite/v3/queue`)**: Pluggable asynchronous messaging with high-speed in-memory driver (default, zero external dependencies) and optional **Redis** (`queue-redis`) or **NATS JetStream** (`queue-nats`) adapters.
+  - **Worker Engine (`gosuite/v3/worker`)**: Non-blocking asynchronous task execution:
+    - **Async Partition API (`POST /v1/partition/run?async=true`)**: Instant HTTP 202 response; offloads heavy serialization and S3 uploads to worker pool.
+    - **Periodic Background Disk Sync (`db.Sync()`)**: Continuous streaming flush to disk every 5 minutes without query blocking.
+  - **Event Broker & Queue (`gosuite/v3/queue`)**: High-throughput CPU-native in-memory queue for Change Data Capture (CDC) events without external service dependencies.
 - **Fine-Grained Memory Allocation**: Support for explicit soft RAM limits (**500MB, 1GB, 5GB**) with auto-detection of Docker/Podman cgroup ceilings.
 - **Multi-Model Routing ("Satu DB = Satu Model")**: Dynamic file separation (`/data/{model}.anchordb`) with path traversal immunity.
 - **Dedicated Port**: Standardized official port **`7447`**.
@@ -50,16 +52,16 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
     +------------------------------+          +------------------------------+          +------------------------------+
     |       REST HTTP Engine       |          |    Cron Scheduler Daemon     |          |     Async Worker Engine      |
     | /v1/save, /v1/get, /v1/list  |          |     (gosuite/v3/cron)        |          |    (gosuite/v3/worker)       |
-    | /v1/update, /v1/graph, /sync |          | Daily 23:00 / Custom Cron    |          | Concurrency & Sub-Workers    |
+    | /v1/update, /v1/graph, /sync |          | Daily 23:00 / Sync Every 5m  |          | Async Partitions & Sync Pool |
     +--------------+---------------+          +--------------+---------------+          +--------------+---------------+
                    |                                         |                                         |
                    +-----------------------------------------+-----------------------------------------+
                                                              |
                                                              v
                                               +------------------------------+
-                                              |     Event Queue Broker       |
+                                              |     In-Memory Event Queue    |
                                               |     (gosuite/v3/queue)       |
-                                              | Memory / Redis / NATS Adapters|
+                                              |  Zero External Dependencies  |
                                               +--------------+---------------+
                                                              |
                                                              v
@@ -80,30 +82,27 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 
 ---
 
-## Background Subsystems: Cron, Worker & Queue
-
-AnchorDB includes production-grade background capabilities powered by `github.com/rachmanzz/gosuite/v3`:
+## Background Subsystems: Cron, Worker & In-Memory Queue
 
 ### 1. Cron Scheduler (`pkg/scheduler` $\rightarrow$ `gosuite/v3/cron`)
-- **Automated Archival**: Automatically triggers partition runs at scheduled times (default `23:00` daily or standard cron syntax like `0 23 * * *`).
-- **Panic Recovery & Overlap Protection**: Jobs are guaranteed not to run concurrently if a previous iteration is still active (`skip-if-still-running`).
-- **Lifecycle Status**: Real-time task inspection via `GET /v1/scheduler/status`.
+- **Automated Archival**: Runs daily (default `23:00` or custom cron expression) to partition historical records older than $N$ days.
+- **Periodic Background Sync**: Triggers safe disk streaming syncs at regular intervals (default `@every 5m`).
+- **Overlap Prevention**: Built-in `skip-if-still-running` protection and panic recovery.
+- **Inspection**: Real-time status via `GET /v1/scheduler/status`.
 
 ### 2. Worker Engine (`pkg/worker` $\rightarrow$ `gosuite/v3/worker`)
-- **Non-Blocking Task Offloading**: Heavy partition file generation, S3 archival uploads, and disk flushes are offloaded from HTTP request goroutines.
-- **Configurable Concurrency**: Automatically scales to available CPU cores with configurable limits.
-- **Worker Status**: Real-time stats (dispatched, completed, failed) via `GET /v1/worker/status`.
+- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "queued"}`) within 1 millisecond. The worker pool generates partition files and uploads to S3 in the background.
+- **Continuous Background Disk Sync**: Safely streams memory-mapped buffers to disk without locking client queries.
+- **Throttled Concurrency**: Controlled worker goroutines prevent CPU starvation.
+- **Inspection**: Real-time metrics via `GET /v1/worker/status`.
 
-### 3. Queue & Event Broker (`pkg/queue` $\rightarrow$ `gosuite/v3/queue`)
+### 3. In-Memory Queue Broker (`pkg/queue` $\rightarrow$ `gosuite/v3/queue`)
 - **Change Data Capture (CDC)**: Publishes database mutation events:
   - `anchordb.record.saved`
   - `anchordb.record.updated`
   - `anchordb.partition.archived`
-- **Zero-Dependency by Default**: Operates out of the box using a high-throughput in-memory queue.
-- **Pluggable External Adapters**:
-  - **Redis (`queue-redis`)**: Priority ZSet and delayed scheduling over Redis.
-  - **NATS JetStream (`queue-nats`)**: Streaming deduplication and distributed pull consumers.
-- **Queue Status**: Live message counters via `GET /v1/queue/status`.
+- **Zero External Dependencies**: Operates completely in-memory using CPU-native Go channels and queues (no Redis, no NATS, no RabbitMQ required).
+- **Inspection**: Real-time message counters via `GET /v1/queue/status`.
 
 ---
 
@@ -122,24 +121,18 @@ All settings can be configured via environment variables or CLI flags:
 | **Cron Enabled** | `-cron-enabled` | `ANCHORDB_CRON_ENABLED` | `true` | Enable background scheduler |
 | **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM` or cron spec `0 23 * * *`) |
 | **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
+| **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval |
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
-| **Queue Enabled** | `-queue-enabled` | `ANCHORDB_QUEUE_ENABLED` | `true` | Enable async queue broker |
-| **Queue Driver** | `-queue-driver` | `ANCHORDB_QUEUE_DRIVER` | `memory` | Adapter: `memory`, `redis`, or `nats` |
+| **Queue Enabled** | `-queue-enabled` | `ANCHORDB_QUEUE_ENABLED` | `true` | Enable in-memory async event broker |
 | **Queue Consumer** | `-queue-consumer` | `ANCHORDB_QUEUE_CONSUMER_ENABLED` | `true` | Enable background queue consumer |
-| **Redis Address** | `-redis-addr` | `ANCHORDB_REDIS_ADDR` | `""` | Redis host:port (e.g. `localhost:6379`) |
-| **Redis Password** | `-redis-password` | `ANCHORDB_REDIS_PASSWORD` | `""` | Redis authentication password |
-| **Redis Database** | `-redis-db` | `ANCHORDB_REDIS_DB` | `0` | Redis database index |
-| **Redis Prefix** | `-redis-prefix` | `ANCHORDB_REDIS_PREFIX` | `anchordb:queue:` | Redis key namespace |
-| **NATS URL** | `-nats-url` | `ANCHORDB_NATS_URL` | `""` | NATS URL (e.g. `nats://localhost:4222`) |
-| **NATS Stream** | `-nats-stream` | `ANCHORDB_NATS_STREAM` | `anchordb_stream`| NATS JetStream stream identifier |
 
 ---
 
 ## Deployment Examples
 
-### 1. Docker / Podman (Standalone In-Memory)
+### 1. Podman / Docker (Pure Self-Contained)
 ```bash
 podman run -d \
   --name anchordb \
@@ -148,24 +141,13 @@ podman run -d \
   -e ANCHORDB_MEMORY_LIMIT=800MB \
   -e ANCHORDB_CRON_ENABLED=true \
   -e ANCHORDB_PARTITION_SCHEDULE="23:00" \
+  -e ANCHORDB_SYNC_INTERVAL="5m" \
   -e ANCHORDB_WORKER_CONCURRENCY=8 \
-  -e ANCHORDB_QUEUE_DRIVER=memory \
   -v ./data:/data:Z \
   anchordb:latest
 ```
 
-### 2. Docker / Podman with Redis Queue Adapter
-```bash
-podman run -d \
-  --name anchordb \
-  -p 7447:7447 \
-  -e ANCHORDB_QUEUE_DRIVER=redis \
-  -e ANCHORDB_REDIS_ADDR=redis:6379 \
-  -v ./data:/data:Z \
-  anchordb:latest
-```
-
-### 3. Docker Compose (Full Stack)
+### 2. Docker Compose
 ```yaml
 services:
   anchordb:
@@ -175,8 +157,8 @@ services:
     environment:
       - ANCHORDB_MEMORY_LIMIT=800MB
       - ANCHORDB_CRON_ENABLED=true
+      - ANCHORDB_SYNC_INTERVAL=5m
       - ANCHORDB_WORKER_CONCURRENCY=8
-      - ANCHORDB_QUEUE_DRIVER=memory # or 'redis' / 'nats'
     volumes:
       - ./data:/data:Z
     deploy:
@@ -195,7 +177,7 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
 - `GET /v1/scheduler/status`: Active cron tasks and next execution times.
 - `GET /v1/worker/status`: Worker pool concurrency and task execution counters.
-- `GET /v1/queue/status`: Queue broker stats and event metrics.
+- `GET /v1/queue/status`: In-memory queue stats and event metrics.
 
 ### 2. Mutation & Query Endpoints
 - `POST /v1/save`: Ingest an entity with key-value properties. Publishes `anchordb.record.saved`.
@@ -203,8 +185,8 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters.
 - `POST /v1/update`: Constant-time batch update with arithmetic mutations. Publishes `anchordb.record.updated`.
 - `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
-- `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk.
-- `POST /v1/partition/run`: Manually trigger partition archival. Publishes `anchordb.partition.archived`.
+- `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
+- `POST /v1/partition/run`: Triggers partition archival (add `"async": true` in JSON body or `?async=true` to offload to worker and return HTTP 202 immediately). Publishes `anchordb.partition.archived`.
 
 ---
 
