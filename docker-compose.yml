@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   anchordb:
     build:
@@ -13,11 +11,13 @@ services:
     environment:
       - ANCHORDB_PORT=7447
       - ANCHORDB_DATA_DIR=/data
-      - ANCHORDB_AUTH_TOKEN=
+      - ANCHORDB_AUTH_TOKEN=""
+      - ANCHORDB_IP_WHITELIST="" # Optional: e.g. "127.0.0.1,::1,192.168.1.0/24"
+      - ANCHORDB_PARTITION_SCHEDULE="23:00"
     volumes:
-      - ./data:/data
+      - ./data:/data:Z
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 512M # Sangat irit! ClickHouse butuh 2-4GB
+          memory: 512M # Ultra-hemat! Bounded mmap memory

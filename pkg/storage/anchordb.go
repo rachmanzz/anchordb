@@ -476,11 +476,11 @@ func (db *AnchorDB) loadEntities() error {
 
 		props := make(map[string]float32, attrCount)
 		for a := 0; a < attrCount; a++ {
-			if offset+1 > len(data) {
+			if offset+2 > len(data) {
 				break
 			}
-			keyLen := int(data[offset])
-			offset += 1
+			keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+			offset += 2
 			if offset+keyLen+4 > len(data) {
 				break
 			}
@@ -925,7 +925,8 @@ func (db *AnchorDB) Sync() error {
 
 		for k, v := range props {
 			kBytes := []byte(k)
-			entityBuf = append(entityBuf, byte(len(kBytes)))
+			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
+			entityBuf = append(entityBuf, lBuf[:]...)
 			entityBuf = append(entityBuf, kBytes...)
 
 			var vBuf [4]byte

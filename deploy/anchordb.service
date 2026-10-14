@@ -4,8 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/anchordb
+User=anchordb
+Group=anchordb
+WorkingDirectory=/var/lib/anchordb
 ExecStart=/opt/anchordb/anchordb-server
 Restart=always
 RestartSec=5
@@ -14,9 +15,12 @@ RestartSec=5
 Environment=ANCHORDB_PORT=7447
 Environment=ANCHORDB_DATA_DIR=/var/lib/anchordb
 Environment=ANCHORDB_AUTH_TOKEN=
+Environment=ANCHORDB_IP_WHITELIST=127.0.0.1,::1
 
-# Resource management
+# Security & Resource limits
 LimitNOFILE=65535
+ProtectSystem=full
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
