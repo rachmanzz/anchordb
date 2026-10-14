@@ -43,7 +43,39 @@ Unlike traditional databases that transfer raw records to the application layer 
 
 ---
 
-## 3. Memory & Resource Frugality
+## 3. Background Pipeline Engine (`gosuite/v3`)
+
+AnchorDB incorporates production-grade background capabilities with zero framework bloat:
+
+```
++--------------------+        +--------------------+        +--------------------+
+|  Cron Scheduler    | -----> |   Worker Engine    | -----> |    Queue Broker    |
+| (gosuite/v3/cron)  |        | (gosuite/v3/worker)|        | (gosuite/v3/queue) |
++--------------------+        +--------------------+        +--------------------+
+          |                             |                             |
+    Auto-Partition              Async S3 Uploads              CDC Event Bus
+  Schedule: 23:00 / Cron         Worker Goroutines         Memory / Redis / NATS
+```
+
+1. **Cron Scheduler (`pkg/scheduler`)**:
+   - Backed by `github.com/rachmanzz/gosuite/v3/cron`.
+   - Built-in overlap prevention (`skip-if-still-running`), panic recovery, and standard 5-field cron or human-friendly `HH:MM` syntax.
+   - Triggers automated partition archiving for records older than `ANCHORDB_PARTITION_RETENTION_DAYS`.
+2. **Worker Pool (`pkg/worker`)**:
+   - Backed by `github.com/rachmanzz/gosuite/v3/worker`.
+   - Offloads heavy CPU-intensive partition serialization and cloud storage uploads (S3/MinIO) out of HTTP request paths.
+   - Throttles concurrency based on host CPU cores.
+3. **Queue Broker & CDC (`pkg/queue`)**:
+   - Backed by `github.com/rachmanzz/gosuite/v3/queue`.
+   - Zero-dependency **in-memory driver** by default.
+   - Optional enterprise adapters:
+     - **Redis (`queue-redis`)**: Priority ZSet and delayed scheduling.
+     - **NATS JetStream (`queue-nats`)**: Streaming deduplication and distributed pull subscribers.
+   - Emits events on mutations: `anchordb.record.saved`, `anchordb.record.updated`, `anchordb.partition.archived`.
+
+---
+
+## 4. Memory & Resource Frugality
 
 * **RAM Tuning**: Configurable soft limits (`500MB`, `1GB`, `5GB`) via `debug.SetMemoryLimit` and automatic cgroup ceiling detection.
 * **Sparse Spatial Grid**: Cell mapping allocates only for populated cells, eliminating fixed overhead on empty models.
@@ -51,7 +83,7 @@ Unlike traditional databases that transfer raw records to the application layer 
 
 ---
 
-## 4. Network Firewall Gateway
+## 5. Network Firewall Gateway
 
 Built-in IP gateway filtering supports:
 * Single exact IPs (`127.0.0.1`, `::1`)

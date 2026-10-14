@@ -1,8 +1,10 @@
-# Multi-stage production build for AnchorDB (Minimal Dependencies, Zero CGO, 100% CPU, non-root, < 15 MB)
-FROM golang:1.24-alpine AS builder
+# Multi-stage production build for AnchorDB (Minimal Dependencies, Zero CGO, 100% CPU, non-root, < 25 MB)
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
 
@@ -24,11 +26,26 @@ VOLUME ["/data"]
 
 USER anchordb
 
-# Default Environment Variables
+# Default Environment Variables (Docker & Podman ready)
 ENV ANCHORDB_PORT=7447 \
     ANCHORDB_DATA_DIR=/data \
     ANCHORDB_AUTH_TOKEN="" \
-    ANCHORDB_MEMORY_LIMIT=""
+    ANCHORDB_MEMORY_LIMIT="" \
+    ANCHORDB_CRON_ENABLED=true \
+    ANCHORDB_PARTITION_SCHEDULE="23:00" \
+    ANCHORDB_PARTITION_RETENTION_DAYS=180 \
+    ANCHORDB_WORKER_ENABLED=true \
+    ANCHORDB_WORKER_CONCURRENCY="" \
+    ANCHORDB_WORKER_QUEUE_SIZE=1000 \
+    ANCHORDB_QUEUE_ENABLED=true \
+    ANCHORDB_QUEUE_DRIVER=memory \
+    ANCHORDB_QUEUE_CONSUMER_ENABLED=true \
+    ANCHORDB_REDIS_ADDR="" \
+    ANCHORDB_REDIS_PASSWORD="" \
+    ANCHORDB_REDIS_DB=0 \
+    ANCHORDB_REDIS_PREFIX="anchordb:queue:" \
+    ANCHORDB_NATS_URL="" \
+    ANCHORDB_NATS_STREAM="anchordb_stream"
 
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:7447/health || exit 1
 

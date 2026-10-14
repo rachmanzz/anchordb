@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,88 +20,132 @@ import (
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
 	"github.com/rachmanzz/anchordb/pkg/partition"
+	"github.com/rachmanzz/anchordb/pkg/queue"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/security"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 	"github.com/rachmanzz/anchordb/pkg/system"
+	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
-// Server holds active AnchorDB database instances keyed by model name
-type Server struct {
-	mu        sync.RWMutex
-	dataDir   string
-	authToken string
-	port      string
-	models    map[string]*storage.AnchorDB
-	scheduler *scheduler.InternalScheduler
-	ipFilter  *security.IPFilter
-	startTime time.Time
+// ServerConfig holds complete runtime configuration parsed from CLI flags and ENV
+type ServerConfig struct {
+	Port          string
+	DataDir       string
+	AuthToken     string
+	MemoryLimit   string
+	IPWhitelist   string
+	TrustProxy    bool
+	MemorySummary string
+
+	// Background subsystems
+	CronEnabled       bool
+	PartitionSchedule string
+	RetentionDays     float32
+
+	WorkerConfig worker.Config
+	QueueConfig  queue.Config
 }
 
-func NewServer(dataDir, authToken, portStr string) *Server {
-	_ = os.MkdirAll(dataDir, 0755)
-	whitelistRule := os.Getenv("ANCHORDB_IP_WHITELIST")
-	trustProxy := os.Getenv("ANCHORDB_TRUST_PROXY") == "true" || os.Getenv("ANCHORDB_TRUST_PROXY") == "1"
-	ipFilter, err := security.NewIPFilter(whitelistRule, trustProxy)
+// Server holds active AnchorDB database instances and background subsystems
+type Server struct {
+	mu          sync.RWMutex
+	dataDir     string
+	authToken   string
+	port        string
+	models      map[string]*storage.AnchorDB
+	scheduler   *scheduler.InternalScheduler
+	cronEnabled bool
+	worker      *worker.Pool
+	queue       *queue.QueueManager
+	ipFilter    *security.IPFilter
+	startTime   time.Time
+}
+
+func NewServer(cfg ServerConfig) (*Server, error) {
+	_ = os.MkdirAll(cfg.DataDir, 0755)
+	ipFilter, err := security.NewIPFilter(cfg.IPWhitelist, cfg.TrustProxy)
 	if err != nil {
-		log.Fatalf("Fatal: Invalid ANCHORDB_IP_WHITELIST %q: %v", whitelistRule, err)
+		return nil, fmt.Errorf("invalid IP whitelist %q: %w", cfg.IPWhitelist, err)
 	}
+
+	// 1. Initialize Worker Pool
+	workerPool := worker.NewPool(cfg.WorkerConfig)
+	workerPool.Start()
+
+	// 2. Initialize Queue Manager
+	queueMgr, err := queue.NewQueueManager(cfg.QueueConfig, workerPool.Dispatcher())
+	if err != nil {
+		_ = workerPool.Shutdown()
+		return nil, fmt.Errorf("failed to initialize queue manager: %w", err)
+	}
+	queueMgr.Start()
+
+	// 3. Initialize Cron Scheduler
+	sched := scheduler.NewInternalScheduler()
 
 	s := &Server{
-		dataDir:   dataDir,
-		authToken: authToken,
-		port:      portStr,
-		models:    make(map[string]*storage.AnchorDB),
-		scheduler: scheduler.NewInternalScheduler(),
-		ipFilter:  ipFilter,
-		startTime: time.Now(),
+		dataDir:     cfg.DataDir,
+		authToken:   cfg.AuthToken,
+		port:        cfg.Port,
+		models:      make(map[string]*storage.AnchorDB),
+		scheduler:   sched,
+		cronEnabled: cfg.CronEnabled,
+		worker:      workerPool,
+		queue:       queueMgr,
+		ipFilter:    ipFilter,
+		startTime:   time.Now(),
 	}
 
-	// Internal Scheduling: default check every day at 23:00 (or custom ANCHORDB_PARTITION_SCHEDULE)
-	schedTime := os.Getenv("ANCHORDB_PARTITION_SCHEDULE")
-	if schedTime == "" {
-		schedTime = "23:00" // Jam 23:00 setiap hari
-	}
-
-	retentionDays := float32(180) // 6 bulan terakhir
-	if retStr := os.Getenv("ANCHORDB_PARTITION_RETENTION_DAYS"); retStr != "" {
-		if r, err := strconv.ParseFloat(retStr, 32); err == nil && r > 0 {
-			retentionDays = float32(r)
-		}
-	}
-
-	_ = s.scheduler.Register("auto_partition_6months", schedTime, func() error {
-		log.Printf("[SCHEDULER] Menjalankan partisi otomatis (arsip data > %.0f hari)...", retentionDays)
-		s.mu.RLock()
-		var loaded []string
-		for m := range s.models {
-			loaded = append(loaded, m)
-		}
-		s.mu.RUnlock()
-
-		for _, m := range loaded {
-			db, err := s.getModel(m)
-			if err != nil {
-				continue
+	// Register auto-partitioning task if cron is enabled
+	if cfg.CronEnabled {
+		_ = s.scheduler.Register("auto_partition_maintenance", cfg.PartitionSchedule, func() error {
+			log.Printf("[SCHEDULER] Menjalankan partisi otomatis (arsip data > %.0f hari)...", cfg.RetentionDays)
+			s.mu.RLock()
+			var loaded []string
+			for m := range s.models {
+				loaded = append(loaded, m)
 			}
-			partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
-				ModelName:     m,
-				DateField:     "tanggal",
-				RetentionDays: retentionDays,
-				Sink:          partition.NewLocalDiskSink(filepath.Join(s.dataDir, "partitions")),
-				FileFormat:    "{date}_{uuid}.anchordb",
-				PruneHotDB:    true,
-			})
-			if err == nil && partRes.ArchivedCount > 0 {
-				log.Printf("[SCHEDULER] Model %q terpartisi: %d record diarsipkan ke %s",
-					m, partRes.ArchivedCount, partRes.TargetLocation)
-			}
-		}
-		return nil
-	})
+			s.mu.RUnlock()
 
-	s.scheduler.Start()
-	return s
+			for _, m := range loaded {
+				modelName := m
+				// Dispatch heavy archival execution to worker pool
+				_ = s.worker.Dispatch(context.Background(), "partition_"+modelName, func(ctx context.Context) error {
+					db, err := s.getModel(modelName)
+					if err != nil {
+						return err
+					}
+					partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
+						ModelName:     modelName,
+						DateField:     "tanggal",
+						RetentionDays: cfg.RetentionDays,
+						Sink:          partition.NewLocalDiskSink(filepath.Join(s.dataDir, "partitions")),
+						FileFormat:    "{date}_{uuid}.anchordb",
+						PruneHotDB:    true,
+					})
+					if err == nil && partRes.ArchivedCount > 0 {
+						log.Printf("[SCHEDULER] Model %q terpartisi: %d record diarsipkan ke %s",
+							modelName, partRes.ArchivedCount, partRes.TargetLocation)
+						if s.queue != nil {
+							_ = s.queue.Publish(ctx, queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
+								Model:          modelName,
+								ArchivedCount:  partRes.ArchivedCount,
+								TargetLocation: partRes.TargetLocation,
+								CutoffDate:     partRes.CutoffDate,
+								Timestamp:      partRes.ExecutionTime,
+							})
+						}
+					}
+					return err
+				})
+			}
+			return nil
+		})
+		s.scheduler.Start()
+	}
+
+	return s, nil
 }
 
 // sanitizeModelName enforces alphanumeric model names, max length, and prevents path traversal
@@ -179,13 +224,10 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Enforce maximum body size (10 MB) to protect against memory exhaustion Slowloris / DoS
-		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
-
 		if s.authToken != "" {
 			authHeader := r.Header.Get("Authorization")
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) != 1 {
+			expected := "Bearer " + s.authToken
+			if subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) != 1 {
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
@@ -211,6 +253,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"port":           s.port,
 		"loaded_models":  loadedModels,
 		"memory":         system.GetMemoryStats(),
+		"background": map[string]interface{}{
+			"scheduler": map[string]interface{}{
+				"enabled": s.cronEnabled,
+				"tasks":   len(s.scheduler.Tasks()),
+			},
+			"worker": s.worker.Stats(),
+			"queue":  s.queue.Stats(),
+		},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -340,6 +390,16 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish mutation event to queue broker
+	if s.queue != nil {
+		_ = s.queue.Publish(r.Context(), queue.TopicRecordSaved, queue.RecordSavedEvent{
+			Model:     req.Model,
+			ID:        0,
+			Count:     1,
+			Timestamp: time.Now(),
+		})
+	}
+
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"name":    req.Name,
@@ -428,9 +488,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	records, hasMore, err := db.ListRecordsWithPaging(storage.QueryOptions{
 		Select:       req.Select,
 		Filters:      filters,
-		Computations: computations,
 		Limit:        limit,
 		Offset:       offset,
+		Computations: computations,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -489,6 +549,15 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish mutation event to queue broker
+	if s.queue != nil && count > 0 {
+		_ = s.queue.Publish(r.Context(), queue.TopicRecordUpdated, queue.RecordUpdatedEvent{
+			Model:     req.Model,
+			ID:        0,
+			Timestamp: time.Now(),
+		})
+	}
+
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":       true,
 		"updated_count": count,
@@ -527,8 +596,12 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	model := r.URL.Query().Get("model")
-	db, err := s.getModel(model)
+	modelName := r.URL.Query().Get("model")
+	if modelName == "" {
+		modelName = "default"
+	}
+
+	db, err := s.getModel(modelName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -541,23 +614,22 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"model":   model,
-		"message": "synced to disk",
+		"message": "sync complete",
 	})
 }
 
 type PartitionRunRequest struct {
-	Model         string  `json:"model"`
-	DateField     string  `json:"date_field"`
-	RetentionDays float32 `json:"retention_days"`
-	SinkType      string  `json:"sink_type"` // "local" or "s3"
-	TargetPath    string  `json:"target_path"`
-	S3Endpoint    string  `json:"s3_endpoint"`
-	S3Bucket      string  `json:"s3_bucket"`
-	S3Prefix      string  `json:"s3_prefix"`
-	S3AccessKey   string  `json:"s3_access_key"`
-	S3SecretKey   string  `json:"s3_secret_key"`
-	PruneHotDB    *bool   `json:"prune_hot_db"`
+	Model         string   `json:"model"`
+	DateField     string   `json:"date_field"`
+	RetentionDays float32  `json:"retention_days"`
+	SinkType      string   `json:"sink_type"` // "local" or "s3"
+	TargetPath    string   `json:"target_path"`
+	S3Endpoint    string   `json:"s3_endpoint"`
+	S3Bucket      string   `json:"s3_bucket"`
+	S3Prefix      string   `json:"s3_prefix"`
+	S3AccessKey   string   `json:"s3_access_key"`
+	S3SecretKey   string   `json:"s3_secret_key"`
+	PruneHotDB    *bool    `json:"prune_hot_db"`
 }
 
 func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
@@ -604,7 +676,6 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		if targetDir == "" {
 			targetDir = filepath.Join(s.dataDir, "partitions")
 		} else {
-			// Enforce path containment within s.dataDir to prevent arbitrary directory write vulnerability
 			cleanTarget := filepath.Clean(targetDir)
 			absDataDir, err1 := filepath.Abs(s.dataDir)
 			absTarget, err2 := filepath.Abs(cleanTarget)
@@ -646,6 +717,17 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":"Partition failed for model %s: %s"}`, m, err.Error()), http.StatusInternalServerError)
 			return
 		}
+
+		if s.queue != nil && res.ArchivedCount > 0 {
+			_ = s.queue.Publish(r.Context(), queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
+				Model:          res.ModelName,
+				ArchivedCount:  res.ArchivedCount,
+				TargetLocation: res.TargetLocation,
+				CutoffDate:     res.CutoffDate,
+				Timestamp:      res.ExecutionTime,
+			})
+		}
+
 		results = append(results, res)
 	}
 
@@ -661,31 +743,115 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":    true,
+		"enabled":    s.cronEnabled,
 		"tasks":      tasks,
 		"uptime_sec": time.Since(s.startTime).Seconds(),
 	})
 }
 
+func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"worker":  s.worker.Stats(),
+	})
+}
+
+func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"queue":   s.queue.Stats(),
+	})
+}
+
+// Environment / flag resolution helpers
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	val = strings.ToLower(val)
+	return val == "true" || val == "1" || val == "yes"
+}
+
+func getEnvInt(key string, fallback int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	if i, err := strconv.Atoi(val); err == nil {
+		return i
+	}
+	return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	if f, err := strconv.ParseFloat(val, 64); err == nil {
+		return f
+	}
+	return fallback
+}
+
 func main() {
+	// 1. Core Server Flags
 	flagPort := flag.String("port", "", "Port to listen on (overrides ANCHORDB_PORT, default 7447)")
 	flagDataDir := flag.String("data-dir", "", "Data directory path (overrides ANCHORDB_DATA_DIR)")
 	flagToken := flag.String("auth-token", "", "Bearer auth token (overrides ANCHORDB_AUTH_TOKEN)")
 	flagMemLimit := flag.String("memory-limit", "", "RAM allocation limit e.g. 500MB, 1GB, 5GB (overrides ANCHORDB_MEMORY_LIMIT)")
 	flag.StringVar(flagMemLimit, "mem-limit", "", "Alias for -memory-limit")
 	flag.StringVar(flagMemLimit, "m", "", "Short alias for -memory-limit")
+
+	flagIPWhitelist := flag.String("ip-whitelist", "", "Allowed IP CIDR rules (overrides ANCHORDB_IP_WHITELIST)")
+	flagTrustProxy := flag.Bool("trust-proxy", false, "Trust X-Forwarded-For headers (overrides ANCHORDB_TRUST_PROXY)")
+
+	// 2. Cron Scheduler Flags
+	flagCronEnabled := flag.Bool("cron-enabled", true, "Enable background cron scheduler (overrides ANCHORDB_CRON_ENABLED)")
+	flagPartitionSchedule := flag.String("partition-schedule", "", "Partition cron schedule or HH:MM e.g. 23:00 (overrides ANCHORDB_PARTITION_SCHEDULE)")
+	flagRetentionDays := flag.Float64("retention-days", 0, "Default partition archival retention days (overrides ANCHORDB_PARTITION_RETENTION_DAYS)")
+
+	// 3. Worker Pool Flags
+	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
+	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
+	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
+
+	// 4. Queue Broker Flags
+	flagQueueEnabled := flag.Bool("queue-enabled", true, "Enable async queue broker (overrides ANCHORDB_QUEUE_ENABLED)")
+	flagQueueDriver := flag.String("queue-driver", "", "Queue broker driver: memory, redis, nats (overrides ANCHORDB_QUEUE_DRIVER)")
+	flagQueueConsumer := flag.Bool("queue-consumer", true, "Enable background queue consumer (overrides ANCHORDB_QUEUE_CONSUMER_ENABLED)")
+
+	// 5. Redis Adapter Flags (Optional)
+	flagRedisAddr := flag.String("redis-addr", "", "Redis server address e.g. localhost:6379 (overrides ANCHORDB_REDIS_ADDR)")
+	flagRedisPassword := flag.String("redis-password", "", "Redis password (overrides ANCHORDB_REDIS_PASSWORD)")
+	flagRedisDB := flag.Int("redis-db", 0, "Redis DB index (overrides ANCHORDB_REDIS_DB)")
+	flagRedisPrefix := flag.String("redis-prefix", "", "Redis queue key prefix (overrides ANCHORDB_REDIS_PREFIX)")
+
+	// 6. NATS Adapter Flags (Optional)
+	flagNATSURL := flag.String("nats-url", "", "NATS server URL e.g. nats://localhost:4222 (overrides ANCHORDB_NATS_URL)")
+	flagNATSStream := flag.String("nats-stream", "", "NATS JetStream stream name (overrides ANCHORDB_NATS_STREAM)")
+
 	flag.Parse()
 
+	// Resolve Core Parameters with precedence: Flag > ENV > Default
 	portStr := *flagPort
 	if portStr == "" {
-		portStr = os.Getenv("ANCHORDB_PORT")
-	}
-	if portStr == "" {
-		portStr = "7447" // Port Resmi AnchorDB
+		portStr = getEnv("ANCHORDB_PORT", "7447")
 	}
 
 	dataDir := *flagDataDir
 	if dataDir == "" {
-		dataDir = os.Getenv("ANCHORDB_DATA_DIR")
+		dataDir = getEnv("ANCHORDB_DATA_DIR", "")
 	}
 	if dataDir == "" {
 		dataDir = "/data"
@@ -696,16 +862,159 @@ func main() {
 
 	authToken := *flagToken
 	if authToken == "" {
-		authToken = os.Getenv("ANCHORDB_AUTH_TOKEN")
+		authToken = getEnv("ANCHORDB_AUTH_TOKEN", "")
+	}
+
+	memLimitStr := *flagMemLimit
+	if memLimitStr == "" {
+		memLimitStr = getEnv("ANCHORDB_MEMORY_LIMIT", "")
+	}
+
+	ipWhitelist := *flagIPWhitelist
+	if ipWhitelist == "" {
+		ipWhitelist = getEnv("ANCHORDB_IP_WHITELIST", "")
+	}
+
+	trustProxy := *flagTrustProxy
+	if !trustProxy {
+		trustProxy = getEnvBool("ANCHORDB_TRUST_PROXY", false)
+	}
+
+	// Resolve Cron Parameters
+	cronEnabled := *flagCronEnabled
+	if !cronEnabled || !flagPassed("cron-enabled") {
+		cronEnabled = getEnvBool("ANCHORDB_CRON_ENABLED", true)
+	}
+
+	partitionSched := *flagPartitionSchedule
+	if partitionSched == "" {
+		partitionSched = getEnv("ANCHORDB_PARTITION_SCHEDULE", "23:00")
+	}
+
+	retentionDays := float32(*flagRetentionDays)
+	if retentionDays <= 0 {
+		retentionDays = float32(getEnvFloat("ANCHORDB_PARTITION_RETENTION_DAYS", 180))
+	}
+
+	// Resolve Worker Parameters
+	workerEnabled := *flagWorkerEnabled
+	if !workerEnabled || !flagPassed("worker-enabled") {
+		workerEnabled = getEnvBool("ANCHORDB_WORKER_ENABLED", true)
+	}
+
+	workerConcurrency := *flagWorkerConcurrency
+	if workerConcurrency <= 0 {
+		workerConcurrency = getEnvInt("ANCHORDB_WORKER_CONCURRENCY", runtime.NumCPU()*2)
+		if workerConcurrency < 2 {
+			workerConcurrency = 2
+		}
+	}
+
+	workerQueueSize := *flagWorkerQueueSize
+	if workerQueueSize <= 0 {
+		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
+	}
+
+	// Resolve Queue Parameters
+	queueEnabled := *flagQueueEnabled
+	if !queueEnabled || !flagPassed("queue-enabled") {
+		queueEnabled = getEnvBool("ANCHORDB_QUEUE_ENABLED", true)
+	}
+
+	queueDriverStr := *flagQueueDriver
+	if queueDriverStr == "" {
+		queueDriverStr = getEnv("ANCHORDB_QUEUE_DRIVER", "")
+	}
+
+	queueConsumer := *flagQueueConsumer
+	if !queueConsumer || !flagPassed("queue-consumer") {
+		queueConsumer = getEnvBool("ANCHORDB_QUEUE_CONSUMER_ENABLED", true)
+	}
+
+	redisAddr := *flagRedisAddr
+	if redisAddr == "" {
+		redisAddr = getEnv("ANCHORDB_REDIS_ADDR", "")
+	}
+
+	redisPassword := *flagRedisPassword
+	if redisPassword == "" {
+		redisPassword = getEnv("ANCHORDB_REDIS_PASSWORD", "")
+	}
+
+	redisDB := *flagRedisDB
+	if redisDB == 0 {
+		redisDB = getEnvInt("ANCHORDB_REDIS_DB", 0)
+	}
+
+	redisPrefix := *flagRedisPrefix
+	if redisPrefix == "" {
+		redisPrefix = getEnv("ANCHORDB_REDIS_PREFIX", "anchordb:queue:")
+	}
+
+	natsURL := *flagNATSURL
+	if natsURL == "" {
+		natsURL = getEnv("ANCHORDB_NATS_URL", "")
+	}
+
+	natsStream := *flagNATSStream
+	if natsStream == "" {
+		natsStream = getEnv("ANCHORDB_NATS_STREAM", "anchordb_stream")
+	}
+
+	// Auto-select queue driver if not explicitly passed
+	driverType := queue.DriverType(strings.ToLower(queueDriverStr))
+	if driverType == "" {
+		if redisAddr != "" {
+			driverType = queue.DriverRedis
+		} else if natsURL != "" {
+			driverType = queue.DriverNATS
+		} else {
+			driverType = queue.DriverMemory
+		}
 	}
 
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
-	_, memSummary, err := system.ApplyMemoryLimit(*flagMemLimit)
+	_, memSummary, err := system.ApplyMemoryLimit(memLimitStr)
 	if err != nil {
 		log.Fatalf("[FATAL] Konfigurasi Memory Limit tidak valid: %v", err)
 	}
 
-	server := NewServer(dataDir, authToken, portStr)
+	serverConfig := ServerConfig{
+		Port:              portStr,
+		DataDir:           dataDir,
+		AuthToken:         authToken,
+		MemoryLimit:       memLimitStr,
+		IPWhitelist:       ipWhitelist,
+		TrustProxy:        trustProxy,
+		MemorySummary:     memSummary,
+		CronEnabled:       cronEnabled,
+		PartitionSchedule: partitionSched,
+		RetentionDays:     retentionDays,
+		WorkerConfig: worker.Config{
+			Enabled:         workerEnabled,
+			Concurrency:     workerConcurrency,
+			QueueSize:       workerQueueSize,
+			ShutdownTimeout: 5 * time.Second,
+		},
+		QueueConfig: queue.Config{
+			Enabled:         queueEnabled,
+			Driver:          driverType,
+			ConsumerEnabled: queueConsumer,
+			PollInterval:    50 * time.Millisecond,
+			BatchSize:       10,
+			RedisAddr:       redisAddr,
+			RedisPassword:   redisPassword,
+			RedisDB:         redisDB,
+			RedisPrefix:     redisPrefix,
+			NATSURL:         natsURL,
+			NATSStream:      natsStream,
+		},
+	}
+
+	server, err := NewServer(serverConfig)
+	if err != nil {
+		log.Fatalf("[FATAL] Gagal memulai AnchorDB Server: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
@@ -717,6 +1026,8 @@ func main() {
 	mux.HandleFunc("/v1/sync", server.authMiddleware(server.handleSync))
 	mux.HandleFunc("/v1/partition/run", server.authMiddleware(server.handlePartitionRun))
 	mux.HandleFunc("/v1/scheduler/status", server.authMiddleware(server.handleSchedulerStatus))
+	mux.HandleFunc("/v1/worker/status", server.authMiddleware(server.handleWorkerStatus))
+	mux.HandleFunc("/v1/queue/status", server.authMiddleware(server.handleQueueStatus))
 
 	fmt.Println("==========================================================")
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
@@ -727,7 +1038,31 @@ func main() {
 	if server.ipFilter.IsEmpty() {
 		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
 	} else {
-		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", os.Getenv("ANCHORDB_IP_WHITELIST"))
+		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", ipWhitelist)
+	}
+	if cronEnabled {
+		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd)\n", partitionSched, retentionDays)
+	} else {
+		fmt.Println("   Cron Engine    : DISABLED")
+	}
+	if workerEnabled {
+		fmt.Printf("   Worker Pool    : ENABLED (Concurrency: %d, Queue: %d)\n", workerConcurrency, workerQueueSize)
+	} else {
+		fmt.Println("   Worker Pool    : DISABLED")
+	}
+	if queueEnabled {
+		var driverDetail string
+		switch driverType {
+		case queue.DriverRedis:
+			driverDetail = fmt.Sprintf("redis @ %s", redisAddr)
+		case queue.DriverNATS:
+			driverDetail = fmt.Sprintf("nats @ %s", natsURL)
+		default:
+			driverDetail = "in-memory (zero-external)"
+		}
+		fmt.Printf("   Queue Broker   : ENABLED (%s, consumer: %t)\n", driverDetail, queueConsumer)
+	} else {
+		fmt.Println("   Queue Broker   : DISABLED")
 	}
 	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
 	fmt.Println("==========================================================")
@@ -742,7 +1077,6 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Graceful shutdown handling
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
 
@@ -754,10 +1088,24 @@ func main() {
 	}()
 
 	<-stopSignal
-	log.Println("[SHUTDOWN] Menghentikan server & menyimpan semua database ke disk...")
-	server.scheduler.Stop()
+	log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
 
-	// Sync all active models cleanly to disk before exit
+	// 1. Stop Cron Scheduler
+	if server.scheduler != nil {
+		server.scheduler.Stop()
+	}
+
+	// 2. Stop Queue Consumer & Broker Connections
+	if server.queue != nil {
+		_ = server.queue.Close()
+	}
+
+	// 3. Stop Worker Pool
+	if server.worker != nil {
+		_ = server.worker.Shutdown()
+	}
+
+	// 4. Sync all active models cleanly to disk before exit
 	server.mu.Lock()
 	for name, db := range server.models {
 		if err := db.Sync(); err != nil {
@@ -771,4 +1119,14 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
+}
+
+func flagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }

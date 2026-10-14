@@ -1,46 +1,52 @@
-# Design Philosophy: Minimal Dependencies & Zero Bloat
+# Filosofi Desain: Minimal Dependencies & Zero Bloat
 
-> *"Do not chase zero dependencies dogmatically; instead, chase pragmatic, battle-tested, and high-performance minimal dependencies."*
-
----
-
-## 1. Why Minimal Dependencies over Dogmatic Zero?
-
-Many experimental projects adopt a dogmatic **"Zero Dependencies"** slogan (relying 100% on standard libraries). While well-intentioned, dogmatic zero-dependencies in high-performance production systems introduces severe pitfalls:
-
-1. **Reinventing the Wheel**: Reimplementing complex algorithms (cryptography, wire protocols, cloud SDKs, high-performance compression) in-house frequently produces subtle edge-case bugs and security flaws.
-2. **Maintenance Drag**: Internal codebases accumulate boilerplate utility functions that have already been battle-tested by millions of developers in well-maintained libraries.
-3. **Performance Ceilings**: Refusing specialized libraries (such as optimized SIMD compression or native storage primitives) in the name of "zero dependencies" leaves real hardware throughput on the table.
-
-Therefore, **AnchorDB adheres to a Pragmatic Minimal Dependencies Philosophy**:
-We maintain zero framework bloat, zero heavy ORMs, and zero CGO, while remaining open to strictly-vetted, high-impact dependencies where they deliver concrete advantages in correctness, throughput, or security.
+> *"Jangan mengejar zero dependencies secara dogmatis, melainkan kejarlah minimal dependencies yang pragmatis, teruji, dan berkinerja tinggi."*
 
 ---
 
-## 2. The 5 Golden Rules for Dependency Adoption
+## 1. Latar Belakang: Mengapa Bukan "Zero Dependencies"?
 
-Every external dependency considered for AnchorDB must pass 5 strict criteria:
+Banyak proyek database bereksperimen dengan slogan **"Zero Dependencies"** (hanya memakai Go standard library). Namun, dalam rekayasa perangkat lunak produksi tingkat lanjut, pendekatan *zero dependencies* yang dogmatis sering kali menimbulkan efek samping negatif:
+1. **Reinventing the Wheel**: Menulis ulang algoritma kompleks secara mandiri (misalnya enkripsi, kompresi, background scheduling, atau antrean terdistribusi) sering kali menghasilkan implementasi yang rawan *bug*, kurang optimal, dan sulit diaudit.
+2. **Kerapuhan Pemeliharaan**: Kode internal membengkak dengan fungsi utilitas *boilerplate* yang sebenarnya sudah diuji oleh jutaan pengembang di pustaka (*libraries*) standar industri.
+3. **Kompromi Performa**: Menolak pustaka khusus (seperti SIMD vector primitives, panic recovery, atau high-performance message routing) demi label "zero dependencies" mengorbankan potensi performa dan stabilitas nyata.
 
-| # | Rule | Requirement |
+Oleh karena itu, **AnchorDB menetapkan filosofi: Minimal Dependencies (Minimalis, Terkurasi, dan Bebas Bloat)**.
+
+---
+
+## 2. Kriteria Ketat Pemilihan Dependensi
+
+Setiap dependensi yang masuk ke dalam AnchorDB harus memenuhi 5 aturan emas (*The 5 Golden Rules*):
+
+| # | Aturan | Penjelasan |
 |---|---|---|
-| **1** | **Zero CGO** | Must be 100% pure Go. No C/C++ toolchains, dynamic linker dependencies, or cross-compilation friction. |
-| **2** | **No Transitive Tree Explosion** | Dependencies bringing large transitive dependency graphs are strictly prohibited. Self-contained, isolated packages only. |
-| **3** | **High Impact to LoC Ratio** | Must provide significant correctness, security, or performance advantages over a custom implementation. |
-| **4** | **Production-Grade & Battle-Tested** | Actively maintained, high test coverage, proven in production deployments. |
-| **5** | **Tiny Binary Impact** | Must preserve AnchorDB's tiny static binary size (< 15 MB) and rapid compilation (< 2–3s). |
+| **1** | **Zero CGO** | Dependensi harus 100% pure Go. Tidak boleh ada dependensi C/C++ yang membutuhkan toolchain CGO, glibc version locking, atau kompilasi silang yang rumit. |
+| **2** | **No Transitive Tree Explosion** | Dependensi yang membawa puluhan sub-dependensi lain (dependency graph raksasa) **dilarang keras**. Dependensi yang diterima adalah yang berdiri sendiri (*self-contained* atau zero transitive dependencies). |
+| **3** | **High Impact to Lines of Code Ratio** | Dependensi hanya diterima jika ia memberikan peningkatan keamanan, keandalan, atau throughput yang signifikan dibanding jika ditulis sendiri. |
+| **4** | **Production-Grade & Battle-Tested** | Pustaka harus aktif dipelihara, memiliki cakupan pengujian (*test coverage*) tinggi, dan terbukti stabil di sistem berbeban tinggi. |
+| **5** | **Tiny Binary Impact** | Binary final AnchorDB harus tetap ringkas (< 20 MB) dan waktu kompilasi `go build` harus tetap berada di bawah 2–3 detik. |
 
 ---
 
-## 3. Architecture Alignment
+## 3. Studi Kasus Implementasi: Background Pipeline (`gosuite/v3`)
 
-* **Core Storage Engine (Stdlib / Native Go First)**:
-  * Memory Mapping: Linux kernel `mmap(MAP_SHARED)`.
-  * Geometry & Arithmetic: In-register float32 Euclidean vector projections.
-  * Concurrency: `sync.RWMutex` with constant-time bounded locks.
-* **System & Memory Management**:
-  * Soft Memory Limit: Go runtime `debug.SetMemoryLimit` paired with cgroups v1/v2 container introspection.
-  * Timing-Safe Authentication: `crypto/subtle.ConstantTimeCompare`.
-* **Pragmatic Minimal Dependencies Boundary**:
-  * Cloud Object Sinks: AWS SDK v2 / MinIO client when advanced multipart upload is required.
-  * Compression: High-throughput compression (e.g., `klauspost/compress`) for cold archival partitions.
-  * Observability: Lightweight Prometheus / OpenTelemetry telemetry.
+Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB mengintegrasikan subsistem latar belakang dari `github.com/rachmanzz/gosuite/v3`:
+
+1. **`cron` (`v3/cron`)**:
+   - Menghadirkan penjadwal tingkat produksi dengan proteksi *skip-if-still-running*, panic recovery, dan graceful shutdown berbatas waktu.
+   - Menggantikan loop manual tanpa menambah dependensi berat.
+2. **`worker` (`v3/worker`)**:
+   - Mengorkestrasi pool goroutine pekerja dan sub-worker fan-out untuk proses partisi disk dan upload S3 yang berat tanpa memblokir HTTP latency.
+3. **`queue` (`v3/queue`)**:
+   - Antrean asinkron untuk Change Data Capture (CDC) mutasi data (`record.saved`, `partition.archived`).
+   - Beroperasi secara mandiri dengan driver in-memory (tanpa dependensi eksternal), namun siap dihubungkan ke adapter **Redis** (`queue-redis`) atau **NATS JetStream** (`queue-nats`) melalui konfigurasi env/flags.
+
+---
+
+## 4. Keuntungan Nyata untuk Pengguna
+
+1. **Keamanan Maksimal**: Audit keamanan menjadi mudah karena *surface attack* kecil dan kode mudah diperiksa secara menyeluruh.
+2. **Kompilasi Cepat**: `go build` berlangsung instan dalam hitungan detik, baik di mesin lokal pengembang maupun di pipeline CI/CD.
+3. **Container Super Ringan**: Image Docker/Podman berbasis Alpine tetap berukuran sangat ramping (**~18 MB**).
+4. **Stabilitas Produksi**: Bebas dari ketergantungan framework web berat (seperti Gin/Fiber) yang sering memaksakan breaking changes antar-versi.

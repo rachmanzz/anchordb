@@ -1,6 +1,6 @@
 # AnchorDB: High-Performance Computational Database Engine (CPU)
 
-[![Go Version](https://img.shields.io/badge/Go-1.27.1-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-blue.svg)](https://golang.org)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20amd64-green.svg)]()
 [![Hardware](https://img.shields.io/badge/Hardware-100%25%20CPU%20%7C%20Zero%20GPU-orange.svg)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Minimal%20Dependencies%20%7C%20Zero%20Bloat-brightgreen.svg)]()
@@ -26,11 +26,11 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
   - Arithmetic operators (`+`, `-`, `*`, `/`) executed inside storage without SQL overhead.
   - Date arithmetic stored as float32 Epoch Days (e.g. `2026-10-14` + `45 hari` $\rightarrow$ `2026-11-28`).
   - Selective column projection (`.Select("jarak", "waktu", "kecepatan")`).
-- **Internal Scheduling & Partitioning (Zero External Cron)**:
-  - Background daemon checks data on a schedule (e.g., daily at `23:00`).
-  - Automatically exports records older than $N$ months into standalone archive files formatted as `{date}_{uuid}.anchordb`.
-  - Supports pluggable destinations: **Local Disk** or **Cloud Object Storage (S3 / MinIO / Cloudflare R2 / GCS)**.
-  - Prunes archived records from the hot database to keep storage lean.
+- **Resilient Background Pipeline (`gosuite/v3`)**:
+  - **Production Cron (`gosuite/v3/cron`)**: Automated partition archiving with panic recovery, overlap prevention, and graceful shutdown.
+  - **Worker Engine (`gosuite/v3/worker`)**: Non-blocking asynchronous task execution and sub-worker fan-out pools.
+  - **Event Broker & Queue (`gosuite/v3/queue`)**: Pluggable asynchronous messaging with high-speed in-memory driver (default, zero external dependencies) and optional **Redis** (`queue-redis`) or **NATS JetStream** (`queue-nats`) adapters.
+- **Fine-Grained Memory Allocation**: Support for explicit soft RAM limits (**500MB, 1GB, 5GB**) with auto-detection of Docker/Podman cgroup ceilings.
 - **Multi-Model Routing ("Satu DB = Satu Model")**: Dynamic file separation (`/data/{model}.anchordb`) with path traversal immunity.
 - **Dedicated Port**: Standardized official port **`7447`**.
 
@@ -44,16 +44,23 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
                                       |                  (Port 7447)                |
                                       +----------------------+----------------------+
                                                              |
-                                   +-------------------------+-------------------------+
-                                   |                                                   |
-                                   v                                                   v
-                    +------------------------------+                    +------------------------------+
-                    |       REST HTTP Engine       |                    |  Internal Scheduler Daemon   |
-                    | /v1/save, /v1/get, /v1/list  |                    | Background loop (e.g. 23:00) |
-                    | /v1/update, /v1/graph, /sync |                    | Lifecycle & Auto-Partition   |
-                    +--------------+---------------+                    +--------------+---------------+
-                                   |                                                   |
-                                   +-------------------------+-------------------------+
+                   +-----------------------------------------+-----------------------------------------+
+                   |                                         |                                         |
+                   v                                         v                                         v
+    +------------------------------+          +------------------------------+          +------------------------------+
+    |       REST HTTP Engine       |          |    Cron Scheduler Daemon     |          |     Async Worker Engine      |
+    | /v1/save, /v1/get, /v1/list  |          |     (gosuite/v3/cron)        |          |    (gosuite/v3/worker)       |
+    | /v1/update, /v1/graph, /sync |          | Daily 23:00 / Custom Cron    |          | Concurrency & Sub-Workers    |
+    +--------------+---------------+          +--------------+---------------+          +--------------+---------------+
+                   |                                         |                                         |
+                   +-----------------------------------------+-----------------------------------------+
+                                                             |
+                                                             v
+                                              +------------------------------+
+                                              |     Event Queue Broker       |
+                                              |     (gosuite/v3/queue)       |
+                                              | Memory / Redis / NATS Adapters|
+                                              +--------------+---------------+
                                                              |
                                                              v
                                               +------------------------------+
@@ -73,212 +80,131 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 
 ---
 
-## Quick Start (Go Driver SDK)
+## Background Subsystems: Cron, Worker & Queue
 
-### 1. Installation
+AnchorDB includes production-grade background capabilities powered by `github.com/rachmanzz/gosuite/v3`:
 
-```bash
-go get github.com/rachmanzz/anchordb
-```
+### 1. Cron Scheduler (`pkg/scheduler` $\rightarrow$ `gosuite/v3/cron`)
+- **Automated Archival**: Automatically triggers partition runs at scheduled times (default `23:00` daily or standard cron syntax like `0 23 * * *`).
+- **Panic Recovery & Overlap Protection**: Jobs are guaranteed not to run concurrently if a previous iteration is still active (`skip-if-still-running`).
+- **Lifecycle Status**: Real-time task inspection via `GET /v1/scheduler/status`.
 
-### 2. Basic Example: In-Storage Math & Date Calculation
+### 2. Worker Engine (`pkg/worker` $\rightarrow$ `gosuite/v3/worker`)
+- **Non-Blocking Task Offloading**: Heavy partition file generation, S3 archival uploads, and disk flushes are offloaded from HTTP request goroutines.
+- **Configurable Concurrency**: Automatically scales to available CPU cores with configurable limits.
+- **Worker Status**: Real-time stats (dispatched, completed, failed) via `GET /v1/worker/status`.
 
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"log"
-
-	"github.com/rachmanzz/anchordb/pkg/driver"
-)
-
-func main() {
-	ctx := context.Background()
-
-	// 1. Connect via driver (mmap zero-copy)
-	client, err := driver.Connect("anchordb:///data/kinematika.anchordb?mode=mmap")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-
-	// 2. Save records with numeric attributes and dates
-	_ = client.Save("mobil_1", map[string]float32{
-		"jarak":   100,
-		"waktu":   2,
-		"tanggal": driver.Date("2026-10-14"),
-	})
-
-	// 3. Selective Projection & On-the-fly Calculation
-	result, _ := client.Get("mobil_1").
-		Select("jarak", "waktu", "kecepatan").
-		Compute("kecepatan", driver.Divide("jarak", "waktu")).
-		Execute(ctx)
-
-	fmt.Printf("Kecepatan: %.1f km/jam\n", result.Get("kecepatan")) // 50.0
-
-	// 4. Batch in-place update (add 10 to distance, add 45 days to date)
-	updated, _ := client.Update().
-		Where("jarak", ">=", 50).
-		Set("jarak", driver.Add("jarak", "10")).
-		Set("tanggal", driver.AddDays("tanggal", 45)).
-		Execute(ctx)
-
-	fmt.Printf("Updated %d records in constant time\n", updated)
-}
-```
+### 3. Queue & Event Broker (`pkg/queue` $\rightarrow$ `gosuite/v3/queue`)
+- **Change Data Capture (CDC)**: Publishes database mutation events:
+  - `anchordb.record.saved`
+  - `anchordb.record.updated`
+  - `anchordb.partition.archived`
+- **Zero-Dependency by Default**: Operates out of the box using a high-throughput in-memory queue.
+- **Pluggable External Adapters**:
+  - **Redis (`queue-redis`)**: Priority ZSet and delayed scheduling over Redis.
+  - **NATS JetStream (`queue-nats`)**: Streaming deduplication and distributed pull consumers.
+- **Queue Status**: Live message counters via `GET /v1/queue/status`.
 
 ---
 
-## Server Deployment
+## Configuration Reference (Docker / Podman / CLI)
 
-### Run via Docker / Podman
+All settings can be configured via environment variables or CLI flags:
 
+| Setting | CLI Flag | Environment Variable | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Port** | `-port` | `ANCHORDB_PORT` | `7447` | HTTP REST API port |
+| **Data Dir** | `-data-dir` | `ANCHORDB_DATA_DIR` | `/data` or `./data` | Directory storing `*.anchordb` files |
+| **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer authorization token |
+| **Memory Limit** | `-memory-limit`, `-m` | `ANCHORDB_MEMORY_LIMIT` | `""` (auto) | Soft memory limit (e.g. `500MB`, `1GB`, `5GB`) |
+| **IP Whitelist** | `-ip-whitelist` | `ANCHORDB_IP_WHITELIST` | `""` (all open) | CIDR or IP list e.g. `127.0.0.1,192.168.1.0/24` |
+| **Trust Proxy** | `-trust-proxy` | `ANCHORDB_TRUST_PROXY` | `false` | Trust `X-Forwarded-For` proxy headers |
+| **Cron Enabled** | `-cron-enabled` | `ANCHORDB_CRON_ENABLED` | `true` | Enable background scheduler |
+| **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM` or cron spec `0 23 * * *`) |
+| **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
+| **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
+| **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
+| **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
+| **Queue Enabled** | `-queue-enabled` | `ANCHORDB_QUEUE_ENABLED` | `true` | Enable async queue broker |
+| **Queue Driver** | `-queue-driver` | `ANCHORDB_QUEUE_DRIVER` | `memory` | Adapter: `memory`, `redis`, or `nats` |
+| **Queue Consumer** | `-queue-consumer` | `ANCHORDB_QUEUE_CONSUMER_ENABLED` | `true` | Enable background queue consumer |
+| **Redis Address** | `-redis-addr` | `ANCHORDB_REDIS_ADDR` | `""` | Redis host:port (e.g. `localhost:6379`) |
+| **Redis Password** | `-redis-password` | `ANCHORDB_REDIS_PASSWORD` | `""` | Redis authentication password |
+| **Redis Database** | `-redis-db` | `ANCHORDB_REDIS_DB` | `0` | Redis database index |
+| **Redis Prefix** | `-redis-prefix` | `ANCHORDB_REDIS_PREFIX` | `anchordb:queue:` | Redis key namespace |
+| **NATS URL** | `-nats-url` | `ANCHORDB_NATS_URL` | `""` | NATS URL (e.g. `nats://localhost:4222`) |
+| **NATS Stream** | `-nats-stream` | `ANCHORDB_NATS_STREAM` | `anchordb_stream`| NATS JetStream stream identifier |
+
+---
+
+## Deployment Examples
+
+### 1. Docker / Podman (Standalone In-Memory)
 ```bash
-# Run with optional IP Whitelisting & Scheduling
 podman run -d \
-  --name anchordb \
-  -p 7447:7447 \
-  -v ./data:/data:Z \
-  -e ANCHORDB_PORT=7447 \
-  -e ANCHORDB_IP_WHITELIST="127.0.0.1,::1,192.168.1.0/24,10.0.0.1-10.0.0.50" \
-  -e ANCHORDB_PARTITION_SCHEDULE="23:00" \
-  localhost/anchordb:latest
-```
-
-Or using Docker Compose:
-```bash
-docker compose up -d
-```
-
-### Security & IP Whitelisting
-
-AnchorDB includes a built-in network firewall gateway. Set `ANCHORDB_IP_WHITELIST` to restrict connections:
-
-- **Single Exact IPs**: `127.0.0.1`, `::1`, `203.0.113.15`
-- **CIDR Subnet Blocks**: `192.168.1.0/24`, `10.0.0.0/16`
-- **Explicit IP Ranges**: `172.16.0.10-172.16.0.50`
-- **Behind Proxy / Load Balancer**: Set `ANCHORDB_TRUST_PROXY=true` to validate `X-Forwarded-For` and `X-Real-IP`.
-
-If client IP is not in the whitelist, AnchorDB immediately rejects with `HTTP 403 Forbidden` before consuming CPU or locks.
-
-### REST API Reference
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/health` | Healthcheck and server status |
-| `POST` | `/v1/save` | Store entity properties in model |
-| `POST` | `/v1/get` | Retrieve entity with selective columns & math |
-| `POST` | `/v1/list` | Stream / paginate entities with range & date filters |
-| `POST` | `/v1/update` | Batch in-storage update with constant-time early exit |
-| `POST` | `/v1/graph` | Execute spatial ray-projection & hourglass convergence |
-| `POST` | `/v1/partition/run` | Trigger on-demand archival partition (Local / S3) |
-| `GET` | `/v1/scheduler/status` | View background scheduler tasks and next run times |
-
-#### Example: Query with Computations via cURL
-```bash
-curl -X POST http://localhost:7447/v1/get \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kinematika",
-    "name": "mobil_1",
-    "select": ["jarak", "waktu", "kecepatan"],
-    "computations": {"kecepatan": "jarak / waktu"}
-  }'
-```
-
----
-
-## Memory Allocation & Resource Tuning (RAM Limits)
-
-AnchorDB provides fine-grained memory bounds with native Go runtime soft limit enforcement (`debug.SetMemoryLimit`). This ensures the Go runtime aggressively reclaims memory before reaching host or container ceilings, eliminating container OOM-killer crashes.
-
-You can configure memory limits (**500MB, 1GB, 5GB**, etc.) via multiple convenient mechanisms:
-
-### 1. Docker / Podman Container Flags
-```bash
-# Limit container to 1 GB RAM with 800 MB soft limit:
-docker run -d \
   --name anchordb \
   -p 7447:7447 \
   -m 1g --memory-swap 1g \
   -e ANCHORDB_MEMORY_LIMIT=800MB \
+  -e ANCHORDB_CRON_ENABLED=true \
+  -e ANCHORDB_PARTITION_SCHEDULE="23:00" \
+  -e ANCHORDB_WORKER_CONCURRENCY=8 \
+  -e ANCHORDB_QUEUE_DRIVER=memory \
   -v ./data:/data:Z \
   anchordb:latest
 ```
-*(If `ANCHORDB_MEMORY_LIMIT` is omitted inside a container, AnchorDB automatically detects the cgroup memory ceiling and sets the soft limit to 85% of container RAM).*
 
-### 2. Docker Compose
+### 2. Docker / Podman with Redis Queue Adapter
+```bash
+podman run -d \
+  --name anchordb \
+  -p 7447:7447 \
+  -e ANCHORDB_QUEUE_DRIVER=redis \
+  -e ANCHORDB_REDIS_ADDR=redis:6379 \
+  -v ./data:/data:Z \
+  anchordb:latest
+```
+
+### 3. Docker Compose (Full Stack)
 ```yaml
 services:
   anchordb:
     image: anchordb:latest
+    ports:
+      - "7447:7447"
     environment:
-      - ANCHORDB_MEMORY_LIMIT=800MB # 500MB, 1GB, 5GB
+      - ANCHORDB_MEMORY_LIMIT=800MB
+      - ANCHORDB_CRON_ENABLED=true
+      - ANCHORDB_WORKER_CONCURRENCY=8
+      - ANCHORDB_QUEUE_DRIVER=memory # or 'redis' / 'nats'
+    volumes:
+      - ./data:/data:Z
     deploy:
       resources:
         limits:
           memory: 1G
 ```
 
-### 3. Server CLI Flags or Environment Variables
-```bash
-# Via CLI flag:
-./anchordb-server -memory-limit 1GB
-./anchordb-server -m 500MB
-./anchordb-server -mem-limit 5GB
-
-# Via Environment Variable:
-export ANCHORDB_MEMORY_LIMIT=1GB
-./anchordb-server
-```
-
-### 4. Real-time Memory Monitoring via `/health`
-Check live memory allocations, current heap usage, and configured limits:
-```bash
-curl http://localhost:7447/health
-```
-```json
-{
-  "status": "ok",
-  "port": "7447",
-  "memory": {
-    "limit_bytes": 1073741824,
-    "limit_human": "1.00 GB",
-    "heap_alloc_bytes": 2451000,
-    "heap_alloc_human": "2.34 MB",
-    "heap_sys_bytes": 12582912,
-    "heap_sys_human": "12.00 MB",
-    "num_gc": 4
-  }
-}
-```
-
 ---
 
-## Benchmark Metrics
+## REST API Reference
 
-Measured on standard CPU (Intel Core i7-1165G7 @ 2.80GHz):
+All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, include `Authorization: Bearer <token>`.
 
-| Operation | Throughput / Latency |
-| :--- | :--- |
-| **Ingestion Throughput** | ~842,000 records / second / core |
-| **10,000 Records Retrieval** | ~1.6 ms |
-| **10,000 Records Batch Math Update** | ~1.8 ms |
-| **Ray Convergence Calculation** | 3.7 microseconds / op |
-| **Internal Scheduler Task Execution** | 6.0 to 14.1 microseconds |
-| **Container Size** | **14.4 MB** (Alpine) |
+### 1. Telemetry & Health Checks
+- `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
+- `GET /v1/scheduler/status`: Active cron tasks and next execution times.
+- `GET /v1/worker/status`: Worker pool concurrency and task execution counters.
+- `GET /v1/queue/status`: Queue broker stats and event metrics.
 
----
-
-## Documentation & Architecture
-
-For deeper technical deep-dives and engineering specifications:
-- [Design Philosophy: Minimal Dependencies & Zero Bloat](docs/philosophy.md)
-- [Architectural Specification & Memory Layout](docs/architecture.md)
-- [REST API Reference](#rest-api-reference)
+### 2. Mutation & Query Endpoints
+- `POST /v1/save`: Ingest an entity with key-value properties. Publishes `anchordb.record.saved`.
+- `POST /v1/get`: Query an entity by name with optional in-storage computations.
+- `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters.
+- `POST /v1/update`: Constant-time batch update with arithmetic mutations. Publishes `anchordb.record.updated`.
+- `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
+- `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk.
+- `POST /v1/partition/run`: Manually trigger partition archival. Publishes `anchordb.partition.archived`.
 
 ---
 

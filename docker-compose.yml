@@ -7,18 +7,63 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
-      - "7447:7447" # Port Resmi AnchorDB
+      - "7447:7447" # Dedicated AnchorDB Port
     environment:
       - ANCHORDB_PORT=7447
       - ANCHORDB_DATA_DIR=/data
       - ANCHORDB_AUTH_TOKEN=""
-      - ANCHORDB_MEMORY_LIMIT=800MB # Soft memory limit (e.g. 500MB, 1GB, 5GB)
+      # Memory allocation (e.g. 500MB, 1GB, 5GB)
+      - ANCHORDB_MEMORY_LIMIT=800MB
       - ANCHORDB_IP_WHITELIST="" # Optional: e.g. "127.0.0.1,::1,192.168.1.0/24"
-      - ANCHORDB_PARTITION_SCHEDULE="23:00"
+      - ANCHORDB_TRUST_PROXY=false
+
+      # Cron Scheduler (gosuite/v3/cron)
+      - ANCHORDB_CRON_ENABLED=true
+      - ANCHORDB_PARTITION_SCHEDULE=23:00
+      - ANCHORDB_PARTITION_RETENTION_DAYS=180
+
+      # Worker Engine (gosuite/v3/worker)
+      - ANCHORDB_WORKER_ENABLED=true
+      - ANCHORDB_WORKER_CONCURRENCY=8
+      - ANCHORDB_WORKER_QUEUE_SIZE=1000
+
+      # Queue Broker (gosuite/v3/queue: memory, redis, or nats)
+      - ANCHORDB_QUEUE_ENABLED=true
+      - ANCHORDB_QUEUE_DRIVER=memory # Change to 'redis' or 'nats' if using external brokers
+      - ANCHORDB_QUEUE_CONSUMER_ENABLED=true
+
+      # Optional Redis Configuration (if ANCHORDB_QUEUE_DRIVER=redis)
+      # - ANCHORDB_REDIS_ADDR=redis:6379
+      # - ANCHORDB_REDIS_PASSWORD=""
+      # - ANCHORDB_REDIS_DB=0
+      # - ANCHORDB_REDIS_PREFIX=anchordb:queue:
+
+      # Optional NATS Configuration (if ANCHORDB_QUEUE_DRIVER=nats)
+      # - ANCHORDB_NATS_URL=nats://nats:4222
+      # - ANCHORDB_NATS_STREAM=anchordb_stream
     volumes:
       - ./data:/data:Z
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 1G # Container hard limit: 512M, 1G, 5G, etc.
+          memory: 1G # Container hard limit: 512M, 1G, 5G
+
+  # Optional Redis service for distributed queue adapter
+  redis:
+    image: redis:7-alpine
+    container_name: anchordb-redis
+    restart: unless-stopped
+    profiles: ["redis"]
+    ports:
+      - "6379:6379"
+
+  # Optional NATS service with JetStream enabled for message streaming adapter
+  nats:
+    image: nats:2.10-alpine
+    container_name: anchordb-nats
+    restart: unless-stopped
+    profiles: ["nats"]
+    command: ["-js"]
+    ports:
+      - "4222:4222"
