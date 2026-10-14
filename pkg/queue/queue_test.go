@@ -81,10 +81,11 @@ func TestQueueManagerMemory(t *testing.T) {
 	}
 }
 
-func TestQueueManagerBoundedCapacity(t *testing.T) {
+func TestQueueManagerWaitingAndRejection(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ConsumerEnabled = false // No consumer pulling, queue will fill up
-	cfg.MaxSize = 3
+	cfg.MaxSize = 2
+	cfg.EnqueueTimeout = 50 * time.Millisecond // Short timeout for rejection test
 
 	qm, err := NewQueueManager(cfg, nil)
 	if err != nil {
@@ -92,28 +93,79 @@ func TestQueueManagerBoundedCapacity(t *testing.T) {
 	}
 	defer func() { _ = qm.Close() }()
 
-	// Publish up to capacity limit (3 items)
-	for i := 0; i < 3; i++ {
+	// Publish up to capacity limit (2 items)
+	for i := 0; i < 2; i++ {
 		if err := qm.Publish(context.Background(), TopicRecordSaved, "item"); err != nil {
 			t.Fatalf("unexpected error at item %d: %v", i, err)
 		}
 	}
 
-	// 4th item should hit bounded limit and return ErrQueueFull
+	// 3rd item should wait for memory space and then be rejected after 50ms
+	t0 := time.Now()
 	err = qm.Publish(context.Background(), TopicRecordSaved, "item_overflow")
+	elapsed := time.Since(t0)
+
 	if err != ErrQueueFull {
 		t.Fatalf("expected ErrQueueFull, got %v", err)
 	}
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("expected publisher to wait before rejection, but returned in %v", elapsed)
+	}
 
 	stats := qm.Stats()
-	if stats.Capacity != 3 {
-		t.Fatalf("expected capacity 3, got %d", stats.Capacity)
+	if stats.Capacity != 2 {
+		t.Fatalf("expected capacity 2, got %d", stats.Capacity)
 	}
-	if stats.Pending != 3 {
-		t.Fatalf("expected pending 3, got %d", stats.Pending)
+	if stats.Pending != 2 {
+		t.Fatalf("expected pending 2, got %d", stats.Pending)
 	}
-	if stats.Dropped != 1 {
-		t.Fatalf("expected dropped 1, got %d", stats.Dropped)
+	if stats.Rejected != 1 {
+		t.Fatalf("expected rejected 1, got %d", stats.Rejected)
+	}
+}
+
+func TestQueueManagerWaitingFlowIntoMemory(t *testing.T) {
+	// Setup worker pool as dispatcher
+	wCfg := worker.DefaultConfig()
+	wCfg.Concurrency = 2
+	wPool := worker.NewPool(wCfg)
+	wPool.Start()
+	defer func() { _ = wPool.Shutdown() }()
+
+	cfg := DefaultConfig()
+	cfg.PollInterval = 5 * time.Millisecond
+	cfg.BatchSize = 1
+	cfg.MaxSize = 1                           // Max 1 item in memory
+	cfg.EnqueueTimeout = 500 * time.Millisecond // Wait up to 500ms
+
+	qm, err := NewQueueManager(cfg, wPool.Dispatcher())
+	if err != nil {
+		t.Fatalf("NewQueueManager failed: %v", err)
+	}
+	defer func() { _ = qm.Close() }()
+
+	var processedCount int32
+	qm.RegisterHandler(TopicRecordSaved, func(ctx context.Context, payload []byte) error {
+		time.Sleep(20 * time.Millisecond) // Simulate work
+		atomic.AddInt32(&processedCount, 1)
+		return nil
+	})
+	qm.Start()
+
+	// Publish item 1
+	if err := qm.Publish(context.Background(), TopicRecordSaved, "item_1"); err != nil {
+		t.Fatalf("item 1 publish failed: %v", err)
+	}
+
+	// Item 2 should wait for item 1 to finish, and successfully enter memory once item 1 finishes!
+	err = qm.Publish(context.Background(), TopicRecordSaved, "item_2")
+	if err != nil {
+		t.Fatalf("expected item 2 to wait and enter memory, got error: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if atomic.LoadInt32(&processedCount) != 2 {
+		t.Fatalf("expected both items processed, got %d", atomic.LoadInt32(&processedCount))
 	}
 }
 
