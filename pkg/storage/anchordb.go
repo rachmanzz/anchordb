@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -42,8 +43,8 @@ type AnchorDB struct {
 
 	Header Header
 
-	// Spatial Grid in RAM for ultra-fast pointer lookup: 256x256 cells
-	Grid [GridDim * GridDim][]uint32
+	// Spatial Grid in RAM for ultra-fast pointer lookup: sparse cell mapping (0 overhead for empty cells)
+	Grid map[uint32][]uint32
 
 	// Lexicon dictionary: word -> node record index
 	Lexicon map[string]uint32
@@ -312,6 +313,7 @@ type EntityRecord struct {
 // Open creates or opens an AnchorDB file using memory mapping.
 func Open(filePath string) (*AnchorDB, error) {
 	db := &AnchorDB{
+		Grid:        make(map[uint32][]uint32),
 		Lexicon:     make(map[string]uint32),
 		Relations:   make(map[string]spatial.Point2D),
 		EntityStore: make(map[string]map[string]float32),
@@ -444,7 +446,7 @@ func (db *AnchorDB) buildIndex() error {
 		p := spatial.Point2D{X: db.rawRecords[i].X, Y: db.rawRecords[i].Y}
 		cell := PointToCell(p, GridDim)
 		idx := CellIndex(cell, GridDim)
-		db.Grid[idx] = append(db.Grid[idx], uint32(i))
+		db.Grid[uint32(idx)] = append(db.Grid[uint32(idx)], uint32(i))
 	}
 
 	return nil
@@ -528,7 +530,7 @@ func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]floa
 	// Insert into grid
 	cell := PointToCell(coord, GridDim)
 	idx := CellIndex(cell, GridDim)
-	db.Grid[idx] = append(db.Grid[idx], recordIndex)
+	db.Grid[uint32(idx)] = append(db.Grid[uint32(idx)], recordIndex)
 
 	db.Header.NodeCount = uint64(len(db.rawRecords))
 
@@ -562,7 +564,7 @@ func (db *AnchorDB) appendNodeLocked(word string, coord spatial.Point2D, roles [
 
 	cell := PointToCell(coord, GridDim)
 	idx := CellIndex(cell, GridDim)
-	db.Grid[idx] = append(db.Grid[idx], recordIndex)
+	db.Grid[uint32(idx)] = append(db.Grid[uint32(idx)], recordIndex)
 
 	db.Header.NodeCount = uint64(len(db.rawRecords))
 	return newID
@@ -907,41 +909,13 @@ func (db *AnchorDB) Sync() error {
 	stringSize := uint64(len(db.stringPool))
 	entityOffset := stringOffset + stringSize
 
-	// Serialize Entity Section into buffer
-	var entityBuf []byte
-	for _, name := range db.EntityOrder {
-		props := db.EntityStore[name]
-		nameBytes := []byte(name)
-
-		// 2 bytes name length + name bytes
-		var lBuf [2]byte
-		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
-		entityBuf = append(entityBuf, lBuf[:]...)
-		entityBuf = append(entityBuf, nameBytes...)
-
-		// 2 bytes attr count
-		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(props)))
-		entityBuf = append(entityBuf, lBuf[:]...)
-
-		for k, v := range props {
-			kBytes := []byte(k)
-			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
-			entityBuf = append(entityBuf, lBuf[:]...)
-			entityBuf = append(entityBuf, kBytes...)
-
-			var vBuf [4]byte
-			binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(v))
-			entityBuf = append(entityBuf, vBuf[:]...)
-		}
-	}
-
 	db.Header.NodesOffset = nodesOffset
 	db.Header.StringOffset = stringOffset
 	db.Header.NodeCount = uint64(len(db.rawRecords))
 	db.Header.EntityCount = uint64(len(db.EntityOrder))
 	db.Header.EntityOffset = entityOffset
 
-	// Write entire database cleanly
+	// Write entire database cleanly using 64KB streaming buffer (O(1) RAM overhead, no 2x memory spikes)
 	if err := db.file.Truncate(0); err != nil {
 		return err
 	}
@@ -949,36 +923,79 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 
+	writer := bufio.NewWriterSize(db.file, 64*1024)
+
 	// 1. Header (64 bytes)
 	var hdrBuf [HeaderSize]byte
 	db.Header.Encode(hdrBuf[:])
-	if _, err := db.file.Write(hdrBuf[:]); err != nil {
+	if _, err := writer.Write(hdrBuf[:]); err != nil {
 		return err
 	}
 
-	// 2. Nodes Array (written in single batch buffer)
-	if len(db.rawRecords) > 0 {
-		nodesBuf := make([]byte, len(db.rawRecords)*RecordSize)
-		for i, rec := range db.rawRecords {
-			rec.Encode(nodesBuf[i*RecordSize : (i+1)*RecordSize])
+	// 2. Nodes Array (written in 1024-node batches, never giant monolithic buffer)
+	const nodeBatchSize = 1024
+	for i := 0; i < len(db.rawRecords); i += nodeBatchSize {
+		end := i + nodeBatchSize
+		if end > len(db.rawRecords) {
+			end = len(db.rawRecords)
 		}
-		if _, err := db.file.Write(nodesBuf); err != nil {
+		batch := make([]byte, (end-i)*RecordSize)
+		for j := i; j < end; j++ {
+			db.rawRecords[j].Encode(batch[(j-i)*RecordSize : (j-i+1)*RecordSize])
+		}
+		if _, err := writer.Write(batch); err != nil {
 			return err
 		}
 	}
 
-	// 3. String Pool (single write)
+	// 3. String Pool (streamed write)
 	if len(db.stringPool) > 0 {
-		if _, err := db.file.Write(db.stringPool); err != nil {
+		if _, err := writer.Write(db.stringPool); err != nil {
 			return err
 		}
 	}
 
-	// 4. Entity Section (single write)
-	if len(entityBuf) > 0 {
-		if _, err := db.file.Write(entityBuf); err != nil {
+	// 4. Entity Section (streamed directly to disk buffer without monolithic allocation)
+	var lBuf [2]byte
+	var vBuf [4]byte
+	for _, name := range db.EntityOrder {
+		props := db.EntityStore[name]
+		nameBytes := []byte(name)
+
+		// 2 bytes name length + name bytes
+		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
+		if _, err := writer.Write(lBuf[:]); err != nil {
 			return err
 		}
+		if _, err := writer.Write(nameBytes); err != nil {
+			return err
+		}
+
+		// 2 bytes attr count
+		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(props)))
+		if _, err := writer.Write(lBuf[:]); err != nil {
+			return err
+		}
+
+		for k, v := range props {
+			kBytes := []byte(k)
+			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
+			if _, err := writer.Write(lBuf[:]); err != nil {
+				return err
+			}
+			if _, err := writer.Write(kBytes); err != nil {
+				return err
+			}
+
+			binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(v))
+			if _, err := writer.Write(vBuf[:]); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		return err
 	}
 
 	_ = db.file.Sync()
@@ -1058,7 +1075,7 @@ func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, 
 	// 2. DDA Ray Marching: Steps cell-by-cell in order of forward distance t
 	TraverseRayDDA(ray, GridDim, 2.0, func(cell CellCoord) bool {
 		idx := CellIndex(cell, GridDim)
-		nodeList := db.Grid[idx]
+		nodeList := db.Grid[uint32(idx)]
 
 		for _, nodeIdx := range nodeList {
 			if inputIndices[nodeIdx] || visitedNodes[nodeIdx] {

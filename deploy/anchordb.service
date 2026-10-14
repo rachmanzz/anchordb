@@ -15,10 +15,12 @@ RestartSec=5
 Environment=ANCHORDB_PORT=7447
 Environment=ANCHORDB_DATA_DIR=/var/lib/anchordb
 Environment=ANCHORDB_AUTH_TOKEN=
+Environment=ANCHORDB_MEMORY_LIMIT=800MB
 Environment=ANCHORDB_IP_WHITELIST=127.0.0.1,::1
 
 # Security & Resource limits
 LimitNOFILE=65535
+MemoryMax=1G
 ProtectSystem=full
 PrivateTmp=true
 

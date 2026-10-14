@@ -27,7 +27,8 @@ USER anchordb
 # Default Environment Variables
 ENV ANCHORDB_PORT=7447 \
     ANCHORDB_DATA_DIR=/data \
-    ANCHORDB_AUTH_TOKEN=""
+    ANCHORDB_AUTH_TOKEN="" \
+    ANCHORDB_MEMORY_LIMIT=""
 
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:7447/health || exit 1
 

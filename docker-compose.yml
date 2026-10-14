@@ -12,6 +12,7 @@ services:
       - ANCHORDB_PORT=7447
       - ANCHORDB_DATA_DIR=/data
       - ANCHORDB_AUTH_TOKEN=""
+      - ANCHORDB_MEMORY_LIMIT=800MB # Soft memory limit (e.g. 500MB, 1GB, 5GB)
       - ANCHORDB_IP_WHITELIST="" # Optional: e.g. "127.0.0.1,::1,192.168.1.0/24"
       - ANCHORDB_PARTITION_SCHEDULE="23:00"
     volumes:
@@ -20,4 +21,4 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 512M # Ultra-hemat! Bounded mmap memory
+          memory: 1G # Container hard limit: 512M, 1G, 5G, etc.

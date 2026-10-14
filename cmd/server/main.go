@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/security"
 	"github.com/rachmanzz/anchordb/pkg/storage"
+	"github.com/rachmanzz/anchordb/pkg/system"
 )
 
 // Server holds active AnchorDB database instances keyed by model name
@@ -208,6 +210,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds": time.Since(s.startTime).Seconds(),
 		"port":           s.port,
 		"loaded_models":  loadedModels,
+		"memory":         system.GetMemoryStats(),
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -664,12 +667,26 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	portStr := os.Getenv("ANCHORDB_PORT")
+	flagPort := flag.String("port", "", "Port to listen on (overrides ANCHORDB_PORT, default 7447)")
+	flagDataDir := flag.String("data-dir", "", "Data directory path (overrides ANCHORDB_DATA_DIR)")
+	flagToken := flag.String("auth-token", "", "Bearer auth token (overrides ANCHORDB_AUTH_TOKEN)")
+	flagMemLimit := flag.String("memory-limit", "", "RAM allocation limit e.g. 500MB, 1GB, 5GB (overrides ANCHORDB_MEMORY_LIMIT)")
+	flag.StringVar(flagMemLimit, "mem-limit", "", "Alias for -memory-limit")
+	flag.StringVar(flagMemLimit, "m", "", "Short alias for -memory-limit")
+	flag.Parse()
+
+	portStr := *flagPort
+	if portStr == "" {
+		portStr = os.Getenv("ANCHORDB_PORT")
+	}
 	if portStr == "" {
 		portStr = "7447" // Port Resmi AnchorDB
 	}
 
-	dataDir := os.Getenv("ANCHORDB_DATA_DIR")
+	dataDir := *flagDataDir
+	if dataDir == "" {
+		dataDir = os.Getenv("ANCHORDB_DATA_DIR")
+	}
 	if dataDir == "" {
 		dataDir = "/data"
 		if _, err := os.Stat(dataDir); os.IsNotExist(err) {
@@ -677,7 +694,16 @@ func main() {
 		}
 	}
 
-	authToken := os.Getenv("ANCHORDB_AUTH_TOKEN")
+	authToken := *flagToken
+	if authToken == "" {
+		authToken = os.Getenv("ANCHORDB_AUTH_TOKEN")
+	}
+
+	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
+	_, memSummary, err := system.ApplyMemoryLimit(*flagMemLimit)
+	if err != nil {
+		log.Fatalf("[FATAL] Konfigurasi Memory Limit tidak valid: %v", err)
+	}
 
 	server := NewServer(dataDir, authToken, portStr)
 
@@ -697,6 +723,7 @@ func main() {
 	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
 	fmt.Println("             All Commercial Rights Reserved               ")
 	fmt.Printf("   Port Dedicated : %s\n", portStr)
+	fmt.Printf("   Memory Limit   : %s\n", memSummary)
 	if server.ipFilter.IsEmpty() {
 		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
 	} else {

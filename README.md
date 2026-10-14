@@ -188,6 +188,73 @@ curl -X POST http://localhost:7447/v1/get \
 
 ---
 
+## Memory Allocation & Resource Tuning (RAM Limits)
+
+AnchorDB provides fine-grained memory bounds with native Go runtime soft limit enforcement (`debug.SetMemoryLimit`). This ensures the Go runtime aggressively reclaims memory before reaching host or container ceilings, eliminating container OOM-killer crashes.
+
+You can configure memory limits (**500MB, 1GB, 5GB**, etc.) via multiple convenient mechanisms:
+
+### 1. Docker / Podman Container Flags
+```bash
+# Limit container to 1 GB RAM with 800 MB soft limit:
+docker run -d \
+  --name anchordb \
+  -p 7447:7447 \
+  -m 1g --memory-swap 1g \
+  -e ANCHORDB_MEMORY_LIMIT=800MB \
+  -v ./data:/data:Z \
+  anchordb:latest
+```
+*(If `ANCHORDB_MEMORY_LIMIT` is omitted inside a container, AnchorDB automatically detects the cgroup memory ceiling and sets the soft limit to 85% of container RAM).*
+
+### 2. Docker Compose
+```yaml
+services:
+  anchordb:
+    image: anchordb:latest
+    environment:
+      - ANCHORDB_MEMORY_LIMIT=800MB # 500MB, 1GB, 5GB
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+```
+
+### 3. Server CLI Flags or Environment Variables
+```bash
+# Via CLI flag:
+./anchordb-server -memory-limit 1GB
+./anchordb-server -m 500MB
+./anchordb-server -mem-limit 5GB
+
+# Via Environment Variable:
+export ANCHORDB_MEMORY_LIMIT=1GB
+./anchordb-server
+```
+
+### 4. Real-time Memory Monitoring via `/health`
+Check live memory allocations, current heap usage, and configured limits:
+```bash
+curl http://localhost:7447/health
+```
+```json
+{
+  "status": "ok",
+  "port": "7447",
+  "memory": {
+    "limit_bytes": 1073741824,
+    "limit_human": "1.00 GB",
+    "heap_alloc_bytes": 2451000,
+    "heap_alloc_human": "2.34 MB",
+    "heap_sys_bytes": 12582912,
+    "heap_sys_human": "12.00 MB",
+    "num_gc": 4
+  }
+}
+```
+
+---
+
 ## Benchmark Metrics
 
 Measured on standard CPU (Intel Core i7-1165G7 @ 2.80GHz):
