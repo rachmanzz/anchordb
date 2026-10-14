@@ -412,7 +412,8 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := db.SaveRecord(req.Name, req.Props); err != nil {
+	effectiveName, err := db.SaveRecordWithID(req.Name, req.Props)
+	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -429,7 +430,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"name":    req.Name,
+		"name":    effectiveName,
 		"message": "record saved",
 	})
 }

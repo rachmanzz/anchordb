@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
 
@@ -675,7 +677,20 @@ func (db *AnchorDB) appendNodeLocked(word string, coord spatial.Point2D, roles [
 }
 
 // SaveRecord stores an entity and its raw numeric properties in AnchorDB (SAVING).
+// If name is an empty string, a unique UUIDv4 is automatically generated.
 func (db *AnchorDB) SaveRecord(name string, props map[string]float32) error {
+	_, err := db.SaveRecordWithID(name, props)
+	return err
+}
+
+// SaveRecordWithID stores an entity and its raw numeric properties, returning the assigned name.
+// If name is an empty string or whitespace, a unique UUIDv4 is automatically generated.
+func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = uuid.NewString()
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -698,7 +713,7 @@ func (db *AnchorDB) SaveRecord(name string, props map[string]float32) error {
 		db.appendNodeLocked(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
 	}
 
-	return nil
+	return name, nil
 }
 
 // GetRecord retrieves stored raw properties of an entity (GETTING), optionally selecting specific fields.

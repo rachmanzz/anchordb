@@ -829,3 +829,44 @@ func TestDriver_HighConcurrencyParallelConnections(t *testing.T) {
 	t.Logf("[PARALEL] Sukses mengeksekusi %d request paralel campuran (Read/Write) dari %d goroutine dalam %v (%.0f ops/detik)",
 		totalReqs, numGoroutines, duration, opsPerSec)
 }
+
+func TestDriver_SaveAutoID(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "driver_autouuid.anchordb")
+
+	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	if err != nil {
+		t.Fatalf("failed to connect via driver: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// 1. Test SaveAutoID
+	id1, err := client.SaveAutoID(map[string]float32{"skor": 88.5})
+	if err != nil {
+		t.Fatalf("SaveAutoID failed: %v", err)
+	}
+	if len(id1) != 36 {
+		t.Fatalf("expected 36-char UUID, got %q", id1)
+	}
+
+	// 2. Test SaveWithID with empty string
+	id2, err := client.SaveWithID("", map[string]float32{"skor": 92.0})
+	if err != nil {
+		t.Fatalf("SaveWithID failed: %v", err)
+	}
+	if len(id2) != 36 || id2 == id1 {
+		t.Fatalf("expected unique 36-char UUID, got %q", id2)
+	}
+
+	// 3. Test retrieving via driver Get
+	rec1, err := client.Get(id1).Select("skor").Execute(ctx)
+	if err != nil {
+		t.Fatalf("client.Get failed for auto UUID: %v", err)
+	}
+	if rec1.Get("skor") != 88.5 {
+		t.Fatalf("expected skor 88.5, got %v", rec1.Get("skor"))
+	}
+}
+

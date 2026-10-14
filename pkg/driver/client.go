@@ -150,8 +150,20 @@ func Assign(valueOrField string) storage.ComputeOp {
 }
 
 // Save stores an entity with its raw numeric properties in AnchorDB (SAVING).
+// If name is empty, a UUIDv4 is automatically generated.
 func (c *Client) Save(name string, props map[string]float32) error {
 	return c.db.SaveRecord(name, props)
+}
+
+// SaveAutoID stores an entity with an automatically generated UUIDv4 identifier.
+func (c *Client) SaveAutoID(props map[string]float32) (string, error) {
+	return c.db.SaveRecordWithID("", props)
+}
+
+// SaveWithID stores an entity with its raw numeric properties in AnchorDB, returning the effective name identifier.
+// If name is an empty string, a UUIDv4 is automatically generated.
+func (c *Client) SaveWithID(name string, props map[string]float32) (string, error) {
+	return c.db.SaveRecordWithID(name, props)
 }
 
 // Get creates a query builder to retrieve an entity and optionally compute derived fields (GETTING & CALCULATING).

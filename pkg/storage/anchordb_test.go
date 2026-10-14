@@ -327,6 +327,53 @@ func TestCompactRecord_MemoryFootprint(t *testing.T) {
 	t.Logf("[OK] CompactRecord and Zero-Copy verification passed for %d records!", n)
 }
 
+func TestAnchorDB_AutoUUID(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "autouuid.anchordb")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open anchordb: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Save with empty string -> should generate UUID
+	id1, err := db.SaveRecordWithID("", map[string]float32{"metric": 42.5})
+	if err != nil {
+		t.Fatalf("SaveRecordWithID failed: %v", err)
+	}
+	if len(id1) != 36 {
+		t.Fatalf("expected 36-char UUID, got %q", id1)
+	}
+
+	// 2. Save with whitespace -> should also generate UUID
+	id2, err := db.SaveRecordWithID("   ", map[string]float32{"metric": 99.0})
+	if err != nil {
+		t.Fatalf("SaveRecordWithID failed: %v", err)
+	}
+	if len(id2) != 36 || id2 == id1 {
+		t.Fatalf("expected unique 36-char UUID, got %q (id1=%q)", id2, id1)
+	}
+
+	// 3. Save with custom explicit ID -> should preserve custom ID
+	id3, err := db.SaveRecordWithID("custom_item_1", map[string]float32{"metric": 10.0})
+	if err != nil {
+		t.Fatalf("SaveRecordWithID failed: %v", err)
+	}
+	if id3 != "custom_item_1" {
+		t.Fatalf("expected 'custom_item_1', got %q", id3)
+	}
+
+	// 4. Retrieve auto-generated UUID record
+	rec1, err := db.GetRecord(id1)
+	if err != nil {
+		t.Fatalf("GetRecord failed for auto UUID: %v", err)
+	}
+	if rec1["metric"] != 42.5 {
+		t.Fatalf("expected metric 42.5, got %v", rec1["metric"])
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)
