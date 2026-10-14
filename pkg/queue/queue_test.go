@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -191,3 +192,48 @@ func TestQueueManagerDisabled(t *testing.T) {
 
 	_ = qm.Close()
 }
+
+func TestQueueManager_ConsumerOn_NoHandler_NoLeak(t *testing.T) {
+	// Setup worker pool as dispatcher
+	wCfg := worker.DefaultConfig()
+	wCfg.Concurrency = 2
+	wPool := worker.NewPool(wCfg)
+	wPool.Start()
+	defer func() { _ = wPool.Shutdown() }()
+
+	cfg := DefaultConfig()
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.BatchSize = 5
+	cfg.MaxSize = 3
+	cfg.EnqueueTimeout = 150 * time.Millisecond
+	cfg.ConsumerEnabled = true
+
+	// Create manager with consumer ON, but DO NOT register any handler!
+	qm, err := NewQueueManager(cfg, wPool.Dispatcher())
+	if err != nil {
+		t.Fatalf("NewQueueManager failed: %v", err)
+	}
+	defer func() { _ = qm.Close() }()
+
+	qm.Start()
+
+	// Publish 5 items (more than MaxSize=3)
+	for i := 0; i < 5; i++ {
+		err := qm.Publish(context.Background(), "unhandled_topic", fmt.Sprintf("payload_%d", i))
+		if err != nil {
+			t.Fatalf("publish %d failed unexpectedly: %v (possible slot leak)", i, err)
+		}
+	}
+
+	// Give time for consumer to drain and settle items
+	time.Sleep(200 * time.Millisecond)
+
+	stats := qm.Stats()
+	if stats.Pending != 0 {
+		t.Fatalf("expected 0 pending slots after consumer drain, got %d (slot leak detected!)", stats.Pending)
+	}
+	if stats.Rejected != 0 {
+		t.Fatalf("expected 0 rejections, got %d", stats.Rejected)
+	}
+}
+

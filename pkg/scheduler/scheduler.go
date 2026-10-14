@@ -182,20 +182,16 @@ func (s *InternalScheduler) Register(name, schedule string, job func() error) er
 		jobFunc:     job,
 	}
 
-	// Register with gosuite cron scheduler
-	if err := s.cronSched.Register(wrapper); err != nil {
+	// Register with gosuite cron scheduler using AddJob to get exact EntryID
+	runner := gsuite_cron.NewTaskRunner(wrapper)
+	entryID, err := s.cronSched.AddJob(cronSpec, runner)
+	if err != nil {
 		return fmt.Errorf("failed to register cron task %q: %w", name, err)
 	}
-
-	// Capture assigned EntryID by matching runner
-	for _, entry := range s.cronSched.Entries() {
-		if entry.Valid() {
-			wrapper.entryID = entry.ID
-		}
-	}
+	wrapper.entryID = entryID
 
 	s.tasks[name] = wrapper
-	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, schedule, cronSpec)
+	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q, entry: %d)", name, schedule, cronSpec, entryID)
 	return nil
 }
 

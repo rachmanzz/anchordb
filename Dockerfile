@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /anchordb-server cmd/s
 FROM alpine:3.19
 
 WORKDIR /app
-RUN mkdir -p /data && adduser -D -u 1000 anchordb && chown -R anchordb:anchordb /data /app
+RUN apk add --no-cache ca-certificates && mkdir -p /data /app && adduser -D -u 1000 anchordb && chown -R anchordb:anchordb /data /app
 
 COPY --from=builder /anchordb-server /app/anchordb-server
 

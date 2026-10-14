@@ -172,7 +172,43 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		s.scheduler.Start()
 	}
 
+	// Register built-in CDC handlers so messages are processed by worker pool and settled cleanly
+	s.registerQueueHandlers()
+
 	return s, nil
+}
+
+func (s *Server) registerQueueHandlers() {
+	if s.queue == nil {
+		return
+	}
+
+	s.queue.RegisterHandler(queue.TopicRecordSaved, func(ctx context.Context, payload []byte) error {
+		var evt queue.RecordSavedEvent
+		if err := json.Unmarshal(payload, &evt); err != nil {
+			return err
+		}
+		log.Printf("[CDC] Record saved: model=%s name=%s count=%d", evt.Model, evt.Name, evt.Count)
+		return nil
+	})
+
+	s.queue.RegisterHandler(queue.TopicRecordUpdated, func(ctx context.Context, payload []byte) error {
+		var evt queue.RecordUpdatedEvent
+		if err := json.Unmarshal(payload, &evt); err != nil {
+			return err
+		}
+		log.Printf("[CDC] Record updated: model=%s modified=%d", evt.Model, evt.ModifiedCount)
+		return nil
+	})
+
+	s.queue.RegisterHandler(queue.TopicPartitionArchived, func(ctx context.Context, payload []byte) error {
+		var evt queue.PartitionArchivedEvent
+		if err := json.Unmarshal(payload, &evt); err != nil {
+			return err
+		}
+		log.Printf("[CDC] Partition archived: model=%s archived=%d location=%s", evt.Model, evt.ArchivedCount, evt.TargetLocation)
+		return nil
+	})
 }
 
 // sanitizeModelName enforces alphanumeric model names, max length, and prevents path traversal
@@ -420,12 +456,14 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 
 	// Publish mutation event to queue broker
 	if s.queue != nil {
-		_ = s.queue.Publish(r.Context(), queue.TopicRecordSaved, queue.RecordSavedEvent{
+		if err := s.queue.Publish(r.Context(), queue.TopicRecordSaved, queue.RecordSavedEvent{
 			Model:     req.Model,
-			ID:        0,
+			Name:      effectiveName,
 			Count:     1,
 			Timestamp: time.Now(),
-		})
+		}); err != nil {
+			log.Printf("[QUEUE] Warning: failed to publish record.saved event: %v", err)
+		}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -579,11 +617,14 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	// Publish mutation event to queue broker
 	if s.queue != nil && count > 0 {
-		_ = s.queue.Publish(r.Context(), queue.TopicRecordUpdated, queue.RecordUpdatedEvent{
-			Model:     req.Model,
-			ID:        0,
-			Timestamp: time.Now(),
-		})
+		if err := s.queue.Publish(r.Context(), queue.TopicRecordUpdated, queue.RecordUpdatedEvent{
+			Model:         req.Model,
+			Names:         req.In,
+			ModifiedCount: count,
+			Timestamp:     time.Now(),
+		}); err != nil {
+			log.Printf("[QUEUE] Warning: failed to publish record.updated event: %v", err)
+		}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -926,6 +967,7 @@ func main() {
 	flagQueueEnabled := flag.Bool("queue-enabled", true, "Enable async queue broker (overrides ANCHORDB_QUEUE_ENABLED)")
 	flagQueueConsumer := flag.Bool("queue-consumer", true, "Enable background queue consumer (overrides ANCHORDB_QUEUE_CONSUMER_ENABLED)")
 	flagQueueMaxSize := flag.Int("queue-max-size", 0, "Max in-memory queue capacity ceiling (overrides ANCHORDB_QUEUE_MAX_SIZE, default 10000)")
+	flagQueueTimeout := flag.Duration("queue-timeout", 200*time.Millisecond, "Max duration to wait for queue slot before rejecting (overrides ANCHORDB_QUEUE_TIMEOUT, default 200ms)")
 
 	flag.Parse()
 
@@ -1052,6 +1094,7 @@ func main() {
 			PollInterval:    20 * time.Millisecond,
 			BatchSize:       20,
 			MaxSize:         queueMaxSize,
+			EnqueueTimeout:  *flagQueueTimeout,
 		},
 	}
 

@@ -1128,6 +1128,12 @@ func (db *AnchorDB) Sync() error {
 	}
 	tempFile = nil // Prevent defer from removing the renamed file
 
+	// Fsync parent directory to ensure rename is committed to filesystem metadata
+	if dirF, err := os.Open(filepath.Dir(db.filePath)); err == nil {
+		_ = dirF.Sync()
+		_ = dirF.Close()
+	}
+
 	// Re-open newly synced file
 	newF, err := os.OpenFile(db.filePath, os.O_RDWR, 0644)
 	if err != nil {

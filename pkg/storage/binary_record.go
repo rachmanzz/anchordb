@@ -73,6 +73,9 @@ func DecodeHeader(buf []byte) (*Header, error) {
 	if h.Magic != MagicHeader {
 		return nil, fmt.Errorf("invalid magic header: expected 0x%X, got 0x%X", MagicHeader, h.Magic)
 	}
+	if h.Version != DBVersion {
+		return nil, fmt.Errorf("unsupported database version: expected %d, got %d", DBVersion, h.Version)
+	}
 	return h, nil
 }
 
