@@ -127,6 +127,7 @@ All settings can be configured via environment variables or CLI flags:
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
 | **Queue Enabled** | `-queue-enabled` | `ANCHORDB_QUEUE_ENABLED` | `true` | Enable in-memory async event broker |
 | **Queue Consumer** | `-queue-consumer` | `ANCHORDB_QUEUE_CONSUMER_ENABLED` | `true` | Enable background queue consumer |
+| **Queue Max Size** | `-queue-max-size` | `ANCHORDB_QUEUE_MAX_SIZE` | `10000` | Bounded in-memory queue ceiling (OOM protection) |
 
 ---
 

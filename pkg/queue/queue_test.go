@@ -22,6 +22,7 @@ func TestQueueManagerMemory(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PollInterval = 10 * time.Millisecond
 	cfg.BatchSize = 5
+	cfg.MaxSize = 100
 
 	qm, err := NewQueueManager(cfg, wPool.Dispatcher())
 	if err != nil {
@@ -77,6 +78,42 @@ func TestQueueManagerMemory(t *testing.T) {
 	}
 	if stats.Processed != 1 {
 		t.Fatalf("expected processed=1, got %d", stats.Processed)
+	}
+}
+
+func TestQueueManagerBoundedCapacity(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ConsumerEnabled = false // No consumer pulling, queue will fill up
+	cfg.MaxSize = 3
+
+	qm, err := NewQueueManager(cfg, nil)
+	if err != nil {
+		t.Fatalf("NewQueueManager failed: %v", err)
+	}
+	defer func() { _ = qm.Close() }()
+
+	// Publish up to capacity limit (3 items)
+	for i := 0; i < 3; i++ {
+		if err := qm.Publish(context.Background(), TopicRecordSaved, "item"); err != nil {
+			t.Fatalf("unexpected error at item %d: %v", i, err)
+		}
+	}
+
+	// 4th item should hit bounded limit and return ErrQueueFull
+	err = qm.Publish(context.Background(), TopicRecordSaved, "item_overflow")
+	if err != ErrQueueFull {
+		t.Fatalf("expected ErrQueueFull, got %v", err)
+	}
+
+	stats := qm.Stats()
+	if stats.Capacity != 3 {
+		t.Fatalf("expected capacity 3, got %d", stats.Capacity)
+	}
+	if stats.Pending != 3 {
+		t.Fatalf("expected pending 3, got %d", stats.Pending)
+	}
+	if stats.Dropped != 1 {
+		t.Fatalf("expected dropped 1, got %d", stats.Dropped)
 	}
 }
 

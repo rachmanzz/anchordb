@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync/atomic"
 	"time"
@@ -9,6 +10,9 @@ import (
 	gsuite_queue "github.com/rachmanzz/gosuite/v3/queue"
 	gsuite_worker "github.com/rachmanzz/gosuite/v3/worker"
 )
+
+// ErrQueueFull is returned when the in-memory queue exceeds its configured capacity ceiling
+var ErrQueueFull = errors.New("queue: in-memory queue capacity limit reached")
 
 // Standard Event Topics for AnchorDB mutations
 const (
@@ -23,15 +27,17 @@ type Config struct {
 	ConsumerEnabled bool          `json:"consumer_enabled"`
 	PollInterval    time.Duration `json:"poll_interval"`
 	BatchSize       int           `json:"batch_size"`
+	MaxSize         int           `json:"max_size"` // Maximum pending in-memory items (backpressure ceiling)
 }
 
-// DefaultConfig provides high-throughput in-memory queue settings
+// DefaultConfig provides high-throughput in-memory queue settings with a safe default capacity bound
 func DefaultConfig() Config {
 	return Config{
 		Enabled:         true,
 		ConsumerEnabled: true,
 		PollInterval:    20 * time.Millisecond,
 		BatchSize:       20,
+		MaxSize:         10000, // Safe default: bounds memory to prevent OOM
 	}
 }
 
@@ -64,25 +70,30 @@ type QueueStats struct {
 	Enabled   bool   `json:"enabled"`
 	Driver    string `json:"driver"`
 	Consumer  bool   `json:"consumer"`
+	Capacity  int    `json:"capacity"`
+	Pending   int64  `json:"pending"`
 	Published int64  `json:"published"`
 	Processed int64  `json:"processed"`
+	Dropped   int64  `json:"dropped"`
 	Failed    int64  `json:"failed"`
 }
 
-// QueueManager orchestrates async messaging powered by github.com/rachmanzz/gosuite/v3/queue (In-Memory)
+// QueueManager orchestrates bounded async messaging powered by github.com/rachmanzz/gosuite/v3/queue (In-Memory)
 type QueueManager struct {
 	cfg        Config
 	driver     gsuite_queue.Driver
 	consumer   *gsuite_queue.Consumer
 	dispatcher gsuite_worker.Dispatcher
 
+	pending   int64
 	published int64
 	processed int64
+	dropped   int64
 	failed    int64
 	running   atomic.Bool
 }
 
-// NewQueueManager instantiates the in-memory queue broker
+// NewQueueManager instantiates the bounded in-memory queue broker
 func NewQueueManager(cfg Config, disp gsuite_worker.Dispatcher) (*QueueManager, error) {
 	if !cfg.Enabled {
 		return &QueueManager{
@@ -91,9 +102,13 @@ func NewQueueManager(cfg Config, disp gsuite_worker.Dispatcher) (*QueueManager, 
 		}, nil
 	}
 
+	if cfg.MaxSize <= 0 {
+		cfg.MaxSize = 10000 // Default 10,000 items
+	}
+
 	driver := gsuite_queue.NewMemoryDriver()
 	gsuite_queue.SetDriver(driver)
-	log.Println("[QUEUE] In-Memory Queue Adapter aktif (Zero External Dependency, CPU-native).")
+	log.Printf("[QUEUE] In-Memory Queue Adapter aktif (Zero External Dependency, Kapasitas Maksimum: %d item).", cfg.MaxSize)
 
 	return &QueueManager{
 		cfg:        cfg,
@@ -130,20 +145,31 @@ func (m *QueueManager) Start() {
 
 		m.consumer = gsuite_queue.NewConsumer(m.driver, gsuite_queue.GetRouter(), m.dispatcher, opts...)
 		m.consumer.Start()
-		log.Printf("[QUEUE] Consumer aktif mendengarkan antrean (poll: %v, batch: %d)",
-			pollInterval, batchSize)
+		log.Printf("[QUEUE] Consumer aktif mendengarkan antrean (poll: %v, batch: %d, limit: %d)",
+			pollInterval, batchSize, m.cfg.MaxSize)
 	}
 }
 
-// Publish enqueues an event topic with automatic JSON serialization
+// Publish enqueues an event topic with automatic JSON serialization and bounded capacity protection
 func (m *QueueManager) Publish(ctx context.Context, topic string, payload any, opts ...gsuite_queue.DispatchOption) error {
 	if !m.cfg.Enabled || m.driver == nil {
 		return nil // Graceful no-op when queue is disabled
 	}
 
+	// Enforce queue capacity bounds to protect RAM from unbounded growth
+	if m.cfg.MaxSize > 0 && atomic.LoadInt64(&m.pending) >= int64(m.cfg.MaxSize) {
+		atomic.AddInt64(&m.dropped, 1)
+		log.Printf("[WARN] In-memory queue penuh (%d pending items), event %q di-drop untuk melindungi RAM",
+			m.cfg.MaxSize, topic)
+		return ErrQueueFull
+	}
+
+	atomic.AddInt64(&m.pending, 1)
 	atomic.AddInt64(&m.published, 1)
+
 	err := gsuite_queue.Dispatch(ctx, topic, payload, opts...)
 	if err != nil {
+		atomic.AddInt64(&m.pending, -1)
 		atomic.AddInt64(&m.failed, 1)
 		log.Printf("[QUEUE] Gagal mempublikasikan pesan ke topik %q: %v", topic, err)
 		return err
@@ -151,9 +177,15 @@ func (m *QueueManager) Publish(ctx context.Context, topic string, payload any, o
 	return nil
 }
 
-// RegisterHandler registers a subscriber callback for a topic
+// RegisterHandler registers a subscriber callback for a topic and updates pending counters upon completion
 func (m *QueueManager) RegisterHandler(topic string, handler func(ctx context.Context, payload []byte) error) {
 	gsuite_queue.RegisterHandler(topic, func(ctx context.Context, msg *gsuite_queue.Message, pool gsuite_worker.SubWorkerPool) error {
+		defer func() {
+			if atomic.LoadInt64(&m.pending) > 0 {
+				atomic.AddInt64(&m.pending, -1)
+			}
+		}()
+
 		err := handler(ctx, msg.Payload)
 		if err != nil {
 			atomic.AddInt64(&m.failed, 1)
@@ -171,12 +203,19 @@ func (m *QueueManager) Stats() QueueStats {
 	if m.cfg.Enabled && m.driver != nil {
 		driverName = m.driver.Name()
 	}
+	pending := atomic.LoadInt64(&m.pending)
+	if pending < 0 {
+		pending = 0
+	}
 	return QueueStats{
 		Enabled:   m.cfg.Enabled,
 		Driver:    driverName,
 		Consumer:  m.running.Load(),
+		Capacity:  m.cfg.MaxSize,
+		Pending:   pending,
 		Published: atomic.LoadInt64(&m.published),
 		Processed: atomic.LoadInt64(&m.processed),
+		Dropped:   atomic.LoadInt64(&m.dropped),
 		Failed:    atomic.LoadInt64(&m.failed),
 	}
 }

@@ -921,9 +921,10 @@ func main() {
 	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
 
-	// 4. Queue Broker Flags (In-Memory)
+	// 4. Queue Broker Flags (In-Memory Bounded)
 	flagQueueEnabled := flag.Bool("queue-enabled", true, "Enable async queue broker (overrides ANCHORDB_QUEUE_ENABLED)")
 	flagQueueConsumer := flag.Bool("queue-consumer", true, "Enable background queue consumer (overrides ANCHORDB_QUEUE_CONSUMER_ENABLED)")
+	flagQueueMaxSize := flag.Int("queue-max-size", 0, "Max in-memory queue capacity ceiling (overrides ANCHORDB_QUEUE_MAX_SIZE, default 10000)")
 
 	flag.Parse()
 
@@ -1015,6 +1016,11 @@ func main() {
 		queueConsumer = getEnvBool("ANCHORDB_QUEUE_CONSUMER_ENABLED", true)
 	}
 
+	queueMaxSize := *flagQueueMaxSize
+	if queueMaxSize <= 0 {
+		queueMaxSize = getEnvInt("ANCHORDB_QUEUE_MAX_SIZE", 10000)
+	}
+
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
 	_, memSummary, err := system.ApplyMemoryLimit(memLimitStr)
 	if err != nil {
@@ -1044,6 +1050,7 @@ func main() {
 			ConsumerEnabled: queueConsumer,
 			PollInterval:    20 * time.Millisecond,
 			BatchSize:       20,
+			MaxSize:         queueMaxSize,
 		},
 	}
 
@@ -1088,7 +1095,8 @@ func main() {
 		fmt.Println("   Worker Pool    : DISABLED")
 	}
 	if queueEnabled {
-		fmt.Printf("   Queue Broker   : ENABLED (In-Memory, Consumer: %t)\n", queueConsumer)
+		fmt.Printf("   Queue Broker   : ENABLED (In-Memory, Consumer: %t, Max Capacity: %d items)\n",
+			queueConsumer, queueMaxSize)
 	} else {
 		fmt.Println("   Queue Broker   : DISABLED")
 	}
