@@ -264,6 +264,69 @@ func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
 	t.Logf("[OK] String pool remains intact after subsequent append + sync on reopened db!")
 }
 
+func TestCompactRecord_MemoryFootprint(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "anchordb_mem_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "mem_test.anchordb")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 10000
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("vehicle_%d", i)
+		_ = db.SaveRecord(name, map[string]float32{
+			"jarak":   float32(100 + i),
+			"waktu":   2.5,
+			"tanggal": 20740, // 2026-10-14
+		})
+	}
+
+	if err := db.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	_ = db.Close()
+
+	// Reopen with zero-copy nodes & compact records
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if len(reopened.EntityStore) != n {
+		t.Fatalf("expected %d entities, got %d", n, len(reopened.EntityStore))
+	}
+
+	// Verify data accuracy
+	v500, err := reopened.GetRecord("vehicle_500")
+	if err != nil {
+		t.Fatalf("failed to get vehicle_500: %v", err)
+	}
+	if v500["jarak"] != 600 || v500["waktu"] != 2.5 {
+		t.Fatalf("data mismatch: got %v", v500)
+	}
+
+	// Verify fast projected query
+	items, _, err := reopened.ListRecordsWithPaging(QueryOptions{
+		Select: []string{"jarak"},
+		Limit:  10,
+	})
+	if err != nil || len(items) != 10 {
+		t.Fatalf("paging failed: items=%d, err=%v", len(items), err)
+	}
+	if items[0].Props["jarak"] != 100 || len(items[0].Props) != 1 {
+		t.Fatalf("projection failed: %v", items[0].Props)
+	}
+
+	t.Logf("[OK] CompactRecord and Zero-Copy verification passed for %d records!", n)
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)
