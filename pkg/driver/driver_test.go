@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -759,6 +760,74 @@ func TestDriver_ScheduledDeactivation_15Days(t *testing.T) {
 		t.Fatalf("user_3_kemarin should remain active (1), got %v", u3.Get("status"))
 	}
 	t.Logf("[OK] user_3_kemarin (Terdaftar: %s) -> Status: %.0f (Aktif)", u3.GetDate("date_terdaftar"), u3.Get("status"))
+}
+
+func TestDriver_HighConcurrencyParallelConnections(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "parallel_stress.anchordb")
+
+	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed awal: 100 entitas
+	for i := 0; i < 100; i++ {
+		_ = client.Save(fmt.Sprintf("item_%d", i), map[string]float32{
+			"jarak": float32(i * 10),
+			"waktu": 2.0,
+			"val":   100.0,
+		})
+	}
+
+	// 2. Simulasi 50 koneksi / goroutine paralel yang melakukan 2.000 request campuran (Read + Write)
+	const numGoroutines = 50
+	const requestsPerWorker = 40
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	t0 := time.Now()
+
+	for g := 0; g < numGoroutines; g++ {
+		workerID := g
+		go func() {
+			defer wg.Done()
+			for r := 0; r < requestsPerWorker; r++ {
+				targetName := fmt.Sprintf("item_%d", (workerID*requestsPerWorker+r)%100)
+
+				if r%5 == 0 {
+					// 20% WRITE CONCURRENT: Mutasi atomik
+					_, _ = client.Update().
+						In(targetName).
+						Set("val", Add("val", "1")).
+						Execute(ctx)
+				} else {
+					// 80% READ CONCURRENT: Kueri paralel tanpa blocking
+					res, err := client.Get(targetName).
+						Select("jarak", "waktu", "kecepatan").
+						Compute("kecepatan", Divide("jarak", "waktu")).
+						Execute(ctx)
+
+					if err != nil || res == nil {
+						t.Errorf("Concurrent read failed for %s: %v", targetName, err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	duration := time.Since(t0)
+	totalReqs := numGoroutines * requestsPerWorker
+	opsPerSec := float64(totalReqs) / duration.Seconds()
+
+	t.Logf("[PARALEL] Sukses mengeksekusi %d request paralel campuran (Read/Write) dari %d goroutine dalam %v (%.0f ops/detik)",
+		totalReqs, numGoroutines, duration, opsPerSec)
 }
 
 
