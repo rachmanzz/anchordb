@@ -7,19 +7,12 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	gsuite_cron "github.com/rachmanzz/gosuite/v3/cron"
-	robfig "github.com/robfig/cron/v3"
 )
 
-// ScheduledTask defines a background maintenance job
-type ScheduledTask struct {
-	Name       string
-	Schedule   string // e.g. "23:00" (daily at 23:00) or "@hourly" or "10m"
-	JobFunc    func() error
-	LastRun    time.Time
-	LastStatus string
-	NextRun    time.Time
+// ScheduledTask defines a background maintenance job contract
+type ScheduledTask interface {
+	Schedule() string
+	Execute(ctx context.Context) error
 }
 
 // TaskInfo represents public serializable task status
@@ -31,120 +24,92 @@ type TaskInfo struct {
 	NextRun    time.Time `json:"next_run"`
 }
 
-// cronTaskWrapper bridges AnchorDB tasks to gosuite/v3/cron.ScheduledTask
-type cronTaskWrapper struct {
+type registeredTask struct {
 	name        string
 	rawSchedule string
 	cronSpec    string
 	jobFunc     func() error
-	task        gsuite_cron.ScheduledTask
-	entryID     gsuite_cron.EntryID
+	task        ScheduledTask
+
+	isDaily    bool
+	targetHour int
+	targetMin  int
+	interval   time.Duration
 
 	mu         sync.RWMutex
 	lastRun    time.Time
 	lastStatus string
+	nextRun    time.Time
 }
 
-func (w *cronTaskWrapper) Schedule() string {
-	return w.cronSpec
+func (t *registeredTask) calculateNext(from time.Time) time.Time {
+	if t.isDaily {
+		targetToday := time.Date(from.Year(), from.Month(), from.Day(), t.targetHour, t.targetMin, 0, 0, from.Location())
+		if targetToday.After(from) {
+			return targetToday
+		}
+		return targetToday.Add(24 * time.Hour)
+	}
+	if t.interval > 0 {
+		return from.Add(t.interval)
+	}
+	return time.Time{}
 }
 
-func (w *cronTaskWrapper) Execute(ctx context.Context) error {
-	w.mu.Lock()
-	w.lastRun = time.Now()
-	w.mu.Unlock()
+func (t *registeredTask) execute(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in task: %v", r)
+			t.mu.Lock()
+			t.lastStatus = fmt.Sprintf("Panic: %v", r)
+			t.mu.Unlock()
+			log.Printf("[SCHEDULER] Task %q PANIC: %v", t.name, r)
+		}
+	}()
 
-	log.Printf("[SCHEDULER] Menjalankan task %q ...", w.name)
+	t.mu.Lock()
+	t.lastRun = time.Now()
+	t.mu.Unlock()
+
+	log.Printf("[SCHEDULER] Menjalankan task %q ...", t.name)
 	t0 := time.Now()
-	var err error
-	if w.task != nil {
-		err = w.task.Execute(ctx)
-	} else if w.jobFunc != nil {
-		err = w.jobFunc()
+
+	if t.task != nil {
+		err = t.task.Execute(ctx)
+	} else if t.jobFunc != nil {
+		err = t.jobFunc()
 	}
 
-	w.mu.Lock()
+	t.mu.Lock()
 	if err != nil {
-		w.lastStatus = fmt.Sprintf("Error: %v", err)
-		log.Printf("[SCHEDULER] Task %q GAGAL: %v", w.name, err)
+		t.lastStatus = fmt.Sprintf("Error: %v", err)
+		log.Printf("[SCHEDULER] Task %q GAGAL: %v", t.name, err)
 	} else {
-		w.lastStatus = "Success"
-		log.Printf("[SCHEDULER] Task %q SUKSES dalam %v", w.name, time.Since(t0))
+		t.lastStatus = "Success"
+		log.Printf("[SCHEDULER] Task %q SUKSES dalam %v", t.name, time.Since(t0))
 	}
-	w.mu.Unlock()
+	t.mu.Unlock()
 	return err
 }
 
-func (w *cronTaskWrapper) OnError(ctx context.Context, err error) {
-	if w.task != nil {
-		w.task.OnError(ctx, err)
-		return
-	}
-	log.Printf("[SCHEDULER] Task %q recoverable error: %v", w.name, err)
-}
-
-func (w *cronTaskWrapper) OnFail(ctx context.Context, err error) {
-	if w.task != nil {
-		w.task.OnFail(ctx, err)
-		return
-	}
-	log.Printf("[SCHEDULER] Task %q critical failure: %v", w.name, err)
-}
-
-// InternalScheduler provides production-grade scheduling using github.com/rachmanzz/gosuite/v3/cron
+// InternalScheduler provides pure Go standard library task scheduling
 type InternalScheduler struct {
-	mu        sync.RWMutex
-	cronSched *gsuite_cron.Scheduler
-	tasks     map[string]*cronTaskWrapper
-	running   bool
+	mu      sync.RWMutex
+	tasks   map[string]*registeredTask
+	running bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
-// NewInternalScheduler creates a new scheduler powered by gosuite/v3/cron
+// NewInternalScheduler creates a new scheduler powered by Go standard library
 func NewInternalScheduler() *InternalScheduler {
 	return &InternalScheduler{
-		cronSched: gsuite_cron.NewScheduler(),
-		tasks:     make(map[string]*cronTaskWrapper),
+		tasks:  make(map[string]*registeredTask),
+		stopCh: make(chan struct{}),
 	}
 }
 
-// Tasks returns active task metadata and upcoming execution schedules
-func (s *InternalScheduler) Tasks() []TaskInfo {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	entries := s.cronSched.Entries()
-	entryMap := make(map[robfig.EntryID]robfig.Entry, len(entries))
-	for _, e := range entries {
-		entryMap[e.ID] = e
-	}
-
-	var res []TaskInfo
-	for _, t := range s.tasks {
-		t.mu.RLock()
-		lastRun := t.lastRun
-		lastStatus := t.lastStatus
-		t.mu.RUnlock()
-
-		nextRun := time.Time{}
-		if entry, ok := entryMap[t.entryID]; ok {
-			nextRun = entry.Next
-			if lastRun.IsZero() && !entry.Prev.IsZero() {
-				lastRun = entry.Prev
-			}
-		}
-
-		res = append(res, TaskInfo{
-			Name:       t.name,
-			Schedule:   t.rawSchedule,
-			LastRun:    lastRun,
-			LastStatus: lastStatus,
-			NextRun:    nextRun,
-		})
-	}
-	return res
-}
-
-// NormalizeSchedule converts convenient formats ("23:00", "10m") into robfig/cron compatible specs
+// NormalizeSchedule converts convenient formats into standard specifications
 func NormalizeSchedule(schedule string) (string, error) {
 	schedule = strings.TrimSpace(schedule)
 	if schedule == "" {
@@ -157,7 +122,7 @@ func NormalizeSchedule(schedule string) (string, error) {
 		if hour < 0 || hour > 23 || min < 0 || min > 59 {
 			return "", fmt.Errorf("invalid time %q: hour must be 0-23 and minute 0-59", schedule)
 		}
-		return gsuite_cron.EveryDay(schedule), nil
+		return fmt.Sprintf("%d %d * * *", min, hour), nil
 	}
 
 	// 2. Duration format (e.g. "10m", "1h", "24h")
@@ -176,7 +141,42 @@ func NormalizeSchedule(schedule string) (string, error) {
 		return schedule, nil
 	}
 
-	return "", fmt.Errorf("unrecognized schedule format %q (use HH:MM like '23:00', duration like '1h', or 5-field cron spec)", schedule)
+	return "", fmt.Errorf("unrecognized schedule format %q", schedule)
+}
+
+func parseScheduleConfig(schedule string) (isDaily bool, targetHour, targetMin int, interval time.Duration, cronSpec string, err error) {
+	cronSpec, err = NormalizeSchedule(schedule)
+	if err != nil {
+		return false, 0, 0, 0, "", err
+	}
+
+	// Check if HH:MM
+	var h, m int
+	if n, _ := fmt.Sscanf(schedule, "%d:%d", &h, &m); n == 2 && !strings.Contains(schedule, " ") {
+		return true, h, m, 0, cronSpec, nil
+	}
+
+	// Check 5-field "M H * * *"
+	var minField, hourField int
+	if n, _ := fmt.Sscanf(cronSpec, "%d %d * * *", &minField, &hourField); n == 2 {
+		return true, hourField, minField, 0, cronSpec, nil
+	}
+
+	// Check @hourly / @daily
+	if cronSpec == "@hourly" {
+		return false, 0, 0, time.Hour, cronSpec, nil
+	}
+	if cronSpec == "@daily" {
+		return true, 0, 0, 0, cronSpec, nil
+	}
+
+	// Check @every duration or raw duration
+	durStr := strings.TrimPrefix(cronSpec, "@every ")
+	if d, parseErr := time.ParseDuration(strings.TrimSpace(durStr)); parseErr == nil {
+		return false, 0, 0, d, cronSpec, nil
+	}
+
+	return false, 0, 0, 0, cronSpec, fmt.Errorf("unsupported schedule execution: %s", schedule)
 }
 
 // Register registers a named scheduled job
@@ -184,62 +184,79 @@ func (s *InternalScheduler) Register(name, schedule string, job func() error) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cronSpec, err := NormalizeSchedule(schedule)
+	isDaily, h, m, interval, cronSpec, err := parseScheduleConfig(schedule)
 	if err != nil {
 		return fmt.Errorf("failed to parse schedule for %q: %w", name, err)
 	}
 
-	wrapper := &cronTaskWrapper{
+	task := &registeredTask{
 		name:        name,
 		rawSchedule: schedule,
 		cronSpec:    cronSpec,
 		jobFunc:     job,
+		isDaily:     isDaily,
+		targetHour:  h,
+		targetMin:   m,
+		interval:    interval,
+		nextRun:     time.Now(),
 	}
+	task.nextRun = task.calculateNext(time.Now())
 
-	// Register with gosuite cron scheduler using AddJob to get exact EntryID
-	runner := gsuite_cron.NewTaskRunner(wrapper)
-	entryID, err := s.cronSched.AddJob(cronSpec, runner)
-	if err != nil {
-		return fmt.Errorf("failed to register cron task %q: %w", name, err)
-	}
-	wrapper.entryID = entryID
-
-	s.tasks[name] = wrapper
-	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q, entry: %d)", name, schedule, cronSpec, entryID)
+	s.tasks[name] = task
+	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, schedule, cronSpec)
 	return nil
 }
 
-// RegisterTask binds a top-global ScheduledTask conforming to gsuite_cron.ScheduledTask
-func (s *InternalScheduler) RegisterTask(name string, task gsuite_cron.ScheduledTask) error {
+// RegisterTask binds a ScheduledTask
+func (s *InternalScheduler) RegisterTask(name string, task ScheduledTask) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	rawSchedule := task.Schedule()
-	cronSpec, err := NormalizeSchedule(rawSchedule)
+	isDaily, h, m, interval, cronSpec, err := parseScheduleConfig(rawSchedule)
 	if err != nil {
 		return fmt.Errorf("failed to parse schedule for %q: %w", name, err)
 	}
 
-	wrapper := &cronTaskWrapper{
+	regTask := &registeredTask{
 		name:        name,
 		rawSchedule: rawSchedule,
 		cronSpec:    cronSpec,
 		task:        task,
+		isDaily:     isDaily,
+		targetHour:  h,
+		targetMin:   m,
+		interval:    interval,
+		nextRun:     time.Now(),
 	}
+	regTask.nextRun = regTask.calculateNext(time.Now())
 
-	runner := gsuite_cron.NewTaskRunner(wrapper)
-	entryID, err := s.cronSched.AddJob(cronSpec, runner)
-	if err != nil {
-		return fmt.Errorf("failed to register cron task %q: %w", name, err)
-	}
-	wrapper.entryID = entryID
-
-	s.tasks[name] = wrapper
-	log.Printf("[SCHEDULER] Top-global cron task %q terdaftar dengan jadwal %q (spec: %q, entry: %d)", name, rawSchedule, cronSpec, entryID)
+	s.tasks[name] = regTask
+	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, rawSchedule, cronSpec)
 	return nil
 }
 
-// Start launches the background scheduler
+// Tasks returns active task metadata and upcoming execution schedules
+func (s *InternalScheduler) Tasks() []TaskInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	res := make([]TaskInfo, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		t.mu.RLock()
+		res = append(res, TaskInfo{
+			Name:       t.name,
+			Schedule:   t.rawSchedule,
+			LastRun:    t.lastRun,
+			LastStatus: t.lastStatus,
+			NextRun:    t.nextRun,
+		})
+		t.mu.RUnlock()
+	}
+	return res
+}
+
+// Start launches the background scheduler goroutines
 func (s *InternalScheduler) Start() {
 	s.mu.Lock()
 	if s.running {
@@ -247,13 +264,46 @@ func (s *InternalScheduler) Start() {
 		return
 	}
 	s.running = true
+	s.stopCh = make(chan struct{})
 	s.mu.Unlock()
 
-	s.cronSched.Start()
-	log.Println("[SCHEDULER] Background scheduler aktif.")
+	s.mu.RLock()
+	for _, task := range s.tasks {
+		s.wg.Add(1)
+		go s.runTaskLoop(task)
+	}
+	s.mu.RUnlock()
+
+	log.Println("[SCHEDULER] Pure Go background scheduler aktif.")
 }
 
-// Stop gracefully shuts down the background scheduler with a timeout
+func (s *InternalScheduler) runTaskLoop(task *registeredTask) {
+	defer s.wg.Done()
+
+	for {
+		task.mu.RLock()
+		next := task.nextRun
+		task.mu.RUnlock()
+
+		now := time.Now()
+		sleepDur := next.Sub(now)
+		if sleepDur <= 0 {
+			sleepDur = 10 * time.Millisecond
+		}
+
+		select {
+		case <-s.stopCh:
+			return
+		case <-time.After(sleepDur):
+			_ = task.execute(context.Background())
+			task.mu.Lock()
+			task.nextRun = task.calculateNext(time.Now())
+			task.mu.Unlock()
+		}
+	}
+}
+
+// Stop gracefully shuts down the background scheduler
 func (s *InternalScheduler) Stop() {
 	s.mu.Lock()
 	if !s.running {
@@ -261,12 +311,18 @@ func (s *InternalScheduler) Stop() {
 		return
 	}
 	s.running = false
+	close(s.stopCh)
 	s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.cronSched.Stop(ctx); err != nil {
-		log.Printf("[SCHEDULER] Stop warning: %v", err)
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 	}
 	log.Println("[SCHEDULER] Background scheduler dihentikan.")
 }
@@ -281,10 +337,10 @@ func (s *InternalScheduler) RunNow(taskName string) error {
 		return fmt.Errorf("task %q not found", taskName)
 	}
 
-	return task.Execute(context.Background())
+	return task.execute(context.Background())
 }
 
-// CalculateNextRun parses "HH:MM" (e.g. "23:00") or duration ("1h", "30m") for backward compatibility
+// CalculateNextRun parses "HH:MM" (e.g. "23:00") or duration ("1h", "30m")
 func CalculateNextRun(schedule string, fromTime time.Time) (time.Time, error) {
 	var hour, min int
 	if n, _ := fmt.Sscanf(schedule, "%d:%d", &hour, &min); n == 2 {

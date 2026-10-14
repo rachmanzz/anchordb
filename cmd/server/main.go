@@ -20,7 +20,6 @@ import (
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
 	"github.com/rachmanzz/anchordb/pkg/partition"
-	"github.com/rachmanzz/anchordb/pkg/queue"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/security"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -45,7 +44,6 @@ type ServerConfig struct {
 	SyncInterval      string
 
 	WorkerConfig worker.Config
-	QueueConfig  queue.Config
 }
 
 // Server holds active AnchorDB database instances and background subsystems
@@ -58,7 +56,6 @@ type Server struct {
 	scheduler   *scheduler.InternalScheduler
 	cronEnabled bool
 	worker      *worker.Pool
-	queue       *queue.QueueManager
 	ipFilter    *security.IPFilter
 	startTime   time.Time
 }
@@ -74,15 +71,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	workerPool := worker.NewPool(cfg.WorkerConfig)
 	workerPool.Start()
 
-	// 2. Initialize In-Memory Queue Manager
-	queueMgr, err := queue.NewQueueManager(cfg.QueueConfig, workerPool.Dispatcher())
-	if err != nil {
-		_ = workerPool.Shutdown()
-		return nil, fmt.Errorf("failed to initialize queue manager: %w", err)
-	}
-	queueMgr.Start()
-
-	// 3. Initialize Cron Scheduler
+	// 2. Initialize Cron Scheduler
 	sched := scheduler.NewInternalScheduler()
 
 	s := &Server{
@@ -93,7 +82,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		scheduler:   sched,
 		cronEnabled: cfg.CronEnabled,
 		worker:      workerPool,
-		queue:       queueMgr,
 		ipFilter:    ipFilter,
 		startTime:   time.Now(),
 	}
@@ -101,53 +89,21 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// Register top-global scheduled tasks if cron is enabled
 	if cfg.CronEnabled {
 		if cfg.PartitionSchedule != "" {
-			_ = s.scheduler.RegisterTask("auto_partition_maintenance", NewAutoPartitionCronTask(s, cfg.PartitionSchedule, cfg.RetentionDays))
+			if err := s.scheduler.RegisterTask("auto_partition_maintenance", NewAutoPartitionCronTask(s, cfg.PartitionSchedule, cfg.RetentionDays)); err != nil {
+				log.Printf("[ERROR] Gagal mendaftarkan cron task auto_partition_maintenance: %v", err)
+			}
 		}
 
 		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
-			_ = s.scheduler.RegisterTask("periodic_background_sync", NewPeriodicSyncCronTask(s, cfg.SyncInterval))
+			if err := s.scheduler.RegisterTask("periodic_background_sync", NewPeriodicSyncCronTask(s, cfg.SyncInterval)); err != nil {
+				log.Printf("[ERROR] Gagal mendaftarkan cron task periodic_background_sync: %v", err)
+			}
 		}
 
 		s.scheduler.Start()
 	}
 
-	// Register built-in CDC handlers so messages are processed by worker pool and settled cleanly
-	s.registerQueueHandlers()
-
 	return s, nil
-}
-
-func (s *Server) registerQueueHandlers() {
-	if s.queue == nil {
-		return
-	}
-
-	s.queue.RegisterHandler(queue.TopicRecordSaved, func(ctx context.Context, payload []byte) error {
-		var evt queue.RecordSavedEvent
-		if err := json.Unmarshal(payload, &evt); err != nil {
-			return err
-		}
-		log.Printf("[CDC] Record saved: model=%s name=%s count=%d", evt.Model, evt.Name, evt.Count)
-		return nil
-	})
-
-	s.queue.RegisterHandler(queue.TopicRecordUpdated, func(ctx context.Context, payload []byte) error {
-		var evt queue.RecordUpdatedEvent
-		if err := json.Unmarshal(payload, &evt); err != nil {
-			return err
-		}
-		log.Printf("[CDC] Record updated: model=%s modified=%d", evt.Model, evt.ModifiedCount)
-		return nil
-	})
-
-	s.queue.RegisterHandler(queue.TopicPartitionArchived, func(ctx context.Context, payload []byte) error {
-		var evt queue.PartitionArchivedEvent
-		if err := json.Unmarshal(payload, &evt); err != nil {
-			return err
-		}
-		log.Printf("[CDC] Partition archived: model=%s archived=%d location=%s", evt.Model, evt.ArchivedCount, evt.TargetLocation)
-		return nil
-	})
 }
 
 // --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
@@ -180,9 +136,10 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 	}
 	t.server.mu.RUnlock()
 
+	var dispatchErr error
 	for _, m := range loaded {
 		modelName := m
-		_ = t.server.worker.Dispatch(ctx, "cron_partition_"+modelName, func(wCtx context.Context) error {
+		err := t.server.worker.Dispatch(ctx, "cron_partition_"+modelName, func(wCtx context.Context) error {
 			db, err := t.server.getModel(modelName)
 			if err != nil {
 				return err
@@ -201,8 +158,12 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 			}
 			return err
 		})
+		if err != nil {
+			log.Printf("[WARN] AutoPartition gagal mendispatch task untuk model %q: %v", modelName, err)
+			dispatchErr = err
+		}
 	}
-	return nil
+	return dispatchErr
 }
 
 func (t *AutoPartitionCronTask) OnError(ctx context.Context, err error) {
@@ -371,7 +332,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 				"tasks":   len(s.scheduler.Tasks()),
 			},
 			"worker": s.worker.Stats(),
-			"queue":  s.queue.Stats(),
 		},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
@@ -703,9 +663,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	// If async requested, offload to worker pool and return immediately
 	if r.URL.Query().Get("async") == "true" {
-		_ = s.worker.Dispatch(context.Background(), "sync_"+modelName, func(ctx context.Context) error {
+		err := s.worker.Dispatch(context.Background(), "sync_"+modelName, func(ctx context.Context) error {
 			return db.Sync()
 		})
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch sync task to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
 			"async":   true,
@@ -829,15 +793,6 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 				if err == nil && res.ArchivedCount > 0 {
 					log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
 						m, res.ArchivedCount, res.TargetLocation)
-					if s.queue != nil {
-						_ = s.queue.Publish(ctx, queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
-							Model:          res.ModelName,
-							ArchivedCount:  res.ArchivedCount,
-							TargetLocation: res.TargetLocation,
-							CutoffDate:     res.CutoffDate,
-							Timestamp:      res.ExecutionTime,
-						})
-					}
 				}
 			}
 			return nil
@@ -879,16 +834,6 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if s.queue != nil && res.ArchivedCount > 0 {
-			_ = s.queue.Publish(r.Context(), queue.TopicPartitionArchived, queue.PartitionArchivedEvent{
-				Model:          res.ModelName,
-				ArchivedCount:  res.ArchivedCount,
-				TargetLocation: res.TargetLocation,
-				CutoffDate:     res.CutoffDate,
-				Timestamp:      res.ExecutionTime,
-			})
-		}
-
 		results = append(results, res)
 	}
 
@@ -915,14 +860,6 @@ func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"worker":  s.worker.Stats(),
-	})
-}
-
-func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"queue":   s.queue.Stats(),
 	})
 }
 
@@ -987,12 +924,6 @@ func main() {
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
 	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
-
-	// 4. Queue Broker Flags (In-Memory Bounded)
-	flagQueueEnabled := flag.Bool("queue-enabled", true, "Enable async queue broker (overrides ANCHORDB_QUEUE_ENABLED)")
-	flagQueueConsumer := flag.Bool("queue-consumer", true, "Enable background queue consumer (overrides ANCHORDB_QUEUE_CONSUMER_ENABLED)")
-	flagQueueMaxSize := flag.Int("queue-max-size", 0, "Max in-memory queue capacity ceiling (overrides ANCHORDB_QUEUE_MAX_SIZE, default 10000)")
-	flagQueueTimeout := flag.Duration("queue-timeout", 200*time.Millisecond, "Max duration to wait for queue slot before rejecting (overrides ANCHORDB_QUEUE_TIMEOUT, default 200ms)")
 
 	flag.Parse()
 
@@ -1073,22 +1004,6 @@ func main() {
 		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
 	}
 
-	// Resolve Queue Parameters (In-Memory)
-	queueEnabled := *flagQueueEnabled
-	if !queueEnabled || !flagPassed("queue-enabled") {
-		queueEnabled = getEnvBool("ANCHORDB_QUEUE_ENABLED", true)
-	}
-
-	queueConsumer := *flagQueueConsumer
-	if !queueConsumer || !flagPassed("queue-consumer") {
-		queueConsumer = getEnvBool("ANCHORDB_QUEUE_CONSUMER_ENABLED", true)
-	}
-
-	queueMaxSize := *flagQueueMaxSize
-	if queueMaxSize <= 0 {
-		queueMaxSize = getEnvInt("ANCHORDB_QUEUE_MAX_SIZE", 10000)
-	}
-
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
 	_, memSummary, err := system.ApplyMemoryLimit(memLimitStr)
 	if err != nil {
@@ -1113,14 +1028,6 @@ func main() {
 			QueueSize:       workerQueueSize,
 			ShutdownTimeout: 5 * time.Second,
 		},
-		QueueConfig: queue.Config{
-			Enabled:         queueEnabled,
-			ConsumerEnabled: queueConsumer,
-			PollInterval:    20 * time.Millisecond,
-			BatchSize:       20,
-			MaxSize:         queueMaxSize,
-			EnqueueTimeout:  *flagQueueTimeout,
-		},
 	}
 
 	server, err := NewServer(serverConfig)
@@ -1139,7 +1046,6 @@ func main() {
 	mux.HandleFunc("/v1/partition/run", server.authMiddleware(server.handlePartitionRun))
 	mux.HandleFunc("/v1/scheduler/status", server.authMiddleware(server.handleSchedulerStatus))
 	mux.HandleFunc("/v1/worker/status", server.authMiddleware(server.handleWorkerStatus))
-	mux.HandleFunc("/v1/queue/status", server.authMiddleware(server.handleQueueStatus))
 
 	fmt.Println("==========================================================")
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
@@ -1162,12 +1068,6 @@ func main() {
 		fmt.Printf("   Worker Pool    : ENABLED (Concurrency: %d, Queue: %d)\n", workerConcurrency, workerQueueSize)
 	} else {
 		fmt.Println("   Worker Pool    : DISABLED")
-	}
-	if queueEnabled {
-		fmt.Printf("   Queue Broker   : ENABLED (In-Memory, Consumer: %t, Max Capacity: %d items)\n",
-			queueConsumer, queueMaxSize)
-	} else {
-		fmt.Println("   Queue Broker   : DISABLED")
 	}
 	fmt.Println("   Architecture   : Minimal Dependencies (Pure Go, Zero External Broker)")
 	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
@@ -1201,12 +1101,7 @@ func main() {
 		server.scheduler.Stop()
 	}
 
-	// 2. Stop Queue Consumer
-	if server.queue != nil {
-		_ = server.queue.Close()
-	}
-
-	// 3. Stop Worker Pool
+	// 2. Stop Worker Pool
 	if server.worker != nil {
 		_ = server.worker.Shutdown()
 	}

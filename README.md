@@ -31,7 +31,6 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
   - **Worker Engine (`gosuite/v3/worker`)**: Non-blocking asynchronous task execution:
     - **Async Partition API (`POST /v1/partition/run?async=true`)**: Instant HTTP 202 response; offloads heavy serialization and S3 uploads to worker pool.
     - **Periodic Background Disk Sync (`db.Sync()`)**: Continuous streaming flush to disk every 5 minutes without query blocking.
-  - **Event Broker & Queue (`gosuite/v3/queue`)**: High-throughput CPU-native in-memory queue for Change Data Capture (CDC) events without external service dependencies.
 - **Fine-Grained Memory Allocation**: Support for explicit soft RAM limits (**500MB, 1GB, 5GB**) with auto-detection of Docker/Podman cgroup ceilings.
 - **Multi-Model Routing ("Satu DB = Satu Model")**: Dynamic file separation (`/data/{model}.anchordb`) with path traversal immunity.
 - **Dedicated Port**: Standardized official port **`7447`**.
@@ -59,13 +58,6 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
                                                              |
                                                              v
                                               +------------------------------+
-                                              |     In-Memory Event Queue    |
-                                              |     (gosuite/v3/queue)       |
-                                              |  Zero External Dependencies  |
-                                              +--------------+---------------+
-                                                             |
-                                                             v
-                                              +------------------------------+
                                               |  AnchorDB Multi-Model Cache  |
                                               |   (sync.RWMutex Threadsafe)  |
                                               +--------------+---------------+
@@ -82,7 +74,7 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 
 ---
 
-## Background Subsystems: Cron, Worker & In-Memory Queue
+## Background Subsystems: Cron & Worker
 
 ### 1. Cron Scheduler (`pkg/scheduler` $\rightarrow$ `gosuite/v3/cron`)
 - **Automated Archival**: Runs daily (default `23:00` or custom cron expression) to partition historical records older than $N$ days.
@@ -95,14 +87,6 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 - **Continuous Background Disk Sync**: Safely streams memory-mapped buffers to disk without locking client queries.
 - **Throttled Concurrency**: Controlled worker goroutines prevent CPU starvation.
 - **Inspection**: Real-time metrics via `GET /v1/worker/status`.
-
-### 3. In-Memory Queue Broker (`pkg/queue` $\rightarrow$ `gosuite/v3/queue`)
-- **Change Data Capture (CDC)**: Publishes database mutation events:
-  - `anchordb.record.saved`
-  - `anchordb.record.updated`
-  - `anchordb.partition.archived`
-- **Zero External Dependencies**: Operates completely in-memory using CPU-native Go channels and queues (no Redis, no NATS, no RabbitMQ required).
-- **Inspection**: Real-time message counters via `GET /v1/queue/status`.
 
 ---
 
@@ -125,9 +109,6 @@ All settings can be configured via environment variables or CLI flags:
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
-| **Queue Enabled** | `-queue-enabled` | `ANCHORDB_QUEUE_ENABLED` | `true` | Enable in-memory async event broker |
-| **Queue Consumer** | `-queue-consumer` | `ANCHORDB_QUEUE_CONSUMER_ENABLED` | `true` | Enable background queue consumer |
-| **Queue Max Size** | `-queue-max-size` | `ANCHORDB_QUEUE_MAX_SIZE` | `10000` | Bounded in-memory queue ceiling (OOM protection) |
 
 ---
 
@@ -178,16 +159,15 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
 - `GET /v1/scheduler/status`: Active cron tasks and next execution times.
 - `GET /v1/worker/status`: Worker pool concurrency and task execution counters.
-- `GET /v1/queue/status`: In-memory queue stats and event metrics.
 
 ### 2. Mutation & Query Endpoints
-- `POST /v1/save`: Ingest an entity with key-value properties. Publishes `anchordb.record.saved`.
+- `POST /v1/save`: Ingest an entity with key-value properties.
 - `POST /v1/get`: Query an entity by name with optional in-storage computations.
 - `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters.
-- `POST /v1/update`: Constant-time batch update with arithmetic mutations. Publishes `anchordb.record.updated`.
+- `POST /v1/update`: Constant-time batch update with arithmetic mutations.
 - `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
 - `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
-- `POST /v1/partition/run`: Triggers partition archival (add `"async": true` in JSON body or `?async=true` to offload to worker and return HTTP 202 immediately). Publishes `anchordb.partition.archived`.
+- `POST /v1/partition/run`: Triggers partition archival (add `"async": true` in JSON body or `?async=true` to offload to worker and return HTTP 202 immediately).
 
 ---
 

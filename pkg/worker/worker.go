@@ -2,14 +2,17 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	gsuite_worker "github.com/rachmanzz/gosuite/v3/worker"
 )
+
+// ErrQueueFull is returned when the worker pool queue is full
+var ErrQueueFull = errors.New("worker task queue is full")
 
 // Config holds configuration parameters for the background worker pool
 type Config struct {
@@ -43,17 +46,25 @@ type PoolStats struct {
 	Failed      int64 `json:"failed"`
 }
 
-// Pool manages background job execution powered by github.com/rachmanzz/gosuite/v3/worker
+type jobItem struct {
+	name string
+	fn   func(ctx context.Context) error
+	ctx  context.Context
+}
+
+// Pool manages concurrent background job execution using pure Go standard library channels
 type Pool struct {
 	cfg        Config
-	engine     *gsuite_worker.Engine
-	dispatched int64
-	completed  int64
-	failed     int64
+	taskCh     chan jobItem
+	quitCh     chan struct{}
+	wg         sync.WaitGroup
+	dispatched atomic.Int64
+	completed  atomic.Int64
+	failed     atomic.Int64
 	running    atomic.Bool
 }
 
-// NewPool initializes a worker pool instance
+// NewPool initializes a pure Go worker pool instance
 func NewPool(cfg Config) *Pool {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = runtime.NumCPU() * 2
@@ -67,66 +78,71 @@ func NewPool(cfg Config) *Pool {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
 	}
-
-	wCfg := gsuite_worker.DefaultConfig()
-	wCfg.MaxWorkers = cfg.Concurrency
-	wCfg.TaskQueueSize = cfg.QueueSize
-	wCfg.ShutdownTimeout = cfg.ShutdownTimeout
-
-	engine := gsuite_worker.NewEngine(wCfg)
-
 	return &Pool{
 		cfg:    cfg,
-		engine: engine,
+		taskCh: make(chan jobItem, cfg.QueueSize),
+		quitCh: make(chan struct{}),
 	}
 }
 
-// Start boots the worker engine workers
+// Start boots worker goroutines
 func (p *Pool) Start() {
 	if !p.cfg.Enabled {
 		log.Println("[WORKER] Worker pool dinonaktifkan oleh konfigurasi.")
 		return
 	}
 	if p.running.CompareAndSwap(false, true) {
-		p.engine.Start()
+		for i := 0; i < p.cfg.Concurrency; i++ {
+			p.wg.Add(1)
+			go p.workerLoop()
+		}
 		log.Printf("[WORKER] Worker pool aktif dengan %d goroutine pekerja (antrean: %d)",
 			p.cfg.Concurrency, p.cfg.QueueSize)
 	}
 }
 
-// Dispatch submits an async task to the worker pool
+func (p *Pool) workerLoop() {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-p.quitCh:
+			return
+		case job, ok := <-p.taskCh:
+			if !ok {
+				return
+			}
+			t0 := time.Now()
+			err := job.fn(job.ctx)
+			if err != nil {
+				p.failed.Add(1)
+				log.Printf("[WORKER] Task %q GAGAL: %v (durasi: %v)", job.name, err, time.Since(t0))
+			} else {
+				p.completed.Add(1)
+				log.Printf("[WORKER] Task %q SUKSES (durasi: %v)", job.name, time.Since(t0))
+			}
+		}
+	}
+}
+
+// Dispatch submits an async task to the worker pool. If pool is disabled, runs synchronously.
+// If queue is full, returns ErrQueueFull immediately without blocking.
 func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Context) error) error {
 	if !p.cfg.Enabled || !p.running.Load() {
-		// If worker is disabled or stopped, run synchronously in current context
 		return fn(ctx)
 	}
 
-	atomic.AddInt64(&p.dispatched, 1)
+	p.dispatched.Add(1)
 
-	task := gsuite_worker.NewTaskFunc(name, func(taskCtx context.Context, pool gsuite_worker.SubWorkerPool) error {
-		t0 := time.Now()
-		err := fn(taskCtx)
-		if err != nil {
-			atomic.AddInt64(&p.failed, 1)
-			log.Printf("[WORKER] Task %q GAGAL: %v (durasi: %v)", name, err, time.Since(t0))
-		} else {
-			atomic.AddInt64(&p.completed, 1)
-			log.Printf("[WORKER] Task %q SUKSES (durasi: %v)", name, time.Since(t0))
-		}
-		return err
-	})
-
-	if err := p.engine.Dispatch(ctx, task); err != nil {
-		atomic.AddInt64(&p.failed, 1)
-		return fmt.Errorf("failed to dispatch task %q to worker pool: %w", name, err)
+	select {
+	case p.taskCh <- jobItem{name: name, fn: fn, ctx: ctx}:
+		return nil
+	case <-ctx.Done():
+		p.failed.Add(1)
+		return ctx.Err()
+	default:
+		p.failed.Add(1)
+		return fmt.Errorf("failed to dispatch task %q: %w", name, ErrQueueFull)
 	}
-
-	return nil
-}
-
-// Dispatcher returns the underlying gosuite worker.Dispatcher interface
-func (p *Pool) Dispatcher() gsuite_worker.Dispatcher {
-	return p.engine
 }
 
 // Stats returns a telemetry snapshot of the worker pool
@@ -135,19 +151,30 @@ func (p *Pool) Stats() PoolStats {
 		Enabled:     p.cfg.Enabled,
 		Running:     p.running.Load(),
 		Concurrency: p.cfg.Concurrency,
-		Dispatched:  atomic.LoadInt64(&p.dispatched),
-		Completed:   atomic.LoadInt64(&p.completed),
-		Failed:      atomic.LoadInt64(&p.failed),
+		Dispatched:  p.dispatched.Load(),
+		Completed:   p.completed.Load(),
+		Failed:      p.failed.Load(),
 	}
 }
 
-// Shutdown gracefully waits for in-flight tasks to finish
+// Shutdown gracefully waits for in-flight tasks to finish within configured timeout
 func (p *Pool) Shutdown() error {
 	if p.running.CompareAndSwap(true, false) {
 		log.Println("[WORKER] Menghentikan worker pool...")
-		err := p.engine.Shutdown()
-		log.Println("[WORKER] Worker pool berhasil dihentikan.")
-		return err
+		close(p.quitCh)
+
+		done := make(chan struct{})
+		go func() {
+			p.wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Println("[WORKER] Worker pool berhasil dihentikan secara bersih.")
+		case <-time.After(p.cfg.ShutdownTimeout):
+			log.Println("[WORKER] Shutdown timeout, worker pool dipaksa berhenti.")
+		}
 	}
 	return nil
 }

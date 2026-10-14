@@ -39,8 +39,6 @@ Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB mengintegrasikan s
 2. **`worker` (`v3/worker`)**:
    - Menjalankan **Async Partitioning** (`POST /v1/partition/run?async=true`) sehingga request HTTP langsung dijawab dalam hitungan milidetik, sementara kompresi berkas dan upload S3 diselesaikan oleh worker di latar belakang.
    - Menjalankan **Periodic Background Disk Sync** (`db.Sync()`) secara kontinu tanpa mengunci query pembacaan data.
-3. **`queue` (`v3/queue`)**:
-   - Antrean in-memory berkinerja tinggi untuk Change Data Capture (CDC) mutasi data (`record.saved`, `record.updated`, `partition.archived`) tanpa membutuhkan server eksternal seperti Redis.
 
 ---
 

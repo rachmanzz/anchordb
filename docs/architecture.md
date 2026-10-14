@@ -48,13 +48,13 @@ Unlike traditional databases that transfer raw records to the application layer 
 AnchorDB incorporates production-grade background capabilities with zero external broker daemons (no Redis, no Kafka):
 
 ```
-+--------------------+        +--------------------+        +--------------------+
-|  Cron Scheduler    | -----> |   Worker Engine    | -----> |  In-Memory Queue   |
-| (gosuite/v3/cron)  |        | (gosuite/v3/worker)|        | (gosuite/v3/queue) |
-+--------------------+        +--------------------+        +--------------------+
-          |                             |                             |
-    Auto-Partition              Async Partition               CDC Event Bus
- & Periodic Sync (5m)          & Background Sync           Zero External Broker
++--------------------+        +--------------------+
+|  Cron Scheduler    | -----> |   Worker Engine    |
+| (gosuite/v3/cron)  |        | (gosuite/v3/worker)|
++--------------------+        +--------------------+
+          |                             |
+    Auto-Partition              Async Partition
+ & Periodic Sync (5m)          & Background Sync
 ```
 
 1. **Cron Scheduler (`pkg/scheduler`)**:
@@ -65,10 +65,6 @@ AnchorDB incorporates production-grade background capabilities with zero externa
    - Backed by `github.com/rachmanzz/gosuite/v3/worker`.
    - **Async Partition**: `POST /v1/partition/run?async=true` offloads heavy serialization and cloud S3 uploads to worker goroutines, responding with HTTP 202 immediately.
    - **Background Disk Sync**: Flushes memory-mapped models to disk periodically without blocking client query latencies.
-3. **In-Memory Queue Broker & CDC (`pkg/queue`)**:
-   - Backed by `github.com/rachmanzz/gosuite/v3/queue`.
-   - High-throughput pure Go in-memory queue.
-   - Emits events on mutations: `anchordb.record.saved`, `anchordb.record.updated`, `anchordb.partition.archived`.
 
 ---
 

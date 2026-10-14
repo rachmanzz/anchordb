@@ -2,7 +2,6 @@ package partition
 
 import (
 	"bytes"
-	"crypto/rand"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,15 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-// GenerateUUID generates a standard RFC4122 v4 UUID with a minimal-dependency implementation
+// GenerateUUID generates a standard RFC4122 v4 UUID
 func GenerateUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	return uuid.NewString()
 }
 
 // PartitionSink defines the storage destination for archived partition files (Local Disk or S3)

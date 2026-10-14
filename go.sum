@@ -1,10 +1,2 @@
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/rachmanzz/gosuite/v3/cron v0.2.2 h1:f3MWSbFyXTd/O/3fx8ZuSTmr5my23mgpxu0UXMFtSXg=
-github.com/rachmanzz/gosuite/v3/cron v0.2.2/go.mod h1:bv17IHdlTB3S6vUCGqFtqkZdTb63UlodowiYDI3Rwcc=
-github.com/rachmanzz/gosuite/v3/queue v0.2.3 h1:Mx8MKygCztfhZSM3tENY8npyGqrLPbt0eL2czPfcVVY=
-github.com/rachmanzz/gosuite/v3/queue v0.2.3/go.mod h1:jk12M3oCHT6dSsaKMr1M+a7xcDasSmsEhmfoe8nEeGI=
-github.com/rachmanzz/gosuite/v3/worker v0.2.3 h1:x0xfprq+dM57g/n/pXlXiSKd+oMifznDGp1GxUFiXmk=
-github.com/rachmanzz/gosuite/v3/worker v0.2.3/go.mod h1:lNAI6b0/ddCadISEX0oM+f+kgFoZOZe1DEJ8tGqoTWA=
-github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
-github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
