@@ -1,0 +1,80 @@
+ANCHORDB COMMERCIAL SOFTWARE LICENSE AGREEMENT
+================================================================================
+Copyright (c) 2026 MUHAMMD ABDURRAHMAN (MUHAMMAD ABDURRAHMAN). 
+All Rights Reserved.
+================================================================================
+
+IMPORTANT — READ CAREFULLY:
+This Commercial Software License Agreement ("Agreement") is a legally binding 
+contract between the licensee (either an individual or a single legal entity, 
+hereinafter referred to as "Licensee") and MUHAMMD ABDURRAHMAN, the sole creator, 
+architect, and copyright owner of the AnchorDB software and technology 
+(hereinafter referred to as "Licensor").
+
+BY INSTALLING, COPYING, DOWNLOADING, ACCESSING, OR OTHERWISE USING THE ANCHORDB 
+SOFTWARE (INCLUDING ITS SOURCE CODE, BINARIES, MMAP ENGINE, DRIVERS, AND 
+DOCUMENTATION), LICENSEE AGREES TO BE BOUND BY THE TERMS OF THIS AGREEMENT.
+
+1. INTELLECTUAL PROPERTY & PROPRIETARY RIGHTS
+---------------------------------------------
+1.1. Proprietary Asset: AnchorDB, including but not limited to its binary storage 
+     architecture (64-byte Header, 40-byte Node Records), zero-copy mmap execution, 
+     straight-ray projection algorithms, hourglass convergence calculations, 
+     role-deficit scoring mechanisms, and internal scheduling engines, constitutes 
+     valuable intellectual property and trade secrets of Licensor.
+1.2. Ownership: Title, copyright, patent rights, trade secret rights, and all other 
+     intellectual and commercial property rights in and to the Software remain 
+     exclusively with MUHAMMD ABDURRAHMAN. This Agreement does not convey to Licensee 
+     any ownership interest in or to the Software.
+
+2. GRANT OF COMMERCIAL LICENSE
+------------------------------
+2.1. Permitted Use: Subject to full compliance with this Agreement and payment of 
+     any applicable commercial licensing fees, Licensor grants Licensee a non-exclusive, 
+     non-transferable, revocable license to install, execute, and utilize AnchorDB 
+     strictly within Licensee's authorized production or internal environments.
+2.2. Scope of Deployment: Deployment limits (including allowed node instances, CPU 
+     cores, clusters, and duration) shall be determined by the specific commercial 
+     order or license tier agreed upon in writing with Licensor.
+
+3. RESTRICTIONS & PROHIBITED CONDUCT
+------------------------------------
+Except as explicitly authorized in writing by MUHAMMD ABDURRAHMAN, Licensee shall not:
+3.1. Reverse Engineer: Decompile, disassemble, reverse engineer, or attempt to derive 
+     the internal logic, algorithms, or binary layouts of the Software.
+3.2. Sublicense & Redistribution: Sell, rent, lease, sublicense, distribute, assign, 
+     or otherwise transfer the Software or any portion thereof to any third party.
+3.3. Cloud DBaaS Restriction: Host, operate, or provide AnchorDB as a public managed 
+     service, Database-as-a-Service (DBaaS), or commercial cloud database offering 
+     competing with Licensor without an explicit Cloud Provider Partnership Agreement.
+3.4. Notice Removal: Remove, alter, or obscure any proprietary notices, labels, 
+     copyright notices, or trademark notices on or within the Software.
+
+4. CONFIDENTIALITY & TRADE SECRETS
+----------------------------------
+Licensee acknowledges that the source code, internal data structures, and mathematical 
+convergence algorithms embodied within AnchorDB represent proprietary and confidential 
+information of MUHAMMD ABDURRAHMAN. Licensee agrees to protect such confidential 
+information with the highest degree of care.
+
+5. TERMINATION
+--------------
+Without prejudice to any other rights, Licensor may terminate this Agreement 
+immediately if Licensee fails to comply with any of the terms and conditions herein. 
+Upon termination, Licensee must immediately destroy all copies of the Software and 
+all of its component parts.
+
+6. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+---------------------------------------------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A 
+PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL MUHAMMD ABDURRAHMAN 
+BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF 
+CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE 
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+Direct Licensing Inquiries & Enterprise Support:
+MUHAMMD ABDURRAHMAN
+Copyright (c) 2026. All Rights Reserved.
+================================================================================

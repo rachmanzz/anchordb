@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  anchordb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anchordb:latest
+    container_name: anchordb
+    restart: unless-stopped
+    ports:
+      - "7447:7447" # Port Resmi AnchorDB
+    environment:
+      - ANCHORDB_PORT=7447
+      - ANCHORDB_DATA_DIR=/data
+      - ANCHORDB_AUTH_TOKEN=
+    volumes:
+      - ./data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M # Sangat irit! ClickHouse butuh 2-4GB

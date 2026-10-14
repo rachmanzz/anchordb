@@ -1,0 +1,21 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Database files
+*.anchordb
+data/*.anchordb
+data/partitions/
+
+# Test artifacts
+*.test
+*.out
+
+# Environment & OS
+.env
+.DS_Store
+Thumbs.db
