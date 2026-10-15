@@ -554,9 +554,17 @@ func (p *Pool) DispatchTask(t Task) error {
 	item := jobItem{task: t}
 
 	// Hold the read lock across the non-blocking send so Shutdown cannot close
-	// the channel in between (which would panic on send-to-closed).
+	// the channel in between (which would panic on send-to-closed). The closed /
+	// draining state MUST be re-checked under this lock: the checks above are
+	// only a fast path and race with Shutdown (TOCTOU).
 	p.chanMu.RLock()
 	defer p.chanMu.RUnlock()
+
+	if p.taskClosed || p.draining.Load() {
+		p.pending.Add(-1)
+		p.failed.Add(1)
+		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
+	}
 
 	select {
 	case p.taskCh <- item:

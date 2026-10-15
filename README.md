@@ -127,6 +127,7 @@ All settings can be configured via environment variables or CLI flags:
 | **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval (`5m`, `30m`, etc.) |
 | **Cron Task Timeout** | `-cron-task-timeout` | `ANCHORDB_CRON_TASK_TIMEOUT` | `""` | Per-task execution context timeout (e.g. `15m`, `1h`) |
 | **Cron Jitter** | `-cron-jitter` | `ANCHORDB_CRON_JITTER` | `""` | Random delay added to scheduled fire time (e.g. `5s`) |
+| **Shutdown Timeout** | `-shutdown-timeout` | `ANCHORDB_SHUTDOWN_TIMEOUT` | `25s` | Total graceful-shutdown budget, split across HTTP drain / scheduler / worker / final sync. Keep below your orchestrator grace period (K8s default 30s). A second `SIGINT/SIGTERM` force-exits (WAL is replayed on next start). While draining, `GET /health` returns `503 {"status":"shutting_down"}`. If HTTP/scheduler/worker do not stop in time, databases are **not closed** (only synced) so late writes are never lost. |
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |

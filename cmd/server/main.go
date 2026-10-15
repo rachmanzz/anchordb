@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,6 +47,7 @@ type ServerConfig struct {
 	SyncInterval      string
 	CronTaskTimeout   time.Duration
 	CronJitter        time.Duration
+	ShutdownTimeout   time.Duration // total graceful shutdown budget (default 25s)
 
 	WorkerConfig worker.Config
 }
@@ -62,10 +64,23 @@ type Server struct {
 	worker      *worker.Pool
 	ipFilter    *security.IPFilter
 	startTime   time.Time
+
+	// Lifecycle state.
+	draining        atomic.Bool   // true once Shutdown began (readiness = 503)
+	closed          bool          // guarded by mu; registry sealed after Shutdown
+	shutdownTimeout time.Duration // total graceful-shutdown budget
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
-	_ = os.MkdirAll(cfg.DataDir, 0755)
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("cannot create data dir %q: %w", cfg.DataDir, err)
+	}
+	if probe, err := os.CreateTemp(cfg.DataDir, ".anchordb_write_check_*"); err != nil {
+		return nil, fmt.Errorf("data dir %q is not writable: %w", cfg.DataDir, err)
+	} else {
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+	}
 	ipFilter, err := security.NewIPFilter(cfg.IPWhitelist, cfg.TrustProxy)
 	if err != nil {
 		return nil, fmt.Errorf("invalid IP whitelist %q: %w", cfg.IPWhitelist, err)
@@ -94,6 +109,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		worker:      workerPool,
 		ipFilter:    ipFilter,
 		startTime:   time.Now(),
+
+		shutdownTimeout: cfg.ShutdownTimeout,
 	}
 
 	// Register top-global scheduled tasks if cron is enabled
@@ -133,6 +150,92 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
 	return s.ipFilter.Middleware(mux)
+}
+
+// ErrServerClosed is returned by getModel once Shutdown has sealed the model registry.
+var ErrServerClosed = errors.New("server is shut down")
+
+// Shutdown performs the full graceful stop: mark draining (readiness) → drain
+// HTTP → stop scheduler → stop worker → Sync (+Close) every model. It is bounded
+// by ctx and splits the budget between phases (HTTP 1/3, scheduler 1/6, worker
+// up to 1/3 via Config.ShutdownTimeout, rest for Sync).
+//
+// Safety rule (L1/L2): the databases are Closed ONLY if every phase before them
+// finished cleanly. If HTTP handlers, cron tasks or worker tasks may still be
+// running, closing the DB (munmap + WAL close) under them would make their
+// writes vanish silently. In that case we still Sync (safe concurrently with
+// mutations) and leave the DB open; durability then rests on the WAL, which is
+// replayed on the next start. The returned error reports what did not stop.
+func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
+	var errs []error
+	safeToClose := true
+
+	budget := s.shutdownTimeout
+	if budget <= 0 {
+		budget = 25 * time.Second
+	}
+
+	// 0. Readiness: /health reports shutting_down so traffic is routed away.
+	s.draining.Store(true)
+
+	// 1. Drain in-flight HTTP requests.
+	if httpSrv != nil {
+		hctx, cancel := context.WithTimeout(ctx, budget/3)
+		if err := httpSrv.Shutdown(hctx); err != nil {
+			errs = append(errs, fmt.Errorf("http drain: %w", err))
+			// Shutdown timed out: force-close listeners and connections so no new
+			// work arrives (handlers already running cannot be killed in Go).
+			_ = httpSrv.Close()
+			safeToClose = false
+		}
+		cancel()
+	}
+
+	// 2. Stop the cron scheduler (cancels task contexts, waits for loops).
+	if s.scheduler != nil {
+		sctx, cancel := context.WithTimeout(ctx, budget/6)
+		if err := s.scheduler.Shutdown(sctx); err != nil {
+			errs = append(errs, fmt.Errorf("scheduler stop: %w", err))
+			safeToClose = false
+		}
+		cancel()
+	}
+
+	// 3. Stop the worker pool, honoring ctx (Pool.Shutdown itself is bounded by
+	// its ShutdownTimeout but takes no context).
+	if s.worker != nil {
+		done := make(chan error, 1)
+		go func() { done <- s.worker.Shutdown() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				errs = append(errs, fmt.Errorf("worker stop: %w", err))
+				safeToClose = false
+			}
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("worker stop: %w", ctx.Err()))
+			safeToClose = false
+		}
+	}
+
+	// 4. Flush every model. Close only when nothing can still be using them.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true // seal the registry: no model may be opened after this point
+	for name, db := range s.models {
+		if err := db.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("sync model %s: %w", name, err))
+		}
+		if safeToClose {
+			_ = db.Close()
+			delete(s.models, name)
+		}
+	}
+	if !safeToClose {
+		log.Printf("[WARN] Database tidak ditutup karena ada pekerjaan yang mungkin masih berjalan; durabilitas dijamin WAL (replay saat restart).")
+	}
+
+	return errors.Join(errs...)
 }
 
 // --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
@@ -319,6 +422,12 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// After Shutdown closed every model the registry is sealed: a late handler
+	// must not open a new DB that would never be Synced/Closed (L11).
+	if s.closed {
+		return nil, ErrServerClosed
+	}
+
 	// Double check
 	if db, exists := s.models[modelName]; exists {
 		return db, nil
@@ -365,8 +474,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	status, code := "ok", http.StatusOK
+	if s.draining.Load() {
+		// Readiness: tell load balancers / K8s to stop routing new traffic.
+		status, code = "shutting_down", http.StatusServiceUnavailable
+	}
+
 	resp := map[string]interface{}{
-		"status":         "ok",
+		"status":         status,
 		"engine":         "AnchorDB",
 		"uptime_seconds": time.Since(s.startTime).Seconds(),
 		"port":           s.port,
@@ -380,6 +495,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"worker": s.worker.Stats(),
 		},
 	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
@@ -1264,6 +1381,7 @@ func main() {
 	flagSyncInterval := flag.String("sync-interval", "", "Interval for periodic background disk sync e.g. 5m (overrides ANCHORDB_SYNC_INTERVAL)")
 	flagCronTaskTimeout := flag.String("cron-task-timeout", "", "Timeout for scheduled cron task execution e.g. 15m (overrides ANCHORDB_CRON_TASK_TIMEOUT)")
 	flagCronJitter := flag.String("cron-jitter", "", "Random jitter added to scheduled fire time e.g. 5s (overrides ANCHORDB_CRON_JITTER)")
+	flagShutdownTimeout := flag.String("shutdown-timeout", "", "Total graceful shutdown budget e.g. 25s; keep below the orchestrator grace period (ANCHORDB_SHUTDOWN_TIMEOUT, default 25s)")
 
 	// 3. Worker Pool Flags
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
@@ -1381,6 +1499,18 @@ func main() {
 		log.Fatalf("[FATAL] Konfigurasi Memory Limit tidak valid: %v", err)
 	}
 
+	// Single global shutdown budget (L7). Phases get a share so the sum stays
+	// within it: HTTP 1/3, scheduler 1/6, worker up to 2x(1/6) = 1/3, leaving
+	// ~1/6 for the final per-model Sync.
+	shutdownTimeout := 25 * time.Second
+	if s := getEnv("ANCHORDB_SHUTDOWN_TIMEOUT", *flagShutdownTimeout); s != "" {
+		if d, perr := time.ParseDuration(s); perr == nil && d > 0 {
+			shutdownTimeout = d
+		} else {
+			log.Printf("[WARN] shutdown-timeout %q tidak valid; memakai default %v", s, shutdownTimeout)
+		}
+	}
+
 	serverConfig := ServerConfig{
 		Port:              portStr,
 		DataDir:           dataDir,
@@ -1395,15 +1525,21 @@ func main() {
 		SyncInterval:      syncInterval,
 		CronTaskTimeout:   cronTaskTimeout,
 		CronJitter:        cronJitter,
+		ShutdownTimeout:   shutdownTimeout,
 		WorkerConfig: worker.Config{
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,
 			QueueSize:       workerQueueSize,
-			ShutdownTimeout: 5 * time.Second,
+			ShutdownTimeout: shutdownTimeout / 6,
 			EnforceMemory:   workerEnforceMemory,
 			MemoryThreshold: workerMemoryThreshold,
 		},
 	}
+
+	// Register signal handling BEFORE any startup work so a SIGTERM during boot
+	// is not lost to the default (immediate, no cleanup) handler (L9).
+	stopSignal := make(chan os.Signal, 2)
+	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
 
 	server, err := NewServer(serverConfig)
 	if err != nil {
@@ -1446,49 +1582,44 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	stopSignal := make(chan os.Signal, 1)
-	signal.Notify(stopSignal, os.Interrupt, syscall.SIGTERM)
-
+	listenErr := make(chan error, 1)
 	go func() {
 		log.Printf("[READY] AnchorDB Server mendengarkan di %s ...", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			listenErr <- err
 		}
 	}()
 
-	<-stopSignal
-	log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
-
-	// 1. Drain in-flight HTTP requests first so handlers finish cleanly
-	httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer httpCancel()
-	if err := srv.Shutdown(httpCtx); err != nil {
-		log.Printf("[WARN] HTTP server shutdown timeout: %v", err)
+	exitCode := 0
+	select {
+	case <-stopSignal:
+		log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
+	case err := <-listenErr:
+		// Same graceful path as a signal: never os.Exit past live data.
+		log.Printf("[ERROR] Server error: %v", err)
+		exitCode = 1
 	}
 
-	// 2. Stop Cron Scheduler
-	if server.scheduler != nil {
-		server.scheduler.Stop()
-	}
+	// A second signal means "stop waiting": force exit. Durability is preserved
+	// by WAL replay on the next start.
+	go func() {
+		<-stopSignal
+		log.Println("[SHUTDOWN] Sinyal kedua diterima; keluar paksa (WAL akan di-replay saat restart).")
+		os.Exit(130)
+	}()
 
-	// 3. Stop Worker Pool gracefully: drained with dedicated budget (cfg.ShutdownTimeout)
-	if server.worker != nil {
-		if err := server.worker.Shutdown(); err != nil {
-			log.Printf("[WARN] Worker pool shutdown error: %v", err)
-		}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), serverConfig.ShutdownTimeout)
+	err = server.Shutdown(shutdownCtx, srv)
+	shutdownCancel()
+	if err != nil {
+		log.Printf("[WARN] Shutdown tidak sepenuhnya bersih: %v", err)
+		exitCode = 1
+	} else {
+		log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
 	}
-
-	// 4. Flush and sync all active models cleanly to disk before exit
-	server.mu.Lock()
-	for name, db := range server.models {
-		if err := db.Sync(); err != nil {
-			log.Printf("[WARN] Gagal sync model %s saat shutdown: %v", name, err)
-		}
-		_ = db.Close()
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
-	server.mu.Unlock()
-
-	log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
 }
 
 func flagPassed(name string) bool {

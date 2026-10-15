@@ -16,6 +16,11 @@ import (
 
 func createTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
+	return createTestServerWithWorkerTimeout(t, 2*time.Second)
+}
+
+func createTestServerWithWorkerTimeout(t *testing.T, workerShutdown time.Duration) (*Server, string) {
+	t.Helper()
 	tmpDir, err := os.MkdirTemp("", "anchordb-server-test-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -28,7 +33,7 @@ func createTestServer(t *testing.T) (*Server, string) {
 			Enabled:         true,
 			Concurrency:     2,
 			QueueSize:       100,
-			ShutdownTimeout: 2 * time.Second,
+			ShutdownTimeout: workerShutdown,
 		},
 	}
 	s, err := NewServer(cfg)
@@ -41,6 +46,9 @@ func createTestServer(t *testing.T) (*Server, string) {
 
 func cleanupServer(t *testing.T, s *Server, dir string) {
 	t.Helper()
+	if s.scheduler != nil {
+		s.scheduler.Stop()
+	}
 	if s.worker != nil {
 		_ = s.worker.Shutdown()
 	}

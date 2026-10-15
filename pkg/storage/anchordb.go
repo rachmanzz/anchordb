@@ -3,6 +3,7 @@ package storage
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +18,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
+
+// ErrDatabaseClosed is returned by mutations and Sync after Close, so a write
+// can never be acknowledged without WAL durability.
+var ErrDatabaseClosed = errors.New("anchordb: database is closed")
 
 // OrderByMode defines the sorting strategy in AnchorDB
 type OrderByMode int
@@ -128,6 +133,7 @@ type AnchorDB struct {
 	mu     sync.RWMutex
 	syncMu sync.Mutex
 	wal    *WALManager
+	closed bool // guarded by mu; set once by Close
 
 	file      *os.File
 	mmapData  []byte
@@ -755,6 +761,9 @@ func (db *AnchorDB) loadEntities() error {
 func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]float32, domainID uint16) (uint64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
 
 	// If already exists, return existing
 	if idx, exists := db.Lexicon[word]; exists {
@@ -843,6 +852,9 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return "", ErrDatabaseClosed
+	}
 
 	attrs := make([]AttrEntry, 0, len(props))
 	for k, v := range props {
@@ -1065,6 +1077,9 @@ type UpdateOptions struct {
 func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
 
 	if len(opts.Mutations) == 0 {
 		return 0, nil
@@ -1185,6 +1200,9 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 func (db *AnchorDB) SetOperationStatus(names []string, status uint8) int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return 0
+	}
 
 	updated := 0
 	for _, name := range names {
@@ -1214,6 +1232,9 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) int {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return 0
+	}
 
 	var toPurge []string
 	for _, name := range db.EntityOrder {
@@ -1260,6 +1281,9 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) int {
 func (db *AnchorDB) DeleteRecords(names []string) int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return 0
+	}
 
 	toDelete := make(map[string]bool, len(names))
 	for _, n := range names {
@@ -1299,6 +1323,10 @@ func (db *AnchorDB) Sync() error {
 
 	// 1. Take in-memory snapshot under brief write lock (microsecond latency)
 	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrDatabaseClosed
+	}
 	totNodes := db.totalNodes()
 	nodesSnapshot := make([]BinaryNodeRecord, totNodes)
 	for j := 0; j < totNodes; j++ {
@@ -1847,10 +1875,20 @@ func (db *AnchorDB) ExecuteGraphChain(initialInputs []string, relationChain []st
 	return chainResults, nil
 }
 
-// Close closes the database and releases mmap and WAL resources.
+// Close closes the database and releases mmap and WAL resources. It is idempotent
+// and mutually exclusive with Sync (it waits for an in-flight Sync to finish), so a
+// Sync can never resurrect a closed database. After Close, mutations and Sync fail
+// with ErrDatabaseClosed instead of silently succeeding without WAL durability.
 func (db *AnchorDB) Close() error {
+	db.syncMu.Lock()
+	defer db.syncMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	if db.closed {
+		return nil
+	}
+	db.closed = true
 
 	if db.wal != nil {
 		_ = db.wal.Close()
