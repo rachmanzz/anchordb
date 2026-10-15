@@ -203,6 +203,10 @@ func (s *InternalScheduler) Register(name, schedule string, job func() error) er
 	task.nextRun = task.calculateNext(time.Now())
 
 	s.tasks[name] = task
+	if s.running {
+		s.wg.Add(1)
+		go s.runTaskLoop(task)
+	}
 	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, schedule, cronSpec)
 	return nil
 }
@@ -232,6 +236,10 @@ func (s *InternalScheduler) RegisterTask(name string, task ScheduledTask) error 
 	regTask.nextRun = regTask.calculateNext(time.Now())
 
 	s.tasks[name] = regTask
+	if s.running {
+		s.wg.Add(1)
+		go s.runTaskLoop(regTask)
+	}
 	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, rawSchedule, cronSpec)
 	return nil
 }

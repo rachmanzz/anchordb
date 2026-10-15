@@ -1173,17 +1173,24 @@ func main() {
 	<-stopSignal
 	log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
 
-	// 1. Stop Cron Scheduler
+	// 1. Drain in-flight HTTP requests first so handlers finish cleanly
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[WARN] HTTP server shutdown timeout: %v", err)
+	}
+
+	// 2. Stop Cron Scheduler
 	if server.scheduler != nil {
 		server.scheduler.Stop()
 	}
 
-	// 2. Stop Worker Pool
+	// 3. Stop Worker Pool
 	if server.worker != nil {
 		_ = server.worker.Shutdown()
 	}
 
-	// 4. Sync all active models cleanly to disk before exit
+	// 4. Flush and sync all active models cleanly to disk before exit
 	server.mu.Lock()
 	for name, db := range server.models {
 		if err := db.Sync(); err != nil {
@@ -1193,9 +1200,6 @@ func main() {
 	}
 	server.mu.Unlock()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
 	log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
 }
 
