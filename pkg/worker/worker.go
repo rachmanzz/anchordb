@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +31,12 @@ var ErrCanceled = errors.New("task canceled before execution")
 // ErrNoGlobalPool is returned by global helpers when no global pool was initialized
 var ErrNoGlobalPool = errors.New("no global worker pool initialized")
 
+// ErrShutdownTimeout is returned by Shutdown when the pool could not be fully
+// stopped within (up to twice) ShutdownTimeout because a task ignored context
+// cancellation. The call returns instead of blocking forever; a stuck task
+// cannot be killed in Go and is left to finish on its own.
+var ErrShutdownTimeout = errors.New("worker pool shutdown exceeded the configured timeout")
+
 // Config holds configuration parameters for the background worker pool
 type Config struct {
 	Enabled         bool          `json:"enabled"`
@@ -38,7 +47,7 @@ type Config struct {
 	// Memory-aware admission control
 	EnforceMemory   bool    `json:"enforce_memory"`
 	MaxMemoryBytes  int64   `json:"max_memory_bytes"` // 0 = use current GOMEMLIMIT
-	MemoryThreshold float64 `json:"memory_threshold"` // 0-1, default 0.90
+	MemoryThreshold float64 `json:"memory_threshold"` // (0,1], default 0.90
 }
 
 // DefaultConfig provides recommended settings based on host CPU capacity
@@ -66,11 +75,15 @@ type PoolStats struct {
 	Dispatched     int64  `json:"dispatched"`
 	Completed      int64  `json:"completed"`
 	Failed         int64  `json:"failed"`
+	Canceled       int64  `json:"canceled"`
 	Retries        int64  `json:"retries"`
 	InFlight       int64  `json:"in_flight"`
 	Queued         int    `json:"queued"`
 	Draining       bool   `json:"draining"`
 	MemoryPressure bool   `json:"memory_pressure"`
+	UsageBytes     uint64 `json:"usage_bytes"`
+	UsageHuman     string `json:"usage_human"`
+	UsageSource    string `json:"usage_source"`
 	HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
 	HeapAllocHuman string `json:"heap_alloc_human"`
 	LimitBytes     int64  `json:"limit_bytes"`
@@ -161,20 +174,25 @@ type jobItem struct {
 
 // Pool manages concurrent background job execution using pure Go standard library channels
 type Pool struct {
-	cfg        Config
-	taskCh     chan jobItem
-	quitCh     chan struct{}
-	wg         sync.WaitGroup
-	dispatched atomic.Int64
-	completed  atomic.Int64
-	failed     atomic.Int64
-	retries    atomic.Int64
-	inflight   atomic.Int64
-	pending    atomic.Int64
-	running    atomic.Bool
-	draining   atomic.Bool
-	taskOnce   sync.Once
-	quitOnce   sync.Once
+	cfg         Config
+	lifecycleMu sync.Mutex   // serializes Start/Shutdown (and restart)
+	chanMu      sync.RWMutex // guards taskCh/quitCh/taskClosed/quitClosed
+	taskCh      chan jobItem
+	quitCh      chan struct{}
+	taskClosed  bool
+	quitClosed  bool
+	wg          sync.WaitGroup
+	dispatched  atomic.Int64
+	completed   atomic.Int64
+	failed      atomic.Int64
+	canceled    atomic.Int64
+	retries     atomic.Int64
+	inflight    atomic.Int64
+	pending     atomic.Int64
+	running     atomic.Bool
+	draining    atomic.Bool
+	stopped     atomic.Bool // true after Shutdown completed or gave up
+	forced      atomic.Bool // true when the last Shutdown hit ErrShutdownTimeout
 }
 
 // NewPool initializes a pure Go worker pool instance
@@ -191,8 +209,11 @@ func NewPool(cfg Config) *Pool {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
 	}
-	if cfg.MemoryThreshold <= 0 || cfg.MemoryThreshold >= 1 {
+	if cfg.MemoryThreshold <= 0 {
 		cfg.MemoryThreshold = 0.90
+	}
+	if cfg.MemoryThreshold > 1 {
+		cfg.MemoryThreshold = 1
 	}
 
 	return &Pool{
@@ -222,13 +243,68 @@ func fmtBytes(b int64) string {
 	return fmt.Sprintf("%.2f %s", float64(b)/float64(div), units[exp])
 }
 
+// processMemoryUsage returns the best available estimate of the memory the
+// process is currently using, together with a short label describing the source.
+//
+// It deliberately avoids HeapAlloc as the primary signal: AnchorDB stores records
+// via syscall.Mmap (file-backed, resident) which never shows up in the Go heap,
+// so a HeapAlloc-only gate would be blind to the dominant memory consumer.
+// Preference order:
+//  1. cgroup v2  (memory.current)        — authoritative inside containers
+//  2. cgroup v1  (memory.usage_in_bytes) — authoritative, older kernels
+//  3. /proc/self/statm RSS               — physical resident set (incl. mmap)
+//  4. runtime.MemStats.Sys               — pure-Go fallback
+func processMemoryUsage() (uint64, string) {
+	if v, ok := readUintFile("/sys/fs/cgroup/memory.current"); ok {
+		return v, "cgroup-v2(memory.current)"
+	}
+	if v, ok := readUintFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); ok {
+		return v, "cgroup-v1(memory.usage_in_bytes)"
+	}
+	if v, ok := readProcRSS(); ok {
+		return v, "proc/self/statm(RSS)"
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Sys, "runtime.Sys"
+}
+
+func readUintFile(path string) (uint64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "max" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+func readProcRSS() (uint64, bool) {
+	b, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) < 2 {
+		return 0, false
+	}
+	pages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return pages * uint64(os.Getpagesize()), true
+}
+
 func (p *Pool) checkMemory() error {
 	if !p.cfg.EnforceMemory {
 		return nil
 	}
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
 	limit := p.cfg.MaxMemoryBytes
 	if limit <= 0 {
 		limit = debug.SetMemoryLimit(-1)
@@ -237,48 +313,76 @@ func (p *Pool) checkMemory() error {
 		return nil // unlimited
 	}
 
+	usage, _ := processMemoryUsage()
 	thresh := float64(limit) * p.cfg.MemoryThreshold
-	if int64(m.HeapAlloc) >= int64(thresh) {
+	if int64(usage) >= int64(thresh) {
 		return ErrMemoryFull
 	}
 	return nil
 }
 
-// Start boots worker goroutines
+// Start boots worker goroutines. It is idempotent while running: calling it on a
+// live pool is a no-op. If the pool was previously shut down cleanly it rebuilds
+// fresh channels and starts again; restarting after a *forced* shutdown (a task
+// that ignored cancellation) is refused to avoid overlapping workers.
 func (p *Pool) Start() {
 	if !p.cfg.Enabled {
 		log.Println("[WORKER] Worker pool dinonaktifkan oleh konfigurasi.")
 		return
 	}
-	if p.running.CompareAndSwap(false, true) {
-		for i := 0; i < p.cfg.Concurrency; i++ {
-			p.wg.Add(1)
-			go p.workerLoop()
-		}
-		log.Printf("[WORKER] Worker pool aktif dengan %d goroutine pekerja (antrean: %d)",
-			p.cfg.Concurrency, p.cfg.QueueSize)
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.running.Load() {
+		return
 	}
+	if p.stopped.Load() {
+		if p.forced.Load() {
+			log.Println("[WORKER] Tidak bisa restart setelah shutdown paksa (task bandel masih berjalan).")
+			return
+		}
+		p.chanMu.Lock()
+		p.taskCh = make(chan jobItem, p.cfg.QueueSize)
+		p.quitCh = make(chan struct{})
+		p.taskClosed = false
+		p.quitClosed = false
+		p.chanMu.Unlock()
+		p.stopped.Store(false)
+		p.pending.Store(0)
+		p.inflight.Store(0)
+	}
+	p.draining.Store(false)
+	p.running.Store(true)
+
+	p.chanMu.RLock()
+	taskCh, quitCh := p.taskCh, p.quitCh
+	p.chanMu.RUnlock()
+	for i := 0; i < p.cfg.Concurrency; i++ {
+		p.wg.Add(1)
+		go p.workerLoop(taskCh, quitCh)
+	}
+	log.Printf("[WORKER] Worker pool aktif dengan %d goroutine pekerja (antrean: %d)",
+		p.cfg.Concurrency, p.cfg.QueueSize)
 }
 
-func (p *Pool) workerLoop() {
+func (p *Pool) workerLoop(taskCh <-chan jobItem, quitCh <-chan struct{}) {
 	defer p.wg.Done()
 	for {
 		select {
-		case <-p.quitCh:
+		case <-quitCh:
 			return
-		case job, ok := <-p.taskCh:
+		case job, ok := <-taskCh:
 			if !ok {
 				return
 			}
 			p.inflight.Add(1)
-			p.executeJob(job.task)
+			p.executeJob(job.task, quitCh)
 			p.inflight.Add(-1)
 			p.pending.Add(-1)
 		}
 	}
 }
 
-func (p *Pool) executeJob(t Task) {
+func (p *Pool) executeJob(t Task, quitCh <-chan struct{}) {
 	start := time.Now()
 	ctx := t.Ctx
 	if ctx == nil {
@@ -329,7 +433,7 @@ func (p *Pool) executeJob(t Task) {
 					timer.Stop()
 					lastErr = ctx.Err()
 					goto FINAL
-				case <-p.quitCh:
+				case <-quitCh:
 					timer.Stop()
 					lastErr = errors.New("worker shutting down")
 					goto FINAL
@@ -405,6 +509,11 @@ func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Co
 	return p.DispatchTask(task)
 }
 
+// DispatchWithOptions is an alias for Dispatch, providing explicit named ergonomics.
+func (p *Pool) DispatchWithOptions(ctx context.Context, name string, fn func(ctx context.Context) error, opts ...Option) error {
+	return p.Dispatch(ctx, name, fn, opts...)
+}
+
 // DispatchTask submits a Task to the worker pool.
 func (p *Pool) DispatchTask(t Task) error {
 	if t.Fn == nil {
@@ -432,6 +541,11 @@ func (p *Pool) DispatchTask(t Task) error {
 	p.dispatched.Add(1)
 	p.pending.Add(1)
 	item := jobItem{task: t}
+
+	// Hold the read lock across the non-blocking send so Shutdown cannot close
+	// the channel in between (which would panic on send-to-closed).
+	p.chanMu.RLock()
+	defer p.chanMu.RUnlock()
 
 	select {
 	case p.taskCh <- item:
@@ -565,8 +679,9 @@ func (p *Pool) Stats() PoolStats {
 		thresh = float64(limit) * p.cfg.MemoryThreshold
 	}
 
+	usage, source := processMemoryUsage()
 	pressure := false
-	if limit > 0 && int64(m.HeapAlloc) >= int64(thresh) {
+	if limit > 0 && int64(usage) >= int64(thresh) {
 		pressure = true
 	}
 
@@ -577,11 +692,15 @@ func (p *Pool) Stats() PoolStats {
 		Dispatched:     p.dispatched.Load(),
 		Completed:      p.completed.Load(),
 		Failed:         p.failed.Load(),
+		Canceled:       p.canceled.Load(),
 		Retries:        p.retries.Load(),
 		InFlight:       p.inflight.Load(),
-		Queued:         len(p.taskCh),
+		Queued:         p.Queued(),
 		Draining:       p.draining.Load(),
 		MemoryPressure: pressure,
+		UsageBytes:     usage,
+		UsageHuman:     fmtBytes(int64(usage)),
+		UsageSource:    source,
 		HeapAllocBytes: m.HeapAlloc,
 		HeapAllocHuman: fmtBytes(int64(m.HeapAlloc)),
 		LimitBytes:     limit,
@@ -593,15 +712,29 @@ func (p *Pool) Stats() PoolStats {
 func (p *Pool) InFlight() int64 { return p.inflight.Load() }
 
 // Queued returns the number of tasks waiting in the queue.
-func (p *Pool) Queued() int { return len(p.taskCh) }
+func (p *Pool) Queued() int {
+	p.chanMu.RLock()
+	defer p.chanMu.RUnlock()
+	return len(p.taskCh)
+}
 
 // Draining reports whether the pool has stopped accepting new tasks.
 func (p *Pool) Draining() bool { return p.draining.Load() }
 
 // BeginDrain stops accepting new tasks (DispatchTask returns ErrDraining) without
 // touching the queue or running workers. Use before WaitIdle for a graceful stop.
+// It is reversible via Resume.
 func (p *Pool) BeginDrain() {
 	p.draining.Store(true)
+}
+
+// Resume re-opens intake after BeginDrain/WaitBeforeShutdown, letting the pool
+// accept new tasks again without a full restart. It is a no-op if the pool has
+// already been shut down.
+func (p *Pool) Resume() {
+	if p.running.Load() {
+		p.draining.Store(false)
+	}
 }
 
 // WaitIdle blocks until every dispatched task has finished (queue empty and no
@@ -626,15 +759,19 @@ func (p *Pool) WaitIdle(ctx context.Context) error {
 // canceled via its OnError hook. In-flight tasks are left untouched, so this is
 // safe to call concurrently and repeatedly. Returns the number of canceled tasks.
 func (p *Pool) SafeCancel() int {
+	p.chanMu.RLock()
+	taskCh := p.taskCh
+	p.chanMu.RUnlock()
+
 	canceled := 0
 	for {
 		select {
-		case job, ok := <-p.taskCh:
+		case job, ok := <-taskCh:
 			if !ok {
 				return canceled
 			}
 			canceled++
-			p.failed.Add(1)
+			p.canceled.Add(1)
 			p.pending.Add(-1)
 			p.reportCanceled(job.task)
 		default:
@@ -661,41 +798,72 @@ func (p *Pool) reportCanceled(t Task) {
 	log.Printf("[WORKER] Task %q DIBATALKAN sebelum eksekusi (antrean dibersihkan).", t.Name)
 }
 
-// Shutdown gracefully drains the queue and stops the pool within ShutdownTimeout.
-// It first stops accepting new work, then closes the task channel so workers can
-// drain remaining queued jobs. If drain does not finish in time, it force-signals
-// workers via quitCh.
+// Shutdown gracefully drains the queue and stops the pool. It first stops
+// accepting new work, then closes the task channel so workers can drain remaining
+// queued jobs, waiting up to ShutdownTimeout. If drain does not finish in time it
+// force-signals workers via quitCh and waits one more ShutdownTimeout; if a stuck
+// task still refuses to finish it returns ErrShutdownTimeout instead of blocking
+// forever (Go cannot kill a goroutine). A successful shutdown is restartable via
+// Start; after a forced (timed-out) shutdown Start is refused.
 func (p *Pool) Shutdown() error {
-	if p.running.CompareAndSwap(true, false) {
-		log.Println("[WORKER] Menghentikan worker pool...")
-		p.draining.Store(true)
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 
-		// Close the task channel: workers finish buffered jobs, then exit on !ok.
-		p.taskOnce.Do(func() { close(p.taskCh) })
+	if !p.running.CompareAndSwap(true, false) {
+		return nil
+	}
+	log.Println("[WORKER] Menghentikan worker pool...")
+	p.draining.Store(true)
 
-		done := make(chan struct{})
-		go func() {
-			p.wg.Wait()
-			close(done)
-		}()
+	// Close the task channel: workers finish buffered jobs, then exit on !ok.
+	p.chanMu.Lock()
+	if !p.taskClosed {
+		close(p.taskCh)
+		p.taskClosed = true
+	}
+	p.chanMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		p.stopped.Store(true)
+		p.forced.Store(false)
+		log.Println("[WORKER] Worker pool berhasil dihentikan secara bersih (antrean ter-drain).")
+		return nil
+	case <-time.After(p.cfg.ShutdownTimeout):
+		// Force workers out (abort retry backoff / unblock workerLoop selects).
+		p.chanMu.Lock()
+		if !p.quitClosed {
+			close(p.quitCh)
+			p.quitClosed = true
+		}
+		p.chanMu.Unlock()
 
 		select {
 		case <-done:
-			log.Println("[WORKER] Worker pool berhasil dihentikan secara bersih (antrean ter-drain).")
+			p.stopped.Store(true)
+			p.forced.Store(false)
+			log.Println("[WORKER] Shutdown selesai setelah sinyal paksa (sebagian task mungkin terpotong).")
+			return nil
 		case <-time.After(p.cfg.ShutdownTimeout):
-			// Force workers out (retry backoff / long tasks).
-			p.quitOnce.Do(func() { close(p.quitCh) })
-			<-done
-			log.Println("[WORKER] Shutdown timeout, worker pool dipaksa berhenti.")
+			p.stopped.Store(true)
+			p.forced.Store(true)
+			log.Println("[WORKER] Shutdown melebihi batas waktu; ada task yang mengabaikan pembatalan. Pool ditandai berhenti paksa.")
+			return ErrShutdownTimeout
 		}
 	}
-	return nil
 }
 
 // WaitBeforeShutdown stops accepting new tasks and blocks until all queued and
 // in-flight tasks complete, bounded by ctx. If ctx expires, remaining QUEUED
 // tasks are safely canceled (in-flight work is never killed). It does not stop
-// the pool; call Shutdown afterward.
+// the pool; call Shutdown afterward. The drain is reversible: call Resume to
+// accept new tasks again without restarting.
 func (p *Pool) WaitBeforeShutdown(ctx context.Context) error {
 	p.BeginDrain()
 	if err := p.WaitIdle(ctx); err != nil {
@@ -712,12 +880,17 @@ func (p *Pool) WaitBeforeShutdown(ctx context.Context) error {
 var (
 	globalMu   sync.RWMutex
 	globalPool *Pool
+	initMu     sync.Mutex // serializes InitGlobal so concurrent calls cannot leak pools
 )
 
 // InitGlobal creates and starts a process-wide worker pool, replacing any
 // previously registered global pool (which is shut down first). Safe to call
-// multiple times; returns the new pool.
+// multiple times, including concurrently (calls are serialized); returns the
+// new pool.
 func InitGlobal(cfg Config) *Pool {
+	initMu.Lock()
+	defer initMu.Unlock()
+
 	p := NewPool(cfg)
 	p.Start()
 

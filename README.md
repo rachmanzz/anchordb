@@ -125,6 +125,8 @@ All settings can be configured via environment variables or CLI flags:
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
+| **Worker Enforce Mem** | `-worker-enforce-memory` | `ANCHORDB_WORKER_ENFORCE_MEMORY` | `false` | Memory-aware admission control |
+| **Worker Mem Thresh** | `-worker-memory-threshold` | `ANCHORDB_WORKER_MEMORY_THRESHOLD` | `0.85` | Memory pressure throttling ratio (0.0-1.0) |
 
 ---
 
@@ -174,17 +176,18 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 ### 1. Telemetry & Health Checks
 - `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
 - `GET /v1/scheduler/status`: Active cron tasks and next execution times.
-- `GET /v1/worker/status`: Worker pool concurrency and task execution counters.
+- `GET /v1/worker/status`: Worker pool concurrency, in-flight/queued tasks, memory pressure, and telemetry stats.
+- `POST /v1/worker/cancel`: Safely cancels queued tasks before execution without interrupting in-flight jobs.
 
 ### 2. Mutation & Query Endpoints
 - `POST /v1/save`: Ingest an entity with key-value properties and optional `operation` status (`1` = Active by default, `0` = Safe-Delete).
 - `POST /v1/get`: Query an entity by name with optional in-storage computations (returns properties and current `operation` status).
 - `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters (filters `operation = 1` active by default; supports `operation` filter or `include_all_operations: true`).
-- `POST /v1/update`: Constant-time batch update with arithmetic mutations (automatically skips entities not in active `operation = 1` state).
+- `POST /v1/update`: Constant-time batch update with arithmetic mutations (automatically skips entities not in active `operation = 1` state; add `"async": true` or `?async=true` to offload to worker).
 - `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
 - `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
 - `POST /v1/partition/run`: Triggers partition archival with Safe-Delete rollback protection (`0` Safe-Delete during archival $\rightarrow$ `2` Tombstone on success; add `"async": true` in JSON body to offload to worker).
-- `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state.
+- `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state (add `"async": true` or `?async=true` to offload to worker).
 
 ### 3. Record Operation Lifecycle Machine
 AnchorDB records follow a resilient four-state operational lifecycle:

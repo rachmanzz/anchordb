@@ -139,25 +139,31 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 	var dispatchErr error
 	for _, m := range loaded {
 		modelName := m
-		err := t.server.worker.Dispatch(ctx, "cron_partition_"+modelName, func(wCtx context.Context) error {
-			db, err := t.server.getModel(modelName)
-			if err != nil {
+		err := t.server.worker.DispatchWithOptions(
+			ctx,
+			"cron_partition_"+modelName,
+			func(wCtx context.Context) error {
+				db, err := t.server.getModel(modelName)
+				if err != nil {
+					return err
+				}
+				partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
+					ModelName:     modelName,
+					DateField:     "tanggal",
+					RetentionDays: t.retentionDays,
+					Sink:          partition.NewLocalDiskSink(filepath.Join(t.server.dataDir, "partitions")),
+					FileFormat:    "{date}_{uuid}.anchordb",
+					PruneHotDB:    true,
+				})
+				if err == nil && partRes.ArchivedCount > 0 {
+					log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
+						modelName, partRes.ArchivedCount, partRes.TargetLocation)
+				}
 				return err
-			}
-			partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
-				ModelName:     modelName,
-				DateField:     "tanggal",
-				RetentionDays: t.retentionDays,
-				Sink:          partition.NewLocalDiskSink(filepath.Join(t.server.dataDir, "partitions")),
-				FileFormat:    "{date}_{uuid}.anchordb",
-				PruneHotDB:    true,
-			})
-			if err == nil && partRes.ArchivedCount > 0 {
-				log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
-					modelName, partRes.ArchivedCount, partRes.TargetLocation)
-			}
-			return err
-		})
+			},
+			worker.WithRetry(2, 500*time.Millisecond),
+			worker.WithRetryJitter(100*time.Millisecond),
+		)
 		if err != nil {
 			log.Printf("[WARN] AutoPartition gagal mendispatch task untuk model %q: %v", modelName, err)
 			dispatchErr = err
@@ -192,27 +198,32 @@ func (t *PeriodicSyncCronTask) Schedule() string {
 }
 
 func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
-	return t.server.worker.Dispatch(ctx, "periodic_disk_sync", func(wCtx context.Context) error {
-		t.server.mu.RLock()
-		var dbs []*storage.AnchorDB
-		for _, d := range t.server.models {
-			dbs = append(dbs, d)
-		}
-		t.server.mu.RUnlock()
-
-		var synced int
-		var purged int
-		for _, d := range dbs {
-			purged += d.CollectTombstones(5000)
-			if err := d.Sync(); err == nil {
-				synced++
+	return t.server.worker.DispatchWithOptions(
+		ctx,
+		"periodic_disk_sync",
+		func(wCtx context.Context) error {
+			t.server.mu.RLock()
+			var dbs []*storage.AnchorDB
+			for _, d := range t.server.models {
+				dbs = append(dbs, d)
 			}
-		}
-		if purged > 0 || synced > 0 {
-			log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk, %d tombstones collected", synced, purged)
-		}
-		return nil
-	})
+			t.server.mu.RUnlock()
+
+			var synced int
+			var purged int
+			for _, d := range dbs {
+				purged += d.CollectTombstones(5000)
+				if err := d.Sync(); err == nil {
+					synced++
+				}
+			}
+			if purged > 0 || synced > 0 {
+				log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk, %d tombstones collected", synced, purged)
+			}
+			return nil
+		},
+		worker.WithRetry(1, 200*time.Millisecond),
+	)
 }
 
 func (t *PeriodicSyncCronTask) OnError(ctx context.Context, err error) {
@@ -380,6 +391,7 @@ type UpdateRequest struct {
 	Filters   []FilterDTO       `json:"filters"`
 	Mutations map[string]string `json:"mutations"` // e.g. {"jarak": "jarak + 10"}
 	Limit     int               `json:"limit"`
+	Async     bool              `json:"async,omitempty"`
 }
 
 type GraphRequest struct {
@@ -623,6 +635,40 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	isAsync := req.Async || r.URL.Query().Get("async") == "true"
+	if isAsync {
+		err := s.worker.DispatchWithOptions(
+			context.Background(),
+			"update_"+req.Model,
+			func(ctx context.Context) error {
+				count, err := db.UpdateRecords(storage.UpdateOptions{
+					TargetEntities: req.In,
+					Filters:        filters,
+					Mutations:      mutations,
+					Limit:          req.Limit,
+				})
+				if err == nil {
+					log.Printf("[WORKER] Async batch update sukses untuk model %q: %d records diperbarui", req.Model, count)
+				}
+				return err
+			},
+			worker.WithRetry(2, 100*time.Millisecond),
+			worker.WithRetryJitter(50*time.Millisecond),
+		)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch update to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"async":   true,
+			"status":  "queued",
+			"message": fmt.Sprintf("Bulk update for model %q dispatched to worker pool", req.Model),
+		})
+		return
+	}
+
 	count, err := db.UpdateRecords(storage.UpdateOptions{
 		TargetEntities: req.In,
 		Filters:        filters,
@@ -798,27 +844,33 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Asynchronous execution via Worker Engine
 	if isAsync {
-		err := s.worker.Dispatch(context.Background(), "partition_run_async", func(ctx context.Context) error {
-			for _, m := range targetModels {
-				db, err := s.getModel(m)
-				if err != nil {
-					continue
+		err := s.worker.DispatchWithOptions(
+			context.Background(),
+			"partition_run_async",
+			func(ctx context.Context) error {
+				for _, m := range targetModels {
+					db, err := s.getModel(m)
+					if err != nil {
+						continue
+					}
+					res, err := partition.ExecutePartition(db, partition.PartitionPolicy{
+						ModelName:     m,
+						DateField:     dateField,
+						RetentionDays: retentionDays,
+						Sink:          sink,
+						FileFormat:    "{date}_{uuid}.anchordb",
+						PruneHotDB:    prune,
+					})
+					if err == nil && res.ArchivedCount > 0 {
+						log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
+							m, res.ArchivedCount, res.TargetLocation)
+					}
 				}
-				res, err := partition.ExecutePartition(db, partition.PartitionPolicy{
-					ModelName:     m,
-					DateField:     dateField,
-					RetentionDays: retentionDays,
-					Sink:          sink,
-					FileFormat:    "{date}_{uuid}.anchordb",
-					PruneHotDB:    prune,
-				})
-				if err == nil && res.ArchivedCount > 0 {
-					log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
-						m, res.ArchivedCount, res.TargetLocation)
-				}
-			}
-			return nil
-		})
+				return nil
+			},
+			worker.WithRetry(2, 500*time.Millisecond),
+			worker.WithRetryJitter(100*time.Millisecond),
+		)
 
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch partition to worker: %s"}`, err.Error()), http.StatusInternalServerError)
@@ -888,6 +940,7 @@ func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
 type CollectorRunRequest struct {
 	Model    string `json:"model"`
 	MaxBatch int    `json:"max_batch"`
+	Async    bool   `json:"async,omitempty"`
 }
 
 func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
@@ -918,6 +971,47 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 	}
 
+	isAsync := req.Async || r.URL.Query().Get("async") == "true"
+	if isAsync {
+		err := s.worker.DispatchWithOptions(
+			context.Background(),
+			"collector_run_async",
+			func(ctx context.Context) error {
+				total := 0
+				for _, m := range targetModels {
+					db, err := s.getModel(m)
+					if err != nil {
+						continue
+					}
+					purged := db.CollectTombstones(maxBatch)
+					if purged > 0 {
+						_ = db.Sync()
+					}
+					total += purged
+				}
+				if total > 0 {
+					log.Printf("[WORKER] Async collector sweep sukses: %d tombstones dibersihkan", total)
+				}
+				return nil
+			},
+			worker.WithRetry(1, 200*time.Millisecond),
+		)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch collector to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"async":   true,
+			"status":  "queued",
+			"message": "Tombstone collection task dispatched to worker pool",
+			"models":  targetModels,
+		})
+		return
+	}
+
 	totalPurged := 0
 	for _, m := range targetModels {
 		db, err := s.getModel(m)
@@ -936,6 +1030,21 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		"success":        true,
 		"purged_records": totalPurged,
 		"models":         targetModels,
+	})
+}
+
+func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	canceled := s.worker.SafeCancel()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"canceled_tasks": canceled,
+		"message":        fmt.Sprintf("%d queued tasks safely canceled", canceled),
 	})
 }
 
@@ -1000,6 +1109,8 @@ func main() {
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
 	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
+	flagWorkerEnforceMemory := flag.Bool("worker-enforce-memory", false, "Enable worker memory admission control (overrides ANCHORDB_WORKER_ENFORCE_MEMORY)")
+	flagWorkerMemoryThreshold := flag.Float64("worker-memory-threshold", 0.85, "Worker memory threshold (overrides ANCHORDB_WORKER_MEMORY_THRESHOLD)")
 
 	flag.Parse()
 
@@ -1080,6 +1191,16 @@ func main() {
 		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
 	}
 
+	workerEnforceMemory := *flagWorkerEnforceMemory
+	if !workerEnforceMemory || !flagPassed("worker-enforce-memory") {
+		workerEnforceMemory = getEnvBool("ANCHORDB_WORKER_ENFORCE_MEMORY", false)
+	}
+
+	workerMemoryThreshold := *flagWorkerMemoryThreshold
+	if workerMemoryThreshold <= 0 || !flagPassed("worker-memory-threshold") {
+		workerMemoryThreshold = getEnvFloat("ANCHORDB_WORKER_MEMORY_THRESHOLD", 0.85)
+	}
+
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
 	_, memSummary, err := system.ApplyMemoryLimit(memLimitStr)
 	if err != nil {
@@ -1103,6 +1224,8 @@ func main() {
 			Concurrency:     workerConcurrency,
 			QueueSize:       workerQueueSize,
 			ShutdownTimeout: 5 * time.Second,
+			EnforceMemory:   workerEnforceMemory,
+			MemoryThreshold: workerMemoryThreshold,
 		},
 	}
 
@@ -1123,6 +1246,7 @@ func main() {
 	mux.HandleFunc("/v1/collector/run", server.authMiddleware(server.handleCollectorRun))
 	mux.HandleFunc("/v1/scheduler/status", server.authMiddleware(server.handleSchedulerStatus))
 	mux.HandleFunc("/v1/worker/status", server.authMiddleware(server.handleWorkerStatus))
+	mux.HandleFunc("/v1/worker/cancel", server.authMiddleware(server.handleWorkerCancel))
 
 	fmt.Println("==========================================================")
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
@@ -1185,8 +1309,9 @@ func main() {
 		server.scheduler.Stop()
 	}
 
-	// 3. Stop Worker Pool
+	// 3. Stop Worker Pool gracefully: wait for in-flight tasks and safely cancel queued tasks
 	if server.worker != nil {
+		_ = server.worker.WaitBeforeShutdown(shutdownCtx)
 		_ = server.worker.Shutdown()
 	}
 

@@ -237,6 +237,140 @@ func TestSafeCancelQueuedTasks(t *testing.T) {
 	if atomic.LoadInt32(&canceled) != 3 {
 		t.Fatalf("expected 3 OnError(ErrCanceled), got %d", atomic.LoadInt32(&canceled))
 	}
+	// Canceled tasks are tracked separately from execution failures.
+	if st := pool.Stats(); st.Canceled != 3 {
+		t.Fatalf("expected Stats().Canceled=3, got %d", st.Canceled)
+	}
+}
+
+func TestResumeAfterWaitBeforeShutdown(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 2
+	pool := NewPool(cfg)
+	pool.Start()
+	defer func() { _ = pool.Shutdown() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := pool.WaitBeforeShutdown(ctx); err != nil {
+		t.Fatalf("WaitBeforeShutdown: %v", err)
+	}
+	if err := pool.Dispatch(context.Background(), "blocked", func(ctx context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
+		t.Fatalf("expected ErrDraining while draining, got %v", err)
+	}
+
+	// Resume must re-open intake (the pool must not stay bricked forever).
+	pool.Resume()
+	if pool.Draining() {
+		t.Fatalf("pool should not be draining after Resume")
+	}
+	var ran int32
+	if err := pool.Dispatch(context.Background(), "after-resume", func(ctx context.Context) error {
+		atomic.AddInt32(&ran, 1)
+		return nil
+	}); err != nil {
+		t.Fatalf("dispatch after Resume: %v", err)
+	}
+	_ = pool.WaitIdle(ctx)
+	if atomic.LoadInt32(&ran) != 1 {
+		t.Fatalf("expected task to run after Resume, ran=%d", atomic.LoadInt32(&ran))
+	}
+}
+
+func TestRestartAfterCleanShutdown(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 2
+	pool := NewPool(cfg)
+	pool.Start()
+
+	if err := pool.Shutdown(); err != nil {
+		t.Fatalf("clean shutdown: %v", err)
+	}
+
+	// A clean shutdown must be restartable.
+	pool.Start()
+	var ran int32
+	if err := pool.Dispatch(context.Background(), "second-life", func(ctx context.Context) error {
+		atomic.AddInt32(&ran, 1)
+		return nil
+	}); err != nil {
+		t.Fatalf("dispatch after restart: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = pool.WaitIdle(ctx)
+	if atomic.LoadInt32(&ran) != 1 {
+		t.Fatalf("expected task to run after restart, ran=%d", atomic.LoadInt32(&ran))
+	}
+	if err := pool.Shutdown(); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+}
+
+func TestShutdownRespectsTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.ShutdownTimeout = 100 * time.Millisecond
+	pool := NewPool(cfg)
+	pool.Start()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	_ = pool.Dispatch(context.Background(), "stuck", func(ctx context.Context) error {
+		close(started)
+		<-release // ignores ctx entirely
+		return nil
+	})
+	<-started
+
+	t0 := time.Now()
+	err := pool.Shutdown()
+	elapsed := time.Since(t0)
+	close(release) // let the leaked goroutine finish
+
+	if !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("expected ErrShutdownTimeout, got %v", err)
+	}
+	// Must return in bounded time (2 * ShutdownTimeout), never block on the task.
+	if elapsed > time.Second {
+		t.Fatalf("Shutdown blocked too long: %v (should be ~2*ShutdownTimeout)", elapsed)
+	}
+
+	// Restart after a forced shutdown must be refused (no overlapping workers).
+	pool.Start()
+	if err := pool.Dispatch(context.Background(), "post-force", func(ctx context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
+		t.Fatalf("expected pool to stay stopped after forced shutdown, got %v", err)
+	}
+}
+
+func TestMemoryUsageMetric(t *testing.T) {
+	usage, source := processMemoryUsage()
+	if usage == 0 {
+		t.Fatalf("expected non-zero memory usage, got 0 (source=%s)", source)
+	}
+	if source == "" {
+		t.Fatalf("expected a non-empty usage source label")
+	}
+
+	cfg := DefaultConfig()
+	cfg.EnforceMemory = true
+	cfg.MaxMemoryBytes = 1 << 62 // huge -> never over threshold
+	pool := NewPool(cfg)
+	if err := pool.checkMemory(); err != nil {
+		t.Fatalf("expected no pressure with a huge limit, got %v", err)
+	}
+	if st := pool.Stats(); st.UsageBytes == 0 || st.UsageSource == "" {
+		t.Fatalf("expected Stats to report usage + source, got %+v", st)
+	}
+}
+
+func TestMemoryThresholdAllowsOne(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MemoryThreshold = 1.0 // must be accepted verbatim (W7)
+	pool := NewPool(cfg)
+	if pool.cfg.MemoryThreshold != 1.0 {
+		t.Fatalf("expected MemoryThreshold=1.0 preserved, got %v", pool.cfg.MemoryThreshold)
+	}
 }
 
 func TestGlobalRegistryFunctions(t *testing.T) {
