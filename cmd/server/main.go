@@ -32,7 +32,12 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
-const maxRequestBodyBytes = 10 << 20
+const (
+	maxRequestBodyBytes = 10 << 20
+	// maxQueryLimit caps how many records a single /v1/list call can return,
+	// preventing a client from requesting the entire dataset in one request.
+	maxQueryLimit = 1000
+)
 
 // ServerConfig holds complete runtime configuration parsed from CLI flags and ENV
 type ServerConfig struct {
@@ -54,6 +59,12 @@ type ServerConfig struct {
 	ShutdownTimeout   time.Duration // total graceful shutdown budget (default 25s)
 
 	WorkerConfig worker.Config
+
+	// Database durability options passed to every opened model.
+	DBOptions storage.Options
+	// Per-client abuse controls. RateLimitPerSec <= 0 disables rate limiting.
+	RateLimitPerSec float64
+	RateLimitBurst  int
 }
 
 // Server holds active AnchorDB database instances and background subsystems
@@ -68,6 +79,9 @@ type Server struct {
 	worker      *worker.Pool
 	ipFilter    *security.IPFilter
 	startTime   time.Time
+
+	dbOptions storage.Options
+	limiter   *rateLimiter
 
 	// Lifecycle state.
 	draining        atomic.Bool   // true once Shutdown began (readiness = 503)
@@ -114,7 +128,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		ipFilter:    ipFilter,
 		startTime:   time.Now(),
 
+		dbOptions: cfg.DBOptions,
+
 		shutdownTimeout: cfg.ShutdownTimeout,
+	}
+
+	if cfg.RateLimitPerSec > 0 {
+		s.limiter = newRateLimiter(cfg.RateLimitPerSec, cfg.RateLimitBurst)
 	}
 
 	// Register top-global scheduled tasks if cron is enabled
@@ -141,6 +161,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/save", s.authMiddleware(s.handleSave))
 	mux.HandleFunc("/v1/get", s.authMiddleware(s.handleGet))
 	mux.HandleFunc("/v1/list", s.authMiddleware(s.handleList))
@@ -155,7 +176,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
-	return s.ipFilter.Middleware(limitRequestBody(mux))
+	return s.rateLimitMiddleware(s.ipFilter.Middleware(limitRequestBody(mux)))
 }
 
 func limitRequestBody(next http.Handler) http.Handler {
@@ -501,7 +522,7 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	}
 
 	dbPath := filepath.Join(s.dataDir, modelName+".anchordb")
-	newDB, err := storage.Open(dbPath)
+	newDB, err := storage.OpenWithOptions(dbPath, s.dbOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open model %q at %s: %w", modelName, dbPath, err)
 	}
@@ -559,6 +580,56 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleMetrics exposes dependency-free Prometheus text-format metrics for
+// scraping. It is intentionally unauthenticated, like /health, so that standard
+// scrapers work; put it behind your reverse proxy if that is not acceptable.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	models := len(s.models)
+	s.mu.RUnlock()
+
+	mem := system.GetMemoryStats()
+	ws := s.worker.Stats()
+
+	draining := 0
+	if s.draining.Load() {
+		draining = 1
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# HELP anchordb_up Whether the server process is running.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_up gauge\nanchordb_up 1\n")
+	fmt.Fprintf(&b, "# HELP anchordb_uptime_seconds Seconds since process start.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_uptime_seconds gauge\nanchordb_uptime_seconds %.3f\n", time.Since(s.startTime).Seconds())
+	fmt.Fprintf(&b, "# HELP anchordb_models_loaded Number of currently open model databases.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_models_loaded gauge\nanchordb_models_loaded %d\n", models)
+	fmt.Fprintf(&b, "# HELP anchordb_draining Whether the server is draining (1) or serving (0).\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_draining gauge\nanchordb_draining %d\n", draining)
+	fmt.Fprintf(&b, "# HELP anchordb_go_goroutines Number of live goroutines.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_go_goroutines gauge\nanchordb_go_goroutines %d\n", runtime.NumGoroutine())
+	fmt.Fprintf(&b, "# HELP anchordb_heap_alloc_bytes Heap bytes currently allocated.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_heap_alloc_bytes gauge\nanchordb_heap_alloc_bytes %d\n", mem.HeapAllocBytes)
+	fmt.Fprintf(&b, "# HELP anchordb_heap_sys_bytes Total heap bytes obtained from the OS.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_heap_sys_bytes gauge\nanchordb_heap_sys_bytes %d\n", mem.HeapSysBytes)
+	fmt.Fprintf(&b, "# HELP anchordb_gc_cycles_total Completed GC cycles.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_gc_cycles_total counter\nanchordb_gc_cycles_total %d\n", mem.NumGC)
+	fmt.Fprintf(&b, "# HELP anchordb_memory_limit_bytes Soft memory limit in bytes (0 = unlimited).\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_memory_limit_bytes gauge\nanchordb_memory_limit_bytes %d\n", mem.LimitBytes)
+	fmt.Fprintf(&b, "# HELP anchordb_worker_jobs_dispatched_total Worker jobs dispatched.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_worker_jobs_dispatched_total counter\nanchordb_worker_jobs_dispatched_total %d\n", ws.Dispatched)
+	fmt.Fprintf(&b, "# HELP anchordb_worker_jobs_completed_total Worker jobs completed.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_worker_jobs_completed_total counter\nanchordb_worker_jobs_completed_total %d\n", ws.Completed)
+	fmt.Fprintf(&b, "# HELP anchordb_worker_jobs_failed_total Worker jobs failed.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_worker_jobs_failed_total counter\nanchordb_worker_jobs_failed_total %d\n", ws.Failed)
+	fmt.Fprintf(&b, "# HELP anchordb_worker_jobs_in_flight Worker jobs currently in flight.\n")
+	fmt.Fprintf(&b, "# TYPE anchordb_worker_jobs_in_flight gauge\nanchordb_worker_jobs_in_flight %d\n", ws.InFlight)
+
+	_, _ = io.WriteString(w, b.String())
 }
 
 // Request / Response types for REST API
@@ -806,9 +877,15 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 10
 	}
+	if limit > maxQueryLimit {
+		limit = maxQueryLimit
+	}
 	offset := req.Offset
 	if req.Page > 1 {
 		offset = (req.Page - 1) * limit
+	}
+	if offset < 0 {
+		offset = 0
 	}
 
 	records, hasMore, err := db.ListRecordsWithPaging(storage.QueryOptions{
@@ -1543,6 +1620,41 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
+// resolveDBOptions parses the WAL durability configuration with precedence
+// Flag > ENV > default. Defaults to the safe SyncAlways mode.
+func resolveDBOptions(flagSyncMode, flagSyncInterval string) (storage.Options, error) {
+	modeStr := flagSyncMode
+	if modeStr == "" {
+		modeStr = getEnv("ANCHORDB_WAL_SYNC", "always")
+	}
+	opts := storage.DefaultOptions()
+	switch strings.ToLower(strings.TrimSpace(modeStr)) {
+	case "", "always", "sync", "fsync":
+		opts.WAL.SyncMode = storage.SyncAlways
+	case "interval", "periodic":
+		opts.WAL.SyncMode = storage.SyncInterval
+	case "none", "off", "false":
+		opts.WAL.SyncMode = storage.SyncNone
+	default:
+		return opts, fmt.Errorf("invalid wal sync mode %q (want always|interval|none)", modeStr)
+	}
+
+	intervalStr := flagSyncInterval
+	if intervalStr == "" {
+		intervalStr = getEnv("ANCHORDB_WAL_SYNC_INTERVAL", "")
+	}
+	if intervalStr != "" {
+		d, err := time.ParseDuration(intervalStr)
+		if err != nil || d <= 0 {
+			return opts, fmt.Errorf("invalid wal sync interval %q", intervalStr)
+		}
+		opts.WAL.SyncInterval = d
+	} else if opts.WAL.SyncMode == storage.SyncInterval {
+		opts.WAL.SyncInterval = 200 * time.Millisecond
+	}
+	return opts, nil
+}
+
 func main() {
 	// 1. Core Server Flags
 	flagPort := flag.String("port", "", "Port to listen on (overrides ANCHORDB_PORT, default 7447)")
@@ -1570,6 +1682,12 @@ func main() {
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
 	flagWorkerEnforceMemory := flag.Bool("worker-enforce-memory", false, "Enable worker memory admission control (overrides ANCHORDB_WORKER_ENFORCE_MEMORY)")
 	flagWorkerMemoryThreshold := flag.Float64("worker-memory-threshold", 0.85, "Worker memory threshold (overrides ANCHORDB_WORKER_MEMORY_THRESHOLD)")
+
+	// 4. Durability & Abuse-Control Flags
+	flagWALSync := flag.String("wal-sync", "", "WAL durability: always|interval|none (overrides ANCHORDB_WAL_SYNC, default always)")
+	flagWALSyncInterval := flag.String("wal-sync-interval", "", "WAL fsync interval for wal-sync=interval e.g. 200ms (overrides ANCHORDB_WAL_SYNC_INTERVAL)")
+	flagRateLimit := flag.Float64("rate-limit", 0, "Per-client request rate limit in req/s; 0 disables (overrides ANCHORDB_RATE_LIMIT)")
+	flagRateLimitBurst := flag.Int("rate-limit-burst", 0, "Per-client burst capacity; defaults to the rate (overrides ANCHORDB_RATE_LIMIT_BURST)")
 
 	flag.Parse()
 
@@ -1692,6 +1810,22 @@ func main() {
 		}
 	}
 
+	// Resolve WAL durability options (Flag > ENV > Default).
+	dbOptions, err := resolveDBOptions(*flagWALSync, *flagWALSyncInterval)
+	if err != nil {
+		log.Fatalf("[FATAL] Konfigurasi WAL tidak valid: %v", err)
+	}
+
+	// Resolve per-client rate limit (Flag > ENV > disabled).
+	rateLimit := *flagRateLimit
+	if !flagPassed("rate-limit") {
+		rateLimit = getEnvFloat("ANCHORDB_RATE_LIMIT", 0)
+	}
+	rateLimitBurst := *flagRateLimitBurst
+	if rateLimitBurst <= 0 {
+		rateLimitBurst = getEnvInt("ANCHORDB_RATE_LIMIT_BURST", 0)
+	}
+
 	serverConfig := ServerConfig{
 		Port:              portStr,
 		DataDir:           dataDir,
@@ -1707,6 +1841,9 @@ func main() {
 		CronTaskTimeout:   cronTaskTimeout,
 		CronJitter:        cronJitter,
 		ShutdownTimeout:   shutdownTimeout,
+		DBOptions:         dbOptions,
+		RateLimitPerSec:   rateLimit,
+		RateLimitBurst:    rateLimitBurst,
 		WorkerConfig: worker.Config{
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,

@@ -84,6 +84,46 @@ func (db *AnchorDB) upsertEdge(source, relation, target string, weight float32) 
 	db.edges = append(db.edges, EdgeRecord{Source: source, Relation: relation, Target: target, Weight: weight})
 	db.adjOut[source] = append(db.adjOut[source], idx)
 	db.adjIn[target] = append(db.adjIn[target], idx)
+	db.edgeLive++
+}
+
+// edgeCompactionThreshold is the minimum number of tombstoned slots before an
+// edge compaction is attempted (compaction also requires tombstones > live).
+const edgeCompactionThreshold = 1024
+
+// tombstoneEdgeLocked marks a live edge as deleted. Caller must hold db.mu.
+func (db *AnchorDB) tombstoneEdgeLocked(idx int) {
+	if idx < 0 || idx >= len(db.edges) || db.edges[idx].Source == "" {
+		return
+	}
+	db.edges[idx] = EdgeRecord{}
+	db.edgeLive--
+	db.edgeTombstones++
+}
+
+// maybeCompactEdgesLocked rewrites the edge slice when tombstones dominate,
+// reclaiming memory that would otherwise grow unbounded across add/remove
+// cycles. Caller must hold db.mu.
+func (db *AnchorDB) maybeCompactEdgesLocked() {
+	if db.edgeTombstones < edgeCompactionThreshold || db.edgeTombstones <= db.edgeLive {
+		return
+	}
+	live := make([]EdgeRecord, 0, db.edgeLive)
+	out := make(map[string][]int)
+	in := make(map[string][]int)
+	for _, e := range db.edges {
+		if e.Source == "" {
+			continue
+		}
+		i := len(live)
+		live = append(live, e)
+		out[e.Source] = append(out[e.Source], i)
+		in[e.Target] = append(in[e.Target], i)
+	}
+	db.edges = live
+	db.adjOut = out
+	db.adjIn = in
+	db.edgeTombstones = 0
 }
 
 // RemoveEdge deletes the directed edge source --relation--> target.
@@ -105,7 +145,8 @@ func (db *AnchorDB) RemoveEdge(source, relation, target string) error {
 			return fmt.Errorf("failed to write edge delete to wal: %w", err)
 		}
 	}
-	db.edges[idx] = EdgeRecord{} // tombstone; empty Source marks it deleted
+	db.tombstoneEdgeLocked(idx)
+	db.maybeCompactEdgesLocked()
 	return nil
 }
 
@@ -162,13 +203,7 @@ func (db *AnchorDB) IncomingEdges(target, relation string) []EdgeRecord {
 func (db *AnchorDB) EdgeCount() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	n := 0
-	for _, e := range db.edges {
-		if e.Source != "" {
-			n++
-		}
-	}
-	return n
+	return db.edgeLive
 }
 
 // ExecuteCausalStep follows a single relation from a set of seed words and
@@ -349,6 +384,7 @@ func (db *AnchorDB) loadEdges() error {
 		db.edges = append(db.edges, e)
 		db.adjOut[e.Source] = append(db.adjOut[e.Source], idx)
 		db.adjIn[e.Target] = append(db.adjIn[e.Target], idx)
+		db.edgeLive++
 	}
 	if offset != len(rest) {
 		return fmt.Errorf("corrupt file: %d trailing bytes after edge section", len(rest)-offset)

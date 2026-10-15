@@ -36,7 +36,9 @@ type Header struct {
 	Reserved     [4]byte // Padding to 64 bytes
 }
 
-// Encode writes Header to a 64-byte buffer.
+// Encode writes Header to a 64-byte buffer. It panics if buf is smaller than
+// HeaderSize: that is a programmer error (all callers allocate a fixed [HeaderSize]
+// buffer), not a runtime condition, mirroring the standard library's copy/encode idiom.
 func (h *Header) Encode(buf []byte) {
 	if len(buf) < HeaderSize {
 		panic("buffer too small for Header")
@@ -93,7 +95,9 @@ type BinaryNodeRecord struct {
 	WordLen    uint16     // 2 bytes: length of word in string pool
 }
 
-// Encode writes BinaryNodeRecord to a 40-byte buffer.
+// Encode writes BinaryNodeRecord to a 40-byte buffer. It panics if buf is
+// smaller than RecordSize: that is a programmer error (callers pass fixed-size
+// record slices), not a runtime condition.
 func (r *BinaryNodeRecord) Encode(buf []byte) {
 	if len(buf) < RecordSize {
 		panic("buffer too small for Record")

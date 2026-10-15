@@ -651,7 +651,7 @@ func TestDriver_DateMath_Add45Days_UserScenario(t *testing.T) {
 
 	// 1. Simpan entitas dengan tanggal 2026-10-14
 	_ = client.Save("kontrak_proyek", map[string]float32{
-		"tanggal_mulai": Date("2026-10-14"),
+		"tanggal_mulai": MustDate("2026-10-14"),
 	})
 
 	// Verifikasi sebelum update
@@ -714,22 +714,22 @@ func TestDriver_RichRangeAndDateFilters(t *testing.T) {
 	_ = client.Save("trip_1", map[string]float32{
 		"jarak":   30.0,
 		"waktu":   1.0,
-		"tanggal": Date("2026-10-05"),
+		"tanggal": MustDate("2026-10-05"),
 	})
 	_ = client.Save("trip_2", map[string]float32{
 		"jarak":   100.0,
 		"waktu":   2.0,
-		"tanggal": Date("2026-10-14"),
+		"tanggal": MustDate("2026-10-14"),
 	})
 	_ = client.Save("trip_3", map[string]float32{
 		"jarak":   120.0,
 		"waktu":   2.5,
-		"tanggal": Date("2026-10-20"),
+		"tanggal": MustDate("2026-10-20"),
 	})
 	_ = client.Save("trip_4", map[string]float32{
 		"jarak":   300.0,
 		"waktu":   5.0,
-		"tanggal": Date("2026-11-01"),
+		"tanggal": MustDate("2026-11-01"),
 	})
 
 	// 1. GET BY DATE: WhereDate("tanggal", "2026-10-14")
@@ -808,15 +808,15 @@ func TestDriver_ScheduledDeactivation_15Days(t *testing.T) {
 	// User 3: terdaftar 2026-10-12 (3 hari lalu -> <= 15 hari -> TETAP AKTIF)
 
 	_ = client.Save("user_1_lama", map[string]float32{
-		"date_terdaftar": Date("2026-09-20"),
+		"date_terdaftar": MustDate("2026-09-20"),
 		"status":         1, // 1 = Aktif, 0 = Non-Aktif
 	})
 	_ = client.Save("user_2_baru", map[string]float32{
-		"date_terdaftar": Date("2026-10-05"),
+		"date_terdaftar": MustDate("2026-10-05"),
 		"status":         1,
 	})
 	_ = client.Save("user_3_kemarin", map[string]float32{
-		"date_terdaftar": Date("2026-10-12"),
+		"date_terdaftar": MustDate("2026-10-12"),
 		"status":         1,
 	})
 

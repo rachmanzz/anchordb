@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
@@ -32,16 +33,55 @@ const (
 
 var ErrWALCorrupt = errors.New("anchordb: corrupt wal")
 
-// WALManager manages an append-only write-ahead log for AnchorDB crash durability.
-type WALManager struct {
-	mu      sync.Mutex
-	file    *os.File
-	path    string
-	corrupt bool
+// SyncMode controls how often mutations are flushed to stable storage. The
+// durability/throughput trade-off is explicit: SyncAlways is durable but caps
+// write throughput at the fsync latency of the device, which is important on
+// slow media such as SD cards.
+type SyncMode int
+
+const (
+	// SyncAlways fsyncs after every WAL entry. Safest; the default.
+	SyncAlways SyncMode = iota
+	// SyncInterval fsyncs from a background goroutine at SyncInterval. Writes
+	// are fast, but a crash can lose up to the last interval of mutations.
+	SyncInterval
+	// SyncNone never fsyncs explicitly; the OS flushes asynchronously. Fastest
+	// and least durable.
+	SyncNone
+)
+
+// WALOptions configures WAL durability behavior.
+type WALOptions struct {
+	SyncMode SyncMode
+	// SyncInterval is used when SyncMode == SyncInterval. Defaults to 200ms.
+	SyncInterval time.Duration
 }
 
-// OpenWAL creates or opens a WAL file at path in append mode.
+// DefaultWALOptions returns the safe default: fsync every write.
+func DefaultWALOptions() WALOptions {
+	return WALOptions{SyncMode: SyncAlways}
+}
+
+// WALManager manages an append-only write-ahead log for AnchorDB crash durability.
+type WALManager struct {
+	mu           sync.Mutex
+	file         *os.File
+	path         string
+	corrupt      bool
+	syncMode     SyncMode
+	syncInterval time.Duration
+	stopSync     chan struct{}
+	syncWg       sync.WaitGroup
+}
+
+// OpenWAL creates or opens a WAL file at path in append mode using the safe
+// default durability (fsync every write).
 func OpenWAL(path string) (*WALManager, error) {
+	return OpenWALWithOptions(path, DefaultWALOptions())
+}
+
+// OpenWALWithOptions creates or opens a WAL file with an explicit durability mode.
+func OpenWALWithOptions(path string, opts WALOptions) (*WALManager, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal %s: %w", path, err)
@@ -50,17 +90,56 @@ func OpenWAL(path string) (*WALManager, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	return &WALManager{
-		file: f,
-		path: path,
-	}, nil
+	w := &WALManager{
+		file:     f,
+		path:     path,
+		syncMode: opts.SyncMode,
+	}
+	if opts.SyncMode == SyncInterval {
+		w.syncInterval = opts.SyncInterval
+		if w.syncInterval <= 0 {
+			w.syncInterval = 200 * time.Millisecond
+		}
+		w.stopSync = make(chan struct{})
+		w.syncWg.Add(1)
+		go w.syncLoop()
+	}
+	return w, nil
 }
 
-// Close closes the underlying WAL file descriptor.
+// syncLoop periodically fsyncs the WAL when SyncMode == SyncInterval.
+func (w *WALManager) syncLoop() {
+	defer w.syncWg.Done()
+	ticker := time.NewTicker(w.syncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.stopSync:
+			return
+		case <-ticker.C:
+			w.mu.Lock()
+			if w.file != nil && !w.corrupt {
+				_ = w.file.Sync()
+			}
+			w.mu.Unlock()
+		}
+	}
+}
+
+// Close stops any background sync goroutine, flushes, and closes the WAL file.
 func (w *WALManager) Close() error {
+	if w.stopSync != nil {
+		close(w.stopSync)
+		w.syncWg.Wait()
+		w.stopSync = nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file != nil {
+		// Always flush on close unless syncing was explicitly disabled.
+		if w.syncMode != SyncNone {
+			_ = w.file.Sync()
+		}
 		err := w.file.Close()
 		w.file = nil
 		return err
@@ -125,8 +204,12 @@ func (w *WALManager) writeEntry(op byte, payload []byte) error {
 			return rollback(err)
 		}
 	}
-	if err := w.file.Sync(); err != nil {
-		return rollback(err)
+	// SyncAlways flushes every entry. SyncInterval/SyncNone defer flushing to
+	// the background loop / OS, trading durability for throughput.
+	if w.syncMode == SyncAlways {
+		if err := w.file.Sync(); err != nil {
+			return rollback(err)
+		}
 	}
 	return nil
 }

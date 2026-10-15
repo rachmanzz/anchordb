@@ -134,6 +134,25 @@ All settings can be configured via environment variables or CLI flags:
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
 | **Worker Enforce Mem** | `-worker-enforce-memory` | `ANCHORDB_WORKER_ENFORCE_MEMORY` | `false` | Memory-aware admission control |
 | **Worker Mem Thresh** | `-worker-memory-threshold` | `ANCHORDB_WORKER_MEMORY_THRESHOLD` | `0.85` | Memory pressure throttling ratio (0.0-1.0) |
+| **WAL Sync Mode** | `-wal-sync` | `ANCHORDB_WAL_SYNC` | `always` | WAL durability: `always` (fsync every write, safest), `interval` (periodic fsync), or `none` (OS-managed, fastest, least durable). Non-`always` trades crash durability for throughput — important on SD cards / slow disks. |
+| **WAL Sync Interval** | `-wal-sync-interval` | `ANCHORDB_WAL_SYNC_INTERVAL` | `200ms` | Fsync interval used when `WAL Sync Mode = interval` |
+| **Rate Limit** | `-rate-limit` | `ANCHORDB_RATE_LIMIT` | `0` (disabled) | Per-client request rate in req/s; `0` disables. Returns `429` with `Retry-After`. `/health` and `/metrics` are exempt. |
+| **Rate Limit Burst** | `-rate-limit-burst` | `ANCHORDB_RATE_LIMIT_BURST` | = rate | Per-client token-bucket burst capacity |
+
+### Durability notes
+
+- The default `always` mode fsyncs after every WAL entry. This is the only mode that guarantees no committed write is lost on power loss, at the cost of throughput being bounded by the device's fsync latency.
+- `interval` fsyncs from a background goroutine; a crash can lose up to one interval of writes.
+- `none` never fsyncs explicitly. Committed writes are still visible to other processes (page cache) and are flushed by the OS eventually, but a power loss can lose recent writes.
+- Regardless of mode, `Sync`, checkpoint, and `Close` flush the WAL and the database file.
+
+### Observability
+
+`GET /metrics` (unauthenticated, like `/health`) exposes Prometheus text-format metrics: uptime, loaded models, draining state, goroutines, heap usage, GC count, and worker job counters.
+
+### TLS / reverse proxy
+
+The server speaks plain HTTP and does not terminate TLS. Put it behind a reverse proxy (nginx, Caddy, Traefik) for TLS, and enable `-trust-proxy` so client IPs are read from `X-Forwarded-For` for the IP whitelist and rate limiter.
 
 ---
 
@@ -182,6 +201,7 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 
 ### 1. Telemetry & Health Checks
 - `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
+- `GET /metrics`: Prometheus text-format metrics (uptime, loaded models, draining state, goroutines, heap, GC, worker counters).
 - `GET /v1/scheduler/status`: Active cron tasks and next execution times.
 - `GET /v1/worker/status`: Worker pool concurrency, in-flight/queued tasks, memory pressure, and telemetry stats.
 - `POST /v1/worker/cancel`: Safely cancels queued tasks before execution without interrupting in-flight jobs.

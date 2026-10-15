@@ -138,8 +138,16 @@ func Subtract(fieldA, fieldB string) storage.ComputeOp {
 	return storage.OpSubtract{FieldA: fieldA, FieldB: fieldB}
 }
 
-// Date converts "YYYY-MM-DD" string to numeric Epoch Days for AnchorDB
-func Date(dateStr string) float32 {
+// Date converts a "YYYY-MM-DD" string to numeric Epoch Days for AnchorDB.
+// It returns an error for malformed input rather than panicking. Use MustDate
+// for compile-time-known date literals where a panic on bad input is acceptable.
+func Date(dateStr string) (float32, error) {
+	return storage.ParseDate(dateStr)
+}
+
+// MustDate is like Date but panics on malformed input. It is intended for
+// hard-coded date literals in examples and tests.
+func MustDate(dateStr string) float32 {
 	d, err := storage.ParseDate(dateStr)
 	if err != nil {
 		panic(fmt.Sprintf("invalid date format %q: %v", dateStr, err))

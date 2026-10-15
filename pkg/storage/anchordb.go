@@ -183,6 +183,10 @@ type AnchorDB struct {
 	edges  []EdgeRecord
 	adjOut map[string][]int
 	adjIn  map[string][]int
+	// edgeLive counts live edges (O(1) EdgeCount); edgeTombstones counts
+	// tombstoned slots pending compaction.
+	edgeLive       int
+	edgeTombstones int
 
 	// entitySectionEnd is the file offset where the entity section ends (and, for
 	// v3 files, where the optional edge section begins). Populated while loading.
@@ -511,8 +515,38 @@ func (db *AnchorDB) markNodeDeleted(idx uint32) {
 	}
 }
 
-// Open creates or opens an AnchorDB file using memory mapping.
+// mmapLen converts a file size to the int length expected by syscall.Mmap,
+// rejecting sizes that overflow int on 32-bit platforms (where Go's int is 32
+// bits and a >2GiB file cannot be mapped as a single region).
+func mmapLen(fileSize int64) (int, error) {
+	if fileSize < 0 {
+		return 0, fmt.Errorf("invalid negative file size %d", fileSize)
+	}
+	if fileSize > int64(math.MaxInt) {
+		return 0, fmt.Errorf("database file too large for this platform: %d bytes (max %d)", fileSize, int64(math.MaxInt))
+	}
+	return int(fileSize), nil
+}
+
+// Options configures an AnchorDB instance.
+type Options struct {
+	// WAL controls write-ahead-log durability. The zero value is not valid;
+	// use DefaultOptions() or set WAL explicitly.
+	WAL WALOptions
+}
+
+// DefaultOptions returns production defaults (durable WAL: fsync every write).
+func DefaultOptions() Options {
+	return Options{WAL: DefaultWALOptions()}
+}
+
+// Open creates or opens an AnchorDB file using memory mapping with default options.
 func Open(filePath string) (*AnchorDB, error) {
+	return OpenWithOptions(filePath, DefaultOptions())
+}
+
+// OpenWithOptions creates or opens an AnchorDB file with explicit options.
+func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 	db := &AnchorDB{
 		Grid:           make(map[uint32][]uint32),
 		Lexicon:        make(map[string]uint32),
@@ -572,7 +606,12 @@ func Open(filePath string) (*AnchorDB, error) {
 	}
 
 	// Memory map the file via Linux mmap
-	mmapData, err := syscall.Mmap(int(f.Fd()), 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	mmapSize, err := mmapLen(fileSize)
+	if err != nil {
+		_ = f.Close()
+		return openErr(err)
+	}
+	mmapData, err := syscall.Mmap(int(f.Fd()), 0, mmapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		_ = f.Close()
 		return openErr(fmt.Errorf("mmap failed: %w", err))
@@ -608,7 +647,7 @@ func Open(filePath string) (*AnchorDB, error) {
 
 	// Initialize WAL for append-only durability
 	walPath := filePath + ".wal"
-	wal, err := OpenWAL(walPath)
+	wal, err := OpenWALWithOptions(walPath, opts.WAL)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to open wal: %w", err)
@@ -628,7 +667,7 @@ func Open(filePath string) (*AnchorDB, error) {
 			db.upsertEdge(ev.Edge.Source, ev.Edge.Relation, ev.Edge.Target, ev.Edge.Weight)
 		case WalOpEdgeDelete:
 			if idx := db.findEdge(ev.Edge.Source, ev.Edge.Relation, ev.Edge.Target); idx >= 0 {
-				db.edges[idx] = EdgeRecord{}
+				db.tombstoneEdgeLocked(idx)
 			}
 		}
 		return nil
@@ -638,9 +677,15 @@ func Open(filePath string) (*AnchorDB, error) {
 		return nil, fmt.Errorf("failed to replay wal: %w", err)
 	}
 
+	// Replayed edge deletions may have left many tombstones; reclaim them once.
+	db.maybeCompactEdgesLocked()
+
 	// Reconcile interrupted operations from ungraceful shutdown/crash:
 	// Any records trapped in OpStatusSafeDelete (0) are automatically transitioned to OpStatusRetry (3).
-	db.reconcileInterruptedOperationsLocked()
+	if _, err := db.reconcileInterruptedOperationsLocked(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return db, nil
 }
@@ -649,7 +694,7 @@ func Open(filePath string) (*AnchorDB, error) {
 // If a record is still in SafeDelete during Open(), it means a previous process crashed or shut down
 // before finalizing archival (to Tombstone) or completing rollback.
 // It transitions them to OpStatusRetry (3) and records the mutation in WAL.
-func (db *AnchorDB) reconcileInterruptedOperationsLocked() int {
+func (db *AnchorDB) reconcileInterruptedOperationsLocked() (int, error) {
 	reconciled := 0
 	for _, name := range db.EntityOrder {
 		cr, exists := db.EntityStore[name]
@@ -657,13 +702,16 @@ func (db *AnchorDB) reconcileInterruptedOperationsLocked() int {
 			cr.Operation = OpStatusRetry
 			db.EntityStore[name] = cr
 			if db.wal != nil {
-				_ = db.wal.WriteSave(name, cr)
+				if err := db.wal.WriteSave(name, cr); err != nil {
+					clear(db.partitionLocks)
+					return reconciled, fmt.Errorf("failed to record reconciliation for %q: %w", name, err)
+				}
 			}
 			reconciled++
 		}
 	}
 	clear(db.partitionLocks)
-	return reconciled
+	return reconciled, nil
 }
 
 func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
@@ -1786,7 +1834,12 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 	fileSize := fi.Size()
-	mmapData, err := syscall.Mmap(int(newF.Fd()), 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	mmapSize, err := mmapLen(fileSize)
+	if err != nil {
+		_ = newF.Close()
+		return err
+	}
+	mmapData, err := syscall.Mmap(int(newF.Fd()), 0, mmapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		_ = newF.Close()
 		return err

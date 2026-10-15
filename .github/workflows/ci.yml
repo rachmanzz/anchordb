@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race)
+        run: go test -race ./...
+
+      - name: Cross-compile (ARM)
+        run: |
+          GOOS=linux GOARCH=arm64 go build -o /tmp/anchordb-server-arm64 ./cmd/server
+          GOOS=linux GOARCH=arm GOARM=7 go build -o /tmp/anchordb-server-armv7 ./cmd/server
+          GOOS=linux GOARCH=arm GOARM=6 go build -o /tmp/anchordb-server-armv6 ./cmd/server
