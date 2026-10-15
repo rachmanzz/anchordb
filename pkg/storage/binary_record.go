@@ -10,7 +10,7 @@ import (
 const (
 	// MagicHeader is "ANCH" in ASCII (0x41, 0x4E, 0x43, 0x48)
 	MagicHeader = 0x48434E41 // Little-endian for "ANCH"
-	DBVersion   = 1
+	DBVersion   = 2
 
 	HeaderSize = 64
 	RecordSize = 40 // Exact 40-byte fixed binary record per node
@@ -73,8 +73,8 @@ func DecodeHeader(buf []byte) (*Header, error) {
 	if h.Magic != MagicHeader {
 		return nil, fmt.Errorf("invalid magic header: expected 0x%X, got 0x%X", MagicHeader, h.Magic)
 	}
-	if h.Version != DBVersion {
-		return nil, fmt.Errorf("unsupported database version: expected %d, got %d", DBVersion, h.Version)
+	if h.Version < 1 || h.Version > DBVersion {
+		return nil, fmt.Errorf("unsupported database version: expected 1..%d, got %d", DBVersion, h.Version)
 	}
 	return h, nil
 }

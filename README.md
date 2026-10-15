@@ -26,11 +26,12 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
   - Arithmetic operators (`+`, `-`, `*`, `/`) executed inside storage without SQL overhead.
   - Date arithmetic stored as float32 Epoch Days (e.g. `2026-10-14` + `45 hari` $\rightarrow$ `2026-11-28`).
   - Selective column projection (`.Select("jarak", "waktu", "kecepatan")`).
-- **Resilient Background Pipeline (`gosuite/v3`)**:
-  - **Production Cron (`gosuite/v3/cron`)**: Automated partition archiving with panic recovery, overlap prevention, and graceful shutdown.
-  - **Worker Engine (`gosuite/v3/worker`)**: Non-blocking asynchronous task execution:
-    - **Async Partition API (`POST /v1/partition/run?async=true`)**: Instant HTTP 202 response; offloads heavy serialization and S3 uploads to worker pool.
-    - **Periodic Background Disk Sync (`db.Sync()`)**: Continuous streaming flush to disk every 5 minutes without query blocking.
+- **Resilient Background Pipeline (Pure Go, zero external broker)**:
+  - **Cron Scheduler (`pkg/scheduler`)**: Pure-Go scheduler with panic recovery, overlap prevention (skip-if-still-running), and graceful shutdown.
+  - **Worker Engine (`pkg/worker`)**: Non-blocking asynchronous task execution on a bounded Go channel pool:
+    - **Async Partition API (`POST /v1/partition/run?async=true`)**: Instant HTTP 202 response; offloads heavy serialization and S3 uploads to the worker pool.
+    - **Periodic Background Disk Sync (`db.Sync()`)**: Streaming flush to disk every 5 minutes (default) without blocking client queries.
+- **Single Direct Dependency**: Binary links exactly one external module — `github.com/google/uuid` — zero brokers, zero cron/queue frameworks, zero CGO.
 - **Fine-Grained Memory Allocation**: Support for explicit soft RAM limits (**500MB, 1GB, 5GB**) with auto-detection of Docker/Podman cgroup ceilings.
 - **Multi-Model Routing ("Satu DB = Satu Model")**: Dynamic file separation (`/data/{model}.anchordb`) with path traversal immunity.
 - **Dedicated Port**: Standardized official port **`7447`**.
@@ -50,7 +51,7 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
                    v                                         v                                         v
     +------------------------------+          +------------------------------+          +------------------------------+
     |       REST HTTP Engine       |          |    Cron Scheduler Daemon     |          |     Async Worker Engine      |
-    | /v1/save, /v1/get, /v1/list  |          |     (gosuite/v3/cron)        |          |    (gosuite/v3/worker)       |
+    | /v1/save, /v1/get, /v1/list  |          |        (pure Go)             |          |        (pure Go)             |
     | /v1/update, /v1/graph, /sync |          | Daily 23:00 / Sync Every 5m  |          | Async Partitions & Sync Pool |
     +--------------+---------------+          +--------------+---------------+          +--------------+---------------+
                    |                                         |                                         |
@@ -76,16 +77,31 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 
 ## Background Subsystems: Cron & Worker
 
-### 1. Cron Scheduler (`pkg/scheduler` $\rightarrow$ `gosuite/v3/cron`)
-- **Automated Archival**: Runs daily (default `23:00` or custom cron expression) to partition historical records older than $N$ days.
-- **Periodic Background Sync**: Triggers safe disk streaming syncs at regular intervals (default `@every 5m`).
+### 1. Cron Scheduler (`pkg/scheduler`, pure Go)
+- **Automated Archival**: Runs daily (default `23:00`) to partition historical records older than $N$ days.
+- **Periodic Background Sync**: Triggers safe disk streaming syncs at regular intervals (default `5m`).
 - **Overlap Prevention**: Built-in `skip-if-still-running` protection and panic recovery.
 - **Inspection**: Real-time status via `GET /v1/scheduler/status`.
 
-### 2. Worker Engine (`pkg/worker` $\rightarrow$ `gosuite/v3/worker`)
-- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "queued"}`) within 1 millisecond. The worker pool generates partition files and uploads to S3 in the background.
-- **Continuous Background Disk Sync**: Safely streams memory-mapped buffers to disk without locking client queries.
-- **Throttled Concurrency**: Controlled worker goroutines prevent CPU starvation.
+**Supported schedule formats** (`ANCHORDB_PARTITION_SCHEDULE` / `ANCHORDB_SYNC_INTERVAL`):
+
+| Format | Example | Meaning |
+| :--- | :--- | :--- |
+| `HH:MM` | `23:00` | Daily at 23:00 |
+| `M H * * *` | `0 23 * * *` | Daily at 23:00 |
+| `@daily` | `@daily` | Daily at 00:00 |
+| `@hourly` | `@hourly` | Every hour |
+| Duration / `@every` | `5m`, `30m`, `@every 1h` | Recurring interval |
+
+> **Note:** only the **time-of-day** is honored for cron specs — day-of-month, month and day-of-week
+> fields (e.g. `0 2 * * 1`) are ignored, and other forms (e.g. `*/5 * * * *`, `@weekly`) are rejected
+> at startup. Use a duration (`5m`) for sub-daily recurring work.
+
+### 2. Worker Engine (`pkg/worker`, pure Go)
+- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "queued"}`) when the worker pool is enabled. The pool generates partition files and uploads to S3 in the background.
+- **Continuous Background Disk Sync**: Streams memory-mapped buffers to disk without locking client queries.
+- **Throttled Concurrency**: A fixed pool of worker goroutines (`ANCHORDB_WORKER_CONCURRENCY`, default `CPU × 2`) prevents CPU starvation.
+- **Bounded Task Queue**: Tasks flow through a bounded Go channel (`ANCHORDB_WORKER_QUEUE_SIZE`, default `1000`); dispatch is non-blocking and fails fast with `ErrQueueFull` when saturated.
 - **Inspection**: Real-time metrics via `GET /v1/worker/status`.
 
 ---
@@ -99,13 +115,13 @@ All settings can be configured via environment variables or CLI flags:
 | **Port** | `-port` | `ANCHORDB_PORT` | `7447` | HTTP REST API port |
 | **Data Dir** | `-data-dir` | `ANCHORDB_DATA_DIR` | `/data` or `./data` | Directory storing `*.anchordb` files |
 | **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer authorization token |
-| **Memory Limit** | `-memory-limit`, `-m` | `ANCHORDB_MEMORY_LIMIT` | `""` (auto) | Soft memory limit (e.g. `500MB`, `1GB`, `5GB`) |
+| **Memory Limit** | `-memory-limit`, `-mem-limit`, `-m` | `ANCHORDB_MEMORY_LIMIT` | `""` (auto) | Soft memory limit (e.g. `500MB`, `1GB`, `5GB`) |
 | **IP Whitelist** | `-ip-whitelist` | `ANCHORDB_IP_WHITELIST` | `""` (all open) | CIDR or IP list e.g. `127.0.0.1,192.168.1.0/24` |
 | **Trust Proxy** | `-trust-proxy` | `ANCHORDB_TRUST_PROXY` | `false` | Trust `X-Forwarded-For` proxy headers |
 | **Cron Enabled** | `-cron-enabled` | `ANCHORDB_CRON_ENABLED` | `true` | Enable background scheduler |
-| **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM` or cron spec `0 23 * * *`) |
+| **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM`, `M H * * *`, `@daily`, `@hourly`, or interval; see note above) |
 | **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
-| **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval |
+| **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval (`5m`, `30m`, etc.) |
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
@@ -161,13 +177,20 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `GET /v1/worker/status`: Worker pool concurrency and task execution counters.
 
 ### 2. Mutation & Query Endpoints
-- `POST /v1/save`: Ingest an entity with key-value properties.
-- `POST /v1/get`: Query an entity by name with optional in-storage computations.
-- `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters.
-- `POST /v1/update`: Constant-time batch update with arithmetic mutations.
+- `POST /v1/save`: Ingest an entity with key-value properties and optional `operation` status (`1` = Active by default, `0` = Safe-Delete).
+- `POST /v1/get`: Query an entity by name with optional in-storage computations (returns properties and current `operation` status).
+- `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters (filters `operation = 1` active by default; supports `operation` filter or `include_all_operations: true`).
+- `POST /v1/update`: Constant-time batch update with arithmetic mutations (automatically skips entities not in active `operation = 1` state).
 - `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
 - `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
-- `POST /v1/partition/run`: Triggers partition archival (add `"async": true` in JSON body or `?async=true` to offload to worker and return HTTP 202 immediately).
+- `POST /v1/partition/run`: Triggers partition archival with Safe-Delete rollback protection (`0` Safe-Delete during archival $\rightarrow$ `2` Tombstone on success; add `"async": true` in JSON body to offload to worker).
+- `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state.
+
+### 3. Record Operation Lifecycle Machine
+AnchorDB records follow a three-state operational lifecycle:
+- **`1` (ACTIVE)**: Normal queryable record (default for new records). Eligible for reads and updates.
+- **`0` (SAFE_DELETE)**: In-flight safe delete / pending archival / partition lock. Locked against mutations; excluded from normal queries. Automatically rolled back to `1` if archival fails.
+- **`2` (TOMBSTONE)**: Marked for deletion upon partition success. Excluded from normal lookups and swept in batches by the background collector during periodic disk sync or `/v1/collector/run`.
 
 ---
 

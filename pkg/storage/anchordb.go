@@ -36,38 +36,49 @@ type GraphQueryResult struct {
 	Score      float32         `json:"score"`
 }
 
+// Operation lifecycle states
+const (
+	OpStatusSafeDelete uint8 = 0 // In-flight safe-delete / pending archive / locked from mutation
+	OpStatusActive     uint8 = 1 // Normal active record (default)
+	OpStatusTombstone  uint8 = 2 // Marked for background garbage collector
+)
+
 // AttrEntry stores a single numeric attribute key-value pair in a compact flat slice
 type AttrEntry struct {
 	Key   string
 	Value float32
 }
 
-// CompactRecord stores properties in a contiguous slice, saving ~70% RAM vs Go hmap
-type CompactRecord []AttrEntry
+// CompactRecord stores properties and operation lifecycle state in a compact structure
+type CompactRecord struct {
+	Operation uint8
+	Attrs     []AttrEntry
+}
 
 func (cr CompactRecord) Get(key string) (float32, bool) {
-	for i := range cr {
-		if cr[i].Key == key {
-			return cr[i].Value, true
+	for i := range cr.Attrs {
+		if cr.Attrs[i].Key == key {
+			return cr.Attrs[i].Value, true
 		}
 	}
 	return 0, false
 }
 
 func (cr CompactRecord) Set(key string, val float32) CompactRecord {
-	for i := range cr {
-		if cr[i].Key == key {
-			cr[i].Value = val
+	for i := range cr.Attrs {
+		if cr.Attrs[i].Key == key {
+			cr.Attrs[i].Value = val
 			return cr
 		}
 	}
-	return append(cr, AttrEntry{Key: key, Value: val})
+	cr.Attrs = append(cr.Attrs, AttrEntry{Key: key, Value: val})
+	return cr
 }
 
 func (cr CompactRecord) ToMap() map[string]float32 {
-	m := make(map[string]float32, len(cr))
-	for i := range cr {
-		m[cr[i].Key] = cr[i].Value
+	m := make(map[string]float32, len(cr.Attrs))
+	for i := range cr.Attrs {
+		m[cr.Attrs[i].Key] = cr.Attrs[i].Value
 	}
 	return m
 }
@@ -85,9 +96,37 @@ func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
 	return m
 }
 
+// MatchesFilter evaluates a FilterCondition directly on CompactRecord without allocating a map on the heap.
+func (cr CompactRecord) MatchesFilter(f FilterCondition) bool {
+	val, exists := cr.Get(f.Field)
+	if !exists {
+		return false
+	}
+	switch f.Operator {
+	case "=":
+		return val == f.Value
+	case "!=":
+		return val != f.Value
+	case ">":
+		return val > f.Value
+	case ">=":
+		return val >= f.Value
+	case "<":
+		return val < f.Value
+	case "<=":
+		return val <= f.Value
+	case "BETWEEN":
+		return val >= f.Value && val <= f.ValueHigh
+	default:
+		return false
+	}
+}
+
 // AnchorDB is the computational spatial graph storage engine.
 type AnchorDB struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
+	syncMu sync.Mutex
+	wal    *WALManager
 
 	file      *os.File
 	mmapData  []byte
@@ -340,13 +379,15 @@ func (f FilterCondition) Matches(props map[string]float32) bool {
 	}
 }
 
-// QueryOptions defines criteria for List queries with pagination and column selection (Projection)
+// QueryOptions defines criteria for List queries with pagination, column selection, and operation filtering
 type QueryOptions struct {
-	Select       []string // Projection: list of fields to return (empty means return all fields)
-	Filters      []FilterCondition
-	Computations map[string]ComputeOp
-	Limit        int
-	Offset       int
+	IncludeAllOperations bool              // If true, returns records regardless of operation status (0, 1, 2)
+	OperationFilter      *uint8            // If specified, filters specifically by this operation status
+	Select               []string          // Projection: list of fields to return (empty means return all fields)
+	Filters              []FilterCondition
+	Computations         map[string]ComputeOp
+	Limit                int
+	Offset               int
 }
 
 // projectProperties filters props to only include fields specified in selectFields.
@@ -364,10 +405,11 @@ func projectProperties(props map[string]float32, selectFields []string) map[stri
 	return projected
 }
 
-// EntityRecord represents a returned entity with properties
+// EntityRecord represents a returned entity with properties and operation lifecycle state
 type EntityRecord struct {
-	Name  string             `json:"name"`
-	Props map[string]float32 `json:"props"`
+	Name      string             `json:"name"`
+	Operation uint8              `json:"operation"`
+	Props     map[string]float32 `json:"props"`
 }
 
 func (db *AnchorDB) internAttr(s string) string {
@@ -489,7 +531,74 @@ func Open(filePath string) (*AnchorDB, error) {
 		return nil, err
 	}
 
+	// Initialize WAL for append-only durability
+	walPath := filePath + ".wal"
+	wal, err := OpenWAL(walPath)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to open wal: %w", err)
+	}
+	db.wal = wal
+
+	// Replay WAL for crash recovery (restores mutations lost before the last Sync)
+	_, err = db.wal.Replay(func(op byte, name string, cr CompactRecord, word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error {
+		switch op {
+		case WalOpSave:
+			db.applyWALSaveLocked(name, cr)
+		case WalOpDelete:
+			db.applyWALDeleteLocked(name)
+		case WalOpNode:
+			db.appendNodeLocked(word, coord, roles, domainID)
+		}
+		return nil
+	})
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to replay wal: %w", err)
+	}
+
 	return db, nil
+}
+
+func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
+	internedAttrs := make([]AttrEntry, 0, len(cr.Attrs))
+	for _, attr := range cr.Attrs {
+		internedAttrs = append(internedAttrs, AttrEntry{
+			Key:   db.internAttr(attr.Key),
+			Value: attr.Value,
+		})
+	}
+	if _, exists := db.EntityStore[name]; !exists {
+		db.EntityOrder = append(db.EntityOrder, name)
+	}
+	db.EntityStore[name] = CompactRecord{
+		Operation: cr.Operation,
+		Attrs:     internedAttrs,
+	}
+
+	// Ensure entity also exists in the geometric graph
+	if _, exists := db.Lexicon[name]; !exists {
+		angle := float32(len(name)) * 0.5
+		coord := spatial.Point2D{
+			X: float32(math.Cos(float64(angle))) * 0.5,
+			Y: float32(math.Sin(float64(angle))) * 0.5,
+		}
+		db.appendNodeLocked(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
+	}
+}
+
+func (db *AnchorDB) applyWALDeleteLocked(name string) {
+	delete(db.EntityStore, name)
+	if nodeIdx, exists := db.Lexicon[name]; exists {
+		delete(db.Lexicon, name)
+		db.markNodeDeleted(nodeIdx)
+	}
+	for i, n := range db.EntityOrder {
+		if n == name {
+			db.EntityOrder = append(db.EntityOrder[:i], db.EntityOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 func (db *AnchorDB) initEmptyFile(filePath string) error {
@@ -573,16 +682,28 @@ func (db *AnchorDB) loadEntities() error {
 		}
 		nameLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
-		if offset+nameLen+2 > len(data) {
+		if offset+nameLen > len(data) {
 			break
 		}
 		name := string(data[offset : offset+nameLen])
 		offset += nameLen
 
+		opStatus := OpStatusActive
+		if db.Header.Version >= 2 {
+			if offset+1 > len(data) {
+				break
+			}
+			opStatus = data[offset]
+			offset += 1
+		}
+
+		if offset+2 > len(data) {
+			break
+		}
 		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 
-		cr := make(CompactRecord, 0, attrCount)
+		attrs := make([]AttrEntry, 0, attrCount)
 		for a := 0; a < attrCount; a++ {
 			if offset+2 > len(data) {
 				break
@@ -596,9 +717,9 @@ func (db *AnchorDB) loadEntities() error {
 			offset += keyLen
 			valBits := binary.LittleEndian.Uint32(data[offset : offset+4])
 			offset += 4
-			cr = append(cr, AttrEntry{Key: key, Value: math.Float32frombits(valBits)})
+			attrs = append(attrs, AttrEntry{Key: key, Value: math.Float32frombits(valBits)})
 		}
-		db.EntityStore[name] = cr
+		db.EntityStore[name] = CompactRecord{Operation: opStatus, Attrs: attrs}
 		db.EntityOrder = append(db.EntityOrder, name)
 	}
 	return nil
@@ -640,6 +761,10 @@ func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]floa
 
 	db.Header.NodeCount = uint64(db.totalNodes())
 
+	if db.wal != nil {
+		_ = db.wal.WriteNode(word, coord, roles, domainID)
+	}
+
 	return newID, nil
 }
 
@@ -676,16 +801,15 @@ func (db *AnchorDB) appendNodeLocked(word string, coord spatial.Point2D, roles [
 	return newID
 }
 
-// SaveRecord stores an entity and its raw numeric properties in AnchorDB (SAVING).
+// SaveRecord stores an entity and its raw numeric properties in AnchorDB with default OpStatusActive (1).
 // If name is an empty string, a unique UUIDv4 is automatically generated.
 func (db *AnchorDB) SaveRecord(name string, props map[string]float32) error {
 	_, err := db.SaveRecordWithID(name, props)
 	return err
 }
 
-// SaveRecordWithID stores an entity and its raw numeric properties, returning the assigned name.
-// If name is an empty string or whitespace, a unique UUIDv4 is automatically generated.
-func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (string, error) {
+// SaveRecordWithIDAndOp stores an entity with an explicit operation lifecycle state.
+func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map[string]float32) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = uuid.NewString()
@@ -694,10 +818,22 @@ func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (str
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	cr := make(CompactRecord, 0, len(props))
+	attrs := make([]AttrEntry, 0, len(props))
 	for k, v := range props {
-		cr = append(cr, AttrEntry{Key: db.internAttr(k), Value: v})
+		attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
 	}
+	cr := CompactRecord{
+		Operation: opStatus,
+		Attrs:     attrs,
+	}
+
+	// Persist to append-only WAL before applying to in-memory store
+	if db.wal != nil {
+		if err := db.wal.WriteSave(name, cr); err != nil {
+			return "", fmt.Errorf("failed to write to wal: %w", err)
+		}
+	}
+
 	if _, exists := db.EntityStore[name]; !exists {
 		db.EntityOrder = append(db.EntityOrder, name)
 	}
@@ -716,17 +852,36 @@ func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (str
 	return name, nil
 }
 
+// SaveRecordWithID stores an entity with default OpStatusActive (1).
+func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (string, error) {
+	return db.SaveRecordWithIDAndOp(name, OpStatusActive, props)
+}
+
 // GetRecord retrieves stored raw properties of an entity (GETTING), optionally selecting specific fields.
+// Returns error if entity does not exist or has been marked as OpStatusTombstone (2).
 func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
 	cr, exists := db.EntityStore[name]
-	if !exists {
+	if !exists || cr.Operation == OpStatusTombstone {
 		return nil, fmt.Errorf("record not found: %q", name)
 	}
 
 	return cr.Project(selectFields), nil
+}
+
+// GetRecordWithOperation retrieves stored properties along with the operation lifecycle state.
+func (db *AnchorDB) GetRecordWithOperation(name string, selectFields ...string) (map[string]float32, uint8, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	cr, exists := db.EntityStore[name]
+	if !exists || cr.Operation == OpStatusTombstone {
+		return nil, 0, fmt.Errorf("record not found: %q", name)
+	}
+
+	return cr.Project(selectFields), cr.Operation, nil
 }
 
 // GetRecordWithCompute retrieves raw properties AND computes derived fields in-storage (CALCULATING),
@@ -771,29 +926,7 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		return nil, false, nil
 	}
 
-	// FAST PATH: If no filters and no calculations, directly slice in O(1)!
-	if len(opts.Filters) == 0 && len(opts.Computations) == 0 {
-		end := offset + limit
-		hasMore := false
-		if end < totalEntities {
-			hasMore = true
-		} else {
-			end = totalEntities
-		}
-
-		results := make([]EntityRecord, end-offset)
-		for i := offset; i < end; i++ {
-			name := db.EntityOrder[i]
-			cr := db.EntityStore[name]
-			results[i-offset] = EntityRecord{
-				Name:  name,
-				Props: cr.Project(opts.Select),
-			}
-		}
-		return results, hasMore, nil
-	}
-
-	// FILTERED / COMPUTED PATH: Stream sequentially with early termination at limit
+	// Stream sequentially with Operation lifecycle filtering and early termination at limit
 	var results []EntityRecord
 	skipped := 0
 	hasMore := false
@@ -801,6 +934,33 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 	for i := 0; i < totalEntities; i++ {
 		name := db.EntityOrder[i]
 		cr := db.EntityStore[name]
+
+		// Filter by Operation lifecycle state
+		if opts.OperationFilter != nil {
+			if cr.Operation != *opts.OperationFilter {
+				continue
+			}
+		} else if !opts.IncludeAllOperations {
+			// By default, only return active records (Operation == OpStatusActive)
+			if cr.Operation != OpStatusActive {
+				continue
+			}
+		}
+
+		// Fast filter check before heap allocation if no computations
+		if len(opts.Computations) == 0 && len(opts.Filters) > 0 {
+			matches := true
+			for _, filter := range opts.Filters {
+				if !cr.MatchesFilter(filter) {
+					matches = false
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
+		}
+
 		props := cr.ToMap()
 
 		// Apply in-storage computations
@@ -817,16 +977,18 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			continue
 		}
 
-		// Apply Where conditions (matches both raw and computed fields)
-		matches := true
-		for _, filter := range opts.Filters {
-			if !filter.Matches(props) {
-				matches = false
-				break
+		// Apply Where conditions if computations were present
+		if len(opts.Computations) > 0 {
+			matches := true
+			for _, filter := range opts.Filters {
+				if !filter.Matches(props) {
+					matches = false
+					break
+				}
 			}
-		}
-		if !matches {
-			continue
+			if !matches {
+				continue
+			}
 		}
 
 		// Handle pagination Offset
@@ -844,8 +1006,9 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		// Project to selected columns
 		finalProps := projectProperties(props, opts.Select)
 		results = append(results, EntityRecord{
-			Name:  name,
-			Props: finalProps,
+			Name:      name,
+			Operation: cr.Operation,
+			Props:     finalProps,
 		})
 	}
 
@@ -884,15 +1047,14 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				break
 			}
 			cr, exists := db.EntityStore[name]
-			if !exists {
+			if !exists || cr.Operation != OpStatusActive {
 				continue
 			}
-			props := cr.ToMap()
 
-			// Check filters if any
+			// Check filters without allocating map on heap
 			matches := true
 			for _, f := range opts.Filters {
-				if !f.Matches(props) {
+				if !cr.MatchesFilter(f) {
 					matches = false
 					break
 				}
@@ -900,6 +1062,8 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			if !matches {
 				continue
 			}
+
+			props := cr.ToMap()
 
 			// Apply in-place mathematical mutations based on snapshot
 			pending := make(map[string]float32, len(opts.Mutations))
@@ -911,6 +1075,9 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			}
 			for k, v := range pending {
 				cr = cr.Set(db.internAttr(k), v)
+			}
+			if db.wal != nil {
+				_ = db.wal.WriteSave(name, cr)
 			}
 			db.EntityStore[name] = cr
 			updatedCount++
@@ -932,12 +1099,14 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		}
 
 		cr := db.EntityStore[name]
-		props := cr.ToMap()
+		if cr.Operation != OpStatusActive {
+			continue
+		}
 
-		// Check filters
+		// Check filters without allocating map on heap
 		matches := true
 		for _, f := range opts.Filters {
-			if !f.Matches(props) {
+			if !cr.MatchesFilter(f) {
 				matches = false
 				break
 			}
@@ -951,6 +1120,8 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			continue
 		}
 
+		props := cr.ToMap()
+
 		// Apply in-place mathematical mutations based on snapshot
 		pending := make(map[string]float32, len(opts.Mutations))
 		for field, op := range opts.Mutations {
@@ -962,11 +1133,90 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		for k, v := range pending {
 			cr = cr.Set(db.internAttr(k), v)
 		}
+		if db.wal != nil {
+			_ = db.wal.WriteSave(name, cr)
+		}
 		db.EntityStore[name] = cr
 		updatedCount++
 	}
 
 	return updatedCount, nil
+}
+
+// SetOperationStatus updates the operation lifecycle state for the specified entity names.
+// Persists the changes to WAL and updates EntityStore. Returns the number of entities updated.
+func (db *AnchorDB) SetOperationStatus(names []string, status uint8) int {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	updated := 0
+	for _, name := range names {
+		cr, exists := db.EntityStore[name]
+		if !exists {
+			continue
+		}
+		if cr.Operation == status {
+			continue
+		}
+		cr.Operation = status
+		db.EntityStore[name] = cr
+		if db.wal != nil {
+			_ = db.wal.WriteSave(name, cr)
+		}
+		updated++
+	}
+	return updated
+}
+
+// CollectTombstones purges up to maxBatch entities marked with OpStatusTombstone (2).
+// Returns the number of tombstones collected and deleted from storage and graph index.
+func (db *AnchorDB) CollectTombstones(maxBatch int) int {
+	if maxBatch <= 0 {
+		maxBatch = 1000
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var toPurge []string
+	for _, name := range db.EntityOrder {
+		if cr, exists := db.EntityStore[name]; exists && cr.Operation == OpStatusTombstone {
+			toPurge = append(toPurge, name)
+			if len(toPurge) >= maxBatch {
+				break
+			}
+		}
+	}
+
+	if len(toPurge) == 0 {
+		return 0
+	}
+
+	for _, n := range toPurge {
+		delete(db.EntityStore, n)
+		if nodeIdx, exists := db.Lexicon[n]; exists {
+			delete(db.Lexicon, n)
+			db.markNodeDeleted(nodeIdx)
+		}
+		if db.wal != nil {
+			_ = db.wal.WriteDelete(n)
+		}
+	}
+
+	purgeSet := make(map[string]bool, len(toPurge))
+	for _, n := range toPurge {
+		purgeSet[n] = true
+	}
+	newOrder := make([]string, 0, len(db.EntityOrder)-len(toPurge))
+	for _, n := range db.EntityOrder {
+		if !purgeSet[n] {
+			newOrder = append(newOrder, n)
+		}
+	}
+	db.EntityOrder = newOrder
+	db.Header.EntityCount = uint64(len(db.EntityOrder))
+
+	return len(toPurge)
 }
 
 // DeleteRecords removes specified entity names from EntityStore, EntityOrder, and graph index.
@@ -984,6 +1234,10 @@ func (db *AnchorDB) DeleteRecords(names []string) int {
 			delete(db.Lexicon, n)
 			db.markNodeDeleted(nodeIdx)
 		}
+
+		if db.wal != nil {
+			_ = db.wal.WriteDelete(n)
+		}
 	}
 
 	newOrder := make([]string, 0, len(db.EntityOrder)-len(toDelete))
@@ -1000,26 +1254,57 @@ func (db *AnchorDB) DeleteRecords(names []string) int {
 	return deletedCount
 }
 
-// Sync flushes all pending memory records to disk.
+// Sync flushes pending records to disk and truncates the WAL log up to the snapshot point.
+// Read and write queries are NOT blocked during disk serialization and kernel fsync.
 func (db *AnchorDB) Sync() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.syncMu.Lock()
+	defer db.syncMu.Unlock()
 
-	// Calculate file offsets
-	nodesOffset := uint64(HeaderSize)
+	// 1. Take in-memory snapshot under brief write lock (microsecond latency)
+	db.mu.Lock()
 	totNodes := db.totalNodes()
+	nodesSnapshot := make([]BinaryNodeRecord, totNodes)
+	for j := 0; j < totNodes; j++ {
+		nodesSnapshot[j] = db.getNode(uint32(j))
+	}
+	stringPoolSnapshot := make([]byte, len(db.stringPool))
+	copy(stringPoolSnapshot, db.stringPool)
+
+	entityOrderSnapshot := make([]string, len(db.EntityOrder))
+	copy(entityOrderSnapshot, db.EntityOrder)
+
+	entityStoreSnapshot := make(map[string]CompactRecord, len(db.EntityStore))
+	for _, name := range entityOrderSnapshot {
+		cr := db.EntityStore[name]
+		attrsCopy := make([]AttrEntry, len(cr.Attrs))
+		copy(attrsCopy, cr.Attrs)
+		entityStoreSnapshot[name] = CompactRecord{
+			Operation: cr.Operation,
+			Attrs:     attrsCopy,
+		}
+	}
+
+	hdrSnapshot := db.Header
+	hdrSnapshot.Version = DBVersion // Ensure synced header is v2
+	nodesOffset := uint64(HeaderSize)
 	nodesSize := uint64(totNodes * RecordSize)
 	stringOffset := nodesOffset + nodesSize
-	stringSize := uint64(len(db.stringPool))
+	stringSize := uint64(len(stringPoolSnapshot))
 	entityOffset := stringOffset + stringSize
 
-	db.Header.NodesOffset = nodesOffset
-	db.Header.StringOffset = stringOffset
-	db.Header.NodeCount = uint64(totNodes)
-	db.Header.EntityCount = uint64(len(db.EntityOrder))
-	db.Header.EntityOffset = entityOffset
+	hdrSnapshot.NodesOffset = nodesOffset
+	hdrSnapshot.StringOffset = stringOffset
+	hdrSnapshot.NodeCount = uint64(totNodes)
+	hdrSnapshot.EntityCount = uint64(len(entityOrderSnapshot))
+	hdrSnapshot.EntityOffset = entityOffset
 
-	// Create atomic temp file in same directory (guarantees atomic POSIX rename on same filesystem)
+	var walCheckpointOffset int64
+	if db.wal != nil {
+		walCheckpointOffset, _ = db.wal.CurrentOffset()
+	}
+	db.mu.Unlock() // UNLOCK: Read/Write queries are free to proceed while disk I/O runs!
+
+	// 2. Stream snapshot to temp file and fsync - TOTALLY UNLOCKED!
 	tempFile, err := os.CreateTemp(filepath.Dir(db.filePath), ".anchordb_sync_*.tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file for sync: %w", err)
@@ -1036,12 +1321,12 @@ func (db *AnchorDB) Sync() error {
 
 	// 1. Header (64 bytes)
 	var hdrBuf [HeaderSize]byte
-	db.Header.Encode(hdrBuf[:])
+	hdrSnapshot.Encode(hdrBuf[:])
 	if _, err := writer.Write(hdrBuf[:]); err != nil {
 		return err
 	}
 
-	// 2. Nodes Array (written in 1024-node batches, read safely from db.getNode without unmapping early)
+	// 2. Nodes Array (written in 1024-node batches from snapshot)
 	const nodeBatchSize = 1024
 	for i := 0; i < totNodes; i += nodeBatchSize {
 		end := i + nodeBatchSize
@@ -1050,26 +1335,26 @@ func (db *AnchorDB) Sync() error {
 		}
 		batch := make([]byte, (end-i)*RecordSize)
 		for j := i; j < end; j++ {
-			rec := db.getNode(uint32(j))
-			rec.Encode(batch[(j-i)*RecordSize : (j-i+1)*RecordSize])
+			nodesSnapshot[j].Encode(batch[(j-i)*RecordSize : (j-i+1)*RecordSize])
 		}
 		if _, err := writer.Write(batch); err != nil {
 			return err
 		}
 	}
 
-	// 3. String Pool (streamed write)
-	if len(db.stringPool) > 0 {
-		if _, err := writer.Write(db.stringPool); err != nil {
+	// 3. String Pool (streamed write from snapshot)
+	if len(stringPoolSnapshot) > 0 {
+		if _, err := writer.Write(stringPoolSnapshot); err != nil {
 			return err
 		}
 	}
 
-	// 4. Entity Section (streamed directly to disk buffer without monolithic allocation)
+	// 4. Entity Section (streamed directly to disk buffer from snapshot)
 	var lBuf [2]byte
 	var vBuf [4]byte
-	for _, name := range db.EntityOrder {
-		cr := db.EntityStore[name]
+	var opBuf [1]byte
+	for _, name := range entityOrderSnapshot {
+		cr := entityStoreSnapshot[name]
 		nameBytes := []byte(name)
 
 		// 2 bytes name length + name bytes
@@ -1081,13 +1366,19 @@ func (db *AnchorDB) Sync() error {
 			return err
 		}
 
+		// 1 byte operation status (DBVersion >= 2)
+		opBuf[0] = cr.Operation
+		if _, err := writer.Write(opBuf[:]); err != nil {
+			return err
+		}
+
 		// 2 bytes attr count
-		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(cr)))
+		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(cr.Attrs)))
 		if _, err := writer.Write(lBuf[:]); err != nil {
 			return err
 		}
 
-		for _, attr := range cr {
+		for _, attr := range cr.Attrs {
 			kBytes := []byte(attr.Key)
 			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
 			if _, err := writer.Write(lBuf[:]); err != nil {
@@ -1111,6 +1402,10 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 	_ = tempFile.Close()
+
+	// 3. Briefly acquire db.mu.Lock only for atomic file swap and WAL checkpointing
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	// Unmap previous file view and close old file descriptor before atomic rename
 	if db.isMmapped && db.mmapData != nil {
@@ -1153,8 +1448,21 @@ func (db *AnchorDB) Sync() error {
 	}
 	db.mmapData = mmapData
 	db.isMmapped = true
-	db.syncedNodeCount = db.Header.NodeCount
-	db.pendingNodes = nil
+	db.Header = hdrSnapshot
+
+	// Prune pending nodes that were captured in snapshot
+	if uint64(len(db.pendingNodes)) >= (uint64(totNodes) - db.syncedNodeCount) {
+		addedSince := uint64(totNodes) - db.syncedNodeCount
+		db.pendingNodes = db.pendingNodes[addedSince:]
+	} else {
+		db.pendingNodes = nil
+	}
+	db.syncedNodeCount = uint64(totNodes)
+
+	// Checkpoint WAL up to the snapshot offset
+	if db.wal != nil {
+		_ = db.wal.Checkpoint(walCheckpointOffset)
+	}
 
 	return nil
 }
@@ -1502,10 +1810,15 @@ func (db *AnchorDB) ExecuteGraphChain(initialInputs []string, relationChain []st
 	return chainResults, nil
 }
 
-// Close closes the database and releases mmap resources.
+// Close closes the database and releases mmap and WAL resources.
 func (db *AnchorDB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	if db.wal != nil {
+		_ = db.wal.Close()
+		db.wal = nil
+	}
 
 	if db.isMmapped && db.mmapData != nil {
 		_ = syscall.Munmap(db.mmapData)

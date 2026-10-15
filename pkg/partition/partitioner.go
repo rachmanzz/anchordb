@@ -48,8 +48,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	cutoffDays := nowDays - policy.RetentionDays
 	cutoffDateStr := storage.FormatDate(cutoffDays)
 
-	// 2. Query all records strictly before cutoff date
+	// 2. Query active records strictly before cutoff date
+	activeOp := storage.OpStatusActive
 	records, _, err := db.ListRecordsWithPaging(storage.QueryOptions{
+		OperationFilter: &activeOp,
 		Filters: []storage.FilterCondition{
 			{
 				Field:    policy.DateField,
@@ -74,6 +76,20 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		}, nil
 	}
 
+	archivedNames := make([]string, len(records))
+	for i, r := range records {
+		archivedNames[i] = r.Name
+	}
+
+	// Phase A: Transition records to SafeDelete (0) to lock from mutations & hide from regular queries
+	db.SetOperationStatus(archivedNames, storage.OpStatusSafeDelete)
+
+	// Helper for rollback if archival fails
+	rollback := func(causeErr error) error {
+		db.SetOperationStatus(archivedNames, storage.OpStatusActive)
+		return causeErr
+	}
+
 	// 3. Create formatted partition file name: e.g. 2026-10-15_uuid.anchordb
 	currentDateStr := time.Now().UTC().Format("2006-01-02")
 	partitionFilename := FormatPartitionFilename(currentDateStr, policy.FileFormat)
@@ -81,44 +97,47 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	// 4. Create isolated temporary .anchordb file for the partition
 	tempDir, err := os.MkdirTemp("", "anchordb_part_*")
 	if err != nil {
-		return nil, err
+		return nil, rollback(err)
 	}
 	defer os.RemoveAll(tempDir)
 
 	tempDBPath := filepath.Join(tempDir, partitionFilename)
 	partDB, err := storage.Open(tempDBPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed creating partition database: %w", err)
+		return nil, rollback(fmt.Errorf("failed creating partition database: %w", err))
 	}
 
-	archivedNames := make([]string, len(records))
-	for i, r := range records {
+	for _, r := range records {
 		_ = partDB.SaveRecord(r.Name, r.Props)
-		archivedNames[i] = r.Name
 	}
 
 	if err := partDB.Sync(); err != nil {
 		_ = partDB.Close()
-		return nil, fmt.Errorf("failed syncing partition database: %w", err)
+		return nil, rollback(fmt.Errorf("failed syncing partition database: %w", err))
 	}
 	_ = partDB.Close()
 
 	// 5. Read binary partition file data
 	data, err := os.ReadFile(tempDBPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed reading partition file data: %w", err)
+		return nil, rollback(fmt.Errorf("failed reading partition file data: %w", err))
 	}
 
 	// 6. Write to sink (Local directory or S3)
 	targetLoc, err := policy.Sink.SavePartition(partitionFilename, data)
 	if err != nil {
-		return nil, fmt.Errorf("failed saving to sink %s: %w", policy.Sink.Name(), err)
+		return nil, rollback(fmt.Errorf("failed saving to sink %s: %w", policy.Sink.Name(), err))
 	}
 
-	// 7. Prune archived records from hot database if configured
+	// Phase B: Archival succeeded!
 	if policy.PruneHotDB {
-		_ = db.DeleteRecords(archivedNames)
+		// Transition to Tombstone (2) and sweep
+		db.SetOperationStatus(archivedNames, storage.OpStatusTombstone)
+		_ = db.CollectTombstones(len(archivedNames))
 		_ = db.Sync() // Compacts active database file on disk!
+	} else {
+		// Kept in hot DB - restore back to Active (1)
+		db.SetOperationStatus(archivedNames, storage.OpStatusActive)
 	}
 
 	return &PartitionResult{

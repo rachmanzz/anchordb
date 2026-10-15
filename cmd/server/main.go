@@ -201,13 +201,15 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 		t.server.mu.RUnlock()
 
 		var synced int
+		var purged int
 		for _, d := range dbs {
+			purged += d.CollectTombstones(5000)
 			if err := d.Sync(); err == nil {
 				synced++
 			}
 		}
-		if synced > 0 {
-			log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk", synced)
+		if purged > 0 || synced > 0 {
+			log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk, %d tombstones collected", synced, purged)
 		}
 		return nil
 	})
@@ -339,9 +341,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // Request / Response types for REST API
 type SaveRequest struct {
-	Model string             `json:"model"`
-	Name  string             `json:"name"`
-	Props map[string]float32 `json:"props"`
+	Model     string             `json:"model"`
+	Name      string             `json:"name"`
+	Operation *uint8             `json:"operation,omitempty"`
+	Props     map[string]float32 `json:"props"`
 }
 
 type GetRequest struct {
@@ -359,13 +362,15 @@ type FilterDTO struct {
 }
 
 type ListRequest struct {
-	Model        string            `json:"model"`
-	Select       []string          `json:"select"`
-	Filters      []FilterDTO       `json:"filters"`
-	Computations map[string]string `json:"computations"`
-	Limit        int               `json:"limit"`
-	Offset       int               `json:"offset"`
-	Page         int               `json:"page"`
+	Model                string            `json:"model"`
+	Select               []string          `json:"select"`
+	Filters              []FilterDTO       `json:"filters"`
+	Computations         map[string]string `json:"computations"`
+	Limit                int               `json:"limit"`
+	Offset               int               `json:"offset"`
+	Page                 int               `json:"page"`
+	IncludeAllOperations bool              `json:"include_all_operations,omitempty"`
+	Operation            *uint8            `json:"operation,omitempty"`
 }
 
 type UpdateRequest struct {
@@ -457,16 +462,22 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	effectiveName, err := db.SaveRecordWithID(req.Name, req.Props)
+	var opStatus uint8 = storage.OpStatusActive
+	if req.Operation != nil {
+		opStatus = *req.Operation
+	}
+
+	effectiveName, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"name":    effectiveName,
-		"message": "record saved",
+		"success":   true,
+		"name":      effectiveName,
+		"operation": opStatus,
+		"message":   "record saved",
 	})
 }
 
@@ -483,14 +494,20 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, op, err := db.GetRecordWithOperation(req.Name)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		return
+	}
+
 	computations := make(map[string]storage.ComputeOp)
 	for outField, expr := range req.Computations {
-		op, err := parseComputeOp(expr)
+		opCompute, err := parseComputeOp(expr)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"invalid computation %q for field %q: %s"}`, expr, outField, err.Error()), http.StatusBadRequest)
 			return
 		}
-		computations[outField] = op
+		computations[outField] = opCompute
 	}
 
 	props, err := db.GetRecordWithCompute(req.Name, computations, req.Select...)
@@ -500,9 +517,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"name":    req.Name,
-		"props":   props,
+		"success":   true,
+		"name":      req.Name,
+		"operation": op,
+		"props":     props,
 	})
 }
 
@@ -549,11 +567,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	records, hasMore, err := db.ListRecordsWithPaging(storage.QueryOptions{
-		Select:       req.Select,
-		Filters:      filters,
-		Limit:        limit,
-		Offset:       offset,
-		Computations: computations,
+		Select:               req.Select,
+		Filters:              filters,
+		Limit:                limit,
+		Offset:               offset,
+		Computations:         computations,
+		IncludeAllOperations: req.IncludeAllOperations,
+		OperationFilter:      req.Operation,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -863,6 +883,60 @@ func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type CollectorRunRequest struct {
+	Model    string `json:"model"`
+	MaxBatch int    `json:"max_batch"`
+}
+
+func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CollectorRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		http.Error(w, fmt.Sprintf(`{"error":"Invalid request body: %s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	maxBatch := req.MaxBatch
+	if maxBatch <= 0 {
+		maxBatch = 5000
+	}
+
+	var targetModels []string
+	if req.Model != "" && req.Model != "*" {
+		targetModels = []string{req.Model}
+	} else {
+		s.mu.RLock()
+		for m := range s.models {
+			targetModels = append(targetModels, m)
+		}
+		s.mu.RUnlock()
+	}
+
+	totalPurged := 0
+	for _, m := range targetModels {
+		db, err := s.getModel(m)
+		if err != nil {
+			continue
+		}
+		purged := db.CollectTombstones(maxBatch)
+		if purged > 0 {
+			_ = db.Sync()
+		}
+		totalPurged += purged
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"purged_records": totalPurged,
+		"models":         targetModels,
+	})
+}
+
 // Environment / flag resolution helpers
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
@@ -1044,6 +1118,7 @@ func main() {
 	mux.HandleFunc("/v1/graph", server.authMiddleware(server.handleGraph))
 	mux.HandleFunc("/v1/sync", server.authMiddleware(server.handleSync))
 	mux.HandleFunc("/v1/partition/run", server.authMiddleware(server.handlePartitionRun))
+	mux.HandleFunc("/v1/collector/run", server.authMiddleware(server.handleCollectorRun))
 	mux.HandleFunc("/v1/scheduler/status", server.authMiddleware(server.handleSchedulerStatus))
 	mux.HandleFunc("/v1/worker/status", server.authMiddleware(server.handleWorkerStatus))
 
