@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +31,8 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/system"
 	"github.com/rachmanzz/anchordb/pkg/worker"
 )
+
+const maxRequestBodyBytes = 10 << 20
 
 // ServerConfig holds complete runtime configuration parsed from CLI flags and ENV
 type ServerConfig struct {
@@ -142,6 +146,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/list", s.authMiddleware(s.handleList))
 	mux.HandleFunc("/v1/update", s.authMiddleware(s.handleUpdate))
 	mux.HandleFunc("/v1/graph", s.authMiddleware(s.handleGraph))
+	mux.HandleFunc("/v1/edge", s.authMiddleware(s.handleEdge))
+	mux.HandleFunc("/v1/causal", s.authMiddleware(s.handleCausal))
 	mux.HandleFunc("/v1/sync", s.authMiddleware(s.handleSync))
 	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
 	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
@@ -149,7 +155,58 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
-	return s.ipFilter.Middleware(mux)
+	return s.ipFilter.Middleware(limitRequestBody(mux))
+}
+
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+		if err != nil {
+			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+			return
+		}
+		if len(body) > maxRequestBodyBytes {
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func dispatchErrorStatus(err error) int {
+	if errors.Is(err, worker.ErrWorkerUnavailable) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
+}
+
+// resolvePathWithExistingSymlinks resolves the existing prefix of path and
+// appends any not-yet-created suffix. This catches symlinks in the destination
+// while still allowing the sink to create a new directory tree.
+func resolvePathWithExistingSymlinks(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	var suffix []string
+	for candidate := path; ; candidate = filepath.Dir(candidate) {
+		resolved, evalErr := filepath.EvalSymlinks(candidate)
+		if evalErr == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(evalErr) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", evalErr
+		}
+		suffix = append(suffix, filepath.Base(candidate))
+	}
 }
 
 // ErrServerClosed is returned by getModel once Shutdown has sealed the model registry.
@@ -346,7 +403,11 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 			var purged int
 			var syncErrs []error
 			for _, d := range dbs {
-				purged += d.CollectTombstones(5000)
+				collected, err := d.CollectTombstones(5000)
+				purged += collected
+				if err != nil {
+					syncErrs = append(syncErrs, err)
+				}
 				if err := d.Sync(); err != nil {
 					syncErrs = append(syncErrs, err)
 				} else {
@@ -549,6 +610,27 @@ type GraphRequest struct {
 	Inputs   []string `json:"inputs"`
 	Relation string   `json:"relation"`
 	LimitK   int      `json:"limit_k"`
+}
+
+// EdgeRequest registers or removes an explicit directed edge
+// (source --relation--> target) used for cause-and-effect links.
+type EdgeRequest struct {
+	Model    string  `json:"model"`
+	Action   string  `json:"action"` // "add" (default) or "remove"
+	Source   string  `json:"source"`
+	Relation string  `json:"relation"`
+	Target   string  `json:"target"`
+	Weight   float32 `json:"weight"`
+}
+
+// CausalRequest traverses explicit edges. A single relation performs one hop;
+// a relations list performs a weighted multi-hop chain.
+type CausalRequest struct {
+	Model     string   `json:"model"`
+	Seeds     []string `json:"seeds"`
+	Relation  string   `json:"relation"`
+	Relations []string `json:"relations"`
+	LimitK    int      `json:"limit_k"`
 }
 
 // parseComputeOp converts a string expression like "jarak / waktu", "jarak + 10", "0", or "-5" to ComputeOp
@@ -788,7 +870,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
 	if isAsync {
 		jobID := uuid.New().String()
-		err := s.worker.Dispatch(
+		err := s.worker.DispatchAsync(
 			context.Background(),
 			"update_"+req.Model,
 			func(ctx context.Context) error {
@@ -808,7 +890,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			// Note: No retry on arithmetic mutations (+ - * /) to prevent duplicate compounding of non-idempotent updates.
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch update to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch update to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -870,6 +952,79 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleEdge adds or removes an explicit causal edge.
+func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
+	var req EdgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	db, err := s.getModel(req.Model)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(req.Action)) {
+	case "", "add", "link":
+		if err := db.AddEdge(req.Source, req.Relation, req.Target, req.Weight); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+	case "remove", "delete", "unlink":
+		if err := db.RemoveEdge(req.Source, req.Relation, req.Target); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+	default:
+		http.Error(w, `{"error":"action must be add or remove"}`, http.StatusBadRequest)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"edge_count": db.EdgeCount(),
+	})
+}
+
+// handleCausal traverses explicit edges by relation, single-hop or multi-hop.
+func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
+	var req CausalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	db, err := s.getModel(req.Model)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	limit := req.LimitK
+	if limit <= 0 {
+		limit = 5
+	}
+
+	var results []storage.CausalResult
+	if len(req.Relations) > 0 {
+		results, err = db.ExecuteCausalChain(r.Context(), req.Seeds, req.Relations, limit)
+	} else {
+		results, err = db.ExecuteCausalStep(r.Context(), req.Seeds, req.Relation, limit)
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"results":    results,
+		"edge_count": db.EdgeCount(),
+	})
+}
+
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	modelName := r.URL.Query().Get("model")
 	if modelName == "" {
@@ -885,7 +1040,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	// If async requested, offload to worker pool and return immediately
 	if r.URL.Query().Get("async") == "true" {
 		jobID := uuid.New().String()
-		err := s.worker.Dispatch(
+		err := s.worker.DispatchAsync(
 			context.Background(),
 			"sync_"+modelName,
 			func(ctx context.Context) error {
@@ -896,7 +1051,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			worker.WithRetry(1, 200*time.Millisecond),
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch sync task to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch sync task to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -922,18 +1077,18 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 type PartitionRunRequest struct {
-	Model         string   `json:"model"`
-	DateField     string   `json:"date_field"`
-	RetentionDays float32  `json:"retention_days"`
-	SinkType      string   `json:"sink_type"` // "local" or "s3"
-	TargetPath    string   `json:"target_path"`
-	S3Endpoint    string   `json:"s3_endpoint"`
-	S3Bucket      string   `json:"s3_bucket"`
-	S3Prefix      string   `json:"s3_prefix"`
-	S3AccessKey   string   `json:"s3_access_key"`
-	S3SecretKey   string   `json:"s3_secret_key"`
-	PruneHotDB    *bool    `json:"prune_hot_db"`
-	Async         bool     `json:"async"` // If true, offloads to worker pool (returns HTTP 202)
+	Model         string  `json:"model"`
+	DateField     string  `json:"date_field"`
+	RetentionDays float32 `json:"retention_days"`
+	SinkType      string  `json:"sink_type"` // "local" or "s3"
+	TargetPath    string  `json:"target_path"`
+	S3Endpoint    string  `json:"s3_endpoint"`
+	S3Bucket      string  `json:"s3_bucket"`
+	S3Prefix      string  `json:"s3_prefix"`
+	S3AccessKey   string  `json:"s3_access_key"`
+	S3SecretKey   string  `json:"s3_secret_key"`
+	PruneHotDB    *bool   `json:"prune_hot_db"`
+	Async         bool    `json:"async"` // If true, offloads to worker pool (returns HTTP 202)
 }
 
 func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
@@ -980,14 +1135,32 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		if targetDir == "" {
 			targetDir = filepath.Join(s.dataDir, "partitions")
 		} else {
-			cleanTarget := filepath.Clean(targetDir)
-			absDataDir, err1 := filepath.Abs(s.dataDir)
-			absTarget, err2 := filepath.Abs(cleanTarget)
-			if err1 != nil || err2 != nil || !strings.HasPrefix(absTarget, absDataDir) {
+			absDataDir, err := filepath.Abs(s.dataDir)
+			if err != nil {
+				http.Error(w, `{"error":"invalid data directory"}`, http.StatusInternalServerError)
+				return
+			}
+			absTarget, err := filepath.Abs(targetDir)
+			if err != nil {
+				http.Error(w, `{"error":"invalid target_path"}`, http.StatusBadRequest)
+				return
+			}
+			resolvedRoot, err := filepath.EvalSymlinks(absDataDir)
+			if err != nil {
+				http.Error(w, `{"error":"cannot resolve data directory"}`, http.StatusInternalServerError)
+				return
+			}
+			resolvedTarget, err := resolvePathWithExistingSymlinks(absTarget)
+			if err != nil {
+				http.Error(w, `{"error":"cannot resolve target_path"}`, http.StatusBadRequest)
+				return
+			}
+			relTarget, relErr := filepath.Rel(resolvedRoot, resolvedTarget)
+			if relErr != nil || relTarget == ".." || strings.HasPrefix(relTarget, ".."+string(filepath.Separator)) || filepath.IsAbs(relTarget) {
 				http.Error(w, fmt.Sprintf(`{"error":"Invalid target_path: must reside inside data directory %s"}`, s.dataDir), http.StatusBadRequest)
 				return
 			}
-			targetDir = absTarget
+			targetDir = resolvedTarget
 		}
 		sink = partition.NewLocalDiskSink(targetDir)
 	}
@@ -1012,7 +1185,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		if modelTag == "" {
 			modelTag = "all"
 		}
-		err := s.worker.Dispatch(
+		err := s.worker.DispatchAsync(
 			context.Background(),
 			"partition_run_async",
 			func(ctx context.Context) error {
@@ -1047,7 +1220,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		)
 
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch partition to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch partition to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
 			return
 		}
 
@@ -1198,7 +1371,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		if modelTag == "" {
 			modelTag = "*"
 		}
-		err := s.worker.Dispatch(
+		err := s.worker.DispatchAsync(
 			context.Background(),
 			"collector_run_async",
 			func(ctx context.Context) error {
@@ -1210,7 +1383,11 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
 					}
-					purged := db.CollectTombstones(maxBatch)
+					purged, err := db.CollectTombstones(maxBatch)
+					if err != nil {
+						errs = append(errs, fmt.Errorf("collect %s: %w", m, err))
+						continue
+					}
 					if purged > 0 {
 						if err := db.Sync(); err != nil {
 							errs = append(errs, fmt.Errorf("sync %s: %w", m, err))
@@ -1228,7 +1405,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 			worker.WithRetry(1, 200*time.Millisecond),
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch collector to worker: %s"}`, err.Error()), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch collector to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
 			return
 		}
 
@@ -1249,7 +1426,11 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		purged := db.CollectTombstones(maxBatch)
+		purged, err := db.CollectTombstones(maxBatch)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"collector failed for model %s: %s"}`, m, err.Error()), http.StatusInternalServerError)
+			return
+		}
 		if purged > 0 {
 			_ = db.Sync()
 		}

@@ -243,6 +243,49 @@ func TestSafeCancelQueuedTasks(t *testing.T) {
 	}
 }
 
+func TestCancelCallbackCanDispatchWithoutDeadlock(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 8
+	pool := NewPool(cfg)
+	pool.Start()
+	defer func() { _ = pool.Shutdown() }()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := pool.Dispatch(context.Background(), "blocker", func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	dispatched := make(chan error, 1)
+	if err := pool.Dispatch(context.Background(), "queued", func(context.Context) error { return nil }, WithOnError(func(context.Context, error) {
+		dispatched <- pool.Dispatch(context.Background(), "from-callback", func(context.Context) error { return nil })
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if canceled := pool.SafeCancel(); canceled != 1 {
+		t.Fatalf("canceled %d tasks, want 1", canceled)
+	}
+	select {
+	case err := <-dispatched:
+		if err != nil {
+			t.Fatalf("callback dispatch failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback dispatch deadlocked")
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := pool.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCancelByModelAndID(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Concurrency = 1
@@ -482,5 +525,34 @@ func TestGlobalRegistryFunctions(t *testing.T) {
 	}
 	if Global() != nil {
 		t.Fatalf("Global() should be nil after ShutdownGlobal")
+	}
+}
+
+func TestShutdownGlobalReturnsShutdownTimeout(t *testing.T) {
+	SetGlobal(nil)
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 1
+	cfg.ShutdownTimeout = 20 * time.Millisecond
+	p := InitGlobal(cfg)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := p.Dispatch(context.Background(), "stuck-global", func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	err := ShutdownGlobal(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("ShutdownGlobal should expose timeout, got %v", err)
+	}
+	close(release)
+	if Global() != nil {
+		t.Fatal("global registry should be cleared after shutdown attempt")
 	}
 }

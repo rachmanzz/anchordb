@@ -1,16 +1,23 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
+
+func registerTestRelation(db *AnchorDB) error {
+	return db.SetRelation("test-down", spatial.Point2D{Y: -1})
+}
 
 func TestAnchorDB_CreateAndQuery(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -21,6 +28,9 @@ func TestAnchorDB_CreateAndQuery(t *testing.T) {
 		t.Fatalf("failed to open anchordb: %v", err)
 	}
 	defer db.Close()
+	if err := registerTestRelation(db); err != nil {
+		t.Fatal(err)
+	}
 
 	// Seed nodes
 	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
@@ -35,7 +45,7 @@ func TestAnchorDB_CreateAndQuery(t *testing.T) {
 	}
 
 	// In-Storage Computational Query: ibu + ayah -> anak
-	results, anchor, err := db.ExecuteGraphStep([]string{"ibu", "ayah"}, "keturunan", 5)
+	results, anchor, err := db.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
 	if err != nil {
 		t.Fatalf("ExecuteGraphStep failed: %v", err)
 	}
@@ -61,6 +71,9 @@ func BenchmarkAnchorDB_ConstantTime_Scale(b *testing.B) {
 		b.Fatalf("failed to open: %v", err)
 	}
 	defer db.Close()
+	if err := registerTestRelation(db); err != nil {
+		b.Fatal(err)
+	}
 
 	// Seed key nodes
 	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
@@ -88,7 +101,7 @@ func BenchmarkAnchorDB_ConstantTime_Scale(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// Pulling top 10 items from 50,000 records
-		results, _, _ := db.ExecuteGraphStep(inputs, "keturunan", 10)
+		results, _, _ := db.ExecuteGraphStep(inputs, "test-down", 10)
 		if len(results) == 0 {
 			b.Fatalf("expected results")
 		}
@@ -238,9 +251,12 @@ func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
 		t.Fatalf("Reopen failed: %v", err)
 	}
 	defer db2.Close()
+	if err := registerTestRelation(db2); err != nil {
+		t.Fatal(err)
+	}
 
 	// CRITICAL CHECK: ExecuteGraphStep must return non-empty word string "anak", not ""!
-	results, _, err := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "keturunan", 5)
+	results, _, err := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
 	if err != nil {
 		t.Fatalf("ExecuteGraphStep after reopen failed: %v", err)
 	}
@@ -259,7 +275,7 @@ func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
 	}
 
 	// Verify all words still intact
-	resAfterAppend, _, _ := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "keturunan", 5)
+	resAfterAppend, _, _ := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
 	if len(resAfterAppend) == 0 || resAfterAppend[0].Word != "anak" {
 		t.Fatalf("Word corrupted after appending to reopened db! got %q", resAfterAppend[0].Word)
 	}
@@ -415,7 +431,9 @@ func TestWAL_CrashRecovery(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		toDelete[i] = fmt.Sprintf("rec_%03d", 190+i)
 	}
-	db.DeleteRecords(toDelete)
+	if _, err := db.DeleteRecords(toDelete); err != nil {
+		t.Fatalf("DeleteRecords: %v", err)
+	}
 
 	// Simulate unexpected crash / kill: close without calling Sync()!
 	// (Mutations were only in Go heap memory and .wal file, NOT in base .anchordb)
@@ -582,6 +600,325 @@ func TestMatchesFilter_ZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestWALFailuresDoNotApplyMutations(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "wal-errors.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.SaveRecordWithID("to-delete", map[string]float32{"value": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetOperationStatus([]string{"to-delete"}, OpStatusTombstone); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeNodes := db.totalNodes()
+	if _, err := db.AppendNode("node-not-persisted", spatial.Point2D{}, [4]float32{}, 1); err == nil {
+		t.Fatal("AppendNode should report closed WAL")
+	}
+	if db.totalNodes() != beforeNodes {
+		t.Fatal("AppendNode changed memory despite WAL failure")
+	}
+
+	if n, err := db.DeleteRecords([]string{"to-delete"}); n != 0 || err == nil {
+		t.Fatalf("DeleteRecords should fail before deleting, got count=%d err=%v", n, err)
+	}
+	db.mu.RLock()
+	_, stillExists := db.EntityStore["to-delete"]
+	db.mu.RUnlock()
+	if !stillExists {
+		t.Fatal("DeleteRecords changed memory despite WAL failure")
+	}
+
+	if n, err := db.CollectTombstones(10); n != 0 || err == nil {
+		t.Fatalf("CollectTombstones should fail before purging, got count=%d err=%v", n, err)
+	}
+	db.mu.RLock()
+	_, stillExists = db.EntityStore["to-delete"]
+	db.mu.RUnlock()
+	if !stillExists {
+		t.Fatal("CollectTombstones changed memory despite WAL failure")
+	}
+}
+
+func TestWALCheckpointPreservesSuffix(t *testing.T) {
+	wal, err := OpenWAL(filepath.Join(t.TempDir(), "checkpoint.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+
+	first := CompactRecord{Operation: OpStatusActive, Attrs: []AttrEntry{{Key: "v", Value: 1}}}
+	second := CompactRecord{Operation: OpStatusActive, Attrs: []AttrEntry{{Key: "v", Value: 2}}}
+	if err := wal.WriteSave("first", first); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := wal.CurrentOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.WriteSave("second", second); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Checkpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	if _, err := wal.Replay(func(_ byte, name string, _ CompactRecord, _ string, _ spatial.Point2D, _ [4]float32, _ uint16) error {
+		names = append(names, name)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "second" {
+		t.Fatalf("replayed WAL suffix = %v, want [second]", names)
+	}
+}
+
+func TestWALReplayTruncatesIncompleteTailBeforeFutureWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tail.wal")
+	wal, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := wal.WriteSave("before", CompactRecord{Operation: OpStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.file.Write([]byte{walMagic, walVer, WalOpSave, 0}); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	count, err := wal.Replay(func(_ byte, name string, _ CompactRecord, _ string, _ spatial.Point2D, _ [4]float32, _ uint16) error {
+		names = append(names, name)
+		return nil
+	})
+	if err != nil || count != 1 || len(names) != 1 || names[0] != "before" {
+		t.Fatalf("Replay incomplete tail: count=%d names=%v err=%v", count, names, err)
+	}
+	if err := wal.WriteSave("after", CompactRecord{Operation: OpStatusActive}); err != nil {
+		t.Fatalf("append after tail recovery: %v", err)
+	}
+
+	names = nil
+	count, err = wal.Replay(func(_ byte, name string, _ CompactRecord, _ string, _ spatial.Point2D, _ [4]float32, _ uint16) error {
+		names = append(names, name)
+		return nil
+	})
+	if err != nil || count != 2 || len(names) != 2 || names[0] != "before" || names[1] != "after" {
+		t.Fatalf("Replay after append: count=%d names=%v err=%v", count, names, err)
+	}
+}
+
+func TestWALReplayFailsClosedOnCompleteCorruptFrame(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.wal")
+	wal, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := wal.WriteSave("durable", CompactRecord{Operation: OpStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.file.Write([]byte{0, walVer, WalOpSave, 0, 0, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = wal.Replay(nil)
+	if !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("Replay should report complete corrupt frame, got %v", err)
+	}
+	if err := wal.WriteSave("must-not-append", CompactRecord{Operation: OpStatusActive}); !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("write after corruption should fail closed, got %v", err)
+	}
+}
+
+func TestRelationsAreValidatedAndUnknownRelationRejected(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "relations.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, exists := db.Relation("keturunan"); exists {
+		t.Fatal("core database must not install domain-specific relation defaults")
+	}
+	if err := db.SetRelation("custom", spatial.Point2D{X: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if direction, exists := db.Relation("custom"); !exists || direction.X != 1 {
+		t.Fatalf("custom relation not returned, direction=%+v exists=%v", direction, exists)
+	}
+	if err := db.SetRelation("zero", spatial.Point2D{}); err == nil {
+		t.Fatal("zero direction should be rejected")
+	}
+	if _, _, err := db.ExecuteGraphStep(nil, "custom", 1); err == nil {
+		t.Fatal("empty input should fail")
+	}
+	if _, err := db.AppendNode("input", spatial.Point2D{}, [4]float32{}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ExecuteGraphStep([]string{"input"}, "unregistered", 1); err == nil || !strings.Contains(err.Error(), "unknown relation") {
+		t.Fatalf("unknown relation should fail explicitly, got %v", err)
+	}
+	if _, _, err := db.ExecuteGraphStepWithOptions([]string{"x"}, "custom", -1, OrderByCompositeDesc, 0.05); err == nil {
+		t.Fatal("negative TopK should fail")
+	}
+}
+
+func TestOpenExclusivelyLocksDatabaseAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "locked.anchordb")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := Open(path); err == nil {
+		_ = second.Close()
+		t.Fatal("second open should fail while first instance owns the database")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(path); err != nil {
+		t.Fatalf("open after release should succeed: %v", err)
+	} else {
+		_ = reopened.Close()
+	}
+}
+
+func TestOpenRejectsTruncatedDatabaseSections(t *testing.T) {
+	tests := []struct {
+		name     string
+		truncate func(t *testing.T, path string)
+	}{
+		{
+			name: "node section",
+			truncate: func(t *testing.T, path string) {
+				if err := os.Truncate(path, HeaderSize+RecordSize-1); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "entity section",
+			truncate: func(t *testing.T, path string) {
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Truncate(path, info.Size()-1); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "corrupt.anchordb")
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SaveRecordWithID("record", map[string]float32{"value": 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			tt.truncate(t, path)
+			if opened, err := Open(path); err == nil {
+				_ = opened.Close()
+				t.Fatal("Open succeeded for truncated database")
+			}
+		})
+	}
+}
+
+func TestFindNearestNeighborsRejectsNegativeLimit(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "nearest.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.AppendNode("node", spatial.Point2D{}, [4]float32{}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FindNearestNeighbors("node", -1); err == nil {
+		t.Fatal("negative neighbor limit should return an error")
+	}
+}
+
+func TestPartitionLockSnapshotsAndBlocksConcurrentMutation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "partition-lock.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SaveRecord("old", map[string]float32{"date": 1, "value": 10}); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.LockPartitionRecords("date", 2, 10)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("LockPartitionRecords = %d records, err=%v", len(records), err)
+	}
+	if records[0].Props["value"] != 10 {
+		t.Fatalf("snapshot value = %v, want 10", records[0].Props["value"])
+	}
+	if err := db.SaveRecord("old", map[string]float32{"date": 1, "value": 20}); !errors.Is(err, ErrRecordLocked) {
+		t.Fatalf("save to locked record should fail, got %v", err)
+	}
+	if n, err := db.DeleteRecords([]string{"old"}); n != 0 || !errors.Is(err, ErrRecordLocked) {
+		t.Fatalf("delete locked record should fail, count=%d err=%v", n, err)
+	}
+	if _, err := db.CompletePartitionRecords([]string{"old"}, OpStatusRetry); err != nil {
+		t.Fatal(err)
+	}
+	props, op, err := db.GetRecordWithOperation("old")
+	if err != nil || op != OpStatusRetry || props["value"] != 10 {
+		t.Fatalf("record after release = props %v op %d err %v", props, op, err)
+	}
+}
+
+func TestWALReplayRecoversTruncatedFrameHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated-header.wal")
+	wal, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := wal.WriteSave("safe", CompactRecord{Operation: OpStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	validOffset, err := wal.CurrentOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.file.Write([]byte{walMagic, walVer, WalOpSave}); err != nil {
+		t.Fatal(err)
+	}
+	count, err := wal.Replay(func(_ byte, name string, _ CompactRecord, _ string, _ spatial.Point2D, _ [4]float32, _ uint16) error {
+		if name != "safe" {
+			t.Errorf("unexpected replayed name %q", name)
+		}
+		return nil
+	})
+	if err != nil || count != 1 {
+		t.Fatalf("Replay truncated header: count=%d err=%v", count, err)
+	}
+	if info, err := wal.file.Stat(); err != nil || info.Size() != validOffset {
+		t.Fatalf("truncated header recovery size = %v, want %d (err=%v)", info, validOffset, err)
+	}
+	if err := wal.WriteSave("after", CompactRecord{Operation: OpStatusActive}); err != nil {
+		t.Fatalf("write after truncated-header recovery: %v", err)
+	}
+}
+
 func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "lifecycle.adb")
@@ -610,7 +947,10 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	}
 
 	// 2. Transition to SafeDelete (0)
-	updated := db.SetOperationStatus([]string{name}, OpStatusSafeDelete)
+	updated, err := db.SetOperationStatus([]string{name}, OpStatusSafeDelete)
+	if err != nil {
+		t.Fatalf("SetOperationStatus: %v", err)
+	}
 	if updated != 1 {
 		t.Errorf("expected 1 record updated to SafeDelete, got %d", updated)
 	}
@@ -647,14 +987,19 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	}
 
 	// 3. Transition to Tombstone (2)
-	db.SetOperationStatus([]string{name}, OpStatusTombstone)
+	if _, err := db.SetOperationStatus([]string{name}, OpStatusTombstone); err != nil {
+		t.Fatalf("SetOperationStatus tombstone: %v", err)
+	}
 	_, err = db.GetRecord(name)
 	if err == nil {
 		t.Error("expected GetRecord to fail for tombstoned record")
 	}
 
 	// 4. Collect Tombstones
-	purged := db.CollectTombstones(10)
+	purged, err := db.CollectTombstones(10)
+	if err != nil {
+		t.Fatalf("CollectTombstones: %v", err)
+	}
 	if purged != 1 {
 		t.Errorf("expected 1 tombstone collected, got %d", purged)
 	}
@@ -664,7 +1009,9 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	if err := db.SaveRecord(name2, map[string]float32{"score": 99}); err != nil {
 		t.Fatalf("SaveRecord failed: %v", err)
 	}
-	db.SetOperationStatus([]string{name2}, OpStatusSafeDelete)
+	if _, err := db.SetOperationStatus([]string{name2}, OpStatusSafeDelete); err != nil {
+		t.Fatalf("SetOperationStatus safe-delete: %v", err)
+	}
 	if err := db.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -687,6 +1034,72 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	}
 }
 
+func TestAppendNodeRejectsNonFiniteGeometry(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "geometry.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	nan := float32(math.NaN())
+	inf := float32(math.Inf(1))
+
+	if _, err := db.AppendNode("bad-x", spatial.Point2D{X: nan}, [4]float32{}, 1); err == nil {
+		t.Fatal("NaN X coordinate should be rejected")
+	}
+	if _, err := db.AppendNode("bad-y", spatial.Point2D{Y: inf}, [4]float32{}, 1); err == nil {
+		t.Fatal("Inf Y coordinate should be rejected")
+	}
+	if _, err := db.AppendNode("bad-role", spatial.Point2D{}, [4]float32{nan, 0, 0, 0}, 1); err == nil {
+		t.Fatal("NaN role should be rejected")
+	}
+	if _, exists := db.Lexicon["bad-x"]; exists {
+		t.Fatal("rejected node must not be indexed")
+	}
+
+	// A non-finite coordinate must still map to a valid grid cell defensively,
+	// so WAL replay of a tampered frame cannot corrupt the spatial index.
+	cell := PointToCell(spatial.Point2D{X: nan, Y: nan}, GridDim)
+	if cell.X < 0 || cell.X >= GridDim || cell.Y < 0 || cell.Y >= GridDim {
+		t.Fatalf("PointToCell produced out-of-range cell %+v", cell)
+	}
+}
+
+func TestUpdateRecordsDirectTargetsHonorsOffset(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "update-offset.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, name := range []string{"a", "b", "c"} {
+		if err := db.SaveRecord(name, map[string]float32{"value": 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	updated, err := db.UpdateRecords(UpdateOptions{
+		TargetEntities: []string{"a", "b", "c"},
+		Mutations:      map[string]ComputeOp{"value": OpAdd{FieldA: "value", FieldB: "1"}},
+		Offset:         2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 {
+		t.Fatalf("direct update honored offset: updated=%d, want 1", updated)
+	}
+
+	a, _ := db.GetRecord("a")
+	b, _ := db.GetRecord("b")
+	c, _ := db.GetRecord("c")
+	if a["value"] != 1 || b["value"] != 1 {
+		t.Fatalf("records before offset were mutated: a=%v b=%v", a["value"], b["value"])
+	}
+	if c["value"] != 2 {
+		t.Fatalf("record at offset was not mutated: c=%v", c["value"])
+	}
+}
 
 func TestMain(m *testing.M) {
 	code := m.Run()

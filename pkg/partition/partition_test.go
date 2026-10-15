@@ -1,6 +1,11 @@
 package partition
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +14,52 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
+
+func TestS3SinkUsesBucketPathAndSigV4(t *testing.T) {
+	var signed bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bucket/prefix/object.anchordb" {
+			t.Errorf("unexpected object path %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") == "" || r.Header.Get("x-amz-date") == "" {
+			t.Errorf("expected signed S3 request, headers=%v", r.Header)
+		} else {
+			signed = true
+		}
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read payload: %v", err)
+		}
+		hash := sha256.Sum256(payload)
+		if got, want := r.Header.Get("x-amz-content-sha256"), hex.EncodeToString(hash[:]); got != want {
+			t.Errorf("payload hash header = %q, want %q", got, want)
+		}
+		parsedTime, err := time.Parse("20060102T150405Z", r.Header.Get("x-amz-date"))
+		if err != nil {
+			t.Errorf("invalid x-amz-date: %v", err)
+		} else {
+			wantReq, err := http.NewRequest(http.MethodPut, "http://"+r.Host+r.URL.RequestURI(), nil)
+			if err != nil {
+				t.Errorf("create signature verification request: %v", err)
+				return
+			}
+			signS3Request(wantReq, payload, "access", "secret", "us-east-1", parsedTime)
+			if got, want := r.Header.Get("Authorization"), wantReq.Header.Get("Authorization"); got != want {
+				t.Errorf("SigV4 authorization mismatch: got %q want %q", got, want)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	sink := NewS3Sink(server.URL, "bucket", "prefix", "access", "secret")
+	if _, err := sink.SavePartition("object.anchordb", []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if !signed {
+		t.Fatal("request was not signed")
+	}
+}
 
 func TestPartition_Archive6Months_AndPrune(t *testing.T) {
 	tmpDir := t.TempDir()

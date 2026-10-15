@@ -18,11 +18,12 @@ type IPRange struct {
 
 // IPFilter evaluates client IP addresses against single IPs, CIDR blocks, and IP ranges
 type IPFilter struct {
-	allowedIPs    map[string]bool
-	allowedCIDRs  []*net.IPNet
-	allowedRanges []IPRange
-	trustProxy    bool
-	rawRule       string
+	allowedIPs        map[string]bool
+	allowedCIDRs      []*net.IPNet
+	trustedProxyCIDRs []*net.IPNet
+	allowedRanges     []IPRange
+	trustProxy        bool
+	rawRule           string
 }
 
 // NewIPFilter parses a comma-separated list of IP rules:
@@ -109,6 +110,25 @@ func NewIPFilter(rules string, trustProxy bool) (*IPFilter, error) {
 	return filter, nil
 }
 
+// NewIPFilterWithTrustedProxies creates an IP whitelist and accepts forwarding
+// headers only from peers matching trustedProxyRules. Proxy rules use CIDR
+// notation (a single IP may be written with /32 or /128). Loopback peers are
+// always trusted when proxy support is enabled.
+func NewIPFilterWithTrustedProxies(rules string, trustedProxyRules []string) (*IPFilter, error) {
+	filter, err := NewIPFilter(rules, len(trustedProxyRules) > 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, rule := range trustedProxyRules {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(rule))
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", rule, err)
+		}
+		filter.trustedProxyCIDRs = append(filter.trustedProxyCIDRs, network)
+	}
+	return filter, nil
+}
+
 // IsEmpty returns true if no whitelist rules were defined
 func (f *IPFilter) IsEmpty() bool {
 	return len(f.allowedIPs) == 0 && len(f.allowedCIDRs) == 0 && len(f.allowedRanges) == 0
@@ -164,12 +184,32 @@ func (f *IPFilter) IsAllowed(ip net.IP) bool {
 
 // ExtractClientIP retrieves client IP from request, taking proxy headers into account if configured
 func (f *IPFilter) ExtractClientIP(r *http.Request) net.IP {
-	if f.trustProxy {
+	// Never accept forwarding headers from an arbitrary client. NewIPFilter's
+	// boolean mode allows local reverse proxies; remote proxies must be explicitly
+	// configured with NewIPFilterWithTrustedProxies.
+	remoteIP := remoteAddrIP(r.RemoteAddr)
+	if f.isTrustedProxy(remoteIP) {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
-			clientIP := strings.TrimSpace(parts[0])
-			if ip := net.ParseIP(clientIP); ip != nil {
-				return ip
+			chain := make([]net.IP, 0, len(parts))
+			valid := true
+			for _, part := range parts {
+				ip := net.ParseIP(strings.TrimSpace(part))
+				if ip == nil {
+					valid = false
+					break
+				}
+				chain = append(chain, ip)
+			}
+			if valid && len(chain) > 0 {
+				// Proxies commonly append the peer they received the request from.
+				// Walk right-to-left, discarding trusted proxies; the first untrusted
+				// address is the client and cannot be overridden by a forged left side.
+				peer := remoteIP
+				for i := len(chain) - 1; i >= 0 && f.isTrustedProxy(peer); i-- {
+					peer = chain[i]
+				}
+				return peer
 			}
 		}
 		if xri := r.Header.Get("X-Real-IP"); xri != "" {
@@ -179,11 +219,30 @@ func (f *IPFilter) ExtractClientIP(r *http.Request) net.IP {
 		}
 	}
 
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+	return remoteIP
+}
+
+func (f *IPFilter) isTrustedProxy(ip net.IP) bool {
+	if !f.trustProxy || ip == nil {
+		return false
 	}
-	return net.ParseIP(host)
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, network := range f.trustedProxyCIDRs {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteAddrIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	return net.ParseIP(strings.Trim(host, "[]"))
 }
 
 // Middleware returns an HTTP middleware verifying incoming IP against whitelist rules

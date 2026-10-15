@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -429,7 +430,13 @@ func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
 
 		fireAt := due
 		if j := time.Duration(s.jitterNs.Load()); j > 0 {
-			fireAt = due.Add(time.Duration(rand.Int63n(int64(j) + 1)))
+			// rand.Int63n panics unless its argument is positive, so guard the
+			// (extreme but reachable) MaxInt64 jitter that would overflow +1.
+			span := int64(j)
+			if span == math.MaxInt64 {
+				span--
+			}
+			fireAt = due.Add(time.Duration(rand.Int63n(span + 1)))
 		}
 
 		if !s.waitUntil(rs, task, fireAt) {

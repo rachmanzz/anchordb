@@ -90,6 +90,29 @@ func (c *Client) DB() *storage.AnchorDB {
 	return c.db
 }
 
+// Link registers a directed, weighted edge source --relation--> target. Used to
+// store explicit cause-and-effect links that the geometric relations cannot
+// express.
+func (c *Client) Link(source, relation, target string, weight float32) error {
+	return c.db.AddEdge(source, relation, target, weight)
+}
+
+// Unlink removes a directed edge.
+func (c *Client) Unlink(source, relation, target string) error {
+	return c.db.RemoveEdge(source, relation, target)
+}
+
+// Causal follows a single relation from a seed word and returns targets ranked
+// by edge weight.
+func (c *Client) Causal(seed, relation string, k int) ([]storage.CausalResult, error) {
+	return c.db.ExecuteCausalStep(context.Background(), []string{seed}, relation, k)
+}
+
+// CausalChain follows a sequence of relations, multiplying weights along the way.
+func (c *Client) CausalChain(seeds, relations []string, k int) ([]storage.CausalResult, error) {
+	return c.db.ExecuteCausalChain(context.Background(), seeds, relations, k)
+}
+
 // Close gracefully closes database memory mappings.
 func (c *Client) Close() error {
 	return c.db.Close()
@@ -198,6 +221,9 @@ func (b *GetBuilder) Compute(outputField string, op storage.ComputeOp) *GetBuild
 
 // Execute retrieves the stored data and calculates all derived fields in-storage
 func (b *GetBuilder) Execute(ctx context.Context) (*EntityResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var props map[string]float32
 	var err error
 
@@ -261,6 +287,7 @@ func (c *Client) List() *ListBuilder {
 // ListBuilder provides fluent filtering, computing, and pagination on collections
 type ListBuilder struct {
 	db           *storage.AnchorDB
+	err          error
 	selectFields []string
 	filters      []storage.FilterCondition
 	computations map[string]storage.ComputeOp
@@ -269,26 +296,26 @@ type ListBuilder struct {
 }
 
 // toFloat32Value converts any numeric or date literal value to float32
-func toFloat32Value(v any) float32 {
+func toFloat32Value(v any) (float32, error) {
 	switch val := v.(type) {
 	case float32:
-		return val
+		return val, nil
 	case float64:
-		return float32(val)
+		return float32(val), nil
 	case int:
-		return float32(val)
+		return float32(val), nil
 	case int64:
-		return float32(val)
+		return float32(val), nil
 	case string:
 		if d, err := storage.ParseDate(val); err == nil {
-			return d
+			return d, nil
 		}
 		if f, err := strconv.ParseFloat(val, 32); err == nil {
-			return float32(f)
+			return float32(f), nil
 		}
-		return 0
+		return 0, fmt.Errorf("invalid numeric or date value %q", val)
 	default:
-		return 0
+		return 0, fmt.Errorf("unsupported filter value type %T", v)
 	}
 }
 
@@ -301,10 +328,15 @@ func (b *ListBuilder) Select(fields ...string) *ListBuilder {
 
 // Where adds a filter condition (supports numbers or date strings)
 func (b *ListBuilder) Where(field, op string, value any) *ListBuilder {
+	converted, err := toFloat32Value(value)
+	if err != nil {
+		b.err = err
+		return b
+	}
 	b.filters = append(b.filters, storage.FilterCondition{
 		Field:    field,
 		Operator: op,
-		Value:    toFloat32Value(value),
+		Value:    converted,
 	})
 	return b
 }
@@ -326,11 +358,21 @@ func (b *ListBuilder) WhereAfter(field string, value any) *ListBuilder {
 
 // Between matches records within range [min, max] (supports numbers or dates)
 func (b *ListBuilder) Between(field string, min, max any) *ListBuilder {
+	low, err := toFloat32Value(min)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	high, err := toFloat32Value(max)
+	if err != nil {
+		b.err = err
+		return b
+	}
 	b.filters = append(b.filters, storage.FilterCondition{
 		Field:     field,
 		Operator:  "BETWEEN",
-		Value:     toFloat32Value(min),
-		ValueHigh: toFloat32Value(max),
+		Value:     low,
+		ValueHigh: high,
 	})
 	return b
 }
@@ -381,7 +423,14 @@ type PagedListResult struct {
 
 // Execute runs the query with in-storage filtering, computing, and early termination
 func (b *ListBuilder) Execute(ctx context.Context) (*PagedListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if b.err != nil {
+		return nil, b.err
+	}
 	records, hasMore, err := b.db.ListRecordsWithPaging(storage.QueryOptions{
+		Context:      ctx,
 		Select:       b.selectFields,
 		Filters:      b.filters,
 		Computations: b.computations,
@@ -418,6 +467,7 @@ func (c *Client) Update() *UpdateBuilder {
 // UpdateBuilder provides fluent batch mutation with in-storage calculations
 type UpdateBuilder struct {
 	db             *storage.AnchorDB
+	err            error
 	targetEntities []string
 	filters        []storage.FilterCondition
 	mutations      map[string]storage.ComputeOp
@@ -433,10 +483,15 @@ func (b *UpdateBuilder) In(names ...string) *UpdateBuilder {
 
 // Where adds a filter condition for which entities should be updated (supports numbers or dates)
 func (b *UpdateBuilder) Where(field, op string, value any) *UpdateBuilder {
+	converted, err := toFloat32Value(value)
+	if err != nil {
+		b.err = err
+		return b
+	}
 	b.filters = append(b.filters, storage.FilterCondition{
 		Field:    field,
 		Operator: op,
-		Value:    toFloat32Value(value),
+		Value:    converted,
 	})
 	return b
 }
@@ -458,11 +513,21 @@ func (b *UpdateBuilder) WhereAfter(field string, value any) *UpdateBuilder {
 
 // Between bounds update to records within [min, max] (number or date)
 func (b *UpdateBuilder) Between(field string, min, max any) *UpdateBuilder {
+	low, err := toFloat32Value(min)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	high, err := toFloat32Value(max)
+	if err != nil {
+		b.err = err
+		return b
+	}
 	b.filters = append(b.filters, storage.FilterCondition{
 		Field:     field,
 		Operator:  "BETWEEN",
-		Value:     toFloat32Value(min),
-		ValueHigh: toFloat32Value(max),
+		Value:     low,
+		ValueHigh: high,
 	})
 	return b
 }
@@ -497,7 +562,14 @@ func (b *UpdateBuilder) Offset(offset int) *UpdateBuilder {
 
 // Execute performs the in-place calculation and update in-storage, returning the count of modified entities
 func (b *UpdateBuilder) Execute(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if b.err != nil {
+		return 0, b.err
+	}
 	return b.db.UpdateRecords(storage.UpdateOptions{
+		Context:        ctx,
 		TargetEntities: b.targetEntities,
 		Filters:        b.filters,
 		Mutations:      b.mutations,

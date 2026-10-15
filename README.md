@@ -52,7 +52,8 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
     +------------------------------+          +------------------------------+          +------------------------------+
     |       REST HTTP Engine       |          |    Cron Scheduler Daemon     |          |     Async Worker Engine      |
     | /v1/save, /v1/get, /v1/list  |          |        (pure Go)             |          |        (pure Go)             |
-    | /v1/update, /v1/graph, /sync |          | Daily 23:00 / Sync Every 5m  |          | Async Partitions & Sync Pool |
+    | /v1/update, /v1/graph,       |          | Daily 23:00 / Sync Every 5m  |          | Async Partitions & Sync Pool |
+    | /v1/edge, /v1/causal, /sync  |          |                              |          |                              |
     +--------------+---------------+          +--------------+---------------+          +--------------+---------------+
                    |                                         |                                         |
                    +-----------------------------------------+-----------------------------------------+
@@ -186,11 +187,13 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `POST /v1/worker/cancel`: Safely cancels queued tasks before execution without interrupting in-flight jobs.
 
 ### 2. Mutation & Query Endpoints
-- `POST /v1/save`: Ingest an entity with key-value properties and optional `operation` status (`1` = Active by default, `0` = Safe-Delete).
+- `POST /v1/save`: Ingest an entity with key-value properties and an optional `operation` status (`1` = Active by default). `0` (Safe-Delete) is an internal partition-lock state and is **rejected** by `/v1/save`; records only enter Safe-Delete through the partition archival flow (lock → archive → complete), never by direct save.
 - `POST /v1/get`: Query an entity by name with optional in-storage computations (returns properties and current `operation` status).
 - `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters (filters `operation = 1` active by default; supports `operation` filter or `include_all_operations: true`).
 - `POST /v1/update`: Constant-time batch update with arithmetic mutations (automatically skips entities not in active `operation = 1` state; add `"async": true` or `?async=true` to offload to worker).
 - `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
+- `POST /v1/edge`: Registers or removes an explicit directed edge `source --relation--> target` with a numeric `weight` (`action: "add"` default, or `"remove"`), enabling deterministic cause-and-effect links.
+- `POST /v1/causal`: Traverses explicit edges from `seeds`; a single `relation` performs one hop, while a `relations` list performs a weighted multi-hop chain.
 - `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
 - `POST /v1/partition/run`: Triggers partition archival with Safe-Delete rollback protection (`0` Safe-Delete during archival $\rightarrow$ `2` Tombstone on success; add `"async": true` in JSON body to offload to worker).
 - `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state (add `"async": true` or `?async=true` to offload to worker).
@@ -201,6 +204,13 @@ AnchorDB records follow a resilient four-state operational lifecycle:
 - **`0` (SAFE_DELETE)**: In-flight safe delete / pending archival / partition lock. Locked against mutations; excluded from normal queries.
 - **`2` (TOMBSTONE)**: Marked for deletion upon partition success. Excluded from normal lookups and swept in batches by the background collector during periodic disk sync or `/v1/collector/run`.
 - **`3` (RETRY)**: Execution failed (e.g. S3 upload timeout) or interrupted by server shutdown/crash while in `0` (Safe-Delete). The startup crash reconciler automatically detects interrupted `0` records and promotes them to `3`. The next partition run automatically re-attempts records in state `3`.
+
+### 4. Durability & Concurrency Guarantees
+- **Single-writer per file**: `Open()` takes an exclusive advisory lock on a `<db>.lock` sidecar held for the instance lifetime; a second process opening the same `.anchordb` fails fast instead of corrupting state.
+- **Write-ahead log with CRC framing**: every mutation is appended to `<db>.wal` (magic + version + opcode + length + CRC32) and `fsync`ed before it is applied in memory. On recovery, an incomplete trailing frame is safely truncated, while a complete but corrupt frame fails closed (writes and checkpointing are disabled until repaired).
+- **Atomic sync**: `db.Sync()` streams a full snapshot to a temp file, `fsync`s it, `rename`s it over the database, and only then swaps the live `mmap` — a failure leaves the previous mapping and WAL intact rather than an unusable database.
+- **Partition locks are enforced**: records in Safe-Delete (`0`) reject updates, deletes, and re-saves until the archival flow completes or the startup reconciler releases them to Retry (`3`).
+- **Backward-compatible format versioning**: `DBVersion` is now `3` (adds the optional causal-edge section). Readers accept versions `1..3`, so databases written by older binaries still open; the legacy `WALManager.Replay` callback keeps its original signature (use `ReplayEvents` to observe edge operations).
 
 ---
 

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,9 @@ import (
 // ErrDatabaseClosed is returned by mutations and Sync after Close, so a write
 // can never be acknowledged without WAL durability.
 var ErrDatabaseClosed = errors.New("anchordb: database is closed")
+
+// ErrRecordLocked indicates the record is in an in-flight partition operation.
+var ErrRecordLocked = errors.New("anchordb: record is locked for partitioning")
 
 // OrderByMode defines the sorting strategy in AnchorDB
 type OrderByMode int
@@ -136,6 +141,7 @@ type AnchorDB struct {
 	closed bool // guarded by mu; set once by Close
 
 	file      *os.File
+	lockFile  *os.File
 	mmapData  []byte
 	isMmapped bool
 
@@ -147,8 +153,11 @@ type AnchorDB struct {
 	// Lexicon dictionary: word -> node record index
 	Lexicon map[string]uint32
 
-	// Relations map: relationName -> shift vector T
-	Relations map[string]spatial.Point2D
+	// relations maps relation names to query direction vectors. Guarded by mu.
+	relations map[string]spatial.Point2D
+	// partitionLocks distinguishes active archive reservations from legacy
+	// lifecycle records that happen to carry OpStatusSafeDelete.
+	partitionLocks map[string]bool
 
 	// Zero-copy mmap node tracking:
 	// Synced nodes are read directly from mmapData without heap allocation.
@@ -168,7 +177,46 @@ type AnchorDB struct {
 	// EntityOrder maintains deterministic insertion order for constant-time sequential scanning
 	EntityOrder []string
 
+	// Causal edges are explicit per-edge relationships (source --relation--> target).
+	// edges holds every edge in insertion order; deleted edges are tombstoned with
+	// an empty Source. adjOut/adjIn index edges by source/target for O(1) traversal.
+	edges  []EdgeRecord
+	adjOut map[string][]int
+	adjIn  map[string][]int
+
+	// entitySectionEnd is the file offset where the entity section ends (and, for
+	// v3 files, where the optional edge section begins). Populated while loading.
+	entitySectionEnd int
+
 	filePath string
+}
+
+// SetRelation registers or replaces a query direction vector safely.
+func (db *AnchorDB) SetRelation(name string, direction spatial.Point2D) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("relation name must not be empty")
+	}
+	if direction.X == 0 && direction.Y == 0 ||
+		math.IsNaN(float64(direction.X)) || math.IsNaN(float64(direction.Y)) ||
+		math.IsInf(float64(direction.X), 0) || math.IsInf(float64(direction.Y), 0) {
+		return fmt.Errorf("relation %q direction must be finite and non-zero", name)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	db.relations[name] = direction
+	return nil
+}
+
+// Relation returns a registered query direction vector.
+func (db *AnchorDB) Relation(name string) (spatial.Point2D, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	direction, ok := db.relations[name]
+	return direction, ok
 }
 
 // ParseDate converts YYYY-MM-DD string to numeric Epoch Days (days since 1970-01-01)
@@ -388,10 +436,11 @@ func (f FilterCondition) Matches(props map[string]float32) bool {
 
 // QueryOptions defines criteria for List queries with pagination, column selection, and operation filtering
 type QueryOptions struct {
-	IncludeAllOperations bool              // If true, returns records regardless of operation status (0, 1, 2, 3)
-	OperationFilter      *uint8            // If specified, filters specifically by this operation status
-	AllowedOperations    []uint8           // If specified, returns records whose operation matches any in this list
-	Select               []string          // Projection: list of fields to return (empty means return all fields)
+	Context              context.Context
+	IncludeAllOperations bool     // If true, returns records regardless of operation status (0, 1, 2, 3)
+	OperationFilter      *uint8   // If specified, filters specifically by this operation status
+	AllowedOperations    []uint8  // If specified, returns records whose operation matches any in this list
+	Select               []string // Projection: list of fields to return (empty means return all fields)
 	Filters              []FilterCondition
 	Computations         map[string]ComputeOp
 	Limit                int
@@ -465,56 +514,68 @@ func (db *AnchorDB) markNodeDeleted(idx uint32) {
 // Open creates or opens an AnchorDB file using memory mapping.
 func Open(filePath string) (*AnchorDB, error) {
 	db := &AnchorDB{
-		Grid:        make(map[uint32][]uint32),
-		Lexicon:     make(map[string]uint32),
-		Relations:   make(map[string]spatial.Point2D),
-		EntityStore: make(map[string]CompactRecord),
-		attrPool:    make(map[string]string),
-		EntityOrder: make([]string, 0),
-		filePath:    filePath,
+		Grid:           make(map[uint32][]uint32),
+		Lexicon:        make(map[string]uint32),
+		relations:      make(map[string]spatial.Point2D),
+		partitionLocks: make(map[string]bool),
+		EntityStore:    make(map[string]CompactRecord),
+		attrPool:       make(map[string]string),
+		EntityOrder:    make([]string, 0),
+		adjOut:         make(map[string][]int),
+		adjIn:          make(map[string][]int),
+		filePath:       filePath,
 	}
 
-	// Register default relation vectors
-	db.Relations["keturunan"] = spatial.Point2D{X: 0.0, Y: -0.8}
-	db.Relations["pertumbuhan"] = spatial.Point2D{X: 0.5, Y: 0.0}
-	db.Relations["edukasi"] = spatial.Point2D{X: 0.0, Y: -0.6}
-	db.Relations["kausalitas"] = spatial.Point2D{X: 0.4, Y: -0.4}
-	db.Relations["vokalisasi"] = spatial.Point2D{X: -0.5, Y: 0.0}
-	db.Relations["perubahan_fase"] = spatial.Point2D{X: 0.0, Y: -0.7}
-	db.Relations["pembakaran"] = spatial.Point2D{X: 0.6, Y: -0.6}
+	// Keep the lock on a sidecar rather than the database inode: Sync atomically
+	// replaces the database file, while this descriptor remains locked.
+	lockFile, err := os.OpenFile(filePath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database lock: %w", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		return nil, fmt.Errorf("database is already open: %w", err)
+	}
+	db.lockFile = lockFile
+	openErr := func(err error) (*AnchorDB, error) {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		db.lockFile = nil
+		return nil, err
+	}
 
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		// Initialize empty database file
 		if err := db.initEmptyFile(filePath); err != nil {
-			return nil, fmt.Errorf("failed to init empty anchordb file: %w", err)
+			return openErr(fmt.Errorf("failed to init empty anchordb file: %w", err))
 		}
 	}
 
 	// Open file
 	f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file %s: %w", filePath, err)
+		return openErr(fmt.Errorf("failed to open file %s: %w", filePath, err))
 	}
 	db.file = f
 
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, err
+		return openErr(err)
 	}
 
 	fileSize := fi.Size()
 	if fileSize < HeaderSize {
 		_ = f.Close()
-		return nil, fmt.Errorf("corrupt file: size %d smaller than header", fileSize)
+		return openErr(fmt.Errorf("corrupt file: size %d smaller than header", fileSize))
 	}
 
 	// Memory map the file via Linux mmap
 	mmapData, err := syscall.Mmap(int(f.Fd()), 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("mmap failed: %w", err)
+		return openErr(fmt.Errorf("mmap failed: %w", err))
 	}
 	db.mmapData = mmapData
 	db.isMmapped = true
@@ -539,6 +600,12 @@ func Open(filePath string) (*AnchorDB, error) {
 		return nil, err
 	}
 
+	// Load the optional causal-edge section (format version >= 3)
+	if err := db.loadEdges(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	// Initialize WAL for append-only durability
 	walPath := filePath + ".wal"
 	wal, err := OpenWAL(walPath)
@@ -549,14 +616,20 @@ func Open(filePath string) (*AnchorDB, error) {
 	db.wal = wal
 
 	// Replay WAL for crash recovery (restores mutations lost before the last Sync)
-	_, err = db.wal.Replay(func(op byte, name string, cr CompactRecord, word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error {
-		switch op {
+	_, err = db.wal.ReplayEvents(func(ev WALEvent) error {
+		switch ev.Op {
 		case WalOpSave:
-			db.applyWALSaveLocked(name, cr)
+			db.applyWALSaveLocked(ev.Name, ev.Record)
 		case WalOpDelete:
-			db.applyWALDeleteLocked(name)
+			db.applyWALDeleteLocked(ev.Name)
 		case WalOpNode:
-			db.appendNodeLocked(word, coord, roles, domainID)
+			db.appendNodeLocked(ev.Word, ev.Coord, ev.Roles, ev.DomainID)
+		case WalOpEdge:
+			db.upsertEdge(ev.Edge.Source, ev.Edge.Relation, ev.Edge.Target, ev.Edge.Weight)
+		case WalOpEdgeDelete:
+			if idx := db.findEdge(ev.Edge.Source, ev.Edge.Relation, ev.Edge.Target); idx >= 0 {
+				db.edges[idx] = EdgeRecord{}
+			}
 		}
 		return nil
 	})
@@ -589,6 +662,7 @@ func (db *AnchorDB) reconcileInterruptedOperationsLocked() int {
 			reconciled++
 		}
 	}
+	clear(db.partitionLocks)
 	return reconciled
 }
 
@@ -661,6 +735,31 @@ func (db *AnchorDB) initEmptyFile(filePath string) error {
 }
 
 func (db *AnchorDB) buildIndex() error {
+	fileSize := uint64(len(db.mmapData))
+	if db.Header.NodesOffset < HeaderSize || db.Header.NodesOffset > fileSize {
+		return fmt.Errorf("corrupt file: invalid node offset %d", db.Header.NodesOffset)
+	}
+	nodeBytes := db.Header.NodeCount * RecordSize
+	if db.Header.NodeCount != 0 && nodeBytes/db.Header.NodeCount != RecordSize {
+		return fmt.Errorf("corrupt file: node section size overflow")
+	}
+	if nodeBytes > fileSize-db.Header.NodesOffset {
+		return fmt.Errorf("corrupt file: node section exceeds file size")
+	}
+	nodeEnd := db.Header.NodesOffset + nodeBytes
+	if db.Header.StringOffset < nodeEnd || db.Header.StringOffset > fileSize ||
+		db.Header.EntityOffset < db.Header.StringOffset || db.Header.EntityOffset > fileSize {
+		return fmt.Errorf("corrupt file: invalid string/entity section offsets")
+	}
+	if db.Header.Version >= 2 && db.Header.EntityCount > 0 && db.Header.EntityOffset == fileSize {
+		return fmt.Errorf("corrupt file: entity section is missing")
+	}
+	if db.Header.NodeCount > uint64(math.MaxInt) {
+		return fmt.Errorf("corrupt file: node count exceeds addressable memory")
+	}
+	if db.Header.NodeCount > 0 && db.Header.StringOffset == db.Header.EntityOffset {
+		return fmt.Errorf("corrupt file: string pool is missing")
+	}
 	nodeCount := int(db.Header.NodeCount)
 	db.syncedNodeCount = uint64(nodeCount)
 	db.pendingNodes = nil
@@ -677,17 +776,18 @@ func (db *AnchorDB) buildIndex() error {
 	for i := 0; i < nodeCount; i++ {
 		offset := int(db.Header.NodesOffset) + i*RecordSize
 		if offset+RecordSize > len(db.mmapData) {
-			break
+			return fmt.Errorf("corrupt file: truncated node record %d", i)
 		}
 		DecodeRecord(db.mmapData[offset:offset+RecordSize], &rec)
 
 		// String lookup
+		if uint64(rec.WordOffset)+uint64(rec.WordLen) > db.Header.EntityOffset-db.Header.StringOffset {
+			return fmt.Errorf("corrupt file: invalid word range in node %d", i)
+		}
 		wordOffset := int(db.Header.StringOffset) + int(rec.WordOffset)
 		wordLen := int(rec.WordLen)
-		if wordOffset+wordLen <= len(db.mmapData) {
-			word := string(db.mmapData[wordOffset : wordOffset+wordLen])
-			db.Lexicon[word] = uint32(i)
-		}
+		word := string(db.mmapData[wordOffset : wordOffset+wordLen])
+		db.Lexicon[word] = uint32(i)
 
 		// Insert into spatial grid cell
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
@@ -700,22 +800,21 @@ func (db *AnchorDB) buildIndex() error {
 }
 
 func (db *AnchorDB) loadEntities() error {
+	db.entitySectionEnd = int(db.Header.EntityOffset)
 	if db.Header.EntityCount == 0 || db.Header.EntityOffset == 0 {
-		return nil
-	}
-	if int(db.Header.EntityOffset) >= len(db.mmapData) {
 		return nil
 	}
 	data := db.mmapData[db.Header.EntityOffset:]
 	offset := 0
+	loaded := uint64(0)
 	for i := uint64(0); i < db.Header.EntityCount; i++ {
 		if offset+2 > len(data) {
-			break
+			return fmt.Errorf("corrupt file: truncated entity name length at entity %d", i)
 		}
 		nameLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 		if offset+nameLen > len(data) {
-			break
+			return fmt.Errorf("corrupt file: truncated entity name at entity %d", i)
 		}
 		name := string(data[offset : offset+nameLen])
 		offset += nameLen
@@ -723,14 +822,14 @@ func (db *AnchorDB) loadEntities() error {
 		opStatus := OpStatusActive
 		if db.Header.Version >= 2 {
 			if offset+1 > len(data) {
-				break
+				return fmt.Errorf("corrupt file: truncated operation status at entity %d", i)
 			}
 			opStatus = data[offset]
 			offset += 1
 		}
 
 		if offset+2 > len(data) {
-			break
+			return fmt.Errorf("corrupt file: truncated attribute count at entity %d", i)
 		}
 		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
@@ -738,12 +837,12 @@ func (db *AnchorDB) loadEntities() error {
 		attrs := make([]AttrEntry, 0, attrCount)
 		for a := 0; a < attrCount; a++ {
 			if offset+2 > len(data) {
-				break
+				return fmt.Errorf("corrupt file: truncated attribute key length at entity %d", i)
 			}
 			keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 			offset += 2
 			if offset+keyLen+4 > len(data) {
-				break
+				return fmt.Errorf("corrupt file: truncated attribute value at entity %d", i)
 			}
 			key := db.internAttr(string(data[offset : offset+keyLen]))
 			offset += keyLen
@@ -753,12 +852,25 @@ func (db *AnchorDB) loadEntities() error {
 		}
 		db.EntityStore[name] = CompactRecord{Operation: opStatus, Attrs: attrs}
 		db.EntityOrder = append(db.EntityOrder, name)
+		loaded++
+	}
+	if loaded != db.Header.EntityCount {
+		return fmt.Errorf("corrupt file: loaded %d of %d entities", loaded, db.Header.EntityCount)
+	}
+	// For v3 the edge section (if any) follows the entity section, so trailing
+	// bytes are expected. For v1/v2 the entity section must run to EOF.
+	db.entitySectionEnd = int(db.Header.EntityOffset) + offset
+	if db.Header.Version < 3 && offset != len(data) {
+		return fmt.Errorf("corrupt file: %d trailing bytes after entity section", len(data)-offset)
 	}
 	return nil
 }
 
 // AppendNode adds a new node record into AnchorDB.
 func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]float32, domainID uint16) (uint64, error) {
+	if err := validateNodeGeometry(coord, roles); err != nil {
+		return 0, err
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -769,38 +881,28 @@ func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]floa
 	if idx, exists := db.Lexicon[word]; exists {
 		return db.getNode(idx).ID, nil
 	}
-
-	newID := uint64(db.totalNodes() + 1)
-	wordBytes := []byte(word)
-	wordOffset := uint32(len(db.stringPool))
-	db.stringPool = append(db.stringPool, wordBytes...)
-
-	rec := BinaryNodeRecord{
-		ID:         newID,
-		X:          coord.X,
-		Y:          coord.Y,
-		Roles:      roles,
-		DomainID:   domainID,
-		WordOffset: wordOffset,
-		WordLen:    uint16(len(wordBytes)),
-	}
-
-	recordIndex := uint32(db.totalNodes())
-	db.pendingNodes = append(db.pendingNodes, rec)
-	db.Lexicon[word] = recordIndex
-
-	// Insert into grid
-	cell := PointToCell(coord, GridDim)
-	idx := CellIndex(cell, GridDim)
-	db.Grid[uint32(idx)] = append(db.Grid[uint32(idx)], recordIndex)
-
-	db.Header.NodeCount = uint64(db.totalNodes())
-
 	if db.wal != nil {
-		_ = db.wal.WriteNode(word, coord, roles, domainID)
+		if err := db.wal.WriteNode(word, coord, roles, domainID); err != nil {
+			return 0, fmt.Errorf("failed to write node %q to wal: %w", word, err)
+		}
 	}
+	return db.appendNodeLocked(word, coord, roles, domainID), nil
+}
 
-	return newID, nil
+// validateNodeGeometry rejects non-finite coordinates and role weights. Such
+// values would otherwise poison spatial lookups (int(NaN) yields an
+// implementation-defined cell index) and downstream score arithmetic.
+func validateNodeGeometry(coord spatial.Point2D, roles [4]float32) error {
+	if math.IsNaN(float64(coord.X)) || math.IsInf(float64(coord.X), 0) ||
+		math.IsNaN(float64(coord.Y)) || math.IsInf(float64(coord.Y), 0) {
+		return fmt.Errorf("node coordinate must be finite, got (%v, %v)", coord.X, coord.Y)
+	}
+	for i, r := range roles {
+		if math.IsNaN(float64(r)) || math.IsInf(float64(r), 0) {
+			return fmt.Errorf("node role[%d] must be finite, got %v", i, r)
+		}
+	}
+	return nil
 }
 
 // appendNodeLocked adds a node without acquiring mutex (caller must hold db.mu.Lock)
@@ -854,6 +956,12 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 	defer db.mu.Unlock()
 	if db.closed {
 		return "", ErrDatabaseClosed
+	}
+	if opStatus == OpStatusSafeDelete {
+		return "", fmt.Errorf("cannot save record with internal partition-lock status")
+	}
+	if db.partitionLocks[name] {
+		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
 	}
 
 	attrs := make([]AttrEntry, 0, len(props))
@@ -970,6 +1078,11 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 	hasMore := false
 
 	for i := 0; i < totalEntities; i++ {
+		if opts.Context != nil {
+			if err := opts.Context.Err(); err != nil {
+				return nil, false, err
+			}
+		}
 		name := db.EntityOrder[i]
 		cr := db.EntityStore[name]
 
@@ -1066,6 +1179,7 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 
 // UpdateOptions defines criteria and mutations for batch in-storage updates
 type UpdateOptions struct {
+	Context        context.Context
 	TargetEntities []string             // If specified, updates directly via O(1) key access
 	Filters        []FilterCondition    // Optional Where conditions
 	Mutations      map[string]ComputeOp // e.g., "jarak" -> OpAdd{FieldA: "jarak", FieldB: "10"}
@@ -1074,6 +1188,8 @@ type UpdateOptions struct {
 }
 
 // UpdateRecords updates entity attributes in-place using in-storage arithmetic mutations with constant-time early exit.
+// If an error occurs after one or more records have been committed, the returned
+// count reports those committed records; batch updates are not transactional.
 func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1093,8 +1209,18 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		if limit <= 0 || limit > len(opts.TargetEntities) {
 			limit = len(opts.TargetEntities)
 		}
+		offset := opts.Offset
+		if offset < 0 {
+			offset = 0
+		}
+		skipped := 0
 
 		for _, name := range opts.TargetEntities {
+			if opts.Context != nil {
+				if err := opts.Context.Err(); err != nil {
+					return updatedCount, err
+				}
+			}
 			if updatedCount >= limit {
 				break
 			}
@@ -1115,21 +1241,30 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				continue
 			}
 
+			// Offset counts matching records, mirroring the scan path below.
+			if skipped < offset {
+				skipped++
+				continue
+			}
+
 			props := cr.ToMap()
 
 			// Apply in-place mathematical mutations based on snapshot
 			pending := make(map[string]float32, len(opts.Mutations))
 			for field, op := range opts.Mutations {
 				newVal, err := op.Apply(props)
-				if err == nil {
-					pending[field] = newVal
+				if err != nil {
+					return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
 				}
+				pending[field] = newVal
 			}
 			for k, v := range pending {
 				cr = cr.Set(db.internAttr(k), v)
 			}
 			if db.wal != nil {
-				_ = db.wal.WriteSave(name, cr)
+				if err := db.wal.WriteSave(name, cr); err != nil {
+					return updatedCount, fmt.Errorf("failed to write update for %q to wal: %w", name, err)
+				}
 			}
 			db.EntityStore[name] = cr
 			updatedCount++
@@ -1146,6 +1281,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	offset := opts.Offset
 
 	for _, name := range db.EntityOrder {
+		if opts.Context != nil {
+			if err := opts.Context.Err(); err != nil {
+				return updatedCount, err
+			}
+		}
 		if updatedCount >= limit {
 			break // Waktu konstan tercapai: stop setelah Limit terpenuhi!
 		}
@@ -1178,15 +1318,18 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		pending := make(map[string]float32, len(opts.Mutations))
 		for field, op := range opts.Mutations {
 			newVal, err := op.Apply(props)
-			if err == nil {
-				pending[field] = newVal
+			if err != nil {
+				return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
 			}
+			pending[field] = newVal
 		}
 		for k, v := range pending {
 			cr = cr.Set(db.internAttr(k), v)
 		}
 		if db.wal != nil {
-			_ = db.wal.WriteSave(name, cr)
+			if err := db.wal.WriteSave(name, cr); err != nil {
+				return updatedCount, fmt.Errorf("failed to write update for %q to wal: %w", name, err)
+			}
 		}
 		db.EntityStore[name] = cr
 		updatedCount++
@@ -1197,11 +1340,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 
 // SetOperationStatus updates the operation lifecycle state for the specified entity names.
 // Persists the changes to WAL and updates EntityStore. Returns the number of entities updated.
-func (db *AnchorDB) SetOperationStatus(names []string, status uint8) int {
+func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
-		return 0
+		return 0, ErrDatabaseClosed
 	}
 
 	updated := 0
@@ -1213,19 +1356,130 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) int {
 		if cr.Operation == status {
 			continue
 		}
+		if db.partitionLocks[name] || status == OpStatusSafeDelete && cr.Operation == OpStatusSafeDelete {
+			return updated, fmt.Errorf("%w: use partition locking APIs to change this state for %q", ErrRecordLocked, name)
+		}
+		if db.wal != nil {
+			updatedRecord := cr
+			updatedRecord.Operation = status
+			if err := db.wal.WriteSave(name, updatedRecord); err != nil {
+				return updated, fmt.Errorf("failed to write operation status for %q to wal: %w", name, err)
+			}
+		}
 		cr.Operation = status
 		db.EntityStore[name] = cr
-		if db.wal != nil {
-			_ = db.wal.WriteSave(name, cr)
-		}
 		updated++
 	}
-	return updated
+	return updated, nil
+}
+
+// CompletePartitionRecords transitions records held in SafeDelete after the
+// partition snapshot has either been archived or must be released for retry.
+func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int, error) {
+	if status != OpStatusActive && status != OpStatusTombstone && status != OpStatusRetry {
+		return 0, fmt.Errorf("invalid partition completion status %d", status)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
+	updated := 0
+	for _, name := range names {
+		cr, exists := db.EntityStore[name]
+		if !exists || cr.Operation != OpStatusSafeDelete || !db.partitionLocks[name] {
+			continue
+		}
+		cr.Operation = status
+		if db.wal != nil {
+			if err := db.wal.WriteSave(name, cr); err != nil {
+				return updated, fmt.Errorf("failed to complete partition state for %q: %w", name, err)
+			}
+		}
+		db.EntityStore[name] = cr
+		delete(db.partitionLocks, name)
+		updated++
+	}
+	return updated, nil
+}
+
+// LockPartitionRecords atomically snapshots eligible records and marks them
+// SafeDelete. The caller may then archive the returned immutable property maps
+// without racing a concurrent update.
+func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit int) ([]EntityRecord, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if dateField == "" {
+		return nil, fmt.Errorf("partition date field must not be empty")
+	}
+	if math.IsNaN(float64(cutoff)) || math.IsInf(float64(cutoff), 0) {
+		return nil, fmt.Errorf("partition cutoff must be finite")
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("partition record limit must be greater than zero")
+	}
+
+	records := make([]EntityRecord, 0)
+	for _, name := range db.EntityOrder {
+		cr, exists := db.EntityStore[name]
+		if !exists || (cr.Operation != OpStatusActive && cr.Operation != OpStatusRetry) {
+			continue
+		}
+		date, exists := cr.Get(dateField)
+		if !exists || date >= cutoff {
+			continue
+		}
+		if len(records) >= limit {
+			break
+		}
+		records = append(records, EntityRecord{
+			Name:      name,
+			Operation: cr.Operation,
+			Props:     cr.ToMap(),
+		})
+	}
+	if len(records) == 0 {
+		return records, nil
+	}
+
+	// Persist each lifecycle transition before exposing it in memory. If a later
+	// WAL write fails, roll the already locked prefix back to Retry where possible.
+	locked := make([]EntityRecord, 0, len(records))
+	for _, record := range records {
+		cr := db.EntityStore[record.Name]
+		updated := cr
+		updated.Operation = OpStatusSafeDelete
+		if db.wal != nil {
+			if err := db.wal.WriteSave(record.Name, updated); err != nil {
+				var rollbackErrs []error
+				for _, written := range locked {
+					current := db.EntityStore[written.Name]
+					current.Operation = OpStatusRetry
+					if db.wal != nil {
+						if rollbackErr := db.wal.WriteSave(written.Name, current); rollbackErr != nil {
+							rollbackErrs = append(rollbackErrs, fmt.Errorf("restore %q to retry: %w", written.Name, rollbackErr))
+							continue
+						}
+					}
+					db.EntityStore[written.Name] = current
+					delete(db.partitionLocks, written.Name)
+				}
+				return nil, errors.Join(fmt.Errorf("failed to persist partition lock for %q: %w", record.Name, err), errors.Join(rollbackErrs...))
+			}
+		}
+		db.EntityStore[record.Name] = updated
+		db.partitionLocks[record.Name] = true
+		locked = append(locked, record)
+	}
+	return records, nil
 }
 
 // CollectTombstones purges up to maxBatch entities marked with OpStatusTombstone (2).
-// Returns the number of tombstones collected and deleted from storage and graph index.
-func (db *AnchorDB) CollectTombstones(maxBatch int) int {
+// It returns the number deleted and any WAL persistence error.
+func (db *AnchorDB) CollectTombstones(maxBatch int) (int, error) {
 	if maxBatch <= 0 {
 		maxBatch = 1000
 	}
@@ -1233,7 +1487,7 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
-		return 0
+		return 0, ErrDatabaseClosed
 	}
 
 	var toPurge []string
@@ -1247,72 +1501,94 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) int {
 	}
 
 	if len(toPurge) == 0 {
-		return 0
+		return 0, nil
 	}
 
+	purgedSet := make(map[string]bool, len(toPurge))
+	purged := 0
 	for _, n := range toPurge {
-		delete(db.EntityStore, n)
-		if nodeIdx, exists := db.Lexicon[n]; exists {
-			delete(db.Lexicon, n)
-			db.markNodeDeleted(nodeIdx)
-		}
 		if db.wal != nil {
-			_ = db.wal.WriteDelete(n)
+			if err := db.wal.WriteDelete(n); err != nil {
+				db.deleteEntityLocked(purgedSet)
+				db.removeEntityNamesLocked(purgedSet)
+				return purged, fmt.Errorf("failed to write tombstone deletion for %q to wal: %w", n, err)
+			}
 		}
+		purgedSet[n] = true
+		purged++
 	}
-
-	purgeSet := make(map[string]bool, len(toPurge))
-	for _, n := range toPurge {
-		purgeSet[n] = true
-	}
-	newOrder := make([]string, 0, len(db.EntityOrder)-len(toPurge))
-	for _, n := range db.EntityOrder {
-		if !purgeSet[n] {
-			newOrder = append(newOrder, n)
-		}
-	}
-	db.EntityOrder = newOrder
-	db.Header.EntityCount = uint64(len(db.EntityOrder))
-
-	return len(toPurge)
+	db.deleteEntityLocked(purgedSet)
+	db.removeEntityNamesLocked(purgedSet)
+	return purged, nil
 }
 
 // DeleteRecords removes specified entity names from EntityStore, EntityOrder, and graph index.
-func (db *AnchorDB) DeleteRecords(names []string) int {
+// It returns the number deleted and any WAL persistence error.
+func (db *AnchorDB) DeleteRecords(names []string) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
-		return 0
+		return 0, ErrDatabaseClosed
+	}
+	for _, name := range names {
+		if db.partitionLocks[name] {
+			return 0, fmt.Errorf("%w: %q", ErrRecordLocked, name)
+		}
 	}
 
 	toDelete := make(map[string]bool, len(names))
 	for _, n := range names {
 		toDelete[n] = true
-		delete(db.EntityStore, n)
+	}
+	deleteNames := make([]string, 0, len(toDelete))
+	for n := range toDelete {
+		deleteNames = append(deleteNames, n)
+	}
+	sort.Strings(deleteNames)
+	persistedDelete := make(map[string]bool, len(toDelete))
+	for _, n := range deleteNames {
+		if db.wal != nil {
+			if err := db.wal.WriteDelete(n); err != nil {
+				db.deleteEntityLocked(persistedDelete)
+				deleted := db.removeEntityNamesLocked(persistedDelete)
+				return deleted, fmt.Errorf("failed to write deletion for %q to wal: %w", n, err)
+			}
+		}
+		persistedDelete[n] = true
+	}
+	db.deleteEntityLocked(persistedDelete)
+	deletedCount := db.removeEntityNamesLocked(persistedDelete)
+	return deletedCount, nil
+}
 
-		// Clean up from graph index if present
-		if nodeIdx, exists := db.Lexicon[n]; exists {
-			delete(db.Lexicon, n)
+func (db *AnchorDB) deleteEntityLocked(names map[string]bool) {
+	for name := range names {
+		delete(db.EntityStore, name)
+		if nodeIdx, exists := db.Lexicon[name]; exists {
+			delete(db.Lexicon, name)
 			db.markNodeDeleted(nodeIdx)
 		}
-
-		if db.wal != nil {
-			_ = db.wal.WriteDelete(n)
-		}
 	}
+}
 
-	newOrder := make([]string, 0, len(db.EntityOrder)-len(toDelete))
-	deletedCount := 0
-	for _, n := range db.EntityOrder {
-		if toDelete[n] {
-			deletedCount++
-		} else {
-			newOrder = append(newOrder, n)
+// removeEntityNamesLocked filters persisted deletions from the ordered entity
+// index and updates the on-disk header count. Caller must hold db.mu.Lock.
+func (db *AnchorDB) removeEntityNamesLocked(deleted map[string]bool) int {
+	if len(deleted) == 0 {
+		return 0
+	}
+	newOrder := make([]string, 0, len(db.EntityOrder))
+	removed := 0
+	for _, name := range db.EntityOrder {
+		if deleted[name] {
+			removed++
+			continue
 		}
+		newOrder = append(newOrder, name)
 	}
 	db.EntityOrder = newOrder
-	db.Header.EntityCount = uint64(len(db.EntityOrder))
-	return deletedCount
+	db.Header.EntityCount = uint64(len(newOrder))
+	return removed
 }
 
 // Sync flushes pending records to disk and truncates the WAL log up to the snapshot point.
@@ -1349,8 +1625,11 @@ func (db *AnchorDB) Sync() error {
 		}
 	}
 
+	edgesSnapshot := make([]EdgeRecord, len(db.edges))
+	copy(edgesSnapshot, db.edges)
+
 	hdrSnapshot := db.Header
-	hdrSnapshot.Version = DBVersion // Ensure synced header is v2
+	hdrSnapshot.Version = DBVersion // Ensure synced header carries the current format version
 	nodesOffset := uint64(HeaderSize)
 	nodesSize := uint64(totNodes * RecordSize)
 	stringOffset := nodesOffset + nodesSize
@@ -1365,7 +1644,12 @@ func (db *AnchorDB) Sync() error {
 
 	var walCheckpointOffset int64
 	if db.wal != nil {
-		walCheckpointOffset, _ = db.wal.CurrentOffset()
+		var err error
+		walCheckpointOffset, err = db.wal.CurrentOffset()
+		if err != nil {
+			db.mu.Unlock()
+			return fmt.Errorf("failed to capture wal checkpoint offset: %w", err)
+		}
 	}
 	db.mu.Unlock() // UNLOCK: Read/Write queries are free to proceed while disk I/O runs!
 
@@ -1460,6 +1744,11 @@ func (db *AnchorDB) Sync() error {
 		}
 	}
 
+	// 5. Causal-edge section (format version >= 3) follows the entity section.
+	if err := writeEdgeSection(writer, edgesSnapshot); err != nil {
+		return err
+	}
+
 	if err := writer.Flush(); err != nil {
 		return err
 	}
@@ -1471,16 +1760,6 @@ func (db *AnchorDB) Sync() error {
 	// 3. Briefly acquire db.mu.Lock only for atomic file swap and WAL checkpointing
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
-	// Unmap previous file view and close old file descriptor before atomic rename
-	if db.isMmapped && db.mmapData != nil {
-		_ = syscall.Munmap(db.mmapData)
-		db.mmapData = nil
-		db.isMmapped = false
-	}
-	if db.file != nil {
-		_ = db.file.Close()
-	}
 
 	// Atomic rename replaces the database file cleanly without corruption risk
 	if err := os.Rename(tempPath, db.filePath); err != nil {
@@ -1499,21 +1778,36 @@ func (db *AnchorDB) Sync() error {
 	if err != nil {
 		return err
 	}
-	db.file = newF
 
 	// Re-mmap
-	fi, err := db.file.Stat()
+	fi, err := newF.Stat()
 	if err != nil {
+		_ = newF.Close()
 		return err
 	}
 	fileSize := fi.Size()
-	mmapData, err := syscall.Mmap(int(db.file.Fd()), 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	mmapData, err := syscall.Mmap(int(newF.Fd()), 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
+		_ = newF.Close()
 		return err
 	}
+	oldFile, oldMmap, oldMapped := db.file, db.mmapData, db.isMmapped
+	if oldMapped && oldMmap != nil {
+		if err := syscall.Munmap(oldMmap); err != nil {
+			_ = syscall.Munmap(mmapData)
+			_ = newF.Close()
+			return fmt.Errorf("release previous database mapping: %w", err)
+		}
+	}
+	db.file = newF
 	db.mmapData = mmapData
 	db.isMmapped = true
 	db.Header = hdrSnapshot
+	if oldFile != nil {
+		if err := oldFile.Close(); err != nil {
+			return fmt.Errorf("close previous database file: %w", err)
+		}
+	}
 
 	// Prune pending nodes that were captured in snapshot
 	if uint64(len(db.pendingNodes)) >= (uint64(totNodes) - db.syncedNodeCount) {
@@ -1526,7 +1820,9 @@ func (db *AnchorDB) Sync() error {
 
 	// Checkpoint WAL up to the snapshot offset
 	if db.wal != nil {
-		_ = db.wal.Checkpoint(walCheckpointOffset)
+		if err := db.wal.Checkpoint(walCheckpointOffset); err != nil {
+			return fmt.Errorf("failed to checkpoint wal: %w", err)
+		}
 	}
 
 	return nil
@@ -1534,11 +1830,33 @@ func (db *AnchorDB) Sync() error {
 
 // ExecuteGraphStepWithOrder runs full internal numerical graph compute in memory with custom ordering:
 func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, limitK int, order OrderByMode) ([]GraphQueryResult, spatial.Point2D, error) {
+	return db.ExecuteGraphStepWithOptions(inputs, relation, limitK, order, 0.05)
+}
+
+// ExecuteGraphStepWithOptions executes a spatial graph step with an explicit
+// beam width. Existing ExecuteGraphStep APIs retain the historical 0.05 width.
+func (db *AnchorDB) ExecuteGraphStepWithOptions(inputs []string, relation string, limitK int, order OrderByMode, beamWidth float32) ([]GraphQueryResult, spatial.Point2D, error) {
+	return db.ExecuteGraphStepWithContext(context.Background(), inputs, relation, limitK, order, beamWidth)
+}
+
+// ExecuteGraphStepWithContext is ExecuteGraphStepWithOptions with cancellation
+// checks during spatial traversal.
+func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []string, relation string, limitK int, order OrderByMode, beamWidth float32) ([]GraphQueryResult, spatial.Point2D, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
+	shift, hasRel := db.relations[relation]
+	if !hasRel {
+		return nil, spatial.Point2D{}, fmt.Errorf("unknown relation %q", relation)
+	}
 	if len(inputs) == 0 {
 		return nil, spatial.Point2D{}, fmt.Errorf("no inputs provided")
+	}
+	if limitK < 0 {
+		return nil, spatial.Point2D{}, fmt.Errorf("limitK must not be negative")
+	}
+	if beamWidth <= 0 || math.IsNaN(float64(beamWidth)) || math.IsInf(float64(beamWidth), 0) {
+		return nil, spatial.Point2D{}, fmt.Errorf("beam width must be finite and greater than zero")
 	}
 
 	// 1. Calculate Barycenter & Role Deficit from raw node records
@@ -1574,73 +1892,85 @@ func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, 
 	}
 
 	// Get Ray Direction
-	shift, hasRel := db.Relations[relation]
-	var rayDir spatial.Point2D
-	if hasRel {
-		rayDir = shift.Normalize()
-	} else {
-		rayDir = spatial.Point2D{X: 0.0, Y: -1.0}
-	}
+	rayDir := shift.Normalize()
 
 	ray := spatial.NewRay(barycenter, rayDir)
-	beamWidthSq := float32(0.05)
+	beamWidthSq := beamWidth * beamWidth
+	cellSize := 2.0 / float32(GridDim)
+	cellRadius := int(math.Ceil(float64(2 * beamWidth / cellSize)))
+	if cellRadius > GridDim {
+		cellRadius = GridDim
+	}
 
 	var candidates []GraphQueryResult
 	visitedNodes := make(map[uint32]bool)
+	visitedCells := make(map[int]bool)
+	var contextErr error
 
 	// 2. DDA Ray Marching: Steps cell-by-cell in order of forward distance t
 	TraverseRayDDA(ray, GridDim, 2.0, func(cell CellCoord) bool {
-		idx := CellIndex(cell, GridDim)
-		nodeList := db.Grid[uint32(idx)]
+		if err := ctx.Err(); err != nil {
+			contextErr = err
+			return false
+		}
+		minX, maxX := max(0, cell.X-cellRadius), min(GridDim-1, cell.X+cellRadius)
+		minY, maxY := max(0, cell.Y-cellRadius), min(GridDim-1, cell.Y+cellRadius)
+		for y := minY; y <= maxY; y++ {
+			for x := minX; x <= maxX; x++ {
+				cellIndex := CellIndex(CellCoord{X: x, Y: y}, GridDim)
+				if visitedCells[cellIndex] {
+					continue
+				}
+				visitedCells[cellIndex] = true
+				nodeList := db.Grid[uint32(cellIndex)]
+				for _, nodeIdx := range nodeList {
+					if inputIndices[nodeIdx] || visitedNodes[nodeIdx] {
+						continue
+					}
+					visitedNodes[nodeIdx] = true
 
-		for _, nodeIdx := range nodeList {
-			if inputIndices[nodeIdx] || visitedNodes[nodeIdx] {
-				continue
+					rec := db.getNode(nodeIdx)
+					if rec.ID == 0 {
+						continue // tombstone / deleted node
+					}
+					targetCoord := spatial.Point2D{X: rec.X, Y: rec.Y}
+
+					// In-register Pythagoras
+					t, distSqPerp := ray.Project(targetCoord)
+					if t <= 0 || distSqPerp > beamWidthSq*4 {
+						continue
+					}
+
+					// Exponential Wave Absorption
+					beamEnergy := ray.BeamEnergy(distSqPerp, beamWidthSq)
+					if beamEnergy <= 0.01 {
+						continue
+					}
+
+					// Role Fit Dot Product
+					roleFit := rec.Roles[0]*deficit[0] + rec.Roles[1]*deficit[1] + rec.Roles[2]*deficit[2] + rec.Roles[3]*deficit[3]
+					// Distance attenuation along the straight ray beam (closer nodes along t receive beam first)
+					finalScore := beamEnergy * (1.0 + 1.5*roleFit) / (1.0 + 0.5*t)
+
+					// Retrieve word from string pool
+					word := db.getWord(rec.WordOffset, rec.WordLen)
+
+					candidates = append(candidates, GraphQueryResult{
+						Word:       word,
+						Coord:      targetCoord,
+						T:          t,
+						DistSqPerp: distSqPerp,
+						Score:      finalScore,
+					})
+				}
 			}
-			visitedNodes[nodeIdx] = true
-
-			rec := db.getNode(nodeIdx)
-			if rec.ID == 0 {
-				continue // tombstone / deleted node
-			}
-			targetCoord := spatial.Point2D{X: rec.X, Y: rec.Y}
-
-			// In-register Pythagoras
-			t, distSqPerp := ray.Project(targetCoord)
-			if t <= 0 || distSqPerp > beamWidthSq*4 {
-				continue
-			}
-
-			// Exponential Wave Absorption
-			beamEnergy := ray.BeamEnergy(distSqPerp, beamWidthSq)
-			if beamEnergy <= 0.01 {
-				continue
-			}
-
-			// Role Fit Dot Product
-			roleFit := rec.Roles[0]*deficit[0] + rec.Roles[1]*deficit[1] + rec.Roles[2]*deficit[2] + rec.Roles[3]*deficit[3]
-			// Distance attenuation along the straight ray beam (closer nodes along t receive beam first)
-			finalScore := beamEnergy * (1.0 + 1.5*roleFit) / (1.0 + 0.5*t)
-
-			// Retrieve word from string pool
-			word := db.getWord(rec.WordOffset, rec.WordLen)
-
-			candidates = append(candidates, GraphQueryResult{
-				Word:       word,
-				Coord:      targetCoord,
-				T:          t,
-				DistSqPerp: distSqPerp,
-				Score:      finalScore,
-			})
 		}
 
-		// Early Termination condition:
-		// If we've found sufficient high-scoring candidates in nearby cells, stop!
-		if len(candidates) >= limitK*5 {
-			return false // BREAK TRAVERSAL! WAKTU KONSTAN TERCAPAI!
-		}
 		return true
 	})
+	if contextErr != nil {
+		return nil, spatial.Point2D{}, contextErr
+	}
 
 	// Sort top-K according to selected OrderByMode with strict transitive comparison
 	switch order {
@@ -1692,7 +2022,7 @@ func (db *AnchorDB) ExecuteGraphStepWithOrder(inputs []string, relation string, 
 
 // ExecuteGraphStep executes graph query with default OrderByCompositeDesc.
 func (db *AnchorDB) ExecuteGraphStep(inputs []string, relation string, limitK int) ([]GraphQueryResult, spatial.Point2D, error) {
-	return db.ExecuteGraphStepWithOrder(inputs, relation, limitK, OrderByCompositeDesc)
+	return db.ExecuteGraphStepWithOptions(inputs, relation, limitK, OrderByCompositeDesc, 0.05)
 }
 
 // CalculateDistance computes direct Euclidean spatial distance between two words in-storage.
@@ -1790,6 +2120,9 @@ func (db *AnchorDB) CalculateCosineSimilarity(wordA, wordB string) (float32, err
 
 // FindNearestNeighbors finds the K spatially closest concepts to a target word in the manifold.
 func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryResult, error) {
+	if limitK < 0 {
+		return nil, fmt.Errorf("limitK must not be negative")
+	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -1856,11 +2189,31 @@ func (db *AnchorDB) getWord(offset uint32, length uint16) string {
 
 // ExecuteGraphChain runs multi-step recursive reasoning entirely in-storage.
 func (db *AnchorDB) ExecuteGraphChain(initialInputs []string, relationChain []string, limitK int) ([]GraphQueryResult, error) {
+	return db.ExecuteGraphChainWithOptions(initialInputs, relationChain, limitK, 0.05)
+}
+
+// ExecuteGraphChainWithOptions runs each graph step with the configured beam width.
+func (db *AnchorDB) ExecuteGraphChainWithOptions(initialInputs []string, relationChain []string, limitK int, beamWidth float32) ([]GraphQueryResult, error) {
+	return db.ExecuteGraphChainWithContext(context.Background(), initialInputs, relationChain, limitK, beamWidth)
+}
+
+// ExecuteGraphChainWithContext runs a chain while observing cancellation between
+// graph steps and during each step's traversal.
+func (db *AnchorDB) ExecuteGraphChainWithContext(ctx context.Context, initialInputs []string, relationChain []string, limitK int, beamWidth float32) ([]GraphQueryResult, error) {
+	if limitK < 0 {
+		return nil, fmt.Errorf("limitK must not be negative")
+	}
+	if beamWidth <= 0 || math.IsNaN(float64(beamWidth)) || math.IsInf(float64(beamWidth), 0) {
+		return nil, fmt.Errorf("beam width must be finite and greater than zero")
+	}
 	currentInputs := initialInputs
 	var chainResults []GraphQueryResult
 
 	for _, rel := range relationChain {
-		results, _, err := db.ExecuteGraphStep(currentInputs, rel, limitK)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		results, _, err := db.ExecuteGraphStepWithContext(ctx, currentInputs, rel, limitK, OrderByCompositeDesc, beamWidth)
 		if err != nil {
 			return nil, err
 		}
@@ -1904,6 +2257,11 @@ func (db *AnchorDB) Close() error {
 	if db.file != nil {
 		_ = db.file.Close()
 		db.file = nil
+	}
+	if db.lockFile != nil {
+		_ = syscall.Flock(int(db.lockFile.Fd()), syscall.LOCK_UN)
+		_ = db.lockFile.Close()
+		db.lockFile = nil
 	}
 	return nil
 }

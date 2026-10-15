@@ -45,13 +45,13 @@ func TestClosedDBRejectsSyncAndMutations(t *testing.T) {
 	if _, err := db.UpdateRecords(UpdateOptions{Mutations: map[string]ComputeOp{"x": OpAdd{FieldA: "x", FieldB: "1"}}}); !errors.Is(err, ErrDatabaseClosed) {
 		t.Fatalf("Update after Close: want ErrDatabaseClosed, got %v", err)
 	}
-	if n := db.DeleteRecords([]string{"a"}); n != 0 {
-		t.Fatalf("Delete after Close should be a no-op, deleted %d", n)
+	if n, err := db.DeleteRecords([]string{"a"}); n != 0 || !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("Delete after Close should report ErrDatabaseClosed, deleted %d: %v", n, err)
 	}
-	if n := db.CollectTombstones(10); n != 0 {
-		t.Fatalf("CollectTombstones after Close should be a no-op, got %d", n)
+	if n, err := db.CollectTombstones(10); n != 0 || !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("CollectTombstones after Close should report ErrDatabaseClosed, got %d: %v", n, err)
 	}
-	if n := db.SetOperationStatus([]string{"a"}, OpStatusTombstone); n != 0 {
+	if n, err := db.SetOperationStatus([]string{"a"}, OpStatusTombstone); n != 0 || !errors.Is(err, ErrDatabaseClosed) {
 		t.Fatalf("SetOperationStatus after Close should be a no-op, got %d", n)
 	}
 

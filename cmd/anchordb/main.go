@@ -49,7 +49,12 @@ func main() {
 	}
 
 	for _, n := range nodes {
-		_, _ = db.AppendNode(n.word, n.coord, n.roles, 1)
+		if _, err := db.AppendNode(n.word, n.coord, n.roles, 1); err != nil {
+			log.Fatalf("failed to append node %q: %v", n.word, err)
+		}
+	}
+	if err := db.SetRelation("demo-down", spatial.Point2D{Y: -1}); err != nil {
+		log.Fatalf("failed to configure demo relation: %v", err)
 	}
 	_ = db.Sync()
 
@@ -61,12 +66,12 @@ func main() {
 	// 3. Eksekusi Kueri Graf Menggunakan Fluent Builder Driver
 	fmt.Println("----------------------------------------------------------")
 	fmt.Println(">>> KUERI 1: In-Storage Pushdown Graph Step")
-	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Relate('keturunan').TopK(5).Execute()")
+	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Relate('demo-down').TopK(5).Execute()")
 
 	qStart := time.Now()
 	resp, err := client.Graph().
 		From("ibu", "ayah").
-		Relate("keturunan").
+		Relate("demo-down").
 		BeamWidth(0.05).
 		TopK(5).
 		Execute(ctx)
@@ -87,12 +92,12 @@ func main() {
 	// 4. Kueri 2: In-Storage Multi-Hop Chaining
 	fmt.Println("\n----------------------------------------------------------")
 	fmt.Println(">>> KUERI 2: In-Storage Multi-Hop Chain Execution")
-	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Chain('keturunan').ExecuteChain()")
+	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Chain('demo-down').ExecuteChain()")
 
 	chainStart := time.Now()
 	chainResp, err := client.Graph().
 		From("ibu", "ayah").
-		Chain("keturunan").
+		Chain("demo-down").
 		ExecuteChain(ctx)
 	chainDuration := time.Since(chainStart)
 

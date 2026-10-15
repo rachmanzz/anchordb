@@ -10,7 +10,10 @@ import (
 const (
 	// MagicHeader is "ANCH" in ASCII (0x41, 0x4E, 0x43, 0x48)
 	MagicHeader = 0x48434E41 // Little-endian for "ANCH"
-	DBVersion   = 2
+	// DBVersion is the on-disk format version written by Sync. Version 3 appends
+	// an optional causal-edge section after the entity section; readers accept
+	// every version from 1..DBVersion, so v1/v2 files remain openable.
+	DBVersion = 3
 
 	HeaderSize = 64
 	RecordSize = 40 // Exact 40-byte fixed binary record per node
@@ -21,7 +24,7 @@ const (
 // Header represents the 64-byte file header of .anchordb
 type Header struct {
 	Magic        uint32  // "ANCH"
-	Version      uint32  // 1
+	Version      uint32  // 1..DBVersion (3 = causal-edge section present)
 	NodeCount    uint64  // Total nodes stored
 	GridCellsX   uint16  // 256
 	GridCellsY   uint16  // 256

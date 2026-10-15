@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,6 +131,60 @@ func TestAsyncUpdateAcceptedAndExecuted(t *testing.T) {
 	props, _ := getResp["props"].(map[string]interface{})
 	if props["balance"] != float64(150) {
 		t.Fatalf("expected balance=150, got %v", props["balance"])
+	}
+}
+
+func TestAsyncDispatchRejectedWhenWorkerDisabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewServer(ServerConfig{
+		DataDir: tmpDir,
+		Port:    "0",
+		WorkerConfig: worker.Config{
+			Enabled: false,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupServer(t, s, tmpDir)
+
+	body := []byte(`{"model":"orders","retention_days":30,"async":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/partition/run", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when async worker unavailable, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRequestBodyLimit(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	body := bytes.NewReader(bytes.Repeat([]byte(" "), maxRequestBodyBytes+1))
+	req := httptest.NewRequest(http.MethodPost, "/v1/save", body)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized request, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPartitionTargetPathRejectsSymlinkEscape(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	outside := t.TempDir()
+	link := filepath.Join(dir, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	body := []byte(`{"model":"orders","target_path":` + strconv.Quote(link) + `}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/partition/run", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for symlink escape, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -311,5 +367,74 @@ func TestSchedulerEndpoints(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 from nonexistent task, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEdgeAndCausalEndpoints(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+	handler := s.Routes()
+
+	post := func(path string, payload map[string]interface{}) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(payload)
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Add two causal edges
+	rec := post("/v1/edge", map[string]interface{}{
+		"model": "causal", "action": "add",
+		"source": "cabai", "relation": "sebab", "target": "inflasi", "weight": 0.9,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add edge status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = post("/v1/edge", map[string]interface{}{
+		"model": "causal", "source": "gagal_panen", "relation": "sebab", "target": "inflasi", "weight": 0.4,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add edge status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Single-hop causal query
+	rec = post("/v1/causal", map[string]interface{}{
+		"model": "causal", "seeds": []string{"cabai", "gagal_panen"}, "relation": "sebab", "limit_k": 5,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("causal status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Success bool `json:"success"`
+		Results []struct {
+			Word  string  `json:"word"`
+			Score float32 `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode causal response: %v", err)
+	}
+	if !resp.Success || len(resp.Results) != 1 || resp.Results[0].Word != "inflasi" || resp.Results[0].Score != 0.9 {
+		t.Fatalf("unexpected causal response: %+v", resp)
+	}
+
+	// 3. Remove an edge
+	rec = post("/v1/edge", map[string]interface{}{
+		"model": "causal", "action": "remove",
+		"source": "gagal_panen", "relation": "sebab", "target": "inflasi",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("remove edge status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 4. Invalid action is rejected
+	rec = post("/v1/edge", map[string]interface{}{
+		"model": "causal", "action": "explode",
+		"source": "a", "relation": "r", "target": "b",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid action status = %d, want 400", rec.Code)
 	}
 }

@@ -17,13 +17,17 @@ func PointToCell(p spatial.Point2D, dim int) CellCoord {
 	normX := (p.X + 1.0) * 0.5
 	normY := (p.Y + 1.0) * 0.5
 
-	if normX < 0 {
+	// Use NaN-safe clamping: `!(normX >= 0)` is true for NaN as well as
+	// negatives, so a non-finite coordinate maps to a valid cell instead of
+	// producing an implementation-defined int(NaN) index that would corrupt the
+	// spatial grid (e.g. via WAL replay of a tampered frame).
+	if !(normX >= 0) {
 		normX = 0
 	} else if normX > 1.0 {
 		normX = 1.0
 	}
 
-	if normY < 0 {
+	if !(normY >= 0) {
 		normY = 0
 	} else if normY > 1.0 {
 		normY = 1.0

@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -81,11 +82,20 @@ func (b *GraphBuilder) TopK(k int) *GraphBuilder {
 
 // Execute triggers internal in-storage numerical compute
 func (b *GraphBuilder) Execute(ctx context.Context) (*GraphResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(b.inputs) == 0 {
 		return nil, fmt.Errorf("no inputs specified in query")
 	}
+	if b.limitK < 0 {
+		return nil, fmt.Errorf("TopK must not be negative")
+	}
+	if b.beamWidth <= 0 || math.IsNaN(float64(b.beamWidth)) || math.IsInf(float64(b.beamWidth), 0) {
+		return nil, fmt.Errorf("BeamWidth must be finite and greater than zero")
+	}
 
-	results, anchor, err := b.db.ExecuteGraphStepWithOrder(b.inputs, b.relation, b.limitK, b.orderMode)
+	results, anchor, err := b.db.ExecuteGraphStepWithContext(ctx, b.inputs, b.relation, b.limitK, b.orderMode, b.beamWidth)
 	if err != nil {
 		return nil, err
 	}
@@ -98,14 +108,23 @@ func (b *GraphBuilder) Execute(ctx context.Context) (*GraphResponse, error) {
 
 // ExecuteChain executes multi-hop reasoning directly inside AnchorDB
 func (b *GraphBuilder) ExecuteChain(ctx context.Context) (*ChainResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(b.inputs) == 0 {
 		return nil, fmt.Errorf("no inputs specified for chain")
 	}
 	if len(b.relations) == 0 {
 		return nil, fmt.Errorf("no relations specified for chain")
 	}
+	if b.limitK < 0 {
+		return nil, fmt.Errorf("TopK must not be negative")
+	}
+	if b.beamWidth <= 0 || math.IsNaN(float64(b.beamWidth)) || math.IsInf(float64(b.beamWidth), 0) {
+		return nil, fmt.Errorf("BeamWidth must be finite and greater than zero")
+	}
 
-	steps, err := b.db.ExecuteGraphChain(b.inputs, b.relations, b.limitK)
+	steps, err := b.db.ExecuteGraphChainWithContext(ctx, b.inputs, b.relations, b.limitK, b.beamWidth)
 	if err != nil {
 		return nil, err
 	}

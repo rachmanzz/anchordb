@@ -2,7 +2,9 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -12,6 +14,105 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
+
+func TestGraphBuilderBeamWidthAndTopKValidation(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "builder-options.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.SetRelation("test-down", spatial.Point2D{Y: -1}); err != nil {
+		t.Fatal(err)
+	}
+	for word, point := range map[string]spatial.Point2D{
+		"a": {Y: 0},
+		"b": {X: 0.02, Y: -0.02},
+		"c": {X: 0.2, Y: -0.2},
+	} {
+		if _, err := db.AppendNode(word, point, [4]float32{}, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	narrow, err := NewGraphBuilder(db).From("a").Relate("test-down").BeamWidth(0.01).TopK(10).Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wide, err := NewGraphBuilder(db).From("a").Relate("test-down").BeamWidth(0.2).TopK(10).Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wide.Results) <= len(narrow.Results) {
+		t.Fatalf("BeamWidth was not applied: narrow=%d wide=%d", len(narrow.Results), len(wide.Results))
+	}
+	for _, k := range []int{-1} {
+		if _, err := NewGraphBuilder(db).From("a").Relate("test-down").TopK(k).Execute(context.Background()); err == nil {
+			t.Fatalf("TopK(%d) should fail", k)
+		}
+	}
+	if _, err := NewGraphBuilder(db).From("a").Relate("test-down").BeamWidth(float32(math.NaN())).Execute(context.Background()); err == nil {
+		t.Fatal("NaN BeamWidth should fail")
+	}
+}
+
+func TestDriverInvalidFilterValueReturnsError(t *testing.T) {
+	client, err := Connect(filepath.Join(t.TempDir(), "invalid-filter.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.List().Where("value", "=", "not-a-number").Execute(context.Background()); err == nil {
+		t.Fatal("invalid list filter should return an error")
+	}
+	if _, err := client.Update().Where("value", "=", "not-a-number").Set("value", Value(1)).Execute(context.Background()); err == nil {
+		t.Fatal("invalid update filter should return an error")
+	}
+}
+
+func TestDriverBuildersRespectCanceledContext(t *testing.T) {
+	client, err := Connect(filepath.Join(t.TempDir(), "canceled-context.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.Get("missing").Execute(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Get should respect canceled context, got %v", err)
+	}
+	if _, err := client.List().Execute(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("List should respect canceled context, got %v", err)
+	}
+	if _, err := client.Update().Execute(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Update should respect canceled context, got %v", err)
+	}
+	if err := client.DB().SetRelation("test", spatial.Point2D{Y: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.DB().AppendNode("input", spatial.Point2D{}, [4]float32{}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGraphBuilder(client.DB()).From("input").Relate("test").Execute(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Graph should respect canceled context, got %v", err)
+	}
+}
+
+func TestDriverBatchUpdatePropagatesComputationError(t *testing.T) {
+	client, err := Connect(filepath.Join(t.TempDir(), "update-error.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Save("zero", map[string]float32{"value": 0}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := client.Update().In("zero").Set("result", Divide("value", "0")).Execute(context.Background())
+	if err == nil || updated != 0 {
+		t.Fatalf("expected failed update with zero records committed, got count=%d err=%v", updated, err)
+	}
+}
 
 func TestDriver_FluentBuilder(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -26,6 +127,9 @@ func TestDriver_FluentBuilder(t *testing.T) {
 
 	// 2. Populate test nodes directly
 	db := client.DB()
+	if err := db.SetRelation("test-down", spatial.Point2D{Y: -1}); err != nil {
+		t.Fatal(err)
+	}
 	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
@@ -38,7 +142,7 @@ func TestDriver_FluentBuilder(t *testing.T) {
 	// 3. Test Fluent Query Builder
 	resp, err := client.Graph().
 		From("ibu", "ayah").
-		Relate("keturunan").
+		Relate("test-down").
 		BeamWidth(0.05).
 		TopK(5).
 		Execute(ctx)
@@ -70,6 +174,9 @@ func TestDriver_MultiHopChain(t *testing.T) {
 	defer client.Close()
 
 	db := client.DB()
+	if err := db.SetRelation("test-down", spatial.Point2D{Y: -1}); err != nil {
+		t.Fatal(err)
+	}
 	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
@@ -79,7 +186,7 @@ func TestDriver_MultiHopChain(t *testing.T) {
 
 	chainResp, err := client.Graph().
 		From("ibu", "ayah").
-		Chain("keturunan").
+		Chain("test-down").
 		ExecuteChain(ctx)
 
 	if err != nil {
@@ -104,6 +211,9 @@ func TestDriver_DirectMathAndOrdering(t *testing.T) {
 	defer client.Close()
 
 	db := client.DB()
+	if err := db.SetRelation("test-down", spatial.Point2D{Y: -1}); err != nil {
+		t.Fatal(err)
+	}
 	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
 	_, _ = db.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
@@ -156,7 +266,7 @@ func TestDriver_DirectMathAndOrdering(t *testing.T) {
 	ctx := context.Background()
 	resp, err := client.Graph().
 		From("ibu", "ayah").
-		Relate("keturunan").
+		Relate("test-down").
 		OrderBy(storage.OrderByDistanceAsc).
 		Execute(ctx)
 	if err != nil {
@@ -870,3 +980,66 @@ func TestDriver_SaveAutoID(t *testing.T) {
 	}
 }
 
+func TestDriver_CausalEdgesRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "driver_causal.anchordb")
+
+	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	if err := client.Link("cabai", "sebab", "inflasi", 0.9); err != nil {
+		t.Fatalf("link failed: %v", err)
+	}
+	if err := client.Link("gagal_panen", "sebab", "inflasi", 0.4); err != nil {
+		t.Fatalf("link failed: %v", err)
+	}
+
+	step, err := client.Causal("cabai", "sebab", 5)
+	if err != nil {
+		t.Fatalf("causal failed: %v", err)
+	}
+	if len(step) != 1 || step[0].Word != "inflasi" || step[0].Score != 0.9 {
+		t.Fatalf("causal step = %+v", step)
+	}
+
+	if err := client.Link("inflasi", "sebab", "krisis", 0.7); err != nil {
+		t.Fatalf("link failed: %v", err)
+	}
+	chain, err := client.CausalChain([]string{"cabai"}, []string{"sebab", "sebab"}, 5)
+	if err != nil {
+		t.Fatalf("causal chain failed: %v", err)
+	}
+	if len(chain) != 1 || chain[0].Word != "krisis" {
+		t.Fatalf("causal chain = %+v", chain)
+	}
+
+	if err := client.Unlink("cabai", "sebab", "inflasi"); err != nil {
+		t.Fatalf("unlink failed: %v", err)
+	}
+	if got, _ := client.Causal("cabai", "sebab", 5); len(got) != 0 {
+		t.Fatalf("unlinked edge still visible: %+v", got)
+	}
+
+	// Durable across Sync + reopen.
+	if err := client.DB().Sync(); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	reopened, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	if err != nil {
+		t.Fatalf("reconnect failed: %v", err)
+	}
+	defer reopened.Close()
+	chain, err = reopened.CausalChain([]string{"gagal_panen"}, []string{"sebab", "sebab"}, 5)
+	if err != nil {
+		t.Fatalf("causal chain after reopen failed: %v", err)
+	}
+	if len(chain) != 1 || chain[0].Word != "krisis" {
+		t.Fatalf("chain after reopen = %+v", chain)
+	}
+}

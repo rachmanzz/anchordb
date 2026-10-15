@@ -29,16 +29,20 @@ Setiap dependensi yang masuk ke dalam AnchorDB harus memenuhi 5 aturan emas (*Th
 
 ---
 
-## 3. Studi Kasus Implementasi: Background Pipeline (`gosuite/v3`)
+## 3. Studi Kasus Implementasi: Dependensi Tunggal vs. Subsistem Internal
 
-Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB mengintegrasikan subsistem latar belakang dari `github.com/rachmanzz/gosuite/v3`:
+Sebagai wujud nyata filosofi *Minimal Dependencies*, AnchorDB hanya menarik **satu dependensi langsung eksternal**: `github.com/google/uuid` (v1.6.0, zero transitive dependency) untuk pembuatan UUIDv4 pada auto-ID record dan nama berkas partisi. Semua kebutuhan lain dipenuhi oleh standard library Go maupun kode internal yang ditulis dan diaudit sendiri:
 
-1. **`cron` (`v3/cron`)**:
-   - Menghadirkan penjadwal tingkat produksi dengan proteksi *skip-if-still-running*, panic recovery, dan graceful shutdown berbatas waktu.
+1. **`pkg/scheduler`** (bukan library cron pihak ketiga):
+   - Penjadwal berbasis `time` + `context` dengan proteksi *skip-if-still-running* (atomic single-flight), panic recovery, timeout per-task, jitter opsional, dan graceful shutdown berbatas waktu.
+   - *Wall-clock aware*: matematika kalender aman-DST dan tunggu terpotong yang tahan lompatan jam NTP.
    - Mengotomatiskan partisi harian dan pemicu sync berkala ke disk.
-2. **`worker` (`v3/worker`)**:
-   - Menjalankan **Async Partitioning** (`POST /v1/partition/run?async=true`) sehingga request HTTP langsung dijawab dalam hitungan milidetik, sementara kompresi berkas dan upload S3 diselesaikan oleh worker di latar belakang.
+2. **`pkg/worker`** (bukan broker/queue framework):
+   - Pool goroutine di atas *bounded Go channel*; dispatch non-blocking dan gagal cepat (`ErrQueueFull`) saat antrean penuh.
+   - Menjalankan **Async Partitioning** (`POST /v1/partition/run?async=true`) sehingga request HTTP langsung dijawab dalam hitungan milidetik, sementara serialisasi berkas dan upload S3 diselesaikan oleh worker di latar belakang.
    - Menjalankan **Periodic Background Disk Sync** (`db.Sync()`) secara kontinu tanpa mengunci query pembacaan data.
+
+Mengimplementasikan subsistem ini secara internal (alih-alih menambah dependensi) menjaga *dependency graph* tetap satu simpul, permukaan serangan tetap kecil, dan binary tetap ringkas sesuai Aturan #2 dan #5 di atas.
 
 ---
 

@@ -2,13 +2,16 @@ package partition
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +43,9 @@ func (s *LocalDiskSink) Name() string {
 }
 
 func (s *LocalDiskSink) SavePartition(filename string, data []byte) (string, error) {
+	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
+		return "", fmt.Errorf("invalid partition filename %q", filename)
+	}
 	if err := os.MkdirAll(s.BaseDir, 0755); err != nil {
 		return "", fmt.Errorf("failed creating partition directory: %w", err)
 	}
@@ -57,6 +63,7 @@ type S3Sink struct {
 	Endpoint   string
 	Bucket     string
 	Prefix     string
+	Region     string
 	AccessKey  string
 	SecretKey  string
 	HTTPClient *http.Client
@@ -67,6 +74,7 @@ func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 		Endpoint:   endpoint,
 		Bucket:     bucket,
 		Prefix:     prefix,
+		Region:     "us-east-1",
 		AccessKey:  accessKey,
 		SecretKey:  secretKey,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
@@ -78,28 +86,45 @@ func (s *S3Sink) Name() string {
 }
 
 func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
+	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
+		return "", fmt.Errorf("S3Sink: invalid partition filename %q", filename)
+	}
 	if s.Bucket == "" {
 		return "", fmt.Errorf("S3Sink: bucket name cannot be empty")
 	}
 
 	endpoint := s.Endpoint
 	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://%s.s3.amazonaws.com", s.Bucket)
+		endpoint = "https://s3.amazonaws.com"
 	}
-	endpoint = strings.TrimRight(endpoint, "/")
-
+	baseURL, err := url.Parse(endpoint)
+	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
+		return "", fmt.Errorf("S3Sink: invalid endpoint %q", endpoint)
+	}
+	if baseURL.RawQuery != "" || baseURL.Fragment != "" {
+		return "", fmt.Errorf("S3Sink: endpoint must not contain query or fragment")
+	}
 	key := path.Join(strings.Trim(s.Prefix, "/"), filename)
-	uploadURL := fmt.Sprintf("%s/%s", endpoint, key)
+	objectPath := path.Join(strings.TrimSuffix(baseURL.Path, "/"), s.Bucket, key)
+	baseURL.Path = objectPath
+	baseURL.RawPath = ""
 
-	req, err := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPut, baseURL.String(), bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: failed creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Length", strconv.Itoa(len(data)))
+	req.ContentLength = int64(len(data))
 
 	if s.AccessKey != "" {
-		req.SetBasicAuth(s.AccessKey, s.SecretKey)
+		if s.SecretKey == "" {
+			return "", fmt.Errorf("S3Sink: secret key cannot be empty when access key is set")
+		}
+		region := s.Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		signS3Request(req, data, s.AccessKey, s.SecretKey, region, time.Now().UTC())
 	}
 
 	client := s.HTTPClient
@@ -109,7 +134,7 @@ func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("S3Sink: upload to %s failed: %w", uploadURL, err)
+		return "", fmt.Errorf("S3Sink: upload to %s failed: %w", req.URL, err)
 	}
 	defer resp.Body.Close()
 
@@ -119,6 +144,44 @@ func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 	}
 
 	return fmt.Sprintf("s3://%s/%s", s.Bucket, key), nil
+}
+
+func signS3Request(req *http.Request, payload []byte, accessKey, secretKey, region string, now time.Time) {
+	const algorithm = "AWS4-HMAC-SHA256"
+	date := now.Format("20060102")
+	amzDate := now.Format("20060102T150405Z")
+	payloadHash := sha256.Sum256(payload)
+	payloadHex := hex.EncodeToString(payloadHash[:])
+	req.Header.Set("x-amz-content-sha256", payloadHex)
+	req.Header.Set("x-amz-date", amzDate)
+	req.Host = req.URL.Host
+	canonicalHeaders := "host:" + req.URL.Host + "\n" +
+		"x-amz-content-sha256:" + payloadHex + "\n" +
+		"x-amz-date:" + amzDate + "\n"
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := strings.Join([]string{
+		req.Method,
+		req.URL.EscapedPath(),
+		req.URL.Query().Encode(),
+		canonicalHeaders,
+		signedHeaders,
+		payloadHex,
+	}, "\n")
+	canonicalHash := sha256.Sum256([]byte(canonicalRequest))
+	scope := date + "/" + region + "/s3/aws4_request"
+	stringToSign := algorithm + "\n" + amzDate + "\n" + scope + "\n" + hex.EncodeToString(canonicalHash[:])
+	dateKey := hmacSHA256([]byte("AWS4"+secretKey), date)
+	regionKey := hmacSHA256(dateKey, region)
+	serviceKey := hmacSHA256(regionKey, "s3")
+	signingKey := hmacSHA256(serviceKey, "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+	req.Header.Set("Authorization", algorithm+" Credential="+accessKey+"/"+scope+", SignedHeaders="+signedHeaders+", Signature="+signature)
+}
+
+func hmacSHA256(key []byte, value string) []byte {
+	h := hmac.New(sha256.New, key)
+	_, _ = h.Write([]byte(value))
+	return h.Sum(nil)
 }
 
 // FormatPartitionFilename creates standard formatted filename: e.g. "2026-10-10_f47ac10b-58cc-4372-a567-0e02b2c3d479.anchordb"

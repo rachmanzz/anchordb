@@ -1,6 +1,7 @@
 package partition
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
+
+var ErrPartitionConflict = errors.New("partition records changed before archival lock")
 
 // PartitionPolicy defines rules for archiving and partitioning historical records
 type PartitionPolicy struct {
@@ -48,20 +51,12 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	cutoffDays := nowDays - policy.RetentionDays
 	cutoffDateStr := storage.FormatDate(cutoffDays)
 
-	// 2. Query eligible records strictly before cutoff date (Active or Retry)
-	records, _, err := db.ListRecordsWithPaging(storage.QueryOptions{
-		AllowedOperations: []uint8{storage.OpStatusActive, storage.OpStatusRetry},
-		Filters: []storage.FilterCondition{
-			{
-				Field:    policy.DateField,
-				Operator: "<",
-				Value:    cutoffDays,
-			},
-		},
-		Limit: 1000000, // Maximum batch
-	})
+	// Select and transition candidates while holding the same database write
+	// lock. This prevents a save/update from slipping between the archive
+	// snapshot and the SafeDelete state change.
+	records, err := db.LockPartitionRecords(policy.DateField, cutoffDays, 1000000)
 	if err != nil {
-		return nil, fmt.Errorf("failed querying partition records: %w", err)
+		return nil, fmt.Errorf("failed locking partition records: %w", err)
 	}
 
 	if len(records) == 0 {
@@ -80,12 +75,11 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		archivedNames[i] = r.Name
 	}
 
-	// Phase A: Transition records to SafeDelete (0) to lock from mutations & hide from regular queries
-	db.SetOperationStatus(archivedNames, storage.OpStatusSafeDelete)
-
 	// Helper for rollback if archival fails -> marks records as OpStatusRetry (3)
 	rollback := func(causeErr error) error {
-		db.SetOperationStatus(archivedNames, storage.OpStatusRetry)
+		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusRetry); err != nil {
+			return fmt.Errorf("%w (also failed to restore records to retry: %v)", causeErr, err)
+		}
 		return causeErr
 	}
 
@@ -107,7 +101,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	for _, r := range records {
-		_ = partDB.SaveRecord(r.Name, r.Props)
+		if err := partDB.SaveRecord(r.Name, r.Props); err != nil {
+			_ = partDB.Close()
+			return nil, rollback(fmt.Errorf("failed adding record %q to partition: %w", r.Name, err))
+		}
 	}
 
 	if err := partDB.Sync(); err != nil {
@@ -131,12 +128,20 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	// Phase B: Archival succeeded!
 	if policy.PruneHotDB {
 		// Transition to Tombstone (2) and sweep
-		db.SetOperationStatus(archivedNames, storage.OpStatusTombstone)
-		_ = db.CollectTombstones(len(archivedNames))
-		_ = db.Sync() // Compacts active database file on disk!
+		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusTombstone); err != nil {
+			return nil, fmt.Errorf("partition saved to %s but failed to mark source records for deletion: %w", targetLoc, err)
+		}
+		if _, err := db.CollectTombstones(len(archivedNames)); err != nil {
+			return nil, fmt.Errorf("partition saved to %s but failed to collect archived records: %w", targetLoc, err)
+		}
+		if err := db.Sync(); err != nil { // Compacts active database file on disk!
+			return nil, fmt.Errorf("partition saved to %s but failed to sync source database: %w", targetLoc, err)
+		}
 	} else {
 		// Kept in hot DB - restore back to Active (1)
-		db.SetOperationStatus(archivedNames, storage.OpStatusActive)
+		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusActive); err != nil {
+			return nil, fmt.Errorf("partition saved to %s but failed to restore source records: %w", targetLoc, err)
+		}
 	}
 
 	return &PartitionResult{

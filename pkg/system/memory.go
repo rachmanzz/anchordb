@@ -75,8 +75,19 @@ func ParseMemoryBytes(s string) (int64, error) {
 	if val <= 0 {
 		return 0, fmt.Errorf("memory limit must be greater than 0, got %v", val)
 	}
-
-	totalBytes := int64(val * float64(multiplier))
+	if math.IsNaN(val) || math.IsInf(val, 0) || val > float64(math.MaxInt64)/float64(multiplier) {
+		return 0, fmt.Errorf("memory limit %q exceeds supported range", s)
+	}
+	bytes := val * float64(multiplier)
+	// float64(math.MaxInt64) rounds up to 2^63, so reject equality too before
+	// converting (which would otherwise wrap to a negative int64).
+	if math.IsInf(bytes, 0) || bytes >= float64(math.MaxInt64) {
+		return 0, fmt.Errorf("memory limit %q exceeds supported range", s)
+	}
+	totalBytes := int64(bytes)
+	if totalBytes <= 0 {
+		return 0, fmt.Errorf("memory limit %q is below one byte", s)
+	}
 	return totalBytes, nil
 }
 
@@ -94,7 +105,10 @@ func FormatBytes(b int64) string {
 		div *= unit
 		exp++
 	}
-	units := []string{"KB", "MB", "GB", "TB"}
+	units := []string{"KB", "MB", "GB", "TB", "PB", "EB"}
+	if exp >= len(units) {
+		return fmt.Sprintf("%.2f EiB", float64(b)/float64(div))
+	}
 	return fmt.Sprintf("%.2f %s", float64(b)/float64(div), units[exp])
 }
 

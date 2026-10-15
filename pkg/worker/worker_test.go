@@ -51,6 +51,17 @@ func TestWorkerPool(t *testing.T) {
 	}
 }
 
+func TestFmtBytesFormatsExabyteRange(t *testing.T) {
+	// 2^63-1 bytes is ~8 EiB; the unit must not be capped at PB while div keeps growing.
+	got := fmtBytes(1<<63 - 1)
+	if got == "" {
+		t.Fatal("expected a formatted value")
+	}
+	if want := "8.00 EB"; got != want {
+		t.Fatalf("fmtBytes(max int64) = %q, want %q", got, want)
+	}
+}
+
 func TestWorkerPoolDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Enabled = false

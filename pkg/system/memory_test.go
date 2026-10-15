@@ -1,6 +1,7 @@
 package system
 
 import (
+	"math"
 	"runtime/debug"
 	"testing"
 )
@@ -25,6 +26,9 @@ func TestParseMemoryBytes(t *testing.T) {
 		{"", 0, true},
 		{"invalid", 0, true},
 		{"-500MB", 0, true},
+		{"NaN", 0, true},
+		{"Inf", 0, true},
+		{"999999999999999999999999999999999999999999999999T", 0, true},
 	}
 
 	for _, tt := range tests {
@@ -36,6 +40,15 @@ func TestParseMemoryBytes(t *testing.T) {
 		if !tt.hasErr && got != tt.expected {
 			t.Errorf("ParseMemoryBytes(%q) = %d, want %d", tt.input, got, tt.expected)
 		}
+	}
+}
+
+func TestFormatBytesSupportsLargeValues(t *testing.T) {
+	if got := FormatBytes(1 << 50); got == "" {
+		t.Fatal("expected formatted value for pebibyte range")
+	}
+	if got := FormatBytes(math.MaxInt64 - 1); got == "" {
+		t.Fatal("expected formatted value near MaxInt64")
 	}
 }
 

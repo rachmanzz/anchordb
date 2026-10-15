@@ -31,6 +31,10 @@ var ErrCanceled = errors.New("task canceled before execution")
 // ErrNoGlobalPool is returned by global helpers when no global pool was initialized
 var ErrNoGlobalPool = errors.New("no global worker pool initialized")
 
+// ErrWorkerUnavailable is returned when an asynchronous dispatch is requested
+// but the pool is disabled or stopped.
+var ErrWorkerUnavailable = errors.New("worker pool is not available for asynchronous dispatch")
+
 // ErrShutdownTimeout is returned by Shutdown when the pool could not be fully
 // stopped within (up to twice) ShutdownTimeout because a task ignored context
 // cancellation. The call returns instead of blocking forever; a stuck task
@@ -47,7 +51,7 @@ type Config struct {
 	// Memory-aware admission control
 	EnforceMemory   bool    `json:"enforce_memory"`
 	MaxMemoryBytes  int64   `json:"max_memory_bytes"` // 0 = use current GOMEMLIMIT
-	MemoryThreshold float64 `json:"memory_threshold"` // (0,1], default 0.90
+	MemoryThreshold float64 `json:"memory_threshold"` // (0,1], default 0.85
 }
 
 // DefaultConfig provides recommended settings based on host CPU capacity
@@ -63,7 +67,7 @@ func DefaultConfig() Config {
 		ShutdownTimeout: 5 * time.Second,
 		EnforceMemory:   false,
 		MaxMemoryBytes:  0,
-		MemoryThreshold: 0.90,
+		MemoryThreshold: 0.85,
 	}
 }
 
@@ -226,7 +230,7 @@ func NewPool(cfg Config) *Pool {
 		cfg.ShutdownTimeout = 5 * time.Second
 	}
 	if cfg.MemoryThreshold <= 0 {
-		cfg.MemoryThreshold = 0.90
+		cfg.MemoryThreshold = 0.85
 	}
 	if cfg.MemoryThreshold > 1 {
 		cfg.MemoryThreshold = 1
@@ -252,9 +256,11 @@ func fmtBytes(b int64) string {
 		div *= unit
 		exp++
 	}
-	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	units := []string{"KB", "MB", "GB", "TB", "PB", "EB"}
 	if exp >= len(units) {
-		exp = len(units) - 1
+		// int64 cannot exceed the exabyte range, so this is unreachable; keep a
+		// safe fallback rather than clamping the unit while div keeps growing.
+		return fmt.Sprintf("%.2f EiB", float64(b)/float64(div))
 	}
 	return fmt.Sprintf("%.2f %s", float64(b)/float64(div), units[exp])
 }
@@ -522,11 +528,27 @@ func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Co
 			o(&task)
 		}
 	}
-	return p.DispatchTask(task)
+	return p.dispatchTask(task, true)
+}
+
+// DispatchAsync enqueues a task without falling back to synchronous execution.
+// Use this when the caller promises that work will run in the background.
+func (p *Pool) DispatchAsync(ctx context.Context, name string, fn func(ctx context.Context) error, opts ...Option) error {
+	task := Task{Name: name, Fn: fn, Ctx: ctx}
+	for _, o := range opts {
+		if o != nil {
+			o(&task)
+		}
+	}
+	return p.dispatchTask(task, false)
 }
 
 // DispatchTask submits a Task to the worker pool.
 func (p *Pool) DispatchTask(t Task) error {
+	return p.dispatchTask(t, true)
+}
+
+func (p *Pool) dispatchTask(t Task, allowSync bool) error {
 	if t.Fn == nil {
 		return errors.New("task function is nil")
 	}
@@ -535,6 +557,9 @@ func (p *Pool) DispatchTask(t Task) error {
 		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
 	}
 	if !p.cfg.Enabled || !p.running.Load() {
+		if !allowSync {
+			return ErrWorkerUnavailable
+		}
 		p.executeJobSync(t)
 		return nil
 	}
@@ -563,6 +588,14 @@ func (p *Pool) DispatchTask(t Task) error {
 	if p.taskClosed || p.draining.Load() {
 		p.pending.Add(-1)
 		p.failed.Add(1)
+		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
+	}
+	if !p.cfg.Enabled || !p.running.Load() {
+		p.pending.Add(-1)
+		p.failed.Add(1)
+		if !allowSync {
+			return ErrWorkerUnavailable
+		}
 		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
 	}
 
@@ -788,41 +821,51 @@ func (p *Pool) CancelMatching(predicate func(t Task) bool) int {
 		return 0
 	}
 	p.chanMu.Lock()
-	defer p.chanMu.Unlock()
+	// Once shutdown closes the channel, workers own draining its remaining
+	// buffered jobs. Do not consume jobs that cannot be safely requeued.
+	if p.taskClosed {
+		p.chanMu.Unlock()
+		return 0
+	}
 
 	taskCh := p.taskCh
 	var kept []jobItem
-	canceled := 0
+	var canceled []jobItem
 	for {
 		select {
 		case job, ok := <-taskCh:
 			if !ok {
-				for _, k := range kept {
-					select {
-					case taskCh <- k:
-					default:
-					}
-				}
-				return canceled
+				// taskClosed is changed under chanMu, so a closed channel here is
+				// an invariant violation. Keep every removed job accounted for.
+				canceled = append(canceled, kept...)
+				kept = nil
+				goto DONE
 			}
 			if predicate(job.task) {
-				canceled++
-				p.canceled.Add(1)
-				p.pending.Add(-1)
-				p.reportCanceled(job.task)
+				canceled = append(canceled, job)
 			} else {
 				kept = append(kept, job)
 			}
 		default:
-			for _, k := range kept {
-				select {
-				case taskCh <- k:
-				default:
-				}
-			}
-			return canceled
+			goto DONE
 		}
 	}
+
+DONE:
+	for _, job := range kept {
+		// Reinsert while still holding chanMu, before producers can enqueue more.
+		taskCh <- job
+	}
+	p.chanMu.Unlock()
+
+	// User callbacks may dispatch more work or acquire pool locks. Invoke only
+	// after releasing chanMu to avoid callback-induced deadlocks.
+	for _, job := range canceled {
+		p.canceled.Add(1)
+		p.pending.Add(-1)
+		p.reportCanceled(job.task)
+	}
+	return len(canceled)
 }
 
 // CancelByModel cancels all queued tasks belonging to the given model.
@@ -1037,14 +1080,16 @@ func ShutdownGlobal(ctx context.Context) error {
 	if p == nil {
 		return ErrNoGlobalPool
 	}
-	_ = p.WaitBeforeShutdown(ctx)
-	p.SafeCancel()
-	_ = p.Shutdown()
+	waitErr := p.WaitBeforeShutdown(ctx)
+	if waitErr != nil {
+		p.SafeCancel()
+	}
+	shutdownErr := p.Shutdown()
 
 	globalMu.Lock()
 	if globalPool == p {
 		globalPool = nil
 	}
 	globalMu.Unlock()
-	return nil
+	return errors.Join(waitErr, shutdownErr)
 }

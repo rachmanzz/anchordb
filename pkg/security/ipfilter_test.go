@@ -97,3 +97,29 @@ func TestIPFilter_HTTPMiddleware(t *testing.T) {
 		t.Errorf("expected 200 OK via X-Forwarded-For, got %d", rec3.Code)
 	}
 }
+
+func TestIPFilter_ProxyHeadersRequireLoopbackPeer(t *testing.T) {
+	filter, err := NewIPFilter("10.0.0.5", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/", nil)
+	request.RemoteAddr = "203.0.113.10:4567"
+	request.Header.Set("X-Forwarded-For", "10.0.0.5")
+	if got := filter.ExtractClientIP(request); got == nil || !got.Equal(net.ParseIP("203.0.113.10")) {
+		t.Fatalf("untrusted peer's forwarding header should be ignored, got %v", got)
+	}
+}
+
+func TestIPFilter_TrustedProxyWalksForwardedChainFromRight(t *testing.T) {
+	filter, err := NewIPFilterWithTrustedProxies("203.0.113.9", []string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/", nil)
+	request.RemoteAddr = "10.0.0.2:8080"
+	request.Header.Set("X-Forwarded-For", "203.0.113.9, 198.51.100.7, 10.0.0.1")
+	if got := filter.ExtractClientIP(request); got == nil || !got.Equal(net.ParseIP("198.51.100.7")) {
+		t.Fatalf("expected first untrusted address in proxy chain, got %v", got)
+	}
+}

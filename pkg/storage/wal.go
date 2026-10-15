@@ -2,11 +2,13 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -16,17 +18,26 @@ import (
 const (
 	walMagic byte = 0xA1 // AnchorDB WAL Magic
 	walVer   byte = 2
+	// WAL entries are expected to be small; cap untrusted on-disk lengths before
+	// allocation so a corrupt or malicious WAL cannot request multi-gigabyte RAM.
+	maxWALPayloadSize = 64 << 20
 
 	WalOpSave   byte = 1
 	WalOpDelete byte = 2
 	WalOpNode   byte = 3
+	WalOpEdge   byte = 4
+	// WalOpEdgeDelete tombstones a previously written edge.
+	WalOpEdgeDelete byte = 5
 )
+
+var ErrWALCorrupt = errors.New("anchordb: corrupt wal")
 
 // WALManager manages an append-only write-ahead log for AnchorDB crash durability.
 type WALManager struct {
-	mu   sync.Mutex
-	file *os.File
-	path string
+	mu      sync.Mutex
+	file    *os.File
+	path    string
+	corrupt bool
 }
 
 // OpenWAL creates or opens a WAL file at path in append mode.
@@ -70,10 +81,32 @@ func (w *WALManager) CurrentOffset() (int64, error) {
 // writeEntry encodes and appends a framed entry:
 // [1 byte Magic][1 byte Version][1 byte OpCode][4 byte PayloadLen][4 byte CRC32][Payload]
 func (w *WALManager) writeEntry(op byte, payload []byte) error {
+	if len(payload) > maxWALPayloadSize {
+		return fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file == nil {
 		return fmt.Errorf("wal file is closed")
+	}
+	if w.corrupt {
+		return fmt.Errorf("%w: writes are disabled until the wal is repaired", ErrWALCorrupt)
+	}
+	start, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek wal end: %w", err)
+	}
+	rollback := func(cause error) error {
+		if err := w.file.Truncate(start); err != nil {
+			return errors.Join(cause, fmt.Errorf("rollback partial wal entry: %w", err))
+		}
+		if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+			return errors.Join(cause, fmt.Errorf("seek wal after rollback: %w", err))
+		}
+		if err := w.file.Sync(); err != nil {
+			return errors.Join(cause, fmt.Errorf("sync wal after rollback: %w", err))
+		}
+		return cause
 	}
 
 	checksum := crc32.ChecksumIEEE(payload)
@@ -85,23 +118,38 @@ func (w *WALManager) writeEntry(op byte, payload []byte) error {
 	binary.LittleEndian.PutUint32(hdr[7:11], checksum)
 
 	if _, err := w.file.Write(hdr[:]); err != nil {
-		return err
+		return rollback(err)
 	}
 	if len(payload) > 0 {
 		if _, err := w.file.Write(payload); err != nil {
-			return err
+			return rollback(err)
 		}
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		return rollback(err)
+	}
+	return nil
 }
 
 // WriteSave writes an entity save/update event to WAL.
 // Payload: [2 byte NameLen][Name][1 byte Operation][2 byte AttrCount][(2 byte KeyLen, Key, 4 byte Value)...]
 func (w *WALManager) WriteSave(name string, cr CompactRecord) error {
 	nameBytes := []byte(name)
+	if len(nameBytes) > math.MaxUint16 {
+		return fmt.Errorf("wal record name exceeds %d bytes", math.MaxUint16)
+	}
+	if len(cr.Attrs) > math.MaxUint16 {
+		return fmt.Errorf("wal record has more than %d attributes", math.MaxUint16)
+	}
 	payloadLen := 2 + len(nameBytes) + 1 + 2
 	for _, attr := range cr.Attrs {
+		if len(attr.Key) > math.MaxUint16 {
+			return fmt.Errorf("wal attribute key exceeds %d bytes", math.MaxUint16)
+		}
 		payloadLen += 2 + len(attr.Key) + 4
+		if payloadLen > maxWALPayloadSize {
+			return fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+		}
 	}
 
 	buf := make([]byte, payloadLen)
@@ -136,6 +184,9 @@ func (w *WALManager) WriteSave(name string, cr CompactRecord) error {
 // Payload: [2 byte NameLen][Name]
 func (w *WALManager) WriteDelete(name string) error {
 	nameBytes := []byte(name)
+	if len(nameBytes) > math.MaxUint16 {
+		return fmt.Errorf("wal record name exceeds %d bytes", math.MaxUint16)
+	}
 	buf := make([]byte, 2+len(nameBytes))
 	binary.LittleEndian.PutUint16(buf[0:2], uint16(len(nameBytes)))
 	copy(buf[2:], nameBytes)
@@ -147,6 +198,9 @@ func (w *WALManager) WriteDelete(name string) error {
 // Payload: [2 byte WordLen][Word][4 byte X][4 byte Y][16 byte Roles][2 byte DomainID]
 func (w *WALManager) WriteNode(word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error {
 	wordBytes := []byte(word)
+	if len(wordBytes) > math.MaxUint16 {
+		return fmt.Errorf("wal node word exceeds %d bytes", math.MaxUint16)
+	}
 	payloadLen := 2 + len(wordBytes) + 4 + 4 + 16 + 2
 	buf := make([]byte, payloadLen)
 	offset := 0
@@ -170,12 +224,129 @@ func (w *WALManager) WriteNode(word string, coord spatial.Point2D, roles [4]floa
 	return w.writeEntry(WalOpNode, buf)
 }
 
-// Checkpoint truncates WAL entries that were already captured in a disk snapshot.
+// WALEvent is a fully decoded WAL operation delivered by ReplayEvents. It
+// carries every field any opcode can produce so a single callback can drive
+// recovery without per-opcode plumbing.
+type WALEvent struct {
+	Op       byte
+	Name     string
+	Record   CompactRecord
+	Word     string
+	Coord    spatial.Point2D
+	Roles    [4]float32
+	DomainID uint16
+	Edge     EdgeRecord
+}
+
+func appendWALString(buf []byte, s string) ([]byte, error) {
+	b := []byte(s)
+	if len(b) > math.MaxUint16 {
+		return nil, fmt.Errorf("wal string exceeds %d bytes", math.MaxUint16)
+	}
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(b)))
+	buf = append(buf, l[:]...)
+	buf = append(buf, b...)
+	return buf, nil
+}
+
+func readWALString(payload []byte, off int) (string, int, error) {
+	if off+2 > len(payload) {
+		return "", off, fmt.Errorf("truncated string length")
+	}
+	n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if off+n > len(payload) {
+		return "", off, fmt.Errorf("truncated string")
+	}
+	return string(payload[off : off+n]), off + n, nil
+}
+
+func decodeWALEdge(payload []byte) (EdgeRecord, error) {
+	src, off, err := readWALString(payload, 0)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	rel, off, err := readWALString(payload, off)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	tgt, off, err := readWALString(payload, off)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	if off+4 != len(payload) {
+		return EdgeRecord{}, fmt.Errorf("edge payload length mismatch: %d trailing bytes", len(payload)-off)
+	}
+	weight := math.Float32frombits(binary.LittleEndian.Uint32(payload[off : off+4]))
+	return EdgeRecord{Source: src, Relation: rel, Target: tgt, Weight: weight}, nil
+}
+
+func decodeWALEdgeKey(payload []byte) (EdgeRecord, error) {
+	src, off, err := readWALString(payload, 0)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	rel, off, err := readWALString(payload, off)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	tgt, off, err := readWALString(payload, off)
+	if err != nil {
+		return EdgeRecord{}, err
+	}
+	if off != len(payload) {
+		return EdgeRecord{}, fmt.Errorf("edge delete payload length mismatch: %d trailing bytes", len(payload)-off)
+	}
+	return EdgeRecord{Source: src, Relation: rel, Target: tgt}, nil
+}
+
+// WriteEdge writes a causal edge add/replace event to WAL.
+// Payload: [2 byte SrcLen][Src][2 byte RelLen][Rel][2 byte TgtLen][Tgt][4 byte Weight]
+func (w *WALManager) WriteEdge(source, relation, target string, weight float32) error {
+	buf, err := appendWALString(nil, source)
+	if err != nil {
+		return err
+	}
+	if buf, err = appendWALString(buf, relation); err != nil {
+		return err
+	}
+	if buf, err = appendWALString(buf, target); err != nil {
+		return err
+	}
+	var wb [4]byte
+	binary.LittleEndian.PutUint32(wb[:], math.Float32bits(weight))
+	buf = append(buf, wb[:]...)
+	return w.writeEntry(WalOpEdge, buf)
+}
+
+// WriteEdgeDelete writes a causal edge removal event to WAL.
+// Payload: [2 byte SrcLen][Src][2 byte RelLen][Rel][2 byte TgtLen][Tgt]
+func (w *WALManager) WriteEdgeDelete(source, relation, target string) error {
+	buf, err := appendWALString(nil, source)
+	if err != nil {
+		return err
+	}
+	if buf, err = appendWALString(buf, relation); err != nil {
+		return err
+	}
+	if buf, err = appendWALString(buf, target); err != nil {
+		return err
+	}
+	return w.writeEntry(WalOpEdgeDelete, buf)
+}
+
+// Checkpoint atomically replaces the WAL with entries written after the snapshot.
+// The old WAL remains intact unless the replacement has been fully written and
+// synced, so a failed checkpoint cannot discard the only durable copy.
 func (w *WALManager) Checkpoint(checkpointOffset int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file == nil {
 		return nil
+	}
+	if w.corrupt {
+		return fmt.Errorf("%w: checkpoint is disabled until the wal is repaired", ErrWALCorrupt)
 	}
 
 	fi, err := w.file.Stat()
@@ -183,187 +354,314 @@ func (w *WALManager) Checkpoint(checkpointOffset int64) error {
 		return err
 	}
 	currentSize := fi.Size()
+	if checkpointOffset < 0 || checkpointOffset > currentSize {
+		return fmt.Errorf("invalid wal checkpoint offset %d (size %d)", checkpointOffset, currentSize)
+	}
 
-	if checkpointOffset >= currentSize {
-		// All writes captured in snapshot; truncate to 0
-		if err := w.file.Truncate(0); err != nil {
-			return err
+	tmp, err := os.CreateTemp(filepath.Dir(w.path), ".anchordb_wal_checkpoint_*.tmp")
+	if err != nil {
+		return fmt.Errorf("create wal checkpoint file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if tmp != nil {
+			_ = tmp.Close()
 		}
-		_, err = w.file.Seek(0, io.SeekStart)
-		return err
-	}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	// Writes arrived after snapshot; preserve remaining bytes from checkpointOffset to end
+	// Writes arrived after the snapshot; preserve that suffix without allocating
+	// a second in-memory copy of the WAL.
 	remSize := currentSize - checkpointOffset
-	buf := make([]byte, remSize)
-	if _, err := w.file.ReadAt(buf, checkpointOffset); err != nil {
-		return err
+	if remSize > 0 {
+		if _, err := io.CopyN(tmp, io.NewSectionReader(w.file, checkpointOffset, remSize), remSize); err != nil {
+			return fmt.Errorf("copy wal checkpoint suffix: %w", err)
+		}
 	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync wal checkpoint: %w", err)
+	}
+	if _, err := tmp.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek replacement wal to end: %w", err)
+	}
+	if err := os.Rename(tmpPath, w.path); err != nil {
+		return fmt.Errorf("replace wal checkpoint: %w", err)
+	}
+	tmpPath = "" // The temporary path is now the live WAL path.
 
-	if err := w.file.Truncate(0); err != nil {
-		return err
+	// Keep using the already-open descriptor, which now refers to the renamed
+	// file. No fallible reopen is needed after publishing the replacement.
+	old := w.file
+	w.file = tmp
+	tmp = nil
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("close previous wal after checkpoint: %w", err)
 	}
-	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
-		return err
+	if dir, err := os.Open(filepath.Dir(w.path)); err != nil {
+		return fmt.Errorf("open wal directory for sync: %w", err)
+	} else {
+		defer dir.Close()
+		if err := dir.Sync(); err != nil {
+			return fmt.Errorf("sync wal directory after checkpoint: %w", err)
+		}
 	}
-	if _, err := w.file.Write(buf); err != nil {
-		return err
-	}
-	return w.file.Sync()
+	return nil
 }
 
-// Replay reads and verifies all valid WAL entries from the beginning of the file.
-func (w *WALManager) Replay(handler func(op byte, name string, cr CompactRecord, word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error) (int, error) {
+// ReplayEvents reads and verifies all valid WAL entries from the beginning of
+// the file, delivering each decoded operation as a WALEvent. This is the
+// forward-looking API used by Open; it understands edge opcodes that the legacy
+// Replay callback cannot express.
+func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, retErr error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	defer func() {
+		if errors.Is(retErr, ErrWALCorrupt) {
+			w.corrupt = true
+		}
+	}()
 	if w.file == nil {
 		return 0, fmt.Errorf("wal file is closed")
 	}
-
+	if w.corrupt {
+		return 0, fmt.Errorf("%w: previous replay detected corruption", ErrWALCorrupt)
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
 
-	count := 0
+	lastValidOffset := int64(0)
 	var hdr [11]byte
-
 	for {
+		frameOffset, seekErr := w.file.Seek(0, io.SeekCurrent)
+		if seekErr != nil {
+			return count, seekErr
+		}
 		_, err := io.ReadFull(w.file, hdr[:])
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF {
+			break
+		}
+		if err == io.ErrUnexpectedEOF {
+			if err := w.truncateReplayTail(lastValidOffset); err != nil {
+				return count, fmt.Errorf("truncate incomplete frame header at %d: %w", frameOffset, err)
+			}
 			break
 		}
 		if err != nil {
-			break
+			return count, fmt.Errorf("read wal header at %d: %w", frameOffset, err)
 		}
 
-		if hdr[0] != walMagic || hdr[1] != walVer {
-			// Corrupt entry or partial write; stop replay gracefully
-			break
+		if hdr[0] != walMagic || hdr[1] == 0 || hdr[1] > walVer {
+			return count, fmt.Errorf("%w: invalid frame header at offset %d", ErrWALCorrupt, frameOffset)
 		}
 
 		op := hdr[2]
 		payloadLen := binary.LittleEndian.Uint32(hdr[3:7])
 		expectedChecksum := binary.LittleEndian.Uint32(hdr[7:11])
+		if payloadLen > maxWALPayloadSize {
+			return count, fmt.Errorf("%w: frame at offset %d declares payload %d > %d", ErrWALCorrupt, frameOffset, payloadLen, maxWALPayloadSize)
+		}
+		// A valid frame cannot exceed the bytes remaining in the WAL. Bound the
+		// allocation before converting the untrusted on-disk length to int.
+		pos, seekErr := w.file.Seek(0, io.SeekCurrent)
+		if seekErr != nil {
+			return count, seekErr
+		}
+		fi, statErr := w.file.Stat()
+		if statErr != nil {
+			return count, statErr
+		}
+		if uint64(payloadLen) > uint64(fi.Size()-pos) {
+			if err := w.truncateReplayTail(lastValidOffset); err != nil {
+				return count, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, err)
+			}
+			break
+		}
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(w.file, payload); err != nil {
-			// Partial payload; stop at last valid entry
+			if truncErr := w.truncateReplayTail(lastValidOffset); truncErr != nil {
+				return count, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, truncErr)
+			}
 			break
 		}
 
 		if crc32.ChecksumIEEE(payload) != expectedChecksum {
-			// Checksum mismatch; stop at last valid entry
-			break
+			return count, fmt.Errorf("%w: checksum mismatch at offset %d", ErrWALCorrupt, frameOffset)
 		}
 
-		// Decode payload according to op
+		// Decode exactly one known frame. A complete but invalid frame is a hard
+		// error; only an incomplete final frame is safely truncatable.
+		valid := true
 		switch op {
 		case WalOpSave:
 			if len(payload) < 4 {
-				continue
-			}
-			offset := 0
-			nLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-			offset += 2
-			if offset+nLen > len(payload) {
-				continue
-			}
-			name := string(payload[offset : offset+nLen])
-			offset += nLen
-
-			opStatus := uint8(1) // Default active
-			if hdr[1] >= 2 {
-				if offset+1 > len(payload) {
-					continue
-				}
-				opStatus = payload[offset]
-				offset += 1
-			}
-
-			if offset+2 > len(payload) {
-				continue
-			}
-			attrCount := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-			offset += 2
-
-			attrs := make([]AttrEntry, 0, attrCount)
-			valid := true
-			for a := 0; a < attrCount; a++ {
-				if offset+2 > len(payload) {
-					valid = false
-					break
-				}
-				kLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+				valid = false
+			} else {
+				offset := 0
+				nLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
 				offset += 2
-				if offset+kLen+4 > len(payload) {
+				if offset+nLen > len(payload) {
 					valid = false
-					break
+				} else {
+					name := string(payload[offset : offset+nLen])
+					offset += nLen
+
+					opStatus := uint8(1) // Default active for legacy v1 WAL frames.
+					if hdr[1] >= 2 {
+						if offset+1 > len(payload) {
+							valid = false
+						} else {
+							opStatus = payload[offset]
+							offset++
+						}
+					}
+					if valid && offset+2 > len(payload) {
+						valid = false
+					}
+					var attrs []AttrEntry
+					if valid {
+						attrCount := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+						offset += 2
+						attrs = make([]AttrEntry, 0, attrCount)
+						for a := 0; a < attrCount; a++ {
+							if offset+2 > len(payload) {
+								valid = false
+								break
+							}
+							kLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+							offset += 2
+							if offset+kLen+4 > len(payload) {
+								valid = false
+								break
+							}
+							key := string(payload[offset : offset+kLen])
+							offset += kLen
+							value := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+							offset += 4
+							attrs = append(attrs, AttrEntry{Key: key, Value: value})
+						}
+					}
+					if valid && offset != len(payload) {
+						valid = false
+					}
+					if valid && handler != nil {
+						cr := CompactRecord{Operation: opStatus, Attrs: attrs}
+						if err := handler(WALEvent{Op: op, Name: name, Record: cr}); err != nil {
+							return count, err
+						}
+						count++
+					}
 				}
-				k := string(payload[offset : offset+kLen])
-				offset += kLen
-				valBits := binary.LittleEndian.Uint32(payload[offset : offset+4])
-				offset += 4
-				attrs = append(attrs, AttrEntry{Key: k, Value: math.Float32frombits(valBits)})
-			}
-			if valid && handler != nil {
-				cr := CompactRecord{Operation: opStatus, Attrs: attrs}
-				if err := handler(op, name, cr, "", spatial.Point2D{}, [4]float32{}, 0); err != nil {
-					return count, err
-				}
-				count++
 			}
 
 		case WalOpDelete:
 			if len(payload) < 2 {
-				continue
-			}
-			nLen := int(binary.LittleEndian.Uint16(payload[0:2]))
-			if 2+nLen > len(payload) {
-				continue
-			}
-			name := string(payload[2 : 2+nLen])
-			if handler != nil {
-				if err := handler(op, name, CompactRecord{}, "", spatial.Point2D{}, [4]float32{}, 0); err != nil {
-					return count, err
+				valid = false
+			} else {
+				nLen := int(binary.LittleEndian.Uint16(payload[0:2]))
+				if 2+nLen != len(payload) {
+					valid = false
+				} else if handler != nil {
+					name := string(payload[2:])
+					if err := handler(WALEvent{Op: op, Name: name}); err != nil {
+						return count, err
+					}
+					count++
 				}
-				count++
 			}
 
 		case WalOpNode:
-			if len(payload) < 2+4+4+16+2 {
-				continue
+			if len(payload) < 28 {
+				valid = false
+			} else {
+				offset := 0
+				wLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+				offset += 2
+				if offset+wLen+26 != len(payload) {
+					valid = false
+				} else {
+					word := string(payload[offset : offset+wLen])
+					offset += wLen
+					x := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+					offset += 4
+					y := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+					offset += 4
+					var roles [4]float32
+					for r := range roles {
+						roles[r] = math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+						offset += 4
+					}
+					domainID := binary.LittleEndian.Uint16(payload[offset : offset+2])
+					if handler != nil {
+						if err := handler(WALEvent{Op: op, Word: word, Coord: spatial.Point2D{X: x, Y: y}, Roles: roles, DomainID: domainID}); err != nil {
+							return count, err
+						}
+						count++
+					}
+				}
 			}
-			offset := 0
-			wLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-			offset += 2
-			if offset+wLen+26 > len(payload) {
-				continue
-			}
-			word := string(payload[offset : offset+wLen])
-			offset += wLen
-
-			x := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
-			offset += 4
-			y := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
-			offset += 4
-
-			var roles [4]float32
-			for r := 0; r < 4; r++ {
-				roles[r] = math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
-				offset += 4
-			}
-
-			domainID := binary.LittleEndian.Uint16(payload[offset : offset+2])
-			if handler != nil {
-				if err := handler(op, "", CompactRecord{}, word, spatial.Point2D{X: x, Y: y}, roles, domainID); err != nil {
+		case WalOpEdge:
+			edge, err := decodeWALEdge(payload)
+			if err != nil {
+				valid = false
+			} else if handler != nil {
+				if err := handler(WALEvent{Op: op, Edge: edge}); err != nil {
 					return count, err
 				}
 				count++
 			}
+		case WalOpEdgeDelete:
+			edge, err := decodeWALEdgeKey(payload)
+			if err != nil {
+				valid = false
+			} else if handler != nil {
+				if err := handler(WALEvent{Op: op, Edge: edge}); err != nil {
+					return count, err
+				}
+				count++
+			}
+		default:
+			valid = false
+		}
+		if !valid {
+			return count, fmt.Errorf("%w: invalid opcode %d or payload at offset %d", ErrWALCorrupt, op, frameOffset)
+		}
+		// Only a completely decoded, checksummed frame advances the durable end.
+		lastValidOffset, err = w.file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return count, err
 		}
 	}
 
 	// Seek to end for subsequent writes
 	_, err := w.file.Seek(0, io.SeekEnd)
 	return count, err
+}
+
+// Replay is the legacy recovery callback. It keeps its original signature for
+// backward compatibility and simply ignores edge opcodes, which the legacy
+// callback shape cannot express. New code should use ReplayEvents.
+func (w *WALManager) Replay(handler func(op byte, name string, cr CompactRecord, word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error) (int, error) {
+	return w.ReplayEvents(func(ev WALEvent) error {
+		if ev.Op == WalOpEdge || ev.Op == WalOpEdgeDelete {
+			return nil
+		}
+		if handler == nil {
+			return nil
+		}
+		return handler(ev.Op, ev.Name, ev.Record, ev.Word, ev.Coord, ev.Roles, ev.DomainID)
+	})
+}
+
+func (w *WALManager) truncateReplayTail(offset int64) error {
+	if err := w.file.Truncate(offset); err != nil {
+		return err
+	}
+	if _, err := w.file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	return w.file.Sync()
 }
