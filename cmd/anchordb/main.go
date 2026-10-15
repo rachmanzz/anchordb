@@ -17,6 +17,7 @@ func main() {
 	fmt.Println("    ANCHORDB: COMPUTATIONAL GRAPH STORAGE ENGINE (CPU)    ")
 	fmt.Println("==========================================================")
 
+	_ = os.MkdirAll("data", 0755)
 	dbFile := filepath.Join("data", "world.anchordb")
 	_ = os.Remove(dbFile) // Start fresh for demo
 
