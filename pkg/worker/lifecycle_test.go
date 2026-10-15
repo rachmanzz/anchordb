@@ -243,6 +243,87 @@ func TestSafeCancelQueuedTasks(t *testing.T) {
 	}
 }
 
+func TestCancelByModelAndID(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 16
+	pool := NewPool(cfg)
+	pool.Start()
+	defer func() { _ = pool.Shutdown() }()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	_ = pool.Dispatch(context.Background(), "blocker", func(ctx context.Context) error {
+		close(started)
+		<-release
+		return nil
+	})
+	<-started
+
+	var modelACanceled int32
+	var modelBExecuted int32
+	var taskCExecuted int32
+
+	// Queue 2 tasks for tenant/model "modelA"
+	for i := 0; i < 2; i++ {
+		_ = pool.Dispatch(context.Background(), fmt.Sprintf("jobA_%d", i),
+			func(ctx context.Context) error { return nil },
+			WithModel("modelA"),
+			WithOnError(func(ctx context.Context, err error) {
+				if errors.Is(err, ErrCanceled) {
+					atomic.AddInt32(&modelACanceled, 1)
+				}
+			}),
+		)
+	}
+
+	// Queue 1 task for "modelB"
+	_ = pool.Dispatch(context.Background(), "jobB_1",
+		func(ctx context.Context) error {
+			atomic.AddInt32(&modelBExecuted, 1)
+			return nil
+		},
+		WithModel("modelB"),
+	)
+
+	// Queue 1 task with specific ID "target-task-id"
+	_ = pool.Dispatch(context.Background(), "jobC_specific",
+		func(ctx context.Context) error {
+			atomic.AddInt32(&taskCExecuted, 1)
+			return nil
+		},
+		WithID("target-task-id"),
+		WithModel("modelC"),
+	)
+
+	if pool.Queued() != 4 {
+		t.Fatalf("expected 4 queued tasks, got %d", pool.Queued())
+	}
+
+	// Cancel only modelA tasks
+	nA := pool.CancelByModel("modelA")
+	if nA != 2 {
+		t.Fatalf("expected 2 tasks canceled for modelA, got %d", nA)
+	}
+	if atomic.LoadInt32(&modelACanceled) != 2 {
+		t.Fatalf("expected 2 OnError(ErrCanceled) for modelA, got %d", atomic.LoadInt32(&modelACanceled))
+	}
+
+	// Unblock worker and let remaining modelB and modelC tasks execute
+	close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = pool.WaitIdle(ctx)
+
+	if atomic.LoadInt32(&modelBExecuted) != 1 {
+		t.Fatalf("expected modelB job to execute successfully, got %d", atomic.LoadInt32(&modelBExecuted))
+	}
+	if atomic.LoadInt32(&taskCExecuted) != 1 {
+		t.Fatalf("expected modelC job to execute successfully, got %d", atomic.LoadInt32(&taskCExecuted))
+	}
+}
+
 func TestResumeAfterWaitBeforeShutdown(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Concurrency = 2

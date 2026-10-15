@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rachmanzz/anchordb/pkg/driver"
 	"github.com/rachmanzz/anchordb/pkg/partition"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
@@ -106,6 +108,24 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+// Routes returns the configured HTTP handler with all endpoints and middlewares registered
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/v1/save", s.authMiddleware(s.handleSave))
+	mux.HandleFunc("/v1/get", s.authMiddleware(s.handleGet))
+	mux.HandleFunc("/v1/list", s.authMiddleware(s.handleList))
+	mux.HandleFunc("/v1/update", s.authMiddleware(s.handleUpdate))
+	mux.HandleFunc("/v1/graph", s.authMiddleware(s.handleGraph))
+	mux.HandleFunc("/v1/sync", s.authMiddleware(s.handleSync))
+	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
+	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
+	mux.HandleFunc("/v1/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
+	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
+	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
+	return s.ipFilter.Middleware(mux)
+}
+
 // --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
 
 // AutoPartitionCronTask is the top-global handler for automated database partitioning.
@@ -139,7 +159,7 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 	var dispatchErr error
 	for _, m := range loaded {
 		modelName := m
-		err := t.server.worker.DispatchWithOptions(
+		err := t.server.worker.Dispatch(
 			ctx,
 			"cron_partition_"+modelName,
 			func(wCtx context.Context) error {
@@ -161,6 +181,7 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 				}
 				return err
 			},
+			worker.WithModel(modelName),
 			worker.WithRetry(2, 500*time.Millisecond),
 			worker.WithRetryJitter(100*time.Millisecond),
 		)
@@ -198,7 +219,7 @@ func (t *PeriodicSyncCronTask) Schedule() string {
 }
 
 func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
-	return t.server.worker.DispatchWithOptions(
+	return t.server.worker.Dispatch(
 		ctx,
 		"periodic_disk_sync",
 		func(wCtx context.Context) error {
@@ -211,16 +232,19 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 
 			var synced int
 			var purged int
+			var syncErrs []error
 			for _, d := range dbs {
 				purged += d.CollectTombstones(5000)
-				if err := d.Sync(); err == nil {
+				if err := d.Sync(); err != nil {
+					syncErrs = append(syncErrs, err)
+				} else {
 					synced++
 				}
 			}
 			if purged > 0 || synced > 0 {
 				log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk, %d tombstones collected", synced, purged)
 			}
-			return nil
+			return errors.Join(syncErrs...)
 		},
 		worker.WithRetry(1, 200*time.Millisecond),
 	)
@@ -637,7 +661,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
 	if isAsync {
-		err := s.worker.DispatchWithOptions(
+		jobID := uuid.New().String()
+		err := s.worker.Dispatch(
 			context.Background(),
 			"update_"+req.Model,
 			func(ctx context.Context) error {
@@ -652,8 +677,9 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 				}
 				return err
 			},
-			worker.WithRetry(2, 100*time.Millisecond),
-			worker.WithRetryJitter(50*time.Millisecond),
+			worker.WithID(jobID),
+			worker.WithModel(req.Model),
+			// Note: No retry on arithmetic mutations (+ - * /) to prevent duplicate compounding of non-idempotent updates.
 		)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch update to worker: %s"}`, err.Error()), http.StatusInternalServerError)
@@ -661,10 +687,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"status":  "accepted",
+			"job_id":  jobID,
+			"model":   req.Model,
 			"async":   true,
-			"status":  "queued",
-			"message": fmt.Sprintf("Bulk update for model %q dispatched to worker pool", req.Model),
+			"message": fmt.Sprintf("Bulk update for model %q accepted by worker pool", req.Model),
 		})
 		return
 	}
@@ -731,17 +758,27 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	// If async requested, offload to worker pool and return immediately
 	if r.URL.Query().Get("async") == "true" {
-		err := s.worker.Dispatch(context.Background(), "sync_"+modelName, func(ctx context.Context) error {
-			return db.Sync()
-		})
+		jobID := uuid.New().String()
+		err := s.worker.Dispatch(
+			context.Background(),
+			"sync_"+modelName,
+			func(ctx context.Context) error {
+				return db.Sync()
+			},
+			worker.WithID(jobID),
+			worker.WithModel(modelName),
+			worker.WithRetry(1, 200*time.Millisecond),
+		)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch sync task to worker: %s"}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
+		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"status":  "accepted",
+			"job_id":  jobID,
+			"model":   modelName,
 			"async":   true,
-			"status":  "queued",
 			"message": fmt.Sprintf("Sync for model %q queued to background worker engine", modelName),
 		})
 		return
@@ -844,13 +881,20 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Asynchronous execution via Worker Engine
 	if isAsync {
-		err := s.worker.DispatchWithOptions(
+		jobID := uuid.New().String()
+		modelTag := req.Model
+		if modelTag == "" {
+			modelTag = "all"
+		}
+		err := s.worker.Dispatch(
 			context.Background(),
 			"partition_run_async",
 			func(ctx context.Context) error {
+				var errs []error
 				for _, m := range targetModels {
 					db, err := s.getModel(m)
 					if err != nil {
+						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
 					}
 					res, err := partition.ExecutePartition(db, partition.PartitionPolicy{
@@ -861,13 +905,17 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 						FileFormat:    "{date}_{uuid}.anchordb",
 						PruneHotDB:    prune,
 					})
-					if err == nil && res.ArchivedCount > 0 {
+					if err != nil {
+						errs = append(errs, fmt.Errorf("partition %s: %w", m, err))
+					} else if res != nil && res.ArchivedCount > 0 {
 						log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
 							m, res.ArchivedCount, res.TargetLocation)
 					}
 				}
-				return nil
+				return errors.Join(errs...)
 			},
+			worker.WithID(jobID),
+			worker.WithModel(modelTag),
 			worker.WithRetry(2, 500*time.Millisecond),
 			worker.WithRetryJitter(100*time.Millisecond),
 		)
@@ -879,10 +927,10 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"status":  "accepted",
+			"job_id":  jobID,
 			"async":   true,
-			"status":  "queued",
-			"message": "Partition task dispatched to background worker pool",
+			"message": "Partition task accepted by background worker pool",
 			"targets": targetModels,
 		})
 		return
@@ -973,27 +1021,38 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
 	if isAsync {
-		err := s.worker.DispatchWithOptions(
+		jobID := uuid.New().String()
+		modelTag := req.Model
+		if modelTag == "" {
+			modelTag = "*"
+		}
+		err := s.worker.Dispatch(
 			context.Background(),
 			"collector_run_async",
 			func(ctx context.Context) error {
 				total := 0
+				var errs []error
 				for _, m := range targetModels {
 					db, err := s.getModel(m)
 					if err != nil {
+						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
 					}
 					purged := db.CollectTombstones(maxBatch)
 					if purged > 0 {
-						_ = db.Sync()
+						if err := db.Sync(); err != nil {
+							errs = append(errs, fmt.Errorf("sync %s: %w", m, err))
+						}
 					}
 					total += purged
 				}
 				if total > 0 {
 					log.Printf("[WORKER] Async collector sweep sukses: %d tombstones dibersihkan", total)
 				}
-				return nil
+				return errors.Join(errs...)
 			},
+			worker.WithID(jobID),
+			worker.WithModel(modelTag),
 			worker.WithRetry(1, 200*time.Millisecond),
 		)
 		if err != nil {
@@ -1003,10 +1062,10 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
+			"status":  "accepted",
+			"job_id":  jobID,
 			"async":   true,
-			"status":  "queued",
-			"message": "Tombstone collection task dispatched to worker pool",
+			"message": "Tombstone collection task accepted by worker pool",
 			"models":  targetModels,
 		})
 		return
@@ -1033,19 +1092,63 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type WorkerCancelRequest struct {
+	JobID string `json:"job_id"`
+	Model string `json:"model"`
+	All   bool   `json:"all"`
+}
+
 func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	canceled := s.worker.SafeCancel()
+	var req WorkerCancelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		http.Error(w, fmt.Sprintf(`{"error":"Invalid request body: %s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":        true,
-		"canceled_tasks": canceled,
-		"message":        fmt.Sprintf("%d queued tasks safely canceled", canceled),
-	})
+	if req.JobID != "" {
+		ok := s.worker.CancelByID(req.JobID)
+		if !ok {
+			http.Error(w, fmt.Sprintf(`{"error":"Task with job_id %q not found in queue"}`, req.JobID), http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"job_id":         req.JobID,
+			"canceled_tasks": 1,
+			"message":        fmt.Sprintf("Task %q canceled from queue", req.JobID),
+		})
+		return
+	}
+
+	if req.Model != "" && req.Model != "*" {
+		canceled := s.worker.CancelByModel(req.Model)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"model":          req.Model,
+			"canceled_tasks": canceled,
+			"message":        fmt.Sprintf("%d queued tasks for model %q canceled", canceled, req.Model),
+		})
+		return
+	}
+
+	if req.All || req.Model == "*" {
+		canceled := s.worker.SafeCancel()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"scope":          "global",
+			"canceled_tasks": canceled,
+			"message":        fmt.Sprintf("%d queued tasks safely canceled globally", canceled),
+		})
+		return
+	}
+
+	http.Error(w, `{"error":"Scoped cancellation required. Provide 'job_id', 'model', or 'all: true' for global cancellation"}`, http.StatusBadRequest)
 }
 
 // Environment / flag resolution helpers
@@ -1234,20 +1337,6 @@ func main() {
 		log.Fatalf("[FATAL] Gagal memulai AnchorDB Server: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", server.handleHealth)
-	mux.HandleFunc("/v1/save", server.authMiddleware(server.handleSave))
-	mux.HandleFunc("/v1/get", server.authMiddleware(server.handleGet))
-	mux.HandleFunc("/v1/list", server.authMiddleware(server.handleList))
-	mux.HandleFunc("/v1/update", server.authMiddleware(server.handleUpdate))
-	mux.HandleFunc("/v1/graph", server.authMiddleware(server.handleGraph))
-	mux.HandleFunc("/v1/sync", server.authMiddleware(server.handleSync))
-	mux.HandleFunc("/v1/partition/run", server.authMiddleware(server.handlePartitionRun))
-	mux.HandleFunc("/v1/collector/run", server.authMiddleware(server.handleCollectorRun))
-	mux.HandleFunc("/v1/scheduler/status", server.authMiddleware(server.handleSchedulerStatus))
-	mux.HandleFunc("/v1/worker/status", server.authMiddleware(server.handleWorkerStatus))
-	mux.HandleFunc("/v1/worker/cancel", server.authMiddleware(server.handleWorkerCancel))
-
 	fmt.Println("==========================================================")
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
 	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
@@ -1277,7 +1366,7 @@ func main() {
 	addr := ":" + portStr
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           server.ipFilter.Middleware(mux),
+		Handler:           server.Routes(),
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -1298,9 +1387,9 @@ func main() {
 	log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
 
 	// 1. Drain in-flight HTTP requests first so handlers finish cleanly
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	if err := srv.Shutdown(httpCtx); err != nil {
 		log.Printf("[WARN] HTTP server shutdown timeout: %v", err)
 	}
 
@@ -1309,10 +1398,11 @@ func main() {
 		server.scheduler.Stop()
 	}
 
-	// 3. Stop Worker Pool gracefully: wait for in-flight tasks and safely cancel queued tasks
+	// 3. Stop Worker Pool gracefully: drained with dedicated budget (cfg.ShutdownTimeout)
 	if server.worker != nil {
-		_ = server.worker.WaitBeforeShutdown(shutdownCtx)
-		_ = server.worker.Shutdown()
+		if err := server.worker.Shutdown(); err != nil {
+			log.Printf("[WARN] Worker pool shutdown error: %v", err)
+		}
 	}
 
 	// 4. Flush and sync all active models cleanly to disk before exit

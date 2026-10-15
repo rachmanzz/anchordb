@@ -98,10 +98,11 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 > at startup. Use a duration (`5m`) for sub-daily recurring work.
 
 ### 2. Worker Engine (`pkg/worker`, pure Go)
-- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "queued"}`) when the worker pool is enabled. The pool generates partition files and uploads to S3 in the background.
+- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "accepted", "job_id": "<uuid>"}`) when the worker pool is enabled. The pool archives data to target sink partition files in the background.
 - **Continuous Background Disk Sync**: Streams memory-mapped buffers to disk without locking client queries.
 - **Throttled Concurrency**: A fixed pool of worker goroutines (`ANCHORDB_WORKER_CONCURRENCY`, default `CPU × 2`) prevents CPU starvation.
 - **Bounded Task Queue**: Tasks flow through a bounded Go channel (`ANCHORDB_WORKER_QUEUE_SIZE`, default `1000`); dispatch is non-blocking and fails fast with `ErrQueueFull` when saturated.
+- **Scoped Task Cancellation**: Cancel specific jobs via `POST /v1/worker/cancel` with `{"job_id": ...}` or `{"model": ...}`, or require explicit `{"all": true}` for global drain.
 - **Inspection**: Real-time metrics via `GET /v1/worker/status`.
 
 ---

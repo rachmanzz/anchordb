@@ -92,7 +92,9 @@ type PoolStats struct {
 
 // Task represents a job to be executed with optional retry/fallback/hooks
 type Task struct {
-	Name string
+	ID    string
+	Model string
+	Name  string
 
 	// Fn is the function to execute. If it returns error (or panics), retry/fallback logic applies.
 	Fn func(ctx context.Context) error
@@ -165,6 +167,20 @@ func WithFallback(fn func(ctx context.Context, err error) error) Option {
 func WithContext(ctx context.Context) Option {
 	return func(t *Task) {
 		t.Ctx = ctx
+	}
+}
+
+// WithID sets a unique identifier for the task to enable scoped tracking and cancellation
+func WithID(id string) Option {
+	return func(t *Task) {
+		t.ID = id
+	}
+}
+
+// WithModel sets the model/tenant name for the task to enable scoped operations
+func WithModel(model string) Option {
+	return func(t *Task) {
+		t.Model = model
 	}
 }
 
@@ -509,11 +525,6 @@ func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Co
 	return p.DispatchTask(task)
 }
 
-// DispatchWithOptions is an alias for Dispatch, providing explicit named ergonomics.
-func (p *Pool) DispatchWithOptions(ctx context.Context, name string, fn func(ctx context.Context) error, opts ...Option) error {
-	return p.Dispatch(ctx, name, fn, opts...)
-}
-
 // DispatchTask submits a Task to the worker pool.
 func (p *Pool) DispatchTask(t Task) error {
 	if t.Fn == nil {
@@ -759,25 +770,71 @@ func (p *Pool) WaitIdle(ctx context.Context) error {
 // canceled via its OnError hook. In-flight tasks are left untouched, so this is
 // safe to call concurrently and repeatedly. Returns the number of canceled tasks.
 func (p *Pool) SafeCancel() int {
-	p.chanMu.RLock()
-	taskCh := p.taskCh
-	p.chanMu.RUnlock()
+	return p.CancelMatching(func(t Task) bool { return true })
+}
 
+// CancelMatching drains queued tasks matching the predicate. Non-matching tasks
+// are safely preserved in the queue in their relative order.
+func (p *Pool) CancelMatching(predicate func(t Task) bool) int {
+	if predicate == nil {
+		return 0
+	}
+	p.chanMu.Lock()
+	defer p.chanMu.Unlock()
+
+	taskCh := p.taskCh
+	var kept []jobItem
 	canceled := 0
 	for {
 		select {
 		case job, ok := <-taskCh:
 			if !ok {
+				for _, k := range kept {
+					select {
+					case taskCh <- k:
+					default:
+					}
+				}
 				return canceled
 			}
-			canceled++
-			p.canceled.Add(1)
-			p.pending.Add(-1)
-			p.reportCanceled(job.task)
+			if predicate(job.task) {
+				canceled++
+				p.canceled.Add(1)
+				p.pending.Add(-1)
+				p.reportCanceled(job.task)
+			} else {
+				kept = append(kept, job)
+			}
 		default:
+			for _, k := range kept {
+				select {
+				case taskCh <- k:
+				default:
+				}
+			}
 			return canceled
 		}
 	}
+}
+
+// CancelByModel cancels all queued tasks belonging to the given model.
+func (p *Pool) CancelByModel(model string) int {
+	if model == "" {
+		return 0
+	}
+	return p.CancelMatching(func(t Task) bool {
+		return t.Model == model
+	})
+}
+
+// CancelByID cancels a specific queued task by its task/job ID.
+func (p *Pool) CancelByID(id string) bool {
+	if id == "" {
+		return false
+	}
+	return p.CancelMatching(func(t Task) bool {
+		return t.ID == id
+	}) > 0
 }
 
 func (p *Pool) reportCanceled(t Task) {
@@ -944,6 +1001,24 @@ func SafeCancelation() (int, error) {
 		return 0, ErrNoGlobalPool
 	}
 	return p.SafeCancel(), nil
+}
+
+// CancelByModel is the globally callable form of Pool.CancelByModel.
+func CancelByModel(model string) (int, error) {
+	p := Global()
+	if p == nil {
+		return 0, ErrNoGlobalPool
+	}
+	return p.CancelByModel(model), nil
+}
+
+// CancelByID is the globally callable form of Pool.CancelByID.
+func CancelByID(id string) (bool, error) {
+	p := Global()
+	if p == nil {
+		return false, ErrNoGlobalPool
+	}
+	return p.CancelByID(id), nil
 }
 
 // ShutdownGlobal performs a full graceful shutdown of the global pool:
