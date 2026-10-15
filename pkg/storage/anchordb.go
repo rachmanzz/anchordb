@@ -41,6 +41,7 @@ const (
 	OpStatusSafeDelete uint8 = 0 // In-flight safe-delete / pending archive / locked from mutation
 	OpStatusActive     uint8 = 1 // Normal active record (default)
 	OpStatusTombstone  uint8 = 2 // Marked for background garbage collector
+	OpStatusRetry      uint8 = 3 // Execution failed or interrupted by crash/shutdown; pending retry
 )
 
 // AttrEntry stores a single numeric attribute key-value pair in a compact flat slice
@@ -381,8 +382,9 @@ func (f FilterCondition) Matches(props map[string]float32) bool {
 
 // QueryOptions defines criteria for List queries with pagination, column selection, and operation filtering
 type QueryOptions struct {
-	IncludeAllOperations bool              // If true, returns records regardless of operation status (0, 1, 2)
+	IncludeAllOperations bool              // If true, returns records regardless of operation status (0, 1, 2, 3)
 	OperationFilter      *uint8            // If specified, filters specifically by this operation status
+	AllowedOperations    []uint8           // If specified, returns records whose operation matches any in this list
 	Select               []string          // Projection: list of fields to return (empty means return all fields)
 	Filters              []FilterCondition
 	Computations         map[string]ComputeOp
@@ -557,7 +559,31 @@ func Open(filePath string) (*AnchorDB, error) {
 		return nil, fmt.Errorf("failed to replay wal: %w", err)
 	}
 
+	// Reconcile interrupted operations from ungraceful shutdown/crash:
+	// Any records trapped in OpStatusSafeDelete (0) are automatically transitioned to OpStatusRetry (3).
+	db.reconcileInterruptedOperationsLocked()
+
 	return db, nil
+}
+
+// reconcileInterruptedOperationsLocked detects any records left in OpStatusSafeDelete (0).
+// If a record is still in SafeDelete during Open(), it means a previous process crashed or shut down
+// before finalizing archival (to Tombstone) or completing rollback.
+// It transitions them to OpStatusRetry (3) and records the mutation in WAL.
+func (db *AnchorDB) reconcileInterruptedOperationsLocked() int {
+	reconciled := 0
+	for _, name := range db.EntityOrder {
+		cr, exists := db.EntityStore[name]
+		if exists && cr.Operation == OpStatusSafeDelete {
+			cr.Operation = OpStatusRetry
+			db.EntityStore[name] = cr
+			if db.wal != nil {
+				_ = db.wal.WriteSave(name, cr)
+			}
+			reconciled++
+		}
+	}
+	return reconciled
 }
 
 func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
@@ -936,7 +962,18 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		cr := db.EntityStore[name]
 
 		// Filter by Operation lifecycle state
-		if opts.OperationFilter != nil {
+		if len(opts.AllowedOperations) > 0 {
+			matchedOp := false
+			for _, allowed := range opts.AllowedOperations {
+				if cr.Operation == allowed {
+					matchedOp = true
+					break
+				}
+			}
+			if !matchedOp {
+				continue
+			}
+		} else if opts.OperationFilter != nil {
 			if cr.Operation != *opts.OperationFilter {
 				continue
 			}

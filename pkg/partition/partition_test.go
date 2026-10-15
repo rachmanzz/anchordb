@@ -169,5 +169,32 @@ func TestPartition_S3Sink_FailSafe(t *testing.T) {
 	if len(db.EntityStore) != 2 {
 		t.Fatalf("CRITICAL FAIL-SAFE VIOLATION: Hot DB was pruned despite S3 upload failure! Remaining records: %d", len(db.EntityStore))
 	}
-	t.Logf("[OK] Fail-safe verified! Hot DB preserved (count=%d) when S3 upload fails.", len(db.EntityStore))
+
+	// Verify failed records are now marked as OpStatusRetry (3)
+	_, op1, err := db.GetRecordWithOperation("old_record_1")
+	if err != nil || op1 != storage.OpStatusRetry {
+		t.Fatalf("expected old_record_1 to have OpStatusRetry (3), got %d (err: %v)", op1, err)
+	}
+	t.Logf("[OK] Fail-safe verified! Hot DB preserved and marked with OpStatusRetry (3) on S3 upload failure.")
+
+	// Next run with working local sink must pick up the OpStatusRetry records and archive them successfully!
+	localSink := NewLocalDiskSink(filepath.Join(tmpDir, "local_retry_archive"))
+	retryRes, err := ExecutePartition(db, PartitionPolicy{
+		ModelName:     "hot_logs",
+		DateField:     "tanggal",
+		RetentionDays: 180,
+		Sink:          localSink,
+		FileFormat:    "{date}_{uuid}.anchordb",
+		PruneHotDB:    true,
+	})
+	if err != nil {
+		t.Fatalf("subsequent partition retry failed: %v", err)
+	}
+	if retryRes.ArchivedCount != 2 {
+		t.Fatalf("expected 2 records archived on retry, got %d", retryRes.ArchivedCount)
+	}
+	if len(db.EntityStore) != 0 {
+		t.Fatalf("expected all records pruned after successful retry, remaining: %d", len(db.EntityStore))
+	}
+	t.Logf("[OK] Subsequent partition retry successfully picked up OpStatusRetry records and archived them!")
 }

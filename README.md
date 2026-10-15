@@ -187,10 +187,11 @@ All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, i
 - `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state.
 
 ### 3. Record Operation Lifecycle Machine
-AnchorDB records follow a three-state operational lifecycle:
+AnchorDB records follow a resilient four-state operational lifecycle:
 - **`1` (ACTIVE)**: Normal queryable record (default for new records). Eligible for reads and updates.
-- **`0` (SAFE_DELETE)**: In-flight safe delete / pending archival / partition lock. Locked against mutations; excluded from normal queries. Automatically rolled back to `1` if archival fails.
+- **`0` (SAFE_DELETE)**: In-flight safe delete / pending archival / partition lock. Locked against mutations; excluded from normal queries.
 - **`2` (TOMBSTONE)**: Marked for deletion upon partition success. Excluded from normal lookups and swept in batches by the background collector during periodic disk sync or `/v1/collector/run`.
+- **`3` (RETRY)**: Execution failed (e.g. S3 upload timeout) or interrupted by server shutdown/crash while in `0` (Safe-Delete). The startup crash reconciler automatically detects interrupted `0` records and promotes them to `3`. The next partition run automatically re-attempts records in state `3`.
 
 ---
 

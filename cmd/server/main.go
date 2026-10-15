@@ -371,6 +371,7 @@ type ListRequest struct {
 	Page                 int               `json:"page"`
 	IncludeAllOperations bool              `json:"include_all_operations,omitempty"`
 	Operation            *uint8            `json:"operation,omitempty"`
+	AllowedOperations    []uint8           `json:"allowed_operations,omitempty"`
 }
 
 type UpdateRequest struct {
@@ -574,6 +575,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		Computations:         computations,
 		IncludeAllOperations: req.IncludeAllOperations,
 		OperationFilter:      req.Operation,
+		AllowedOperations:    req.AllowedOperations,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)

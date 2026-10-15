@@ -48,10 +48,9 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	cutoffDays := nowDays - policy.RetentionDays
 	cutoffDateStr := storage.FormatDate(cutoffDays)
 
-	// 2. Query active records strictly before cutoff date
-	activeOp := storage.OpStatusActive
+	// 2. Query eligible records strictly before cutoff date (Active or Retry)
 	records, _, err := db.ListRecordsWithPaging(storage.QueryOptions{
-		OperationFilter: &activeOp,
+		AllowedOperations: []uint8{storage.OpStatusActive, storage.OpStatusRetry},
 		Filters: []storage.FilterCondition{
 			{
 				Field:    policy.DateField,
@@ -84,9 +83,9 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	// Phase A: Transition records to SafeDelete (0) to lock from mutations & hide from regular queries
 	db.SetOperationStatus(archivedNames, storage.OpStatusSafeDelete)
 
-	// Helper for rollback if archival fails
+	// Helper for rollback if archival fails -> marks records as OpStatusRetry (3)
 	rollback := func(causeErr error) error {
-		db.SetOperationStatus(archivedNames, storage.OpStatusActive)
+		db.SetOperationStatus(archivedNames, storage.OpStatusRetry)
 		return causeErr
 	}
 

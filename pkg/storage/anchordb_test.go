@@ -670,7 +670,8 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Reopen
+	// Reopen simulates crash / shutdown while record was in SafeDelete:
+	// Startup crash reconciler must automatically transition it to OpStatusRetry (3)!
 	db2, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
@@ -681,8 +682,8 @@ func TestOperationLifecycle_SafeDeleteAndCollector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRecordWithOperation after reopen failed: %v", err)
 	}
-	if op2 != OpStatusSafeDelete {
-		t.Errorf("expected op %d after reopen, got %d", OpStatusSafeDelete, op2)
+	if op2 != OpStatusRetry {
+		t.Errorf("expected op %d (OpStatusRetry) after startup crash reconciler, got %d", OpStatusRetry, op2)
 	}
 }
 
