@@ -44,6 +44,8 @@ type ServerConfig struct {
 	PartitionSchedule string
 	RetentionDays     float32
 	SyncInterval      string
+	CronTaskTimeout   time.Duration
+	CronJitter        time.Duration
 
 	WorkerConfig worker.Config
 }
@@ -75,6 +77,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	// 2. Initialize Cron Scheduler
 	sched := scheduler.NewInternalScheduler()
+	if cfg.CronTaskTimeout > 0 {
+		sched.SetTaskTimeout(cfg.CronTaskTimeout)
+	}
+	if cfg.CronJitter > 0 {
+		sched.SetJitter(cfg.CronJitter)
+	}
 
 	s := &Server{
 		dataDir:     cfg.DataDir,
@@ -121,6 +129,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
 	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
 	mux.HandleFunc("/v1/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
+	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
 	return s.ipFilter.Middleware(mux)
@@ -970,10 +979,56 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	tasks := s.scheduler.Tasks()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":    true,
-		"enabled":    s.cronEnabled,
-		"tasks":      tasks,
-		"uptime_sec": time.Since(s.startTime).Seconds(),
+		"success":      true,
+		"enabled":      s.cronEnabled,
+		"task_timeout": s.scheduler.TaskTimeout().String(),
+		"jitter":       s.scheduler.Jitter().String(),
+		"tasks":        tasks,
+		"uptime_sec":   time.Since(s.startTime).Seconds(),
+	})
+}
+
+type SchedulerRunRequest struct {
+	Task string `json:"task"`
+}
+
+func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	taskName := r.URL.Query().Get("task")
+	if taskName == "" {
+		var req SchedulerRunRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			taskName = req.Task
+		}
+	}
+	taskName = strings.TrimSpace(taskName)
+	if taskName == "" {
+		http.Error(w, `{"error":"Task name is required (pass 'task' query param or JSON {'task': '...'})"}`, http.StatusBadRequest)
+		return
+	}
+
+	if err := s.scheduler.RunNow(taskName); err != nil {
+		if strings.Contains(err.Error(), "already running") {
+			http.Error(w, fmt.Sprintf(`{"error":"Task %q is currently running"}`, taskName), http.StatusConflict)
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, fmt.Sprintf(`{"error":"Task %q not found in scheduler"}`, taskName), http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf(`{"error":"Failed to execute task %q: %s"}`, taskName, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"task":    taskName,
+		"message": fmt.Sprintf("Scheduled task %q triggered and executed successfully", taskName),
 	})
 }
 
@@ -1207,6 +1262,8 @@ func main() {
 	flagPartitionSchedule := flag.String("partition-schedule", "", "Partition cron schedule or HH:MM e.g. 23:00 (overrides ANCHORDB_PARTITION_SCHEDULE)")
 	flagRetentionDays := flag.Float64("retention-days", 0, "Default partition archival retention days (overrides ANCHORDB_PARTITION_RETENTION_DAYS)")
 	flagSyncInterval := flag.String("sync-interval", "", "Interval for periodic background disk sync e.g. 5m (overrides ANCHORDB_SYNC_INTERVAL)")
+	flagCronTaskTimeout := flag.String("cron-task-timeout", "", "Timeout for scheduled cron task execution e.g. 15m (overrides ANCHORDB_CRON_TASK_TIMEOUT)")
+	flagCronJitter := flag.String("cron-jitter", "", "Random jitter added to scheduled fire time e.g. 5s (overrides ANCHORDB_CRON_JITTER)")
 
 	// 3. Worker Pool Flags
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
@@ -1275,6 +1332,20 @@ func main() {
 		syncInterval = getEnv("ANCHORDB_SYNC_INTERVAL", "5m")
 	}
 
+	var cronTaskTimeout time.Duration
+	if cronTaskTimeoutStr := getEnv("ANCHORDB_CRON_TASK_TIMEOUT", *flagCronTaskTimeout); cronTaskTimeoutStr != "" {
+		if d, err := time.ParseDuration(cronTaskTimeoutStr); err == nil {
+			cronTaskTimeout = d
+		}
+	}
+
+	var cronJitter time.Duration
+	if cronJitterStr := getEnv("ANCHORDB_CRON_JITTER", *flagCronJitter); cronJitterStr != "" {
+		if d, err := time.ParseDuration(cronJitterStr); err == nil {
+			cronJitter = d
+		}
+	}
+
 	// Resolve Worker Parameters
 	workerEnabled := *flagWorkerEnabled
 	if !workerEnabled || !flagPassed("worker-enabled") {
@@ -1322,6 +1393,8 @@ func main() {
 		PartitionSchedule: partitionSched,
 		RetentionDays:     retentionDays,
 		SyncInterval:      syncInterval,
+		CronTaskTimeout:   cronTaskTimeout,
+		CronJitter:        cronJitter,
 		WorkerConfig: worker.Config{
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,
@@ -1349,8 +1422,8 @@ func main() {
 		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", ipWhitelist)
 	}
 	if cronEnabled {
-		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd, Sync: %s)\n",
-			partitionSched, retentionDays, syncInterval)
+		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd, Sync: %s, Timeout: %v, Jitter: %v)\n",
+			partitionSched, retentionDays, syncInterval, server.scheduler.TaskTimeout(), server.scheduler.Jitter())
 	} else {
 		fmt.Println("   Cron Engine    : DISABLED")
 	}

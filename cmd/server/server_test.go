@@ -245,3 +245,63 @@ func TestWorkerCancelScopedEndpoint(t *testing.T) {
 		t.Fatalf("expected tenant_b task to execute, got %d", atomic.LoadInt32(&taskBExecuted))
 	}
 }
+
+func TestSchedulerEndpoints(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	handler := s.Routes()
+
+	// 1. Register a test task directly in the scheduler
+	var runCount int32
+	err := s.scheduler.Register("test_maintenance", "@every 1h", func() error {
+		atomic.AddInt32(&runCount, 1)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	// 2. Query /v1/scheduler/status
+	req := httptest.NewRequest(http.MethodGet, "/v1/scheduler/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var statusResp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&statusResp); err != nil {
+		t.Fatalf("decode status response failed: %v", err)
+	}
+
+	tasksList, ok := statusResp["tasks"].([]interface{})
+	if !ok || len(tasksList) == 0 {
+		t.Fatalf("expected non-empty tasks list, got %v", statusResp["tasks"])
+	}
+
+	// 3. Trigger task on demand via POST /v1/scheduler/run
+	runBody := []byte(`{"task":"test_maintenance"}`)
+	req = httptest.NewRequest(http.MethodPost, "/v1/scheduler/run", bytes.NewReader(runBody))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from scheduler run, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if atomic.LoadInt32(&runCount) != 1 {
+		t.Fatalf("expected task to be executed once, got %d", atomic.LoadInt32(&runCount))
+	}
+
+	// 4. Trigger nonexistent task -> 404
+	badRunBody := []byte(`{"task":"nonexistent_task"}`)
+	req = httptest.NewRequest(http.MethodPost, "/v1/scheduler/run", bytes.NewReader(badRunBody))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 from nonexistent task, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

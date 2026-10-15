@@ -324,3 +324,23 @@ func TestTaskTimeoutCancelsExecution(t *testing.T) {
 		t.Fatal("expected the task context to be canceled by the timeout")
 	}
 }
+
+func TestTimeoutAndJitterGetters(t *testing.T) {
+	s := NewInternalScheduler()
+	if s.TaskTimeout() != 0 {
+		t.Fatalf("expected 0 default timeout, got %v", s.TaskTimeout())
+	}
+	if s.Jitter() != 0 {
+		t.Fatalf("expected 0 default jitter, got %v", s.Jitter())
+	}
+
+	s.SetTaskTimeout(5 * time.Minute)
+	s.SetJitter(10 * time.Second)
+
+	if s.TaskTimeout() != 5*time.Minute {
+		t.Fatalf("expected 5m, got %v", s.TaskTimeout())
+	}
+	if s.Jitter() != 10*time.Second {
+		t.Fatalf("expected 10s, got %v", s.Jitter())
+	}
+}

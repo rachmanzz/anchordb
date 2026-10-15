@@ -184,6 +184,11 @@ func (s *InternalScheduler) SetTaskTimeout(d time.Duration) {
 	s.timeoutNs.Store(int64(d))
 }
 
+// TaskTimeout returns the currently configured per-execution timeout (0 if none).
+func (s *InternalScheduler) TaskTimeout() time.Duration {
+	return time.Duration(s.timeoutNs.Load())
+}
+
 // SetJitter adds a random delay in [0, d) to each scheduled fire time to avoid a
 // thundering herd when many tasks share the same instant (e.g. all at "00:00").
 // 0 disables jitter. The stored NextRun stays the un-jittered schedule.
@@ -192,6 +197,11 @@ func (s *InternalScheduler) SetJitter(d time.Duration) {
 		d = 0
 	}
 	s.jitterNs.Store(int64(d))
+}
+
+// Jitter returns the currently configured fire jitter duration (0 if none).
+func (s *InternalScheduler) Jitter() time.Duration {
+	return time.Duration(s.jitterNs.Load())
 }
 
 // NormalizeSchedule converts convenient formats into standard specifications.

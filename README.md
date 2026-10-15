@@ -80,8 +80,10 @@ Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
 ### 1. Cron Scheduler (`pkg/scheduler`, pure Go)
 - **Automated Archival**: Runs daily (default `23:00`) to partition historical records older than $N$ days.
 - **Periodic Background Sync**: Triggers safe disk streaming syncs at regular intervals (default `5m`).
-- **Overlap Prevention**: Built-in `skip-if-still-running` protection and panic recovery.
-- **Inspection**: Real-time status via `GET /v1/scheduler/status`.
+- **Overlap Prevention**: Built-in atomic `running` single-flight protection and skipped-tick tracking.
+- **Wall-Clock Awareness**: DST-safe calendar math and sliced waits resistant to NTP clock jumps.
+- **On-Demand Execution**: Trigger any registered cron task on demand via `POST /v1/scheduler/run?task=<name>` or JSON `{"task": "<name>"}`.
+- **Inspection**: Real-time status via `GET /v1/scheduler/status` reporting task state, skipped ticks, timeout, and jitter.
 
 **Supported schedule formats** (`ANCHORDB_PARTITION_SCHEDULE` / `ANCHORDB_SYNC_INTERVAL`):
 
@@ -123,6 +125,8 @@ All settings can be configured via environment variables or CLI flags:
 | **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM`, `M H * * *`, `@daily`, `@hourly`, or interval; see note above) |
 | **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
 | **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval (`5m`, `30m`, etc.) |
+| **Cron Task Timeout** | `-cron-task-timeout` | `ANCHORDB_CRON_TASK_TIMEOUT` | `""` | Per-task execution context timeout (e.g. `15m`, `1h`) |
+| **Cron Jitter** | `-cron-jitter` | `ANCHORDB_CRON_JITTER` | `""` | Random delay added to scheduled fire time (e.g. `5s`) |
 | **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
 | **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
 | **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
