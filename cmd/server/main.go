@@ -1867,7 +1867,7 @@ func main() {
 	fmt.Println("==========================================================")
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
 	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
-	fmt.Println("             All Commercial Rights Reserved               ")
+	fmt.Println("             Licensed under Apache-2.0                    ")
 	fmt.Printf("   Port Dedicated : %s\n", portStr)
 	fmt.Printf("   Memory Limit   : %s\n", memSummary)
 	if server.ipFilter.IsEmpty() {

@@ -5,11 +5,11 @@
 [![Hardware](https://img.shields.io/badge/Hardware-100%25%20CPU%20%7C%20Zero%20GPU-orange.svg)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Minimal%20Dependencies%20%7C%20Zero%20Bloat-brightgreen.svg)]()
 [![Dedicated Port](https://img.shields.io/badge/Port-7447-red.svg)]()
-[![License](https://img.shields.io/badge/License-Commercial%20Proprietary-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 **AnchorDB** is an ultra-fast, zero-GPU computational database and graph convergence engine built in pure Go. It delivers bounded **constant-time $O(K)$** performance for retrieval, in-storage arithmetic, date mathematics, multi-hop reasoning, and batch mutations on massive recordsets directly in CPU cache and memory-mapped storage.
 
-Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
+Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. Licensed under the Apache License, Version 2.0.
 
 ---
 
@@ -234,10 +234,10 @@ AnchorDB records follow a resilient four-state operational lifecycle:
 
 ---
 
-## License & Commercial Property
-
-AnchorDB is proprietary commercial software owned exclusively by **MUHAMMD ABDURRAHMAN**.
-
-Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Rights Reserved.
-
-For full license terms and enterprise licensing inquiries, refer to the [LICENSE](LICENSE) file.
+## License
+ 
+AnchorDB is open-source software licensed under the **Apache License, Version 2.0**.
+ 
+Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**.
+ 
+See the [LICENSE](LICENSE) file for the full license text.

@@ -2,7 +2,7 @@
 
 AnchorDB is a high-performance computational database and spatial convergence engine designed for **100% CPU execution**, **bounded constant-time $O(K)$ retrieval**, and **minimal memory footprints**.
 
-Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. All Commercial Rights Reserved.
+Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. Licensed under the Apache License, Version 2.0.
 
 ---
 
