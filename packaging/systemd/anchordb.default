@@ -1,0 +1,22 @@
+# ==============================================================================
+# AnchorDB System Service Configuration File
+# Location: /etc/default/anchordb (Debian/Ubuntu) or /etc/sysconfig/anchordb (RHEL)
+# ==============================================================================
+
+# Port for HTTP server to listen on (default: 7447)
+PORT=7447
+
+# Base data directory where database models and WAL files are stored
+DATA_DIR=/var/lib/anchordb
+
+# Optional secret bearer token for API authentication (leave empty to disable)
+AUTH_TOKEN=
+
+# Write-Ahead Log durability mode: always | interval | none (default: always)
+WAL_SYNC=always
+
+# Fsync interval when WAL_SYNC=interval (e.g. 50ms, 200ms)
+WAL_SYNC_INTERVAL=200ms
+
+# Rate limit in requests/sec per client IP (0 disables rate limiting)
+RATE_LIMIT=0
