@@ -452,8 +452,8 @@ func runPersistenceRestartTest(ctx context.Context) {
 	if err != nil || len(causal) == 0 {
 		log.Fatalf("Canary causal edge missing after restart: %v", err)
 	}
-	fmt.Printf("      -> Canary Causal Edge verified: %s -> triggers -> %s (Weight: %.2f) [OK]\n",
-		"canary_node_primary", causal[0].Word, causal[0].Weight)
+	fmt.Printf("      -> Canary Causal Edge verified: %s -> triggers -> %s (Score: %.2f) [OK]\n",
+		"canary_node_primary", causal[0].Word, causal[0].Score)
 
 	// Verify bulk records count
 	listRes, err := reopenedClient.List().Page(1, 10).Execute(ctx)

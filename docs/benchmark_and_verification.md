@@ -115,3 +115,27 @@ After completing the tests, stop and clean up the container:
 podman rm -f anchordb-live-test
 rm -rf /tmp/anchordb_container_test_data
 ```
+
+---
+
+## 5. Standalone Engine Microbenchmark Suite (`pkg/storage/bench_test.go`)
+
+In addition to the end-to-end container integration test suite, AnchorDB includes a dedicated in-repo Go benchmark file in [`pkg/storage/bench_test.go`](../pkg/storage/bench_test.go) to measure raw CPU latencies, zero-allocation properties, and storage engine throughput without network or container overhead.
+
+### How to Run
+
+```bash
+# Run all storage benchmarks with memory allocation statistics
+go test -bench=. -benchmem -run=^# ./pkg/storage
+```
+
+### Measured Engine Benchmarks
+
+| Benchmark Name | Target Subsystem | Typical Result | Memory Allocations |
+| :--- | :--- | :--- | :--- |
+| `BenchmarkInStorageCompute_Arithmetic` | In-Storage Math (`Divide`, `Multiply`, `AddConst`) | ~24 ns/op (40M+ ops/sec) | **0 B/op, 0 allocs/op** |
+| `BenchmarkSpatial_TraverseRayDDA` | Fast Voxel DDA Raycasting across 256×256 Grid | ~1.2 µs/op | **0 B/op, 0 allocs/op** |
+| `BenchmarkGraph_ExecuteCausalChain` | Multi-Hop Causal Graph Path Traversal (4 hops) | ~2.4 µs/op | 1,096 B/op, 10 allocs/op |
+| `BenchmarkWAL_SyncNone` | WAL Ingestion (OS Page Cache Durability) | ~3.0 µs/op (320k+ writes/sec) | 778 B/op, 4 allocs/op |
+| `BenchmarkWAL_SyncInterval` | WAL Ingestion (Buffered Periodic fsync 50ms) | ~3.2 µs/op | 778 B/op, 4 allocs/op |
+| `BenchmarkWAL_SyncAlways` | WAL Ingestion (Physical Disk fsync per commit) | Media latency (NVMe vs SSD) | 778 B/op, 4 allocs/op |

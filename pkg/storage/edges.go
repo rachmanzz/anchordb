@@ -29,8 +29,9 @@ type EdgeRecord struct {
 type CausalResult struct {
 	Word     string  `json:"word"`
 	Relation string  `json:"relation"`
-	Weight   float32 `json:"weight"`
 	Score    float32 `json:"score"`
+	// Weight is a backward-compatible alias for Score. Deprecated: use Score instead.
+	Weight float32 `json:"weight"`
 }
 
 func validateEdge(source, relation, target string, weight float32) error {

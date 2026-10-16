@@ -368,7 +368,12 @@ govulncheck ./...
 
 # Unit and integration tests with race detector
 go test -race ./...
+
+# Storage microbenchmarks (pkg/storage/bench_test.go)
+go test -bench=. -benchmem -run=^# ./pkg/storage
 ```
+
+See [Benchmark & Verification Guide](docs/benchmark_and_verification.md) for independent 5-phase container stress and latency reproduction.
 
 ---
 
