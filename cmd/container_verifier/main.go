@@ -662,8 +662,8 @@ func runSchemaStressTest(ctx context.Context) {
 
 	// 2. High-Concurrency Valid Writes (5,000 writes across 50 goroutines)
 	const (
-		numWorkers      = 50
-		writesPerWorker = 100
+		numWorkers       = 50
+		writesPerWorker  = 100
 		totalValidWrites = numWorkers * writesPerWorker
 	)
 	fmt.Printf("[2/6] Executing %d valid concurrent writes across %d parallel goroutines...\n", totalValidWrites, numWorkers)
@@ -826,4 +826,3 @@ func runSchemaStressTest(ctx context.Context) {
 	}
 	fmt.Println("      -> Model schema successfully reset and re-attached with new contract [OK]")
 }
-

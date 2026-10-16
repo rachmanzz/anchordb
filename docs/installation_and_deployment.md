@@ -234,7 +234,7 @@ Binaries included in the archive:
 To use AnchorDB from within another Go application, import the official client driver SDK:
 
 ```bash
-go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.0
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.1
 ```
 *(or `go get github.com/rachmanzz/anchordb/pkg/driver` for the latest revision)*
 

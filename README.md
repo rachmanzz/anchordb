@@ -147,7 +147,7 @@ services:
 To connect your Go application to AnchorDB or embed the engine:
 
 ```bash
-go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.0
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.1
 ```
 
 ### 4. Standalone Binaries (Linux & macOS)
