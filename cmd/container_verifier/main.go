@@ -276,7 +276,7 @@ func runConcurrencyRampUp(ctx context.Context) {
 		var (
 			successCount atomic.Int64
 			failureCount atomic.Int64
-			latencies    = make([]time.Duration, tier.requests)
+			latencies    = make([]time.Duration, 0, tier.requests)
 			latMu        sync.Mutex
 		)
 
@@ -338,14 +338,22 @@ func runConcurrencyRampUp(ctx context.Context) {
 		if len(latencies) > 0 {
 			avgLat = totalLat / time.Duration(len(latencies))
 		}
+		minLat := latencies[0]
+		p50Lat := latencies[len(latencies)/2]
 		p95Index := int(float64(len(latencies)) * 0.95)
 		if p95Index >= len(latencies) {
 			p95Index = len(latencies) - 1
 		}
 		p95Lat := latencies[p95Index]
+		p99Index := int(float64(len(latencies)) * 0.99)
+		if p99Index >= len(latencies) {
+			p99Index = len(latencies) - 1
+		}
+		p99Lat := latencies[p99Index]
+		maxLat := latencies[len(latencies)-1]
 
-		fmt.Printf("      -> Concurrency %3d: %d OK, %d Failed | Total: %v (%.0f req/s) | Avg: %v, p95: %v\n",
-			tier.concurrency, successCount.Load(), failureCount.Load(), duration, throughput, avgLat, p95Lat)
+		fmt.Printf("      -> Concurrency %3d: %d OK, %d Failed | Duration: %v (%.0f req/s) | min=%v, avg=%v, p50=%v, p95=%v, p99=%v, max=%v\n",
+			tier.concurrency, successCount.Load(), failureCount.Load(), duration, throughput, minLat, avgLat, p50Lat, p95Lat, p99Lat, maxLat)
 
 		client.Close()
 		if failureCount.Load() > 0 {
