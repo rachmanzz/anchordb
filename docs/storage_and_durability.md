@@ -50,9 +50,11 @@ AnchorDB supports three WAL durability modes, configured via `-wal-sync` or `ANC
 
 | Mode | Behavior | Crash Resilience | Recommended For |
 | :--- | :--- | :--- | :--- |
-| **`always`** (default) | Calls `fsync` after every WAL append. | Maximum: Zero committed writes lost on power failure. | Production databases, critical financial/transaction data. |
+| **`always`** (default) | Calls `fsync` after every WAL append (per record or batch transaction commit). | Maximum: Zero committed writes lost on power failure. | Production databases, critical financial/transaction data. |
 | **`interval`** | Buffers writes and calls `fsync` periodically (default `200ms`). | High: At most one interval window of writes lost on sudden power failure. | High-throughput logging, edge devices, SD cards. |
 | **`none`** | Relies entirely on the OS page cache flush. | Standard OS durability: writes preserved across clean process exits, but can lose recent writes on ungraceful power loss. | Ephemeral testing, bulk data imports. |
+
+> **Batch Fsync Amortization**: In `always` mode, invoking `fsync` on individual sequential HTTP writes incurs physical storage latency (~1–5ms on NVMe/SSD, ~15–30ms on HDD/SD). When high write throughput is required under `always` durability, send records using batch endpoints (e.g. batch `/v1/write` or batch updates) to amortize the single fsync across all records in that commit window.
 
 ---
 

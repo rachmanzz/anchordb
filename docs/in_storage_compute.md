@@ -10,7 +10,7 @@ AnchorDB provides arithmetic and assignment operators defined in `pkg/storage` a
 
 | Operator | Driver Function | Description | Example |
 | :--- | :--- | :--- | :--- |
-| **Divide** | `driver.Divide(fieldA, fieldB)` | Divides `fieldA` by `fieldB`. Division by zero yields `0`. | `driver.Divide("distance", "duration")` |
+| **Divide** | `driver.Divide(fieldA, fieldB)` | Divides `fieldA` by `fieldB`. Returns an error if `fieldB` is 0 (aborts and rolls back batch mutations). | `driver.Divide("distance", "duration")` |
 | **Multiply** | `driver.Multiply(fieldA, fieldB)` | Multiplies `fieldA` by `fieldB`. | `driver.Multiply("unit_price", "quantity")` |
 | **Add** | `driver.Add(fieldA, fieldB)` | Adds two attribute fields. | `driver.Add("base_score", "bonus_score")` |
 | **Add Constant** | `driver.AddConst(field, val)` | Adds a numeric float constant to an attribute. | `driver.AddConst("base_score", 10.0)` |
@@ -26,6 +26,9 @@ AnchorDB provides arithmetic and assignment operators defined in `pkg/storage` a
 ## 2. Date Mathematics
 
 Dates in AnchorDB are stored internally as IEEE 754 `float32` numbers representing **Epoch Days** (the number of days elapsed since January 1, 1970 UTC). This representation allows calendar arithmetic to be executed as fast, single-cycle floating point additions and subtractions.
+
+> **Date Timezone & Precision**:
+> All date parsing (`ParseDate`) assumes UTC midnight (`00:00:00 UTC`) without timezone offset ambiguity. Epoch days represent whole integer days from the 1970-01-01 UTC epoch. When formatting via `FormatDate`, values are rounded to the nearest integer day (`math.Round`) before converting back to `"YYYY-MM-DD"`.
 
 ### Date Functions
 
@@ -150,5 +153,5 @@ In-storage calculations can be triggered over the HTTP REST API.
 
 1. **Numeric Precision**: AnchorDB optimizes attribute storage as IEEE 754 single-precision floats (`float32`). It is tailored for telemetry, IoT, metrics, and spatial coordinates, rather than arbitrary-precision banking decimals.
 2. **Deterministic Binary Operations**: Supported operators are limited to arithmetic (`+`, `-`, `*`, `/`) and date offsets (`+days`, `-days`, `days_between`). AnchorDB intentionally avoids embedding a general-purpose programming language (e.g. Lua or JavaScript) in storage to maintain zero-GPU, sub-microsecond latency.
-3. **Division by Zero Protection**: Division operations automatically yield `0.0` with logged warnings rather than aborting the transaction or generating hardware traps.
+3. **Strict Division-by-Zero Semantics**: Division operations strictly validate that the divisor is non-zero. If the divisor resolves to zero, the engine returns an error (`division by zero: <field> is 0`) and rolls back the active mutation or query pass, preserving mathematical and financial integrity.
 

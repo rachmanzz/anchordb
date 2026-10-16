@@ -289,9 +289,10 @@ func (db *AnchorDB) ExecuteCausalChain(ctx context.Context, seeds []string, rela
 	}
 	best := make(map[string]CausalResult, len(last))
 	for word, score := range last {
-		best[word] = CausalResult{Word: word, Relation: relations[len(relations)-1], Score: score}
+		best[word] = CausalResult{Word: word, Relation: relations[len(relations)-1], Weight: score, Score: score}
 	}
 	return rankCausal(best, limitK), nil
+
 }
 
 func rankCausal(best map[string]CausalResult, limitK int) []CausalResult {

@@ -88,6 +88,8 @@ Retrieves an entity by name with optional in-storage computations and selective 
 ### `POST /v1/list`
 Queries records matching attribute ranges or date criteria with pagination.
 
+> **Pagination Limit Cap**: The `limit` parameter is capped at `1000` (`maxQueryLimit`). Requests specifying a limit higher than 1000 are automatically clamped to 1000 to prevent unbounded memory allocation and denial of service.
+
 **Request Payload**:
 ```json
 {

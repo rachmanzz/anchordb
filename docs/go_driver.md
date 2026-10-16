@@ -231,7 +231,8 @@ steps, _ := client.Causal("soil_dry", "triggers", 5)
 // Multi-hop causal chain
 chain, _ := client.CausalChain([]string{"soil_dry"}, []string{"triggers", "causes"}, 5)
 for _, step := range chain {
-    fmt.Printf("Outcome: %s (Cumulative Weight: %.3f)\n", step.Word, step.Weight)
+    // Both step.Score and step.Weight are populated with the cumulative score
+    fmt.Printf("Outcome: %s (Cumulative Score: %.3f)\n", step.Word, step.Score)
 }
 ```
 
