@@ -20,6 +20,14 @@ Connecting directly to local `.anchordb` files in an application process acquire
 
 ## 2. Installation & Connecting
 
+Add the driver to your Go project using `go get`:
+
+```bash
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.0
+```
+
+Then import it in your Go code:
+
 ```go
 import "github.com/rachmanzz/anchordb/pkg/driver"
 ```

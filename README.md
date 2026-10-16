@@ -39,6 +39,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 - **[REST API Reference](docs/rest_api.md)**: HTTP daemon configuration, authentication, telemetry, and endpoints.
 - **[Go Driver SDK Guide](docs/go_driver.md)**: Connection setup, query builders, and integration examples.
 - **[Benchmark & Verification Guide](docs/benchmark_and_verification.md)**: Reproducible test suite, Little's Law validation, and container durability.
+- **[Installation & Deployment Guide](docs/installation_and_deployment.md)**: Native packages (.deb, .rpm), systemd service management, Docker/Podman container images, and universal archives.
 
 
 
@@ -80,51 +81,44 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 ---
 
-## Quick Start
+## Installation & Quick Start
 
-### Building from Source
+AnchorDB offers multiple official installation and deployment methods:
 
-Prerequisites: Go 1.26 or newer (toolchain `go1.27.2+` recommended for security patches).
+For complete operational and deployment options, see the **[Installation & Deployment Guide](docs/installation_and_deployment.md)**.
 
+### 1. Native Linux Packages (`.deb` / `.rpm`) with Automated Background Systemd
 
-```bash
-# Clone repository
-git clone https://github.com/rachmanzz/anchordb.git
-cd anchordb
-
-# Build server binary
-go build -o bin/anchordb-server ./cmd/server
-
-# Build demo CLI binary
-go build -o bin/anchordb ./cmd/anchordb
-```
-
-### Running the Server
-
-Start the standalone HTTP server:
+Pre-built native packages are published on [GitHub Releases](https://github.com/rachmanzz/anchordb/releases). Installing a package automatically provisions the `anchordb:anchordb` service user, configures `/var/lib/anchordb` with `0750` permissions, and registers a background `systemd` service that starts automatically.
 
 ```bash
-export ANCHORDB_AUTH_TOKEN="your-secure-token"
-./bin/anchordb-server -port 7447 -data-dir ./data
+# Ubuntu / Debian (.deb)
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_amd64.deb
+sudo dpkg -i anchordb_0.1.0_amd64.deb
+
+# RHEL / CentOS / Fedora (.rpm)
+sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_amd64.rpm
 ```
 
-For local testing without authentication:
-
+Verify service status:
 ```bash
-export ANCHORDB_ALLOW_INSECURE="true"
-./bin/anchordb-server -port 7447 -data-dir ./data
+sudo systemctl status anchordb
 ```
+*(Configuration is managed at `/etc/default/anchordb` or `/etc/sysconfig/anchordb`. If port `7447` is occupied by another service, the installer logs a safe warning without failing; modify `PORT` in that file and run `sudo systemctl restart anchordb`)*
 
-### Running with Docker or Podman
+### 2. Multi-Architecture Container Images (Docker & Podman)
+
+Official multi-architecture images (`linux/amd64` and `linux/arm64`) are published to the GitHub Container Registry (`ghcr.io`):
 
 ```bash
 docker run -d \
   --name anchordb \
   -p 7447:7447 \
+  -v ./data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="your-secure-token" \
   -e ANCHORDB_DATA_DIR="/data" \
-  -v ./data:/data:Z \
-  anchordb:latest
+  --restart unless-stopped \
+  ghcr.io/rachmanzz/anchordb:latest
 ```
 
 Using Docker Compose:
@@ -132,7 +126,9 @@ Using Docker Compose:
 ```yaml
 services:
   anchordb:
-    image: anchordb:latest
+    image: ghcr.io/rachmanzz/anchordb:latest
+    container_name: anchordb
+    restart: unless-stopped
     ports:
       - "7447:7447"
     environment:
@@ -140,6 +136,38 @@ services:
       - ANCHORDB_DATA_DIR=/data
     volumes:
       - ./data:/data:Z
+```
+
+### 3. Go Driver Client SDK
+
+To connect your Go application to AnchorDB or embed the engine:
+
+```bash
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.0
+```
+
+### 4. Standalone Binaries (Linux & macOS)
+
+Download universal pre-compiled archives (`.tar.gz`) for Linux or macOS from [GitHub Releases](https://github.com/rachmanzz/anchordb/releases):
+
+```bash
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_linux_amd64.tar.gz
+tar -xzf anchordb_0.1.0_linux_amd64.tar.gz
+./anchordb-server -port 7447 -data-dir ./data
+```
+
+### 5. Building from Source
+
+Prerequisites: Go 1.26 or newer (toolchain `go1.27.2+` recommended).
+
+```bash
+git clone https://github.com/rachmanzz/anchordb.git
+cd anchordb
+
+# Build server, CLI, and benchmark binaries
+go build -o bin/anchordb-server ./cmd/server
+go build -o bin/anchordb ./cmd/anchordb
+go build -o bin/anchordb-benchmark ./cmd/benchmark
 ```
 
 ---

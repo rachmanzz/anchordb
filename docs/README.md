@@ -51,4 +51,10 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
    * Little's Law validation ($L = \lambda \cdot W$) across concurrent worker pools.
    * Container crash durability, background sync, and cold partition archival.
 
+10. **[Installation & Deployment Guide](installation_and_deployment.md)**
+   * Native OS packages (`.deb` / `.rpm`) with background `systemd` service.
+   * Multi-architecture containers (`ghcr.io/rachmanzz/anchordb:latest`).
+   * Pre-compiled standalone archives for Linux and macOS.
+   * Go driver client installation and compiling from source.
+
 
