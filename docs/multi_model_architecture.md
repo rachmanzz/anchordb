@@ -140,5 +140,5 @@ For applications requiring strict schema immutability and contract enforcement, 
 - **Attach Verification**: When clients attach to a model, the engine compares declared schemas; mismatches are rejected immediately, blocking all subsequent insert/update operations.
 - **Lock Permanence**: The schema cannot be detached or altered dynamically until an explicit administrative reset.
 
-For detailed design specifications, see the **[PRD: Register Model & Strict Schema Immutability](prd_register_model.md)**.
+For usage and API guidelines, see the **[Go Driver SDK Guide](go_driver.md#4-schema-attachment--contract-enforcement-clientattach)** and **[REST API Reference](rest_api.md#6-model-schema-management-endpoints)**.
 

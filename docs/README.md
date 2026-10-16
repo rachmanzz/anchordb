@@ -28,42 +28,35 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
    * Remote Engine vs. Embedded Engine execution modes.
    * Strict schema registration and model attachment contract.
 
-5. **[Model Schema Registration & Immutability Contract](prd_register_model.md)**
-   * One-time model schema registration and permanent file locking.
-   * Support for primitives and 1D arrays (`string[]`, `float[]`, `int[]`, `bool[]`, `date[]`).
-   * Required vs. optional (`?`) syntax.
-   * Attach/connect schema verification, comparison, and fail-fast rejection (`ErrSchemaMismatch`).
-   * Permanent lock lifecycle and administrative hard reset contract (`POST /v1/model/reset`).
-
-6. **[Data Partitioning & Record Lifecycle](partitioning_and_lifecycle.md)**
+5. **[Data Partitioning & Record Lifecycle](partitioning_and_lifecycle.md)**
    * Four-state record machine (`ACTIVE`, `SAFE_DELETE`, `TOMBSTONE`, `RETRY`).
    * Partition policies, retention cutoffs, and streaming partition files.
    * Sinks: Local Disk and S3-compatible Object Storage (streamed SigV4, SSRF protection).
    * Tombstone garbage collection.
 
-7. **[Background Subsystems: Scheduler & Worker Pool](background_subsystems.md)**
+6. **[Background Subsystems: Scheduler & Worker Pool](background_subsystems.md)**
    * Pure-Go Cron scheduler (`pkg/scheduler`): wall-clock semantics, DST safety, overlap prevention.
    * Asynchronous worker pool (`pkg/worker`): bounded task queue, fixed concurrency, and memory admission controls.
 
-8. **[REST API Reference](rest_api.md)**
+7. **[REST API Reference](rest_api.md)**
    * Server daemon configuration, authentication, rate limiting, and IP whitelisting.
    * Endpoint catalog covering health checks, telemetry, CRUD, and graph queries.
    * Model Schema Management: `POST /v1/model/attach`, `GET /v1/model/schema`, `POST /v1/model/reset`.
    * Partition archival, inspection, and maintenance operations.
 
-9. **[Go Driver SDK Guide](go_driver.md)**
+8. **[Go Driver SDK Guide](go_driver.md)**
    * Client connection configuration (Remote Engine `ConnectRemote` and Embedded Engine `OpenEmbedded`).
    * Schema Attachment (`client.Attach`, `client.AttachModel`, `driver.WithAttachSchema`).
    * Fluent query builders: `Get`, `List`, `Update`, `Graph`, and `Math`.
    * Cold partition inspection and context cancellation handling.
 
-10. **[Benchmark & Integration Verification Guide](benchmark_and_verification.md)**
+9. **[Benchmark & Integration Verification Guide](benchmark_and_verification.md)**
    * Reproducible 6-phase test suite execution (`cmd/container_verifier`).
    * Little's Law validation ($L = \lambda \cdot W$) across concurrent worker pools.
    * Container crash durability, background sync, and cold partition archival.
    * High-load schema attachment, validation, and fail-fast rejection stress testing.
 
-11. **[Installation & Deployment Guide](installation_and_deployment.md)**
+10. **[Installation & Deployment Guide](installation_and_deployment.md)**
    * Native OS packages (`.deb` / `.rpm`) with background `systemd` service.
    * Multi-architecture containers (`ghcr.io/rachmanzz/anchordb:latest`).
    * Pre-compiled standalone archives for Linux and macOS.

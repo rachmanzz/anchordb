@@ -34,7 +34,6 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 ## Feature Documentation
 
 - **[Multi-Model Architecture: One Model = One File](docs/multi_model_architecture.md)**: Independent storage files, failure isolation, and memory-mapped model routing.
-- **[Model Schema Registration & Immutability Contract](docs/prd_register_model.md)**: One-time registration, contract enforcement, and 1D array support.
 - **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, attribute projections, and batch updates.
 - **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, and weighted causal chains.
 - **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
