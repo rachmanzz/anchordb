@@ -199,10 +199,20 @@ import (
 )
 
 func main() {
-	// Mode A: Remote Engine (Client-Server over HTTP)
+	// 1. Declare Model Schema Contract
+	// AnchorDB enforces strict data contracts per model to prevent drift and corruption.
+	schema := driver.Schema{
+		"distance":  "float",     // Required float32 metric
+		"duration":  "float",     // Required float32 metric
+		"sensor_id": "string?",   // Optional string attribute (trailing ?)
+		"tags":      "string[]?", // Optional 1D string array
+	}
+
+	// Mode A: Remote Engine (Connect over HTTP with schema attachment & verification)
 	client, err := driver.ConnectRemote("http://localhost:7447",
 		driver.WithToken("your_auth_token"),
 		driver.WithModel("plant_iot"),
+		driver.WithAttachSchema(schema), // Locks and validates schema contract
 	)
 	if err != nil {
 		log.Fatalf("connection failed: %v", err)
@@ -212,13 +222,13 @@ func main() {
 	// Mode B: Embedded Engine (In-Process Runtime, No TCP Port)
 	// embeddedClient, err := driver.OpenEmbedded("./data",
 	// 	driver.WithModel("plant_iot"),
+	// 	driver.WithAttachSchema(schema),
 	// 	driver.WithSyncInterval(5 * time.Second),
 	// )
 
-
 	ctx := context.Background()
 
-	// Save record
+	// Save record (strictly validated against the locked model schema)
 	err = client.Save("sensor_zone_1", map[string]float32{
 		"distance": 120.0,
 		"duration": 2.0,
@@ -240,7 +250,43 @@ func main() {
 }
 ```
 
-### 2. Filtering & Pagination
+### 2. Model Schema Contract & Attachment
+
+AnchorDB enforces strict schema immutability per model database to guarantee type safety and prevent silent schema drift across distributed microservices.
+
+```go
+// Define schema contract: required types and optional (?) fields
+sensorSchema := driver.Schema{
+	"voltage":          "float",       // Required float32
+	"current":          "float",       // Required float32
+	"status":           "int",         // Required integer
+	"brand":            "string?",     // Optional string
+	"tags":             "string[]?",   // Optional 1D string array
+	"vector_embedding": "float[]",     // Required 1D float vector embedding
+}
+
+// 1. Attach to active model (fails fast if an incompatible schema was already locked)
+if err := client.Attach(sensorSchema); err != nil {
+	log.Fatalf("schema verification failed: %v", err)
+}
+
+// 2. Or attach when spawning a new model client:
+deviceClient, err := client.AttachModel("devices_zone_1", sensorSchema)
+
+// 3. Inspect registered schema contract
+registeredSchema, err := client.GetSchema(ctx)
+```
+
+#### Supported Types & Validation Rules
+- **Primitives**: `string`, `int`, `float`, `bool`, `date` (`YYYY-MM-DD` epoch day).
+- **1D Arrays**: `string[]`, `int[]`, `float[]`, `bool[]`, `date[]`.
+- **Required (Default)**: Omission of `?` makes the field strictly mandatory. Missing fields return `driver.ErrMissingRequiredField`.
+- **Optional (`?` Modifier)**: Suffix `?` allows the field to be omitted on write without reserving empty space.
+- **Fail-Fast Safety**: Supplying undeclared attributes returns `driver.ErrUnknownField`. Mismatched connection contracts return `driver.ErrSchemaMismatch` (`HTTP 409 Conflict`).
+
+For comprehensive specifications, see the **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**.
+
+### 3. Filtering & Pagination
 
 ```go
 // List records with property and calculated value filters
@@ -256,7 +302,7 @@ for _, item := range result.Items {
 }
 ```
 
-### 3. Date Arithmetic
+### 4. Date Arithmetic
 
 Date values are stored as float32 Epoch Days (days since Unix epoch).
 
@@ -277,7 +323,7 @@ updated, _ := client.Get("contract_1").Execute(ctx)
 fmt.Println("New Date:", updated.GetDate("start_date"))
 ```
 
-### 4. Causal Graph Traversal
+### 5. Causal Graph Traversal
 
 ```go
 // Link directed edges with weight scores
@@ -304,6 +350,13 @@ All requests and responses use JSON. When an auth token is configured, endpoints
 | :--- | :--- | :--- |
 | `GET` | `/health` | Server health check (detailed stats require auth) |
 | `GET` | `/metrics` | Prometheus-compatible metrics endpoint |
+
+### Model Schema Management
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/v1/model/attach` | Attach and permanently lock a schema contract to a model (fails with HTTP 409 if mismatched) |
+| `GET` | `/v1/model/schema` | Retrieve the active schema contract for a model |
+| `POST` | `/v1/model/reset` | Administrative hard reset of a model's registered schema (`confirm: true` required) |
 
 ### CRUD & Computations
 | Method | Endpoint | Description |
@@ -375,8 +428,8 @@ Settings can be specified through command-line flags or environment variables:
 
 AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D spatial indexing, and directed causal reasoning. It is designed with clear architectural trade-offs:
 
-1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. There are no tables, schemas, migrations, or cross-model relational `JOIN` operations.
-2. **Numeric Property Vectors**: Record properties are stored as `float32` values. AnchorDB is ideal for telemetry, IoT sensors, numerical attributes, and dates (Epoch Days), rather than arbitrary text documents or binary blobs.
+1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. Each model maintains its own immutable schema contract, and there are no relational SQL tables, cross-model relational `JOIN` operations, or dynamic migrations.
+2. **Computational Property Storage & 1D Arrays**: Attribute values are stored as scalar primitives (`float`, `int`, `bool`, `date`, `string`) and 1D arrays (`float[]`, `string[]`, `int[]`, `bool[]`, `date[]`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
 3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (Remote HTTP Server or Embedded In-Process Engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
 
