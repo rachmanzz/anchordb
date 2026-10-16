@@ -1,6 +1,7 @@
 # AnchorDB
 
-[![Go Version](https://img.shields.io/badge/Go-1.22+-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-blue.svg)](https://golang.org)
+
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
@@ -37,6 +38,8 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 - **[Background Subsystems: Scheduler & Worker Pool](docs/background_subsystems.md)**: Wall-clock cron scheduler and bounded async worker pool.
 - **[REST API Reference](docs/rest_api.md)**: HTTP daemon configuration, authentication, telemetry, and endpoints.
 - **[Go Driver SDK Guide](docs/go_driver.md)**: Connection setup, query builders, and integration examples.
+- **[Benchmark & Verification Guide](docs/benchmark_and_verification.md)**: Reproducible test suite, Little's Law validation, and container durability.
+
 
 
 ---
@@ -81,7 +84,8 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 ### Building from Source
 
-Prerequisites: Go 1.22 or newer.
+Prerequisites: Go 1.26 or newer (toolchain `go1.27.2+` recommended for security patches).
+
 
 ```bash
 # Clone repository

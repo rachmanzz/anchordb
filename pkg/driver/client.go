@@ -350,13 +350,34 @@ func Multiply(fieldA, fieldB string) storage.ComputeOp {
 }
 
 // Add creates an in-storage addition operator (a + b).
+// Both fieldA and fieldB can be attribute names or stringified numeric literals (e.g. "10").
 func Add(fieldA, fieldB string) storage.ComputeOp {
 	return storage.OpAdd{FieldA: fieldA, FieldB: fieldB}
+}
+
+// AddConst creates an in-storage addition operator adding a numeric constant to an attribute (field + val).
+func AddConst(field string, val float32) storage.ComputeOp {
+	return storage.OpAdd{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
 }
 
 // Subtract creates an in-storage subtraction operator (a - b).
 func Subtract(fieldA, fieldB string) storage.ComputeOp {
 	return storage.OpSubtract{FieldA: fieldA, FieldB: fieldB}
+}
+
+// SubtractConst creates an in-storage subtraction operator subtracting a numeric constant from an attribute (field - val).
+func SubtractConst(field string, val float32) storage.ComputeOp {
+	return storage.OpSubtract{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
+}
+
+// MultiplyConst creates an in-storage multiplication operator multiplying an attribute by a numeric constant (field * val).
+func MultiplyConst(field string, val float32) storage.ComputeOp {
+	return storage.OpMultiply{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
+}
+
+// DivideConst creates an in-storage division operator dividing an attribute by a numeric constant (field / val).
+func DivideConst(field string, val float32) storage.ComputeOp {
+	return storage.OpDivide{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
 }
 
 // Date converts a "YYYY-MM-DD" string to numeric Epoch Days.

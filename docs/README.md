@@ -46,3 +46,9 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
    * Fluent query builders: `Get`, `List`, `Update`, `Graph`, and `Math`.
    * Cold partition inspection and context cancellation handling.
 
+9. **[Benchmark & Integration Verification Guide](benchmark_and_verification.md)**
+   * Reproducible test suite execution (`cmd/container_verifier`).
+   * Little's Law validation ($L = \lambda \cdot W$) across concurrent worker pools.
+   * Container crash durability, background sync, and cold partition archival.
+
+

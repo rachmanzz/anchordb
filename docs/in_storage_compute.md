@@ -10,11 +10,16 @@ AnchorDB provides arithmetic and assignment operators defined in `pkg/storage` a
 
 | Operator | Driver Function | Description | Example |
 | :--- | :--- | :--- | :--- |
-| **Divide** | `driver.Divide(fieldA, fieldB)` | Divides `fieldA` by `fieldB` or literal constant. Division by zero yields `0`. | `driver.Divide("distance", "duration")` |
-| **Multiply** | `driver.Multiply(fieldA, fieldB)` | Multiplies `fieldA` by `fieldB` or literal constant. | `driver.Multiply("unit_price", "quantity")` |
-| **Add** | `driver.Add(fieldA, fieldB)` | Adds `fieldA` and `fieldB` (or numeric constant). | `driver.Add("base_score", "10")` |
+| **Divide** | `driver.Divide(fieldA, fieldB)` | Divides `fieldA` by `fieldB`. Division by zero yields `0`. | `driver.Divide("distance", "duration")` |
+| **Multiply** | `driver.Multiply(fieldA, fieldB)` | Multiplies `fieldA` by `fieldB`. | `driver.Multiply("unit_price", "quantity")` |
+| **Add** | `driver.Add(fieldA, fieldB)` | Adds two attribute fields. | `driver.Add("base_score", "bonus_score")` |
+| **Add Constant** | `driver.AddConst(field, val)` | Adds a numeric float constant to an attribute. | `driver.AddConst("base_score", 10.0)` |
 | **Subtract** | `driver.Subtract(fieldA, fieldB)` | Subtracts `fieldB` from `fieldA`. | `driver.Subtract("gross_revenue", "tax")` |
+| **Subtract Constant** | `driver.SubtractConst(field, val)` | Subtracts a numeric float constant from an attribute. | `driver.SubtractConst("balance", 25.0)` |
 | **Assign** | `driver.Value(val)` | Directly assigns a constant value to a field. | `driver.Value(100.0)` |
+
+> **Token Resolution Note**: Under the hood, operators resolve parameters via `resolveValue(token, props)`. A parameter token can be an attribute key name (e.g. `"base_score"`), a stringified numeric literal (e.g. `"10"`), or an ISO date string (e.g. `"2026-10-14"`). Typed helpers like `driver.AddConst(field, floatVal)` allow passing native numeric constants directly without manual stringification.
+
 
 ---
 
