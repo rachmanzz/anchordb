@@ -1,10 +1,33 @@
 # Reproducible Benchmark & Integration Verification Guide
 
-AnchorDB includes a comprehensive automated integration and stress verification suite in `cmd/container_verifier/main.go`. This guide explains how to run, reproduce, and verify all engine operations and mathematical performance metrics independently.
+AnchorDB includes three independent tiers of verification and performance measurement:
+1. **Standalone Bare-Metal CLI Benchmark (`cmd/benchmark`)**: Instant zero-dependency evaluation of arithmetic compute, spatial grid DDA, causal graphs, and embedded engine throughput without requiring Docker.
+2. **Native Go Microbenchmark Suite (`pkg/storage/bench_test.go`)**: Standard Go testing benchmarks measuring allocations and ns/op.
+3. **End-to-End Container Verification Suite (`cmd/container_verifier`)**: Full 5-phase integration test verifying container lifecycles, concurrency ramp-up with Little's Law, crash durability, background cron scheduling, and partition archival.
 
 ---
 
-## 1. Prerequisites
+## 1. Quick Start: Zero-Dependency Standalone Benchmark
+
+To evaluate AnchorDB's performance immediately on bare metal without Docker or network configuration:
+
+```bash
+git clone https://github.com/rachmanzz/anchordb.git
+cd anchordb
+
+# Run standalone benchmark suite across all engine subsystems
+go run ./cmd/benchmark
+```
+
+This runs:
+* **In-Storage Arithmetic**: 5,000,000 formula operations (`Divide`, `Multiply`, `AddConst`).
+* **Spatial Grid DDA**: 500,000 raycasts across the 256×256 discrete spatial index.
+* **Causal Reasoning**: 200,000 multi-hop 4-step path traversals (`ExecuteCausalChain`).
+* **Engine Ingestion & Reads**: 100,000 records ingested with WAL, spatial indexing, and point queries.
+
+---
+
+## 2. Container Verification Prerequisites
 
 - **Go**: 1.26+ (with toolchain 1.27.2+ recommended)
 - **Container Engine**: Docker or Podman

@@ -369,7 +369,10 @@ govulncheck ./...
 # Unit and integration tests with race detector
 go test -race ./...
 
-# Storage microbenchmarks (pkg/storage/bench_test.go)
+# Standalone bare-metal benchmark CLI (cmd/benchmark)
+go run ./cmd/benchmark
+
+# Storage microbenchmarks with memory allocations (pkg/storage/bench_test.go)
 go test -bench=. -benchmem -run=^# ./pkg/storage
 ```
 
