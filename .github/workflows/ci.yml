@@ -39,8 +39,40 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
       - name: Cross-compile (ARM)
         run: |
           GOOS=linux GOARCH=arm64 go build -o /tmp/anchordb-server-arm64 ./cmd/server
           GOOS=linux GOARCH=arm GOARM=7 go build -o /tmp/anchordb-server-armv7 ./cmd/server
           GOOS=linux GOARCH=arm GOARM=6 go build -o /tmp/anchordb-server-armv6 ./cmd/server
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Version pinned to match the release the codebase is verified against;
+      # config lives in .golangci.yml.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build (never push) so Dockerfile regressions are caught early.
+      - name: Build image
+        run: docker build -t anchordb:ci .

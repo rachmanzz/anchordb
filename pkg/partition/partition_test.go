@@ -43,7 +43,7 @@ func TestS3SinkUsesBucketPathAndSigV4(t *testing.T) {
 				t.Errorf("create signature verification request: %v", err)
 				return
 			}
-			signS3Request(wantReq, payload, "access", "secret", "us-east-1", parsedTime)
+			signS3Request(wantReq, hex.EncodeToString(hash[:]), "access", "secret", "us-east-1", parsedTime)
 			if got, want := r.Header.Get("Authorization"), wantReq.Header.Get("Authorization"); got != want {
 				t.Errorf("SigV4 authorization mismatch: got %q want %q", got, want)
 			}
@@ -53,6 +53,8 @@ func TestS3SinkUsesBucketPathAndSigV4(t *testing.T) {
 	defer server.Close()
 
 	sink := NewS3Sink(server.URL, "bucket", "prefix", "access", "secret")
+	// The test server speaks plaintext http; opt in explicitly.
+	sink.AllowInsecureHTTP = true
 	if _, err := sink.SavePartition("object.anchordb", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
@@ -72,29 +74,29 @@ func TestPartition_Archive6Months_AndPrune(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Hitung tanggal:
-	// Hari ini: 2026-10-15
-	// 8 bulan lalu: ~240 hari lalu (harus di-archive)
-	// 7 bulan lalu: ~210 hari lalu (harus di-archive)
-	// 2 bulan lalu: ~60 hari lalu (harus TETAP di hot DB)
-	// Hari ini: 0 hari (harus TETAP di hot DB)
+	// Calculate dates:
+	// Today: 2026-10-15
+	// 8 months ago: ~240 days ago (must be archived)
+	// 7 months ago: ~210 days ago (must be archived)
+	// 2 months ago: ~60 days ago (must REMAIN in hot DB)
+	// Today: 0 days (must REMAIN in hot DB)
 	nowDays := float32(time.Now().Unix() / 86400)
 
-	_ = db.SaveRecord("log_8_bulan_lalu", map[string]float32{
-		"tanggal": nowDays - 240,
-		"status":  500,
+	_ = db.SaveRecord("log_8_months_ago", map[string]float32{
+		"date":   nowDays - 240,
+		"status": 500,
 	})
-	_ = db.SaveRecord("log_7_bulan_lalu", map[string]float32{
-		"tanggal": nowDays - 210,
-		"status":  502,
+	_ = db.SaveRecord("log_7_months_ago", map[string]float32{
+		"date":   nowDays - 210,
+		"status": 502,
 	})
-	_ = db.SaveRecord("log_2_bulan_lalu", map[string]float32{
-		"tanggal": nowDays - 60,
-		"status":  200,
+	_ = db.SaveRecord("log_2_months_ago", map[string]float32{
+		"date":   nowDays - 60,
+		"status": 200,
 	})
-	_ = db.SaveRecord("log_hari_ini", map[string]float32{
-		"tanggal": nowDays,
-		"status":  200,
+	_ = db.SaveRecord("log_today", map[string]float32{
+		"date":   nowDays,
+		"status": 200,
 	})
 
 	_ = db.Sync()
@@ -103,18 +105,18 @@ func TestPartition_Archive6Months_AndPrune(t *testing.T) {
 		t.Fatalf("expected 4 records initially, got %d", len(db.EntityStore))
 	}
 
-	// Buat Sink & Policy: simpan data > 6 bulan (180 hari) ke partition file format {date}_{uuid}.anchordb
+	// Create Sink & Policy: archive data older than 6 months (180 days) to partition file format {date}_{uuid}.anchordb
 	sink := NewLocalDiskSink(partDir)
 	policy := PartitionPolicy{
 		ModelName:     "logs",
-		DateField:     "tanggal",
-		RetentionDays: 180, // 6 bulan terakhir
+		DateField:     "date",
+		RetentionDays: 180, // last 6 months
 		Sink:          sink,
 		FileFormat:    "{date}_{uuid}.anchordb",
-		PruneHotDB:    true, // bersihkan dari hot db
+		PruneHotDB:    true, // prune from hot db
 	}
 
-	// Eksekusi partisi
+	// Execute partition
 	result, err := ExecutePartition(db, policy)
 	if err != nil {
 		t.Fatalf("ExecutePartition failed: %v", err)
@@ -124,30 +126,30 @@ func TestPartition_Archive6Months_AndPrune(t *testing.T) {
 		t.Fatalf("expected 2 historical records archived, got %d", result.ArchivedCount)
 	}
 
-	t.Logf("[OK] Partisi Berhasil: %d record diarsipkan ke: %s", result.ArchivedCount, result.TargetLocation)
+	t.Logf("[OK] Partition successful: %d records archived to: %s", result.ArchivedCount, result.TargetLocation)
 
-	// Verifikasi format nama berkas: YYYY-MM-DD_<uuid>.anchordb
+	// Verify partition filename format: YYYY-MM-DD_<uuid>.anchordb
 	filename := filepath.Base(result.TargetLocation)
 	if !strings.HasSuffix(filename, ".anchordb") || len(filename) < 20 {
 		t.Fatalf("invalid partition filename format: %s", filename)
 	}
-	t.Logf("[OK] Format Berkas Partisi Terverifikasi: %s", filename)
+	t.Logf("[OK] Partition file format verified: %s", filename)
 
-	// Verifikasi Hot DB: 2 data lama terhapus, 2 data baru tetap utuh!
+	// Verify Hot DB: 2 old records pruned, 2 recent records preserved!
 	if len(db.EntityStore) != 2 {
 		t.Fatalf("expected 2 records remaining in hot DB, got %d", len(db.EntityStore))
 	}
-	if _, exists := db.EntityStore["log_hari_ini"]; !exists {
-		t.Fatalf("expected log_hari_ini still in hot DB")
+	if _, exists := db.EntityStore["log_today"]; !exists {
+		t.Fatalf("expected log_today still in hot DB")
 	}
-	if _, exists := db.EntityStore["log_2_bulan_lalu"]; !exists {
-		t.Fatalf("expected log_2_bulan_lalu still in hot DB")
+	if _, exists := db.EntityStore["log_2_months_ago"]; !exists {
+		t.Fatalf("expected log_2_months_ago still in hot DB")
 	}
-	if _, exists := db.EntityStore["log_8_bulan_lalu"]; exists {
-		t.Fatalf("expected log_8_bulan_lalu pruned from hot DB")
+	if _, exists := db.EntityStore["log_8_months_ago"]; exists {
+		t.Fatalf("expected log_8_months_ago pruned from hot DB")
 	}
 
-	// Verifikasi Berkas Partisi: buka secara mandiri dan pastikan data arsip utuh
+	// Verify partition archive: open standalone and verify archived records are intact
 	archivedDB, err := storage.Open(result.TargetLocation)
 	if err != nil {
 		t.Fatalf("failed to open archived partition file: %v", err)
@@ -157,12 +159,12 @@ func TestPartition_Archive6Months_AndPrune(t *testing.T) {
 	if len(archivedDB.EntityStore) != 2 {
 		t.Fatalf("expected 2 records inside archived partition, got %d", len(archivedDB.EntityStore))
 	}
-	t.Logf("[OK] Berkas Arsip Partisi Mandiri Berhasil Diverifikasi!")
+	t.Logf("[OK] Standalone partition archive verified successfully!")
 }
 
 func TestScheduler_CalculateNextRun_2300(t *testing.T) {
-	// Uji jadwal "23:00"
-	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC) // Jam 10 pagi
+	// Test schedule "23:00"
+	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC) // 10:00 AM UTC
 	next, err := scheduler.CalculateNextRun("23:00", now)
 	if err != nil {
 		t.Fatalf("failed: %v", err)
@@ -172,7 +174,7 @@ func TestScheduler_CalculateNextRun_2300(t *testing.T) {
 		t.Fatalf("expected today 23:00, got %v", next)
 	}
 
-	// Jika sudah lewat jam 23:00 hari ini (misal jam 23:30), harus jadwalkan besok jam 23:00
+	// If past 23:00 today (e.g. 23:30), must schedule for tomorrow at 23:00
 	nowPast := time.Date(2026, 10, 15, 23, 30, 0, 0, time.UTC)
 	nextTomorrow, err := scheduler.CalculateNextRun("23:00", nowPast)
 	if err != nil {
@@ -182,7 +184,7 @@ func TestScheduler_CalculateNextRun_2300(t *testing.T) {
 	if nextTomorrow.Day() != 16 || nextTomorrow.Hour() != 23 {
 		t.Fatalf("expected tomorrow 23:00, got %v", nextTomorrow)
 	}
-	t.Logf("[OK] Jadwal Internal '23:00' Terverifikasi Akurat!")
+	t.Logf("[OK] Internal schedule '23:00' verified accurate!")
 }
 
 func TestPartition_S3Sink_FailSafe(t *testing.T) {
@@ -196,8 +198,8 @@ func TestPartition_S3Sink_FailSafe(t *testing.T) {
 	defer db.Close()
 
 	nowDays := float32(time.Now().Unix() / 86400)
-	_ = db.SaveRecord("old_record_1", map[string]float32{"tanggal": nowDays - 300})
-	_ = db.SaveRecord("old_record_2", map[string]float32{"tanggal": nowDays - 250})
+	_ = db.SaveRecord("old_record_1", map[string]float32{"date": nowDays - 300})
+	_ = db.SaveRecord("old_record_2", map[string]float32{"date": nowDays - 250})
 	_ = db.Sync()
 
 	// S3 Sink pointing to unreachable address so upload fails
@@ -206,7 +208,7 @@ func TestPartition_S3Sink_FailSafe(t *testing.T) {
 	// Execute partition with PruneHotDB: true
 	_, err = ExecutePartition(db, PartitionPolicy{
 		ModelName:     "hot_logs",
-		DateField:     "tanggal",
+		DateField:     "date",
 		RetentionDays: 180,
 		Sink:          s3Sink,
 		PruneHotDB:    true,
@@ -232,7 +234,7 @@ func TestPartition_S3Sink_FailSafe(t *testing.T) {
 	localSink := NewLocalDiskSink(filepath.Join(tmpDir, "local_retry_archive"))
 	retryRes, err := ExecutePartition(db, PartitionPolicy{
 		ModelName:     "hot_logs",
-		DateField:     "tanggal",
+		DateField:     "date",
 		RetentionDays: 180,
 		Sink:          localSink,
 		FileFormat:    "{date}_{uuid}.anchordb",

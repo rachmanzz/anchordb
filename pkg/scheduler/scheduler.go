@@ -124,7 +124,7 @@ func (t *registeredTask) execute(ctx context.Context) (err error) {
 	t.lastRun = time.Now()
 	t.mu.Unlock()
 
-	log.Printf("[SCHEDULER] Menjalankan task %q ...", t.name)
+	log.Printf("[SCHEDULER] Running task %q ...", t.name)
 	t0 := time.Now()
 
 	if t.task != nil {
@@ -136,10 +136,10 @@ func (t *registeredTask) execute(ctx context.Context) (err error) {
 	t.mu.Lock()
 	if err != nil {
 		t.lastStatus = fmt.Sprintf("Error: %v", err)
-		log.Printf("[SCHEDULER] Task %q GAGAL: %v", t.name, err)
+		log.Printf("[SCHEDULER] Task %q FAILED: %v", t.name, err)
 	} else {
 		t.lastStatus = "Success"
-		log.Printf("[SCHEDULER] Task %q SUKSES dalam %v", t.name, time.Since(t0))
+		log.Printf("[SCHEDULER] Task %q SUCCEEDED in %v", t.name, time.Since(t0))
 	}
 	t.mu.Unlock()
 	return err
@@ -348,7 +348,7 @@ func (s *InternalScheduler) register(name, schedule string, t *registeredTask) e
 		s.run.wg.Add(1) // safe: s.run is read/set under s.mu and Wait happens after run=nil
 		go s.runTaskLoop(s.run, t)
 	}
-	log.Printf("[SCHEDULER] Task %q terdaftar dengan jadwal %q (spec: %q)", name, schedule, spec.cronSpec)
+	log.Printf("[SCHEDULER] Task %q registered with schedule %q (spec: %q)", name, schedule, spec.cronSpec)
 	return nil
 }
 
@@ -365,7 +365,7 @@ func (s *InternalScheduler) Unregister(name string) error {
 	s.mu.Unlock()
 
 	close(t.stop)
-	log.Printf("[SCHEDULER] Task %q dihapus.", name)
+	log.Printf("[SCHEDULER] Task %q removed.", name)
 	return nil
 }
 
@@ -414,7 +414,7 @@ func (s *InternalScheduler) Start() {
 	}
 	s.mu.Unlock()
 
-	log.Println("[SCHEDULER] Pure Go background scheduler aktif.")
+	log.Println("[SCHEDULER] Pure Go background scheduler active.")
 }
 
 func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
@@ -454,7 +454,7 @@ func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
 			task.running.Store(false)
 		} else {
 			task.skippedRuns.Add(1)
-			log.Printf("[SCHEDULER] Task %q masih berjalan; tick dilewati untuk mencegah tumpang-tindih.", task.name)
+			log.Printf("[SCHEDULER] Task %q still running; tick skipped to prevent overlap.", task.name)
 		}
 
 		// Advance the schedule. Prefer the scheduled grid; if we have fallen
@@ -462,7 +462,7 @@ func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
 		now := s.now()
 		next := task.nextAt(due)
 		if !next.After(now) {
-			log.Printf("[SCHEDULER] Task %q tertinggal dari jadwal; tick terlewat dilewati.", task.name)
+			log.Printf("[SCHEDULER] Task %q fell behind schedule; missed tick skipped.", task.name)
 			next = task.nextAt(now)
 		}
 		task.mu.Lock()
@@ -533,10 +533,10 @@ func (s *InternalScheduler) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		log.Println("[SCHEDULER] Background scheduler dihentikan (semua task selesai).")
+		log.Println("[SCHEDULER] Background scheduler stopped (all tasks finished).")
 		return nil
 	case <-ctx.Done():
-		log.Printf("[SCHEDULER] Background scheduler dihentikan paksa (timeout: %v).", ctx.Err())
+		log.Printf("[SCHEDULER] Background scheduler forcibly stopped (timeout: %v).", ctx.Err())
 		return ctx.Err()
 	}
 }

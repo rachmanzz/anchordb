@@ -11,7 +11,10 @@ services:
     environment:
       - ANCHORDB_PORT=7447
       - ANCHORDB_DATA_DIR=/data
-      - ANCHORDB_AUTH_TOKEN=""
+      # SECURITY: a strong token is mandatory. Export it before `docker compose up`:
+      #   export ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 32)"
+      # (the container refuses to start if it is unset/empty).
+      - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:?set ANCHORDB_AUTH_TOKEN to a strong secret before starting}
       # Memory allocation (e.g. 500MB, 1GB, 5GB)
       - ANCHORDB_MEMORY_LIMIT=800MB
       - ANCHORDB_IP_WHITELIST="" # Optional: e.g. "127.0.0.1,::1,192.168.1.0/24"

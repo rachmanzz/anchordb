@@ -1,179 +1,116 @@
-# AnchorDB: High-Performance Computational Database Engine (CPU)
+# AnchorDB
 
-[![Go Version](https://img.shields.io/badge/Go-1.26+-blue.svg)](https://golang.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20amd64-green.svg)]()
-[![Hardware](https://img.shields.io/badge/Hardware-100%25%20CPU%20%7C%20Zero%20GPU-orange.svg)]()
-[![Architecture](https://img.shields.io/badge/Architecture-Minimal%20Dependencies%20%7C%20Zero%20Bloat-brightgreen.svg)]()
-[![Dedicated Port](https://img.shields.io/badge/Port-7447-red.svg)]()
+[![Go Version](https://img.shields.io/badge/Go-1.22+-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
-**AnchorDB** is an ultra-fast, zero-GPU computational database and graph convergence engine built in pure Go. It delivers bounded **constant-time $O(K)$** performance for retrieval, in-storage arithmetic, date mathematics, multi-hop reasoning, and batch mutations on massive recordsets directly in CPU cache and memory-mapped storage.
-
-Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**. Licensed under the Apache License, Version 2.0.
-
----
-
-## Key Highlights
-
-- **100% CPU, Zero GPU**: Operates on standard CPU registers and memory-mapped files (`mmap(MAP_SHARED)`) without expensive CUDA/GPU hardware or CGO.
-- **Minimal Dependencies Architecture**: We reject dogmatic "zero-dependencies" purism in favor of **pragmatic, minimal, strictly-vetted dependencies**. The engine maintains zero bloat, zero heavy frameworks, zero external broker daemons (no Redis, no Kafka, no RabbitMQ), and a minimal attack surface.
-- **Ultra-Compact Memory & Binary Layout**:
-  - **Zero-Copy Node Decoding**: Historical nodes read directly from mmap without heap duplication.
-  - **CompactRecord & String Interning**: Key-value entity attributes stored in contiguous slices with shared interned key pointers, slashing RAM footprint by ~70% (~80B/entity).
-  - **Binary Header**: 64-byte fixed layout; **Record**: 40-byte fixed nodes.
-- **Constant-Time Bound $O(K)$**: Whether querying or updating 10,000 records out of 100,000+, AnchorDB guarantees early termination and execution within 1 to 3 milliseconds.
-- **In-Storage Mathematics & Projections**:
-  - Arithmetic operators (`+`, `-`, `*`, `/`) executed inside storage without SQL overhead.
-  - Date arithmetic stored as float32 Epoch Days (e.g. `2026-10-14` + `45 hari` $\rightarrow$ `2026-11-28`).
-  - Selective column projection (`.Select("jarak", "waktu", "kecepatan")`).
-- **Resilient Background Pipeline (Pure Go, zero external broker)**:
-  - **Cron Scheduler (`pkg/scheduler`)**: Pure-Go scheduler with panic recovery, overlap prevention (skip-if-still-running), and graceful shutdown.
-  - **Worker Engine (`pkg/worker`)**: Non-blocking asynchronous task execution on a bounded Go channel pool:
-    - **Async Partition API (`POST /v1/partition/run?async=true`)**: Instant HTTP 202 response; offloads heavy serialization and S3 uploads to the worker pool.
-    - **Periodic Background Disk Sync (`db.Sync()`)**: Streaming flush to disk every 5 minutes (default) without blocking client queries.
-- **Single Direct Dependency**: Binary links exactly one external module — `github.com/google/uuid` — zero brokers, zero cron/queue frameworks, zero CGO.
-- **Fine-Grained Memory Allocation**: Support for explicit soft RAM limits (**500MB, 1GB, 5GB**) with auto-detection of Docker/Podman cgroup ceilings.
-- **Multi-Model Routing ("Satu DB = Satu Model")**: Dynamic file separation (`/data/{model}.anchordb`) with path traversal immunity.
-- **Dedicated Port**: Standardized official port **`7447`**.
+AnchorDB is an embedded and network-accessible database engine written in Go. It combines key-value record storage with in-storage arithmetic and date computations, a 2D spatial and directed causal graph engine, write-ahead logging (WAL), memory-mapped persistence, and automated background data partitioning.
 
 ---
 
-## Architecture Overview
+## Features
+
+- **Memory-Mapped Storage (`mmap`)**: Uses shared memory mapping for reading and writing records directly, with atomic snapshot synchronization to disk.
+- **In-Storage Computations**: Evaluates arithmetic expressions (`+`, `-`, `*`, `/`) and date math (epoch day arithmetic) directly during read queries or batch updates, avoiding the round-trip overhead of external compute layers.
+- **Compact Record Storage**: Key-value entity attributes are stored using contiguous binary structures and interned attribute names to reduce heap allocations and memory usage.
+- **Spatial & Causal Graph Capabilities**:
+  - **2D Spatial Index**: Grid-based indexing supporting directional ray-casting, barycenter computation, and nearest-neighbor search.
+  - **Causal Graph**: Directed, weighted edges (`source --relation--> target`) with support for single-step lookups and multi-hop causal chain traversal.
+- **Crash Durability & WAL**: Write-Ahead Logging with CRC32 frame checksums, automatic recovery on startup, and configurable sync modes (`always`, `interval`, `none`).
+- **Data Lifecycle & Archival**:
+  - Four-state lifecycle (`ACTIVE`, `SAFE_DELETE`, `TOMBSTONE`, `RETRY`) preventing data loss during archival.
+  - Automated partition archival by retention period to local disk or S3-compatible object storage.
+- **Background Subsystems**:
+  - Wall-clock aware cron scheduler (`pkg/scheduler`) for scheduled syncs and archival.
+  - Asynchronous worker pool (`pkg/worker`) for background jobs and non-blocking maintenance tasks.
+- **API & Client SDK**: RESTful HTTP API (default port `7447`) and a fluent Go driver library (`pkg/driver`).
+
+---
+
+## Architecture
 
 ```
-                                      +---------------------------------------------+
-                                      |            AnchorDB Server Daemon           |
-                                      |                  (Port 7447)                |
-                                      +----------------------+----------------------+
-                                                             |
-                   +-----------------------------------------+-----------------------------------------+
-                   |                                         |                                         |
-                   v                                         v                                         v
-    +------------------------------+          +------------------------------+          +------------------------------+
-    |       REST HTTP Engine       |          |    Cron Scheduler Daemon     |          |     Async Worker Engine      |
-    | /v1/save, /v1/get, /v1/list  |          |        (pure Go)             |          |        (pure Go)             |
-    | /v1/update, /v1/graph,       |          | Daily 23:00 / Sync Every 5m  |          | Async Partitions & Sync Pool |
-    | /v1/edge, /v1/causal, /sync  |          |                              |          |                              |
-    +--------------+---------------+          +--------------+---------------+          +--------------+---------------+
-                   |                                         |                                         |
-                   +-----------------------------------------+-----------------------------------------+
-                                                             |
-                                                             v
-                                              +------------------------------+
-                                              |  AnchorDB Multi-Model Cache  |
-                                              |   (sync.RWMutex Threadsafe)  |
-                                              +--------------+---------------+
-                                                             |
-                     +---------------------------------------+---------------------------------------+
-                     |                                       |                                       |
-                     v                                       v                                       v
-      +-----------------------------+         +-----------------------------+         +-----------------------------+
-      |  mmap(MAP_SHARED) Hot DB    |         |    In-Storage Math Engine   |         |    Partition Sink Engine    |
-      | 64-byte Header, 40B Records |         |  O(K) Add, Multiply, Date   |         |  {date}_{uuid}.anchordb     |
-      |   /data/{model}.anchordb    |         |  Early Termination Bound    |         |  Local Disk / S3 Object     |
-      +-----------------------------+         +-----------------------------+         +-----------------------------+
+                       +---------------------------------------------+
+                       |            AnchorDB Server Daemon           |
+                       |                  (Port 7447)                |
+                       +----------------------+----------------------+
+                                              |
+                   +--------------------------+--------------------------+
+                   |                          |                          |
+                   v                          v                          v
+    +------------------------------+   +--------------------+   +---------------------+
+    |       REST HTTP Engine       |   |   Cron Scheduler   |   | Async Worker Pool   |
+    |  /v1/save, /v1/get, /v1/list |   |     (pkg/scheduler)|   |    (pkg/worker)     |
+    |  /v1/update, /v1/edge, etc.  |   | Periodic Sync/Jobs |   | Background Tasks    |
+    +--------------+---------------+   +----------+---------+   +----------+----------+
+                   |                              |                        |
+                   +------------------------------+------------------------+
+                                                  |
+                                                  v
+                               +-------------------------------------+
+                               |         AnchorDB Engine Core        |
+                               |  Entity Store, Spatial Grid, Lexicon|
+                               +------------------+------------------+
+                                                  |
+                     +----------------------------+----------------------------+
+                     |                            |                            |
+                     v                            v                            v
+      +-----------------------------+   +--------------------+   +--------------------------+
+      |  mmap(MAP_SHARED) Hot DB    |   |  Write-Ahead Log   |   |   Partition Sink Engine  |
+      |   /data/{model}.anchordb    |   |     (.wal, CRC32)  |   |   Local Disk / S3 Object |
+      +-----------------------------+   +--------------------+   +--------------------------+
 ```
 
 ---
 
-## Background Subsystems: Cron & Worker
+## Quick Start
 
-### 1. Cron Scheduler (`pkg/scheduler`, pure Go)
-- **Automated Archival**: Runs daily (default `23:00`) to partition historical records older than $N$ days.
-- **Periodic Background Sync**: Triggers safe disk streaming syncs at regular intervals (default `5m`).
-- **Overlap Prevention**: Built-in atomic `running` single-flight protection and skipped-tick tracking.
-- **Wall-Clock Awareness**: DST-safe calendar math and sliced waits resistant to NTP clock jumps.
-- **On-Demand Execution**: Trigger any registered cron task on demand via `POST /v1/scheduler/run?task=<name>` or JSON `{"task": "<name>"}`.
-- **Inspection**: Real-time status via `GET /v1/scheduler/status` reporting task state, skipped ticks, timeout, and jitter.
+### Building from Source
 
-**Supported schedule formats** (`ANCHORDB_PARTITION_SCHEDULE` / `ANCHORDB_SYNC_INTERVAL`):
+Prerequisites: Go 1.22 or newer.
 
-| Format | Example | Meaning |
-| :--- | :--- | :--- |
-| `HH:MM` | `23:00` | Daily at 23:00 |
-| `M H * * *` | `0 23 * * *` | Daily at 23:00 |
-| `@daily` | `@daily` | Daily at 00:00 |
-| `@hourly` | `@hourly` | Every hour |
-| Duration / `@every` | `5m`, `30m`, `@every 1h` | Recurring interval |
-
-> **Note:** only the **time-of-day** is honored for cron specs — day-of-month, month and day-of-week
-> fields (e.g. `0 2 * * 1`) are ignored, and other forms (e.g. `*/5 * * * *`, `@weekly`) are rejected
-> at startup. Use a duration (`5m`) for sub-daily recurring work.
-
-### 2. Worker Engine (`pkg/worker`, pure Go)
-- **Async Partition Offloading (`POST /v1/partition/run?async=true`)**: Returns HTTP 202 immediately (`{"status": "accepted", "job_id": "<uuid>"}`) when the worker pool is enabled. The pool archives data to target sink partition files in the background.
-- **Continuous Background Disk Sync**: Streams memory-mapped buffers to disk without locking client queries.
-- **Throttled Concurrency**: A fixed pool of worker goroutines (`ANCHORDB_WORKER_CONCURRENCY`, default `CPU × 2`) prevents CPU starvation.
-- **Bounded Task Queue**: Tasks flow through a bounded Go channel (`ANCHORDB_WORKER_QUEUE_SIZE`, default `1000`); dispatch is non-blocking and fails fast with `ErrQueueFull` when saturated.
-- **Scoped Task Cancellation**: Cancel specific jobs via `POST /v1/worker/cancel` with `{"job_id": ...}` or `{"model": ...}`, or require explicit `{"all": true}` for global drain.
-- **Inspection**: Real-time metrics via `GET /v1/worker/status`.
-
----
-
-## Configuration Reference (Docker / Podman / CLI)
-
-All settings can be configured via environment variables or CLI flags:
-
-| Setting | CLI Flag | Environment Variable | Default | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **Port** | `-port` | `ANCHORDB_PORT` | `7447` | HTTP REST API port |
-| **Data Dir** | `-data-dir` | `ANCHORDB_DATA_DIR` | `/data` or `./data` | Directory storing `*.anchordb` files |
-| **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer authorization token |
-| **Memory Limit** | `-memory-limit`, `-mem-limit`, `-m` | `ANCHORDB_MEMORY_LIMIT` | `""` (auto) | Soft memory limit (e.g. `500MB`, `1GB`, `5GB`) |
-| **IP Whitelist** | `-ip-whitelist` | `ANCHORDB_IP_WHITELIST` | `""` (all open) | CIDR or IP list e.g. `127.0.0.1,192.168.1.0/24` |
-| **Trust Proxy** | `-trust-proxy` | `ANCHORDB_TRUST_PROXY` | `false` | Trust `X-Forwarded-For` proxy headers |
-| **Cron Enabled** | `-cron-enabled` | `ANCHORDB_CRON_ENABLED` | `true` | Enable background scheduler |
-| **Partition Schedule** | `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival time (`HH:MM`, `M H * * *`, `@daily`, `@hourly`, or interval; see note above) |
-| **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
-| **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval (`5m`, `30m`, etc.) |
-| **Cron Task Timeout** | `-cron-task-timeout` | `ANCHORDB_CRON_TASK_TIMEOUT` | `""` | Per-task execution context timeout (e.g. `15m`, `1h`) |
-| **Cron Jitter** | `-cron-jitter` | `ANCHORDB_CRON_JITTER` | `""` | Random delay added to scheduled fire time (e.g. `5s`) |
-| **Shutdown Timeout** | `-shutdown-timeout` | `ANCHORDB_SHUTDOWN_TIMEOUT` | `25s` | Total graceful-shutdown budget, split across HTTP drain / scheduler / worker / final sync. Keep below your orchestrator grace period (K8s default 30s). A second `SIGINT/SIGTERM` force-exits (WAL is replayed on next start). While draining, `GET /health` returns `503 {"status":"shutting_down"}`. If HTTP/scheduler/worker do not stop in time, databases are **not closed** (only synced) so late writes are never lost. |
-| **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
-| **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max parallel worker goroutines |
-| **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Task queue capacity |
-| **Worker Enforce Mem** | `-worker-enforce-memory` | `ANCHORDB_WORKER_ENFORCE_MEMORY` | `false` | Memory-aware admission control |
-| **Worker Mem Thresh** | `-worker-memory-threshold` | `ANCHORDB_WORKER_MEMORY_THRESHOLD` | `0.85` | Memory pressure throttling ratio (0.0-1.0) |
-| **WAL Sync Mode** | `-wal-sync` | `ANCHORDB_WAL_SYNC` | `always` | WAL durability: `always` (fsync every write, safest), `interval` (periodic fsync), or `none` (OS-managed, fastest, least durable). Non-`always` trades crash durability for throughput — important on SD cards / slow disks. |
-| **WAL Sync Interval** | `-wal-sync-interval` | `ANCHORDB_WAL_SYNC_INTERVAL` | `200ms` | Fsync interval used when `WAL Sync Mode = interval` |
-| **Rate Limit** | `-rate-limit` | `ANCHORDB_RATE_LIMIT` | `0` (disabled) | Per-client request rate in req/s; `0` disables. Returns `429` with `Retry-After`. `/health` and `/metrics` are exempt. |
-| **Rate Limit Burst** | `-rate-limit-burst` | `ANCHORDB_RATE_LIMIT_BURST` | = rate | Per-client token-bucket burst capacity |
-
-### Durability notes
-
-- The default `always` mode fsyncs after every WAL entry. This is the only mode that guarantees no committed write is lost on power loss, at the cost of throughput being bounded by the device's fsync latency.
-- `interval` fsyncs from a background goroutine; a crash can lose up to one interval of writes.
-- `none` never fsyncs explicitly. Committed writes are still visible to other processes (page cache) and are flushed by the OS eventually, but a power loss can lose recent writes.
-- Regardless of mode, `Sync`, checkpoint, and `Close` flush the WAL and the database file.
-
-### Observability
-
-`GET /metrics` (unauthenticated, like `/health`) exposes Prometheus text-format metrics: uptime, loaded models, draining state, goroutines, heap usage, GC count, and worker job counters.
-
-### TLS / reverse proxy
-
-The server speaks plain HTTP and does not terminate TLS. Put it behind a reverse proxy (nginx, Caddy, Traefik) for TLS, and enable `-trust-proxy` so client IPs are read from `X-Forwarded-For` for the IP whitelist and rate limiter.
-
----
-
-## Deployment Examples
-
-### 1. Podman / Docker (Pure Self-Contained)
 ```bash
-podman run -d \
+# Clone repository
+git clone https://github.com/rachmanzz/anchordb.git
+cd anchordb
+
+# Build server binary
+go build -o bin/anchordb-server ./cmd/server
+
+# Build demo CLI binary
+go build -o bin/anchordb ./cmd/anchordb
+```
+
+### Running the Server
+
+Start the standalone HTTP server:
+
+```bash
+export ANCHORDB_AUTH_TOKEN="your-secure-token"
+./bin/anchordb-server -port 7447 -data-dir ./data
+```
+
+For local testing without authentication:
+
+```bash
+export ANCHORDB_ALLOW_INSECURE="true"
+./bin/anchordb-server -port 7447 -data-dir ./data
+```
+
+### Running with Docker or Podman
+
+```bash
+docker run -d \
   --name anchordb \
   -p 7447:7447 \
-  -m 1g --memory-swap 1g \
-  -e ANCHORDB_MEMORY_LIMIT=800MB \
-  -e ANCHORDB_CRON_ENABLED=true \
-  -e ANCHORDB_PARTITION_SCHEDULE="23:00" \
-  -e ANCHORDB_SYNC_INTERVAL="5m" \
-  -e ANCHORDB_WORKER_CONCURRENCY=8 \
+  -e ANCHORDB_AUTH_TOKEN="your-secure-token" \
+  -e ANCHORDB_DATA_DIR="/data" \
   -v ./data:/data:Z \
   anchordb:latest
 ```
 
-### 2. Docker Compose
+Using Docker Compose:
+
 ```yaml
 services:
   anchordb:
@@ -181,63 +118,214 @@ services:
     ports:
       - "7447:7447"
     environment:
-      - ANCHORDB_MEMORY_LIMIT=800MB
-      - ANCHORDB_CRON_ENABLED=true
-      - ANCHORDB_SYNC_INTERVAL=5m
-      - ANCHORDB_WORKER_CONCURRENCY=8
+      - ANCHORDB_AUTH_TOKEN=your-secure-token
+      - ANCHORDB_DATA_DIR=/data
     volumes:
       - ./data:/data:Z
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+```
+
+---
+
+## Using the Go Driver SDK
+
+AnchorDB includes a Go client driver in `pkg/driver`.
+
+### 1. Connecting to a Database
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/rachmanzz/anchordb/pkg/driver"
+)
+
+func main() {
+	client, err := driver.Connect("anchordb://./data/app.anchordb?mode=mmap")
+	if err != nil {
+		log.Fatalf("connection failed: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// Save record
+	err = client.Save("vehicle_1", map[string]float32{
+		"distance": 120.0,
+		"duration": 2.0,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Retrieve with in-storage computation
+	record, err := client.Get("vehicle_1").
+		Select("distance", "duration", "speed").
+		Compute("speed", driver.Divide("distance", "duration")).
+		Execute(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Speed: %.1f km/h\n", record.Get("speed"))
+}
+```
+
+### 2. Filtering & Pagination
+
+```go
+// List records with property and calculated value filters
+result, err := client.List().
+	Where("distance", ">=", 50.0).
+	Compute("speed", driver.Divide("distance", "duration")).
+	Where("speed", ">", 40.0).
+	Page(1, 10).
+	Execute(ctx)
+
+for _, item := range result.Items {
+	fmt.Printf("%s: distance=%.0f, speed=%.1f\n", item.Name, item.Get("distance"), item.Get("speed"))
+}
+```
+
+### 3. Date Arithmetic
+
+Date values are stored as float32 Epoch Days (days since Unix epoch).
+
+```go
+// Store date
+_ = client.Save("contract_1", map[string]float32{
+	"start_date": driver.MustDate("2026-10-14"),
+})
+
+// Update: add 45 days
+_, _ = client.Update().
+	In("contract_1").
+	Set("start_date", driver.AddDays("start_date", 45)).
+	Execute(ctx)
+
+// Result is 2026-11-28
+updated, _ := client.Get("contract_1").Execute(ctx)
+fmt.Println("New Date:", updated.GetDate("start_date"))
+```
+
+### 4. Causal Graph Traversal
+
+```go
+// Link directed edges with weight scores
+_ = client.Link("fuel_shortage", "causes", "inflation", 0.9)
+_ = client.Link("inflation", "causes", "economic_crisis", 0.7)
+
+// 1-Hop query
+step, _ := client.Causal("fuel_shortage", "causes", 5)
+// Returns: [{"Word": "inflation", "Score": 0.9}]
+
+// Multi-hop chain query
+chain, _ := client.CausalChain([]string{"fuel_shortage"}, []string{"causes", "causes"}, 5)
+// Returns: [{"Word": "economic_crisis", "Score": ...}]
 ```
 
 ---
 
 ## REST API Reference
 
-All requests and responses use JSON. When `ANCHORDB_AUTH_TOKEN` is configured, include `Authorization: Bearer <token>`.
+All requests and responses use JSON. When an auth token is configured, endpoints under `/v1/*` require `Authorization: Bearer <token>`.
 
-### 1. Telemetry & Health Checks
-- `GET /health`: Comprehensive system status, memory allocations, and background subsystem health.
-- `GET /metrics`: Prometheus text-format metrics (uptime, loaded models, draining state, goroutines, heap, GC, worker counters).
-- `GET /v1/scheduler/status`: Active cron tasks and next execution times.
-- `GET /v1/worker/status`: Worker pool concurrency, in-flight/queued tasks, memory pressure, and telemetry stats.
-- `POST /v1/worker/cancel`: Safely cancels queued tasks before execution without interrupting in-flight jobs.
+### Health & Metrics
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Server health check (detailed stats require auth) |
+| `GET` | `/metrics` | Prometheus-compatible metrics endpoint |
 
-### 2. Mutation & Query Endpoints
-- `POST /v1/save`: Ingest an entity with key-value properties and an optional `operation` status (`1` = Active by default). `0` (Safe-Delete) is an internal partition-lock state and is **rejected** by `/v1/save`; records only enter Safe-Delete through the partition archival flow (lock → archive → complete), never by direct save.
-- `POST /v1/get`: Query an entity by name with optional in-storage computations (returns properties and current `operation` status).
-- `POST /v1/list`: Paginated constant-time retrieval with arithmetic and date filters (filters `operation = 1` active by default; supports `operation` filter or `include_all_operations: true`).
-- `POST /v1/update`: Constant-time batch update with arithmetic mutations (automatically skips entities not in active `operation = 1` state; add `"async": true` or `?async=true` to offload to worker).
-- `POST /v1/graph`: Graph ray-projection multi-hop reasoning.
-- `POST /v1/edge`: Registers or removes an explicit directed edge `source --relation--> target` with a numeric `weight` (`action: "add"` default, or `"remove"`), enabling deterministic cause-and-effect links.
-- `POST /v1/causal`: Traverses explicit edges from `seeds`; a single `relation` performs one hop, while a `relations` list performs a weighted multi-hop chain.
-- `GET /v1/sync?model={name}`: Flushes hot mmap changes to disk (add `?async=true` to offload to worker).
-- `POST /v1/partition/run`: Triggers partition archival with Safe-Delete rollback protection (`0` Safe-Delete during archival $\rightarrow$ `2` Tombstone on success; add `"async": true` in JSON body to offload to worker).
-- `POST /v1/collector/run`: Runs garbage collection to purge records in `operation = 2` (Tombstone) state (add `"async": true` or `?async=true` to offload to worker).
+### CRUD & Computations
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/v1/save` | Store an entity with key-value properties |
+| `POST` | `/v1/get` | Retrieve an entity by name, optionally projecting or computing fields |
+| `POST` | `/v1/list` | Paginated query with range, date, and compute filters |
+| `POST` | `/v1/update` | Batch update records matching filter conditions |
 
-### 3. Record Operation Lifecycle Machine
-AnchorDB records follow a resilient four-state operational lifecycle:
-- **`1` (ACTIVE)**: Normal queryable record (default for new records). Eligible for reads and updates.
-- **`0` (SAFE_DELETE)**: In-flight safe delete / pending archival / partition lock. Locked against mutations; excluded from normal queries.
-- **`2` (TOMBSTONE)**: Marked for deletion upon partition success. Excluded from normal lookups and swept in batches by the background collector during periodic disk sync or `/v1/collector/run`.
-- **`3` (RETRY)**: Execution failed (e.g. S3 upload timeout) or interrupted by server shutdown/crash while in `0` (Safe-Delete). The startup crash reconciler automatically detects interrupted `0` records and promotes them to `3`. The next partition run automatically re-attempts records in state `3`.
+### Graph & Causal Links
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/v1/graph` | Spatial ray-projection and nearest neighbor search |
+| `POST` | `/v1/edge` | Add or remove directed causal edges |
+| `POST` | `/v1/causal` | Query 1-hop or multi-hop causal paths from seed nodes |
 
-### 4. Durability & Concurrency Guarantees
-- **Single-writer per file**: `Open()` takes an exclusive advisory lock on a `<db>.lock` sidecar held for the instance lifetime; a second process opening the same `.anchordb` fails fast instead of corrupting state.
-- **Write-ahead log with CRC framing**: every mutation is appended to `<db>.wal` (magic + version + opcode + length + CRC32) and `fsync`ed before it is applied in memory. On recovery, an incomplete trailing frame is safely truncated, while a complete but corrupt frame fails closed (writes and checkpointing are disabled until repaired).
-- **Atomic sync**: `db.Sync()` streams a full snapshot to a temp file, `fsync`s it, `rename`s it over the database, and only then swaps the live `mmap` — a failure leaves the previous mapping and WAL intact rather than an unusable database.
-- **Partition locks are enforced**: records in Safe-Delete (`0`) reject updates, deletes, and re-saves until the archival flow completes or the startup reconciler releases them to Retry (`3`).
-- **Backward-compatible format versioning**: `DBVersion` is now `3` (adds the optional causal-edge section). Readers accept versions `1..3`, so databases written by older binaries still open; the legacy `WALManager.Replay` callback keeps its original signature (use `ReplayEvents` to observe edge operations).
+### Administration & Maintenance
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/v1/sync` | Flush memory-mapped changes to disk |
+| `POST` | `/v1/partition/run` | Execute partition archival (supports `async: true`) |
+| `POST` | `/v1/collector/run` | Run garbage collection on tombstoned records |
+| `GET` | `/v1/scheduler/status`| View scheduled background jobs |
+| `GET` | `/v1/worker/status` | View background worker pool status |
+| `POST` | `/v1/worker/cancel` | Cancel queued background tasks |
+
+---
+
+## Record Lifecycle
+
+AnchorDB maintains four operational states for records to ensure safety during archival and crash recovery:
+
+| State | Name | Description |
+| :---: | :--- | :--- |
+| `1` | **ACTIVE** | Normal record state, available for reads and mutations. |
+| `0` | **SAFE_DELETE** | Temporary lock state while an archival job is executing. Mutations are blocked. |
+| `2` | **TOMBSTONE** | Marked for removal after successful partition archival; purged by the collector. |
+| `3` | **RETRY** | Assigned by crash reconciliation if the server stops during archival; re-queued next run. |
+
+---
+
+## Configuration Reference
+
+Settings can be specified through command-line flags or environment variables:
+
+| Setting | Flag | Environment Variable | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Port** | `-port` | `ANCHORDB_PORT` | `7447` | HTTP listening port |
+| **Data Directory** | `-data-dir` | `ANCHORDB_DATA_DIR` | `./data` | Directory for `.anchordb` files |
+| **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer token for API authentication |
+| **Allow Insecure** | — | `ANCHORDB_ALLOW_INSECURE` | `false` | Disable auth requirement for local testing |
+| **IP Whitelist** | `-ip-whitelist` | `ANCHORDB_IP_WHITELIST` | `""` | Comma-separated allowed IPs/CIDRs |
+| **Trust Proxy** | `-trust-proxy` | `ANCHORDB_TRUST_PROXY` | `false` | Parse client IP from `X-Forwarded-For` |
+| **Memory Limit** | `-memory-limit` | `ANCHORDB_MEMORY_LIMIT` | `""` | Soft memory budget (e.g. `1GB`) |
+| **Cron Enabled** | `-cron-enabled` | `ANCHORDB_CRON_ENABLED` | `true` | Enable background scheduler |
+| **Partition Schedule**| `-partition-schedule` | `ANCHORDB_PARTITION_SCHEDULE` | `23:00` | Archival schedule (`HH:MM`, `@daily`, `@every 1h`) |
+| **Retention Days** | `-retention-days` | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Days of hot data before partitioning |
+| **Sync Interval** | `-sync-interval` | `ANCHORDB_SYNC_INTERVAL` | `5m` | Background disk sync interval |
+| **Worker Enabled** | `-worker-enabled` | `ANCHORDB_WORKER_ENABLED` | `true` | Enable background worker pool |
+| **Worker Concurrency**| `-worker-concurrency` | `ANCHORDB_WORKER_CONCURRENCY` | `CPU * 2` | Max concurrent worker goroutines |
+| **Worker Queue Size** | `-worker-queue-size` | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | In-memory task queue size |
+| **WAL Sync Mode** | `-wal-sync` | `ANCHORDB_WAL_SYNC` | `always` | `always` (fsync per write), `interval`, or `none` |
+| **WAL Sync Interval** | `-wal-sync-interval`| `ANCHORDB_WAL_SYNC_INTERVAL` | `200ms` | Interval when WAL sync mode is `interval` |
+| **Rate Limit** | `-rate-limit` | `ANCHORDB_RATE_LIMIT` | `0` (off) | Max requests per second per client IP |
+
+---
+
+## Development & Testing
+
+Run the test suite and verification tools:
+
+```bash
+# Code formatting
+gofmt -l .
+
+# Static analysis
+go vet ./...
+golangci-lint run ./...
+
+# Vulnerability checks
+govulncheck ./...
+
+# Unit and integration tests with race detector
+go test -race ./...
+```
 
 ---
 
 ## License
- 
-AnchorDB is open-source software licensed under the **Apache License, Version 2.0**.
- 
-Copyright (c) 2026 **MUHAMMD ABDURRAHMAN**.
- 
-See the [LICENSE](LICENSE) file for the full license text.
+
+AnchorDB is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.

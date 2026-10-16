@@ -165,13 +165,19 @@ type AnchorDB struct {
 	syncedNodeCount uint64
 	pendingNodes    []BinaryNodeRecord
 
+	// deletedNodeIdx records node indices tombstoned since the last Sync, so a
+	// deletion that races with Sync's unlocked snapshot/remap window can be
+	// re-applied to the freshly mapped file (otherwise the node is resurrected).
+	// Guarded by mu.
+	deletedNodeIdx map[uint32]bool
+
 	// Active string pool for newly appended nodes
 	stringPool []byte
 
 	// EntityStore stores key-value numerical attributes for entities: entityName -> CompactRecord
 	EntityStore map[string]CompactRecord
 
-	// String interning pool for entity attribute keys (e.g. "jarak", "waktu", "kecepatan")
+	// String interning pool for entity attribute keys (e.g. "distance", "duration", "speed")
 	attrPool map[string]string
 
 	// EntityOrder maintains deterministic insertion order for constant-time sequential scanning
@@ -477,8 +483,52 @@ func (db *AnchorDB) internAttr(s string) string {
 	if interned, exists := db.attrPool[s]; exists {
 		return interned
 	}
+	// Bound the pool: interning only exists to share string headers, so when the
+	// pool grows past the cap we rebuild it from the keys still referenced by live
+	// records. Without this, applications that use many distinct/dynamic attribute
+	// keys would grow the pool without limit.
+	if len(db.attrPool) >= maxAttrPoolEntries {
+		db.compactAttrPoolLocked()
+		if interned, exists := db.attrPool[s]; exists {
+			return interned
+		}
+	}
 	db.attrPool[s] = s
 	return s
+}
+
+// maxAttrPoolEntries is the number of interned attribute keys allowed before the
+// pool is compacted down to the keys still referenced by live records.
+const maxAttrPoolEntries = 1 << 17 // 131072
+
+// compactAttrPoolLocked rebuilds the interning pool from the keys referenced by
+// live records, dropping entries for keys no longer in use. Caller must hold
+// db.mu (write lock).
+func (db *AnchorDB) compactAttrPoolLocked() {
+	if len(db.attrPool) == 0 {
+		return
+	}
+	referenced := make(map[string]string, len(db.attrPool))
+	for _, cr := range db.EntityStore {
+		for i := range cr.Attrs {
+			k := cr.Attrs[i].Key
+			referenced[k] = k
+		}
+	}
+	db.attrPool = referenced
+}
+
+// CompactAttrPool rebuilds the attribute interning pool, releasing memory held
+// for attribute keys that are no longer referenced. It is called automatically
+// once the pool exceeds an internal cap; this exported form allows callers to
+// trigger it at a convenient time (e.g. after a bulk delete).
+func (db *AnchorDB) CompactAttrPool() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return
+	}
+	db.compactAttrPoolLocked()
 }
 
 func (db *AnchorDB) totalNodes() int {
@@ -502,6 +552,16 @@ func (db *AnchorDB) getNode(idx uint32) BinaryNodeRecord {
 }
 
 func (db *AnchorDB) markNodeDeleted(idx uint32) {
+	db.zeroNodeLocked(idx)
+	if db.deletedNodeIdx == nil {
+		db.deletedNodeIdx = make(map[uint32]bool)
+	}
+	db.deletedNodeIdx[idx] = true
+}
+
+// zeroNodeLocked clears the node's ID in the current mapping or pending slice.
+// Caller must hold db.mu.
+func (db *AnchorDB) zeroNodeLocked(idx uint32) {
 	if uint64(idx) < db.syncedNodeCount && db.isMmapped && db.mmapData != nil {
 		offset := int(db.Header.NodesOffset) + int(idx)*RecordSize
 		if offset+8 <= len(db.mmapData) {
@@ -513,6 +573,17 @@ func (db *AnchorDB) markNodeDeleted(idx uint32) {
 			db.pendingNodes[pIdx].ID = 0
 		}
 	}
+}
+
+// reapplyDeletesLocked re-applies node tombstones recorded since the last Sync to
+// the current mapping, then clears the record. This closes the race where Sync
+// snapshots a live node, a concurrent delete tombstones it, and Sync then swaps
+// in the snapshot (which still contains the live node). Caller must hold db.mu.
+func (db *AnchorDB) reapplyDeletesLocked() {
+	for idx := range db.deletedNodeIdx {
+		db.zeroNodeLocked(idx)
+	}
+	clear(db.deletedNodeIdx)
 }
 
 // mmapLen converts a file size to the int length expected by syscall.Mmap,
@@ -562,7 +633,7 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 
 	// Keep the lock on a sidecar rather than the database inode: Sync atomically
 	// replaces the database file, while this descriptor remains locked.
-	lockFile, err := os.OpenFile(filePath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	lockFile, err := os.OpenFile(filePath+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database lock: %w", err)
 	}
@@ -587,7 +658,7 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 	}
 
 	// Open file
-	f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+	f, err := os.OpenFile(filePath, os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return openErr(fmt.Errorf("failed to open file %s: %w", filePath, err))
 	}
@@ -756,11 +827,10 @@ func (db *AnchorDB) applyWALDeleteLocked(name string) {
 }
 
 func (db *AnchorDB) initEmptyFile(filePath string) error {
-	f, err := os.Create(filePath)
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	hdr := Header{
 		Magic:        MagicHeader,
@@ -778,8 +848,21 @@ func (db *AnchorDB) initEmptyFile(filePath string) error {
 	var buf [HeaderSize]byte
 	hdr.Encode(buf[:])
 
-	_, err = f.Write(buf[:])
-	return err
+	if _, err := f.Write(buf[:]); err != nil {
+		_ = f.Close()
+		return err
+	}
+	// Make the header (file data) and the directory entry durable before the
+	// database is used. Without this, a crash shortly after first Open() can leave
+	// a headerless/truncated file that fails to open permanently.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(filePath))
 }
 
 func (db *AnchorDB) buildIndex() error {
@@ -1056,6 +1139,9 @@ func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (str
 func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
 
 	cr, exists := db.EntityStore[name]
 	if !exists || cr.Operation == OpStatusTombstone {
@@ -1069,6 +1155,9 @@ func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]f
 func (db *AnchorDB) GetRecordWithOperation(name string, selectFields ...string) (map[string]float32, uint8, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, 0, ErrDatabaseClosed
+	}
 
 	cr, exists := db.EntityStore[name]
 	if !exists || cr.Operation == OpStatusTombstone {
@@ -1080,8 +1169,8 @@ func (db *AnchorDB) GetRecordWithOperation(name string, selectFields ...string) 
 
 // GetRecordWithCompute retrieves raw properties AND computes derived fields in-storage (CALCULATING),
 // optionally selecting specific fields (SELECTING / PROJECTION).
-// e.g., input {jarak: 100, waktu: 2, luas: 500} -> with Compute("kecepatan", Divide("jarak", "waktu"))
-// and selectFields "jarak", "waktu", "kecepatan" -> returns {jarak: 100, waktu: 2, kecepatan: 50} (luas tidak diambil!)
+// e.g., input {distance: 100, duration: 2, area: 500} -> with Compute("speed", Divide("distance", "duration"))
+// and selectFields "distance", "duration", "speed" -> returns {distance: 100, duration: 2, speed: 50} (area is not returned!)
 func (db *AnchorDB) GetRecordWithCompute(name string, computations map[string]ComputeOp, selectFields ...string) (map[string]float32, error) {
 	// Retrieve raw without projection first so computations have access to all fields
 	props, err := db.GetRecord(name)
@@ -1230,7 +1319,7 @@ type UpdateOptions struct {
 	Context        context.Context
 	TargetEntities []string             // If specified, updates directly via O(1) key access
 	Filters        []FilterCondition    // Optional Where conditions
-	Mutations      map[string]ComputeOp // e.g., "jarak" -> OpAdd{FieldA: "jarak", FieldB: "10"}
+	Mutations      map[string]ComputeOp // e.g., "distance" -> OpAdd{FieldA: "distance", FieldB: "10"}
 	Limit          int                  // Maximum records to update (Constant-Time Bound O(K))
 	Offset         int
 }
@@ -1335,7 +1424,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			}
 		}
 		if updatedCount >= limit {
-			break // Waktu konstan tercapai: stop setelah Limit terpenuhi!
+			break // Constant-time bound reached: stop once Limit is satisfied!
 		}
 
 		cr := db.EntityStore[name]
@@ -1754,6 +1843,15 @@ func (db *AnchorDB) Sync() error {
 		cr := entityStoreSnapshot[name]
 		nameBytes := []byte(name)
 
+		// The binary format stores lengths as uint16; reject oversized values
+		// instead of silently truncating them into a corrupt file.
+		if len(nameBytes) > math.MaxUint16 {
+			return fmt.Errorf("entity name %q too long (%d bytes) for binary format", name, len(nameBytes))
+		}
+		if len(cr.Attrs) > math.MaxUint16 {
+			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", name, len(cr.Attrs))
+		}
+
 		// 2 bytes name length + name bytes
 		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
 		if _, err := writer.Write(lBuf[:]); err != nil {
@@ -1777,6 +1875,9 @@ func (db *AnchorDB) Sync() error {
 
 		for _, attr := range cr.Attrs {
 			kBytes := []byte(attr.Key)
+			if len(kBytes) > math.MaxUint16 {
+				return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), name)
+			}
 			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
 			if _, err := writer.Write(lBuf[:]); err != nil {
 				return err
@@ -1815,11 +1916,11 @@ func (db *AnchorDB) Sync() error {
 	}
 	tempFile = nil // Prevent defer from removing the renamed file
 
-	// Fsync parent directory to ensure rename is committed to filesystem metadata
-	if dirF, err := os.Open(filepath.Dir(db.filePath)); err == nil {
-		_ = dirF.Sync()
-		_ = dirF.Close()
-	}
+	// Fsync the parent directory so the rename is committed to filesystem
+	// metadata. If this fails we must NOT checkpoint the WAL below: a crash could
+	// otherwise roll the directory back to the pre-rename file while the WAL that
+	// carried the snapshot's mutations has already been truncated (silent data loss).
+	dirSyncErr := syncDir(filepath.Dir(db.filePath))
 
 	// Re-open newly synced file
 	newF, err := os.OpenFile(db.filePath, os.O_RDWR, 0644)
@@ -1871,6 +1972,16 @@ func (db *AnchorDB) Sync() error {
 	}
 	db.syncedNodeCount = uint64(totNodes)
 
+	// Re-apply tombstones recorded while db.mu was released during serialization
+	// so a delete that raced this Sync is not lost in the freshly mapped file.
+	db.reapplyDeletesLocked()
+
+	// Do not discard WAL entries until the replacement file is durable. If the
+	// directory fsync failed, keep the WAL so a crash can still replay mutations.
+	if dirSyncErr != nil {
+		return fmt.Errorf("database replaced but directory fsync failed; WAL retained for recovery: %w", dirSyncErr)
+	}
+
 	// Checkpoint WAL up to the snapshot offset
 	if db.wal != nil {
 		if err := db.wal.Checkpoint(walCheckpointOffset); err != nil {
@@ -1897,6 +2008,9 @@ func (db *AnchorDB) ExecuteGraphStepWithOptions(inputs []string, relation string
 func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []string, relation string, limitK int, order OrderByMode, beamWidth float32) ([]GraphQueryResult, spatial.Point2D, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, spatial.Point2D{}, ErrDatabaseClosed
+	}
 
 	shift, hasRel := db.relations[relation]
 	if !hasRel {
@@ -2178,6 +2292,9 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
 
 	targetIdx, exists := db.Lexicon[word]
 	if !exists {

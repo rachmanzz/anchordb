@@ -25,7 +25,10 @@ func GenerateUUID() string {
 
 // PartitionSink defines the storage destination for archived partition files (Local Disk or S3)
 type PartitionSink interface {
-	SavePartition(filename string, data []byte) (string, error)
+	// SavePartitionFromFile stores the file at srcPath under the partition name
+	// filename, streaming it so an arbitrarily large archive is never buffered
+	// fully in memory.
+	SavePartitionFromFile(filename, srcPath string) (string, error)
 	Name() string
 }
 
@@ -42,6 +45,55 @@ func (s *LocalDiskSink) Name() string {
 	return fmt.Sprintf("LocalDisk (%s)", s.BaseDir)
 }
 
+func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string, error) {
+	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
+		return "", fmt.Errorf("invalid partition filename %q", filename)
+	}
+	if err := os.MkdirAll(s.BaseDir, 0755); err != nil {
+		return "", fmt.Errorf("failed creating partition directory: %w", err)
+	}
+
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("failed opening source partition %s: %w", srcPath, err)
+	}
+	defer src.Close()
+
+	targetPath := filepath.Join(s.BaseDir, filename)
+	// Write to a temp file in the destination directory, fsync, then rename so a
+	// crash never leaves a partially written partition under the final name.
+	tmp, err := os.CreateTemp(s.BaseDir, ".partition_*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("failed creating temp partition file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed writing partition file %s: %w", targetPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed syncing partition file %s: %w", targetPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed closing partition file %s: %w", targetPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed setting partition file permissions: %w", err)
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, err)
+	}
+	return targetPath, nil
+}
+
 func (s *LocalDiskSink) SavePartition(filename string, data []byte) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
@@ -51,7 +103,7 @@ func (s *LocalDiskSink) SavePartition(filename string, data []byte) (string, err
 	}
 
 	targetPath := filepath.Join(s.BaseDir, filename)
-	if err := os.WriteFile(targetPath, data, 0644); err != nil {
+	if err := os.WriteFile(targetPath, data, 0600); err != nil {
 		return "", fmt.Errorf("failed writing partition file %s: %w", targetPath, err)
 	}
 
@@ -67,6 +119,10 @@ type S3Sink struct {
 	AccessKey  string
 	SecretKey  string
 	HTTPClient *http.Client
+	// AllowInsecureHTTP permits sending SigV4 credentials to a plaintext http
+	// endpoint. Leave false unless the endpoint is a trusted local/loopback
+	// service, since the Authorization header is otherwise sent in the clear.
+	AllowInsecureHTTP bool
 }
 
 func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
@@ -85,7 +141,27 @@ func (s *S3Sink) Name() string {
 	return fmt.Sprintf("S3 (%s/%s/%s)", s.Endpoint, s.Bucket, s.Prefix)
 }
 
+func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error) {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("S3Sink: open source partition %s: %w", srcPath, err)
+	}
+	defer src.Close()
+	fi, err := src.Stat()
+	if err != nil {
+		return "", fmt.Errorf("S3Sink: stat source partition %s: %w", srcPath, err)
+	}
+	return s.put(filename, src, fi.Size())
+}
+
 func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
+	return s.put(filename, bytes.NewReader(data), int64(len(data)))
+}
+
+// put uploads an object whose bytes come from body. body must be seekable so the
+// payload can be hashed for SigV4 and then re-read for transmission without
+// buffering the whole object in memory.
+func (s *S3Sink) put(filename string, body io.ReadSeeker, size int64) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("S3Sink: invalid partition filename %q", filename)
 	}
@@ -104,17 +180,31 @@ func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 	if baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return "", fmt.Errorf("S3Sink: endpoint must not contain query or fragment")
 	}
+	// Never transmit SigV4 credentials (Authorization header) over plaintext HTTP.
+	if baseURL.Scheme == "http" && s.AccessKey != "" && !s.AllowInsecureHTTP {
+		return "", fmt.Errorf("S3Sink: refusing to send credentials over plaintext http endpoint %q; use https or set AllowInsecureHTTP", s.Endpoint)
+	}
 	key := path.Join(strings.Trim(s.Prefix, "/"), filename)
 	objectPath := path.Join(strings.TrimSuffix(baseURL.Path, "/"), s.Bucket, key)
 	baseURL.Path = objectPath
 	baseURL.RawPath = ""
 
-	req, err := http.NewRequest(http.MethodPut, baseURL.String(), bytes.NewReader(data))
+	// Hash the payload by streaming it, then rewind for the actual upload.
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, body); err != nil {
+		return "", fmt.Errorf("S3Sink: hash payload: %w", err)
+	}
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("S3Sink: rewind payload: %w", err)
+	}
+	payloadHex := hex.EncodeToString(hasher.Sum(nil))
+
+	req, err := http.NewRequest(http.MethodPut, baseURL.String(), body)
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: failed creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(data))
+	req.ContentLength = size
 
 	if s.AccessKey != "" {
 		if s.SecretKey == "" {
@@ -124,7 +214,7 @@ func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 		if region == "" {
 			region = "us-east-1"
 		}
-		signS3Request(req, data, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+		signS3Request(req, payloadHex, s.AccessKey, s.SecretKey, region, time.Now().UTC())
 	}
 
 	client := s.HTTPClient
@@ -146,12 +236,10 @@ func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 	return fmt.Sprintf("s3://%s/%s", s.Bucket, key), nil
 }
 
-func signS3Request(req *http.Request, payload []byte, accessKey, secretKey, region string, now time.Time) {
+func signS3Request(req *http.Request, payloadHex, accessKey, secretKey, region string, now time.Time) {
 	const algorithm = "AWS4-HMAC-SHA256"
 	date := now.Format("20060102")
 	amzDate := now.Format("20060102T150405Z")
-	payloadHash := sha256.Sum256(payload)
-	payloadHex := hex.EncodeToString(payloadHash[:])
 	req.Header.Set("x-amz-content-sha256", payloadHex)
 	req.Header.Set("x-amz-date", amzDate)
 	req.Host = req.URL.Host

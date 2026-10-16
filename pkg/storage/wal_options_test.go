@@ -33,7 +33,7 @@ func TestOpenWithOptionsSyncModes(t *testing.T) {
 			if err := db.SaveRecord("rec-1", map[string]float32{"v": 42}); err != nil {
 				t.Fatalf("save: %v", err)
 			}
-			if err := db.AddEdge("a", "sebab", "b", 0.5); err != nil {
+			if err := db.AddEdge("a", "causes", "b", 0.5); err != nil {
 				t.Fatalf("add edge: %v", err)
 			}
 
@@ -60,7 +60,7 @@ func TestOpenWithOptionsSyncModes(t *testing.T) {
 			if rec["v"] != 42 {
 				t.Fatalf("record not recovered, got %+v", rec)
 			}
-			if got := reopened.OutgoingEdges("a", "sebab"); len(got) != 1 || got[0].Target != "b" {
+			if got := reopened.OutgoingEdges("a", "causes"); len(got) != 1 || got[0].Target != "b" {
 				t.Fatalf("edge not recovered: %+v", got)
 			}
 		})

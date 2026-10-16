@@ -17,7 +17,7 @@ var edgeSectionMagic = [4]byte{'E', 'D', 'G', '3'}
 // EdgeRecord is a directed, weighted relationship between two graph nodes.
 // It is the per-edge counterpart to the global relations map: instead of a
 // single direction per relation name, each edge names its own Source and Target
-// so cause-and-effect links can be stored explicitly (A --sebab--> B).
+// so cause-and-effect links can be stored explicitly (A --causes--> B).
 type EdgeRecord struct {
 	Source   string  `json:"source"`
 	Relation string  `json:"relation"`

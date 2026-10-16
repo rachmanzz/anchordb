@@ -215,7 +215,7 @@ type GetBuilder struct {
 }
 
 // Select specifies which columns/attributes to retrieve (projection).
-// e.g., Select("jarak", "waktu", "kecepatan")
+// e.g., Select("distance", "duration", "speed")
 func (b *GetBuilder) Select(fields ...string) *GetBuilder {
 	b.selectFields = append(b.selectFields, fields...)
 	return b
@@ -328,7 +328,7 @@ func toFloat32Value(v any) (float32, error) {
 }
 
 // Select specifies which columns/attributes to retrieve (projection).
-// e.g., Select("jarak", "waktu", "kecepatan")
+// e.g., Select("distance", "duration", "speed")
 func (b *ListBuilder) Select(fields ...string) *ListBuilder {
 	b.selectFields = append(b.selectFields, fields...)
 	return b
@@ -550,7 +550,7 @@ func (b *UpdateBuilder) BetweenDate(field, startDate, endDate string) *UpdateBui
 	return b.Between(field, startDate, endDate)
 }
 
-// Set defines an attribute to update using in-storage math (e.g. Set("jarak", driver.Add("jarak", "10")))
+// Set defines an attribute to update using in-storage math (e.g. Set("distance", driver.Add("distance", "10")))
 func (b *UpdateBuilder) Set(field string, op storage.ComputeOp) *UpdateBuilder {
 	b.mutations[field] = op
 	return b

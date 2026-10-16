@@ -211,11 +211,11 @@ func (f *IPFilter) ExtractClientIP(r *http.Request) net.IP {
 				}
 				return peer
 			}
-		}
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
-				return ip
-			}
+			// X-Forwarded-For was present but malformed. Do NOT fall back to other
+			// client-supplied headers (e.g. X-Real-IP): that lets a client bypass
+			// the whitelist and rate limiter by sending a garbage XFF alongside a
+			// spoofed X-Real-IP. Treat the peer as the client instead.
+			return remoteIP
 		}
 	}
 
@@ -252,7 +252,7 @@ func (f *IPFilter) Middleware(next http.Handler) http.Handler {
 		if !f.IsAllowed(clientIP) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"Forbidden: client IP %s is not allowed by AnchorDB whitelist"}`, clientIP)))
+			_, _ = fmt.Fprintf(w, `{"error":"Forbidden: client IP %s is not allowed by AnchorDB whitelist"}`, clientIP)
 			return
 		}
 		next.ServeHTTP(w, r)

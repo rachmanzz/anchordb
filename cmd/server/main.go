@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -141,13 +143,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.CronEnabled {
 		if cfg.PartitionSchedule != "" {
 			if err := s.scheduler.RegisterTask("auto_partition_maintenance", NewAutoPartitionCronTask(s, cfg.PartitionSchedule, cfg.RetentionDays)); err != nil {
-				log.Printf("[ERROR] Gagal mendaftarkan cron task auto_partition_maintenance: %v", err)
+				log.Printf("[ERROR] Failed to register cron task auto_partition_maintenance: %v", err)
 			}
 		}
 
 		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
 			if err := s.scheduler.RegisterTask("periodic_background_sync", NewPeriodicSyncCronTask(s, cfg.SyncInterval)); err != nil {
-				log.Printf("[ERROR] Gagal mendaftarkan cron task periodic_background_sync: %v", err)
+				log.Printf("[ERROR] Failed to register cron task periodic_background_sync: %v", err)
 			}
 		}
 
@@ -176,7 +178,28 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
-	return s.rateLimitMiddleware(s.ipFilter.Middleware(limitRequestBody(mux)))
+	// recoverMiddleware is outermost so a panic in any layer yields a clean 500
+	// instead of dropping the connection with a stack trace.
+	return recoverMiddleware(s.rateLimitMiddleware(s.ipFilter.Middleware(mux)))
+}
+
+// recoverMiddleware catches panics from downstream handlers, logs them, and
+// returns a generic 500 without leaking internal details or a stack trace.
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
+				log.Printf("[ERROR] panic recovered serving %s %s: %v", r.Method, r.URL.Path, rec)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"error":"internal server error"}`)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func limitRequestBody(next http.Handler) http.Handler {
@@ -200,6 +223,49 @@ func dispatchErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusInternalServerError
+}
+
+// requireMethod writes a 405 response and reports false when r.Method is not one
+// of the allowed methods.
+func requireMethod(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
+	for _, m := range allowed {
+		if r.Method == m {
+			return true
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_, _ = io.WriteString(w, fmt.Sprintf(`{"error":"method not allowed; use %s"}`, strings.Join(allowed, " or ")))
+	return false
+}
+
+// validateS3Endpoint rejects endpoints that would let an authenticated caller
+// use the server as an SSRF proxy (loopback, private, link-local and metadata
+// addresses). Set ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT=true to permit them for a
+// trusted local MinIO-style deployment.
+func validateS3Endpoint(endpoint string, allowPrivate bool) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("invalid s3_endpoint %q", endpoint)
+	}
+	if allowPrivate {
+		return nil
+	}
+	host := u.Hostname()
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve s3_endpoint host %q", host)
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("s3_endpoint %q resolves to a private/loopback address; refusing (set ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT=true to allow)", host)
+		}
+	}
+	return nil
 }
 
 // resolvePathWithExistingSymlinks resolves the existing prefix of path and
@@ -310,7 +376,7 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		}
 	}
 	if !safeToClose {
-		log.Printf("[WARN] Database tidak ditutup karena ada pekerjaan yang mungkin masih berjalan; durabilitas dijamin WAL (replay saat restart).")
+		log.Printf("[WARN] Databases not closed because background work may still be running; durability guaranteed by WAL (replayed on restart).")
 	}
 
 	return errors.Join(errs...)
@@ -338,7 +404,7 @@ func (t *AutoPartitionCronTask) Schedule() string {
 }
 
 func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
-	log.Printf("[SCHEDULER] Menjalankan partisi otomatis (arsip data > %.0f hari)...", t.retentionDays)
+	log.Printf("[SCHEDULER] Running automatic partition maintenance (archiving data > %.0f days)...", t.retentionDays)
 	t.server.mu.RLock()
 	var loaded []string
 	for m := range t.server.models {
@@ -359,14 +425,14 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 				}
 				partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
 					ModelName:     modelName,
-					DateField:     "tanggal",
+					DateField:     "date",
 					RetentionDays: t.retentionDays,
 					Sink:          partition.NewLocalDiskSink(filepath.Join(t.server.dataDir, "partitions")),
 					FileFormat:    "{date}_{uuid}.anchordb",
 					PruneHotDB:    true,
 				})
 				if err == nil && partRes.ArchivedCount > 0 {
-					log.Printf("[WORKER] Model %q terpartisi: %d record diarsipkan ke %s",
+					log.Printf("[WORKER] Model %q partitioned: %d records archived to %s",
 						modelName, partRes.ArchivedCount, partRes.TargetLocation)
 				}
 				return err
@@ -376,7 +442,7 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 			worker.WithRetryJitter(100*time.Millisecond),
 		)
 		if err != nil {
-			log.Printf("[WARN] AutoPartition gagal mendispatch task untuk model %q: %v", modelName, err)
+			log.Printf("[WARN] AutoPartition failed to dispatch task for model %q: %v", modelName, err)
 			dispatchErr = err
 		}
 	}
@@ -436,7 +502,7 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 				}
 			}
 			if purged > 0 || synced > 0 {
-				log.Printf("[WORKER] Background sync berkala sukses: %d model tersimpan ke disk, %d tombstones collected", synced, purged)
+				log.Printf("[WORKER] Periodic background sync succeeded: %d models synced to disk, %d tombstones collected", synced, purged)
 			}
 			return errors.Join(syncErrs...)
 		},
@@ -466,11 +532,19 @@ func sanitizeModelName(name string) (string, error) {
 		return "", fmt.Errorf("invalid model name (path traversal rejected): %q", name)
 	}
 	for _, ch := range name {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+		if !isAllowedNameChar(ch, false) {
 			return "", fmt.Errorf("invalid character %q in model name: %q", ch, name)
 		}
 	}
 	return name, nil
+}
+
+// isAllowedNameChar reports whether ch is a safe character for a model name or
+// identifier: ASCII letters, digits, underscore and hyphen, plus dot when
+// allowDot is set.
+func isAllowedNameChar(ch rune, allowDot bool) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+		ch == '_' || ch == '-' || (allowDot && ch == '.')
 }
 
 // isValidIdentifier checks that an identifier consists only of safe characters (letters, digits, underscore, dot, hyphen)
@@ -479,14 +553,14 @@ func isValidIdentifier(token string) bool {
 		return false
 	}
 	for _, ch := range token {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.') {
+		if !isAllowedNameChar(ch, true) {
 			return false
 		}
 	}
 	return true
 }
 
-// getModel retrieves or dynamically opens an AnchorDB instance ("Satu DB = Satu Model")
+// getModel retrieves or dynamically opens an AnchorDB instance ("One DB = One Model")
 func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	cleanName, err := sanitizeModelName(modelName)
 	if err != nil {
@@ -524,43 +598,68 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	dbPath := filepath.Join(s.dataDir, modelName+".anchordb")
 	newDB, err := storage.OpenWithOptions(dbPath, s.dbOptions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open model %q at %s: %w", modelName, dbPath, err)
+		// Log full detail (including the on-disk path) server-side only; the
+		// client gets a generic message so internal paths are not disclosed.
+		log.Printf("[ERROR] Failed to open model %q at %s: %v", modelName, dbPath, err)
+		return nil, fmt.Errorf("failed to open model %q", modelName)
 	}
 
 	s.models[modelName] = newDB
-	log.Printf("[INFO] Model %q dimuat dari disk: %s", modelName, dbPath)
+	log.Printf("[INFO] Model %q loaded from disk: %s", modelName, dbPath)
 	return newDB, nil
 }
 
+// isAuthorized reports whether the request carries a valid bearer token. When no
+// token is configured (explicit insecure mode) every request is authorized.
+func (s *Server) isAuthorized(r *http.Request) bool {
+	if s.authToken == "" {
+		return true
+	}
+	authHeader := r.Header.Get("Authorization")
+	expected := "Bearer " + s.authToken
+	return subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) == 1
+}
+
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	// The request body is only buffered *after* authentication and rate limiting
+	// succeed, so unauthenticated clients cannot force large allocations.
+	limited := limitRequestBody(next)
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.authToken != "" {
-			authHeader := r.Header.Get("Authorization")
-			expected := "Bearer " + s.authToken
-			if subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) != 1 {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
+		if !s.isAuthorized(r) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		next(w, r)
+		limited.ServeHTTP(w, r)
 	}
 }
 
 // Health check endpoint
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	status, code := "ok", http.StatusOK
+	if s.draining.Load() {
+		// Readiness: tell load balancers / K8s to stop routing new traffic.
+		status, code = "shutting_down", http.StatusServiceUnavailable
+	}
+
+	// Unauthenticated callers only get liveness/readiness. Internal state
+	// (loaded model names, memory, scheduler/worker stats) requires auth.
+	if !s.isAuthorized(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": status,
+			"engine": "AnchorDB",
+		})
+		return
+	}
+
 	s.mu.RLock()
 	var loadedModels []string
 	for k := range s.models {
 		loadedModels = append(loadedModels, k)
 	}
 	s.mu.RUnlock()
-
-	status, code := "ok", http.StatusOK
-	if s.draining.Load() {
-		// Readiness: tell load balancers / K8s to stop routing new traffic.
-		status, code = "shutting_down", http.StatusServiceUnavailable
-	}
 
 	resp := map[string]interface{}{
 		"status":         status,
@@ -644,7 +743,7 @@ type GetRequest struct {
 	Model        string            `json:"model"`
 	Name         string            `json:"name"`
 	Select       []string          `json:"select"`
-	Computations map[string]string `json:"computations"` // e.g. {"kecepatan": "jarak / waktu"}
+	Computations map[string]string `json:"computations"` // e.g. {"speed": "distance / duration"}
 }
 
 type FilterDTO struct {
@@ -671,7 +770,7 @@ type UpdateRequest struct {
 	Model     string            `json:"model"`
 	In        []string          `json:"in"`
 	Filters   []FilterDTO       `json:"filters"`
-	Mutations map[string]string `json:"mutations"` // e.g. {"jarak": "jarak + 10"}
+	Mutations map[string]string `json:"mutations"` // e.g. {"distance": "distance + 10"}
 	Limit     int               `json:"limit"`
 	Async     bool              `json:"async,omitempty"`
 }
@@ -704,7 +803,7 @@ type CausalRequest struct {
 	LimitK    int      `json:"limit_k"`
 }
 
-// parseComputeOp converts a string expression like "jarak / waktu", "jarak + 10", "0", or "-5" to ComputeOp
+// parseComputeOp converts a string expression like "distance / duration", "distance + 10", "0", or "-5" to ComputeOp
 func parseComputeOp(expr string) (storage.ComputeOp, error) {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
@@ -755,17 +854,50 @@ func parseComputeOp(expr string) (storage.ComputeOp, error) {
 	return nil, fmt.Errorf("unsupported or malformed expression %q", expr)
 }
 
-func parseVal(str string) float32 {
+// parseVal converts a filter value to float32. An empty string is treated as
+// zero (filters that do not use ValueHigh leave it empty). A non-empty value
+// that parses as neither a date nor a number is a hard error so callers cannot
+// silently match/update unintended records.
+func parseVal(str string) (float32, error) {
+	if str == "" {
+		return 0, nil
+	}
 	if d, err := storage.ParseDate(str); err == nil {
-		return d
+		return d, nil
 	}
 	if f, err := strconv.ParseFloat(str, 32); err == nil {
-		return float32(f)
+		return float32(f), nil
 	}
-	return 0
+	return 0, fmt.Errorf("invalid numeric value %q", str)
+}
+
+// buildFilters converts API filter DTOs into storage filter conditions,
+// rejecting any value that is not a valid number or date.
+func buildFilters(filters []FilterDTO) ([]storage.FilterCondition, error) {
+	out := make([]storage.FilterCondition, 0, len(filters))
+	for _, f := range filters {
+		value, err := parseVal(f.Value)
+		if err != nil {
+			return nil, fmt.Errorf("filter field %q: %w", f.Field, err)
+		}
+		valueHigh, err := parseVal(f.ValueHigh)
+		if err != nil {
+			return nil, fmt.Errorf("filter field %q (value_high): %w", f.Field, err)
+		}
+		out = append(out, storage.FilterCondition{
+			Field:     f.Field,
+			Operator:  f.Operator,
+			Value:     value,
+			ValueHigh: valueHigh,
+		})
+	}
+	return out, nil
 }
 
 func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req SaveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -778,7 +910,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var opStatus uint8 = storage.OpStatusActive
+	opStatus := storage.OpStatusActive
 	if req.Operation != nil {
 		opStatus = *req.Operation
 	}
@@ -798,6 +930,9 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req GetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -841,6 +976,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req ListRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -863,14 +1001,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		computations[outField] = op
 	}
 
-	var filters []storage.FilterCondition
-	for _, f := range req.Filters {
-		filters = append(filters, storage.FilterCondition{
-			Field:     f.Field,
-			Operator:  f.Operator,
-			Value:     parseVal(f.Value),
-			ValueHigh: parseVal(f.ValueHigh),
-		})
+	filters, err := buildFilters(req.Filters)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
 	}
 
 	limit := req.Limit
@@ -912,6 +1046,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req UpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -934,14 +1071,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		mutations[field] = op
 	}
 
-	var filters []storage.FilterCondition
-	for _, f := range req.Filters {
-		filters = append(filters, storage.FilterCondition{
-			Field:     f.Field,
-			Operator:  f.Operator,
-			Value:     parseVal(f.Value),
-			ValueHigh: parseVal(f.ValueHigh),
-		})
+	filters, err := buildFilters(req.Filters)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
 	}
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
@@ -958,7 +1091,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 					Limit:          req.Limit,
 				})
 				if err == nil {
-					log.Printf("[WORKER] Async batch update sukses untuk model %q: %d records diperbarui", req.Model, count)
+					log.Printf("[WORKER] Async batch update succeeded for model %q: %d records updated", req.Model, count)
 				}
 				return err
 			},
@@ -999,6 +1132,9 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req GraphRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -1031,6 +1167,9 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 
 // handleEdge adds or removes an explicit causal edge.
 func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req EdgeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -1067,6 +1206,9 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 
 // handleCausal traverses explicit edges by relation, single-hop or multi-hop.
 func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	var req CausalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
@@ -1103,6 +1245,9 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
 	modelName := r.URL.Query().Get("model")
 	if modelName == "" {
 		modelName = "default"
@@ -1182,7 +1327,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	dateField := req.DateField
 	if dateField == "" {
-		dateField = "tanggal"
+		dateField = "date"
 	}
 
 	retentionDays := req.RetentionDays
@@ -1197,6 +1342,10 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	var sink partition.PartitionSink
 	if strings.ToLower(req.SinkType) == "s3" {
+		if err := validateS3Endpoint(req.S3Endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 		endpoint := req.S3Endpoint
 		bucket := req.S3Bucket
 		if bucket == "" {
@@ -1206,7 +1355,9 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		if prefix == "" {
 			prefix = "partitions"
 		}
-		sink = partition.NewS3Sink(endpoint, bucket, prefix, req.S3AccessKey, req.S3SecretKey)
+		s3sink := partition.NewS3Sink(endpoint, bucket, prefix, req.S3AccessKey, req.S3SecretKey)
+		s3sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+		sink = s3sink
 	} else {
 		targetDir := req.TargetPath
 		if targetDir == "" {
@@ -1284,7 +1435,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 					if err != nil {
 						errs = append(errs, fmt.Errorf("partition %s: %w", m, err))
 					} else if res != nil && res.ArchivedCount > 0 {
-						log.Printf("[WORKER] Async partisi sukses untuk model %q: %d record diarsipkan ke %s",
+						log.Printf("[WORKER] Async partition succeeded for model %q: %d records archived to %s",
 							m, res.ArchivedCount, res.TargetLocation)
 					}
 				}
@@ -1343,6 +1494,9 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
+		return
+	}
 	tasks := s.scheduler.Tasks()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1400,6 +1554,9 @@ func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -1473,7 +1630,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 					total += purged
 				}
 				if total > 0 {
-					log.Printf("[WORKER] Async collector sweep sukses: %d tombstones dibersihkan", total)
+					log.Printf("[WORKER] Async collector sweep succeeded: %d tombstones purged", total)
 				}
 				return errors.Join(errs...)
 			},
@@ -1712,6 +1869,13 @@ func main() {
 	if authToken == "" {
 		authToken = getEnv("ANCHORDB_AUTH_TOKEN", "")
 	}
+	if *flagToken != "" {
+		log.Printf("[WARN] Auth token provided via CLI flag; its value is visible in `ps`/cmdline. Use ANCHORDB_AUTH_TOKEN instead.")
+	}
+	if authToken == "" && !getEnvBool("ANCHORDB_ALLOW_INSECURE", false) {
+		log.Fatalf("[FATAL] ANCHORDB_AUTH_TOKEN is not set. Server refuses to run without authentication. " +
+			"Set a strong token (e.g. `openssl rand -hex 32`), or for trusted LOCAL access only set ANCHORDB_ALLOW_INSECURE=true.")
+	}
 
 	memLimitStr := *flagMemLimit
 	if memLimitStr == "" {
@@ -1795,7 +1959,7 @@ func main() {
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
 	_, memSummary, err := system.ApplyMemoryLimit(memLimitStr)
 	if err != nil {
-		log.Fatalf("[FATAL] Konfigurasi Memory Limit tidak valid: %v", err)
+		log.Fatalf("[FATAL] Invalid Memory Limit configuration: %v", err)
 	}
 
 	// Single global shutdown budget (L7). Phases get a share so the sum stays
@@ -1806,14 +1970,14 @@ func main() {
 		if d, perr := time.ParseDuration(s); perr == nil && d > 0 {
 			shutdownTimeout = d
 		} else {
-			log.Printf("[WARN] shutdown-timeout %q tidak valid; memakai default %v", s, shutdownTimeout)
+			log.Printf("[WARN] Invalid shutdown-timeout %q; using default %v", s, shutdownTimeout)
 		}
 	}
 
 	// Resolve WAL durability options (Flag > ENV > Default).
 	dbOptions, err := resolveDBOptions(*flagWALSync, *flagWALSyncInterval)
 	if err != nil {
-		log.Fatalf("[FATAL] Konfigurasi WAL tidak valid: %v", err)
+		log.Fatalf("[FATAL] Invalid WAL configuration: %v", err)
 	}
 
 	// Resolve per-client rate limit (Flag > ENV > disabled).
@@ -1861,7 +2025,7 @@ func main() {
 
 	server, err := NewServer(serverConfig)
 	if err != nil {
-		log.Fatalf("[FATAL] Gagal memulai AnchorDB Server: %v", err)
+		log.Fatalf("[FATAL] Failed to start AnchorDB Server: %v", err)
 	}
 
 	fmt.Println("==========================================================")
@@ -1870,6 +2034,11 @@ func main() {
 	fmt.Println("             Licensed under Apache-2.0                    ")
 	fmt.Printf("   Port Dedicated : %s\n", portStr)
 	fmt.Printf("   Memory Limit   : %s\n", memSummary)
+	if authToken == "" {
+		fmt.Println("   Auth           : DISABLED (ANCHORDB_ALLOW_INSECURE=true)")
+	} else {
+		fmt.Println("   Auth           : ENABLED (Bearer token required)")
+	}
 	if server.ipFilter.IsEmpty() {
 		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
 	} else {
@@ -1898,11 +2067,12 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10, // cap request headers at 64 KiB (default is 1 MiB)
 	}
 
 	listenErr := make(chan error, 1)
 	go func() {
-		log.Printf("[READY] AnchorDB Server mendengarkan di %s ...", addr)
+		log.Printf("[READY] AnchorDB Server listening on %s ...", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			listenErr <- err
 		}
@@ -1911,7 +2081,7 @@ func main() {
 	exitCode := 0
 	select {
 	case <-stopSignal:
-		log.Println("[SHUTDOWN] Menghentikan server & mematikan background pipeline...")
+		log.Println("[SHUTDOWN] Stopping server & shutting down background pipeline...")
 	case err := <-listenErr:
 		// Same graceful path as a signal: never os.Exit past live data.
 		log.Printf("[ERROR] Server error: %v", err)
@@ -1922,7 +2092,7 @@ func main() {
 	// by WAL replay on the next start.
 	go func() {
 		<-stopSignal
-		log.Println("[SHUTDOWN] Sinyal kedua diterima; keluar paksa (WAL akan di-replay saat restart).")
+		log.Println("[SHUTDOWN] Second signal received; force exiting (WAL will be replayed on restart).")
 		os.Exit(130)
 	}()
 
@@ -1930,10 +2100,10 @@ func main() {
 	err = server.Shutdown(shutdownCtx, srv)
 	shutdownCancel()
 	if err != nil {
-		log.Printf("[WARN] Shutdown tidak sepenuhnya bersih: %v", err)
+		log.Printf("[WARN] Shutdown was not completely clean: %v", err)
 		exitCode = 1
 	} else {
-		log.Println("[EXIT] AnchorDB Server berhasil dihentikan secara graceful.")
+		log.Println("[EXIT] AnchorDB Server stopped gracefully.")
 	}
 	if exitCode != 0 {
 		os.Exit(exitCode)

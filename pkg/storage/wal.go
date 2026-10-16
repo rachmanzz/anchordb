@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -82,9 +83,23 @@ func OpenWAL(path string) (*WALManager, error) {
 
 // OpenWALWithOptions creates or opens a WAL file with an explicit durability mode.
 func OpenWALWithOptions(path string, opts WALOptions) (*WALManager, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	// O_NOFOLLOW: never follow a symlink that a local attacker may have planted
+	// at the WAL path; the WAL is a sensitive durability artifact.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal %s: %w", path, err)
+	}
+	// A freshly created WAL must be durable (file *and* directory entry) before
+	// any frame is appended, or a crash right after creation can lose the file.
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() == 0 {
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("failed to fsync new wal %s: %w", path, err)
+		}
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("failed to fsync wal directory for %s: %w", path, err)
+		}
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		_ = f.Close()
@@ -102,19 +117,21 @@ func OpenWALWithOptions(path string, opts WALOptions) (*WALManager, error) {
 		}
 		w.stopSync = make(chan struct{})
 		w.syncWg.Add(1)
-		go w.syncLoop()
+		go w.syncLoop(w.stopSync)
 	}
 	return w, nil
 }
 
-// syncLoop periodically fsyncs the WAL when SyncMode == SyncInterval.
-func (w *WALManager) syncLoop() {
+// syncLoop periodically fsyncs the WAL when SyncMode == SyncInterval. The stop
+// channel is passed as an argument (not read from the struct) so Close can
+// detach it under the mutex without racing this goroutine.
+func (w *WALManager) syncLoop(stop <-chan struct{}) {
 	defer w.syncWg.Done()
 	ticker := time.NewTicker(w.syncInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-w.stopSync:
+		case <-stop:
 			return
 		case <-ticker.C:
 			w.mu.Lock()
@@ -127,12 +144,19 @@ func (w *WALManager) syncLoop() {
 }
 
 // Close stops any background sync goroutine, flushes, and closes the WAL file.
+// It is safe to call more than once and concurrently.
 func (w *WALManager) Close() error {
-	if w.stopSync != nil {
-		close(w.stopSync)
+	// Detach the stop channel under the lock so two concurrent Close calls cannot
+	// both observe it as non-nil (which would panic with "close of closed channel").
+	w.mu.Lock()
+	stop := w.stopSync
+	w.stopSync = nil
+	w.mu.Unlock()
+	if stop != nil {
+		close(stop)
 		w.syncWg.Wait()
-		w.stopSync = nil
 	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file != nil {
@@ -145,6 +169,17 @@ func (w *WALManager) Close() error {
 		return err
 	}
 	return nil
+}
+
+// syncDir fsyncs a directory so that file creation/rename entries within it are
+// committed to stable storage.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // CurrentOffset returns the current byte offset of the WAL file.
@@ -515,64 +550,87 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 		return 0, err
 	}
 
-	lastValidOffset := int64(0)
+	count, _, err := w.scanWALLocked(handler, true)
+	if err != nil {
+		return count, err
+	}
+
+	// Seek to end for subsequent writes
+	_, err = w.file.Seek(0, io.SeekEnd)
+	return count, err
+}
+
+// scanWALLocked walks frames from the start of the WAL. It decodes each valid
+// frame and invokes handler (which may be nil). It stops at the first incomplete
+// frame (truncating it only when truncateIncomplete is true) or the first
+// corrupt frame, and returns the number of decoded events plus the offset of the
+// end of the last fully valid frame. Caller must hold w.mu and have positioned
+// the file at the start.
+func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncomplete bool) (count int, lastValidOffset int64, retErr error) {
+	lastValidOffset = 0
 	var hdr [11]byte
 	for {
 		frameOffset, seekErr := w.file.Seek(0, io.SeekCurrent)
 		if seekErr != nil {
-			return count, seekErr
+			return count, lastValidOffset, seekErr
 		}
 		_, err := io.ReadFull(w.file, hdr[:])
 		if err == io.EOF {
 			break
 		}
 		if err == io.ErrUnexpectedEOF {
-			if err := w.truncateReplayTail(lastValidOffset); err != nil {
-				return count, fmt.Errorf("truncate incomplete frame header at %d: %w", frameOffset, err)
+			if truncateIncomplete {
+				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
+					return count, lastValidOffset, fmt.Errorf("truncate incomplete frame header at %d: %w", frameOffset, terr)
+				}
 			}
-			break
+			return count, lastValidOffset, nil
 		}
 		if err != nil {
-			return count, fmt.Errorf("read wal header at %d: %w", frameOffset, err)
+			return count, lastValidOffset, fmt.Errorf("read wal header at %d: %w", frameOffset, err)
 		}
 
 		if hdr[0] != walMagic || hdr[1] == 0 || hdr[1] > walVer {
-			return count, fmt.Errorf("%w: invalid frame header at offset %d", ErrWALCorrupt, frameOffset)
+			return count, lastValidOffset, fmt.Errorf("%w: invalid frame header at offset %d", ErrWALCorrupt, frameOffset)
 		}
 
 		op := hdr[2]
 		payloadLen := binary.LittleEndian.Uint32(hdr[3:7])
 		expectedChecksum := binary.LittleEndian.Uint32(hdr[7:11])
 		if payloadLen > maxWALPayloadSize {
-			return count, fmt.Errorf("%w: frame at offset %d declares payload %d > %d", ErrWALCorrupt, frameOffset, payloadLen, maxWALPayloadSize)
+			return count, lastValidOffset, fmt.Errorf("%w: frame at offset %d declares payload %d > %d", ErrWALCorrupt, frameOffset, payloadLen, maxWALPayloadSize)
 		}
 		// A valid frame cannot exceed the bytes remaining in the WAL. Bound the
 		// allocation before converting the untrusted on-disk length to int.
 		pos, seekErr := w.file.Seek(0, io.SeekCurrent)
 		if seekErr != nil {
-			return count, seekErr
+			return count, lastValidOffset, seekErr
 		}
 		fi, statErr := w.file.Stat()
 		if statErr != nil {
-			return count, statErr
+			return count, lastValidOffset, statErr
 		}
 		if uint64(payloadLen) > uint64(fi.Size()-pos) {
-			if err := w.truncateReplayTail(lastValidOffset); err != nil {
-				return count, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, err)
+			if truncateIncomplete {
+				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
+					return count, lastValidOffset, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, terr)
+				}
 			}
-			break
+			return count, lastValidOffset, nil
 		}
 
 		payload := make([]byte, payloadLen)
 		if _, err := io.ReadFull(w.file, payload); err != nil {
-			if truncErr := w.truncateReplayTail(lastValidOffset); truncErr != nil {
-				return count, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, truncErr)
+			if truncateIncomplete {
+				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
+					return count, lastValidOffset, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, terr)
+				}
 			}
-			break
+			return count, lastValidOffset, nil
 		}
 
 		if crc32.ChecksumIEEE(payload) != expectedChecksum {
-			return count, fmt.Errorf("%w: checksum mismatch at offset %d", ErrWALCorrupt, frameOffset)
+			return count, lastValidOffset, fmt.Errorf("%w: checksum mismatch at offset %d", ErrWALCorrupt, frameOffset)
 		}
 
 		// Decode exactly one known frame. A complete but invalid frame is a hard
@@ -633,7 +691,7 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 					if valid && handler != nil {
 						cr := CompactRecord{Operation: opStatus, Attrs: attrs}
 						if err := handler(WALEvent{Op: op, Name: name, Record: cr}); err != nil {
-							return count, err
+							return count, lastValidOffset, err
 						}
 						count++
 					}
@@ -650,7 +708,7 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 				} else if handler != nil {
 					name := string(payload[2:])
 					if err := handler(WALEvent{Op: op, Name: name}); err != nil {
-						return count, err
+						return count, lastValidOffset, err
 					}
 					count++
 				}
@@ -680,7 +738,7 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 					domainID := binary.LittleEndian.Uint16(payload[offset : offset+2])
 					if handler != nil {
 						if err := handler(WALEvent{Op: op, Word: word, Coord: spatial.Point2D{X: x, Y: y}, Roles: roles, DomainID: domainID}); err != nil {
-							return count, err
+							return count, lastValidOffset, err
 						}
 						count++
 					}
@@ -692,7 +750,7 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 				valid = false
 			} else if handler != nil {
 				if err := handler(WALEvent{Op: op, Edge: edge}); err != nil {
-					return count, err
+					return count, lastValidOffset, err
 				}
 				count++
 			}
@@ -702,7 +760,7 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 				valid = false
 			} else if handler != nil {
 				if err := handler(WALEvent{Op: op, Edge: edge}); err != nil {
-					return count, err
+					return count, lastValidOffset, err
 				}
 				count++
 			}
@@ -710,18 +768,113 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 			valid = false
 		}
 		if !valid {
-			return count, fmt.Errorf("%w: invalid opcode %d or payload at offset %d", ErrWALCorrupt, op, frameOffset)
+			return count, lastValidOffset, fmt.Errorf("%w: invalid opcode %d or payload at offset %d", ErrWALCorrupt, op, frameOffset)
 		}
 		// Only a completely decoded, checksummed frame advances the durable end.
 		lastValidOffset, err = w.file.Seek(0, io.SeekCurrent)
 		if err != nil {
-			return count, err
+			return count, lastValidOffset, err
 		}
 	}
 
-	// Seek to end for subsequent writes
-	_, err := w.file.Seek(0, io.SeekEnd)
-	return count, err
+	return count, lastValidOffset, nil
+}
+
+// WALRepairResult describes what RepairWALFile changed.
+type WALRepairResult struct {
+	// Path is the repaired WAL file.
+	Path string
+	// ValidBytes is the length of the intact prefix that was kept.
+	ValidBytes int64
+	// DiscardedBytes is the number of bytes removed from the tail (0 if healthy).
+	DiscardedBytes int64
+	// BackupPath is where the discarded tail was copied for forensics, if any.
+	BackupPath string
+	// Repaired reports whether the file was modified.
+	Repaired bool
+}
+
+// RepairWALFile scans a WAL file and truncates it at the end of the last fully
+// valid frame when a corrupt or incomplete frame is found, first copying the
+// discarded suffix to a "<path>.corrupt-<timestamp>" backup. A healthy WAL is
+// left untouched. Use this to recover a database whose Open previously failed
+// with ErrWALCorrupt, then retry Open.
+func RepairWALFile(path string) (*WALRepairResult, error) {
+	w, err := OpenWALWithOptions(path, WALOptions{SyncMode: SyncNone})
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+	return w.Repair()
+}
+
+// Repair performs the scan/truncate described by RepairWALFile on an open WAL.
+func (w *WALManager) Repair() (*WALRepairResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil, fmt.Errorf("wal file is closed")
+	}
+	fi, err := w.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := fi.Size()
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	_, validEnd, scanErr := w.scanWALLocked(nil, false)
+
+	res := &WALRepairResult{Path: w.path, ValidBytes: validEnd}
+	if validEnd >= size {
+		// Nothing recoverable was lost; the file is healthy (or empty).
+		w.corrupt = false
+		if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+			return nil, err
+		}
+		return res, scanErr
+	}
+
+	// Preserve the bad suffix for forensics before discarding it.
+	backup := fmt.Sprintf("%s.corrupt-%s", w.path, time.Now().UTC().Format("20060102T150405"))
+	if err := copyFileRange(w.file, backup, validEnd, size-validEnd); err != nil {
+		return nil, fmt.Errorf("wal repair: backup corrupt tail: %w", err)
+	}
+	res.BackupPath = backup
+	res.DiscardedBytes = size - validEnd
+
+	if err := w.file.Truncate(validEnd); err != nil {
+		return nil, fmt.Errorf("wal repair: truncate wal: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return nil, fmt.Errorf("wal repair: sync wal: %w", err)
+	}
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		return nil, err
+	}
+	w.corrupt = false
+	res.Repaired = true
+	return res, nil
+}
+
+// copyFileRange copies [off, off+n) of src into a new file at dstPath.
+func copyFileRange(src *os.File, dstPath string, off, n int64) error {
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, io.NewSectionReader(src, off, n)); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(dstPath))
 }
 
 // Replay is the legacy recovery callback. It keeps its original signature for

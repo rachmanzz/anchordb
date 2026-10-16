@@ -14,9 +14,9 @@ var ErrPartitionConflict = errors.New("partition records changed before archival
 
 // PartitionPolicy defines rules for archiving and partitioning historical records
 type PartitionPolicy struct {
-	ModelName     string        // e.g. "logs" or "transaksi"
-	DateField     string        // e.g. "tanggal" or "timestamp"
-	RetentionDays float32       // e.g. 180 (6 bulan)
+	ModelName     string        // e.g. "logs" or "transactions"
+	DateField     string        // e.g. "date" or "timestamp"
+	RetentionDays float32       // e.g. 180 (6 months)
 	Sink          PartitionSink // LocalDiskSink or S3Sink
 	FileFormat    string        // e.g. "{date}_{uuid}.anchordb"
 	PruneHotDB    bool          // If true, deletes archived records from active hot database
@@ -37,10 +37,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	t0 := time.Now()
 
 	if policy.DateField == "" {
-		policy.DateField = "tanggal"
+		policy.DateField = "date"
 	}
 	if policy.RetentionDays <= 0 {
-		policy.RetentionDays = 180 // Default 6 bulan
+		policy.RetentionDays = 180 // Default 6 months
 	}
 	if policy.Sink == nil {
 		policy.Sink = NewLocalDiskSink("./data/partitions")
@@ -113,14 +113,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 	_ = partDB.Close()
 
-	// 5. Read binary partition file data
-	data, err := os.ReadFile(tempDBPath)
-	if err != nil {
-		return nil, rollback(fmt.Errorf("failed reading partition file data: %w", err))
-	}
-
-	// 6. Write to sink (Local directory or S3)
-	targetLoc, err := policy.Sink.SavePartition(partitionFilename, data)
+	// 5. Hand the partition file straight to the sink. Streaming from disk means
+	//    a large archive is never buffered entirely in memory (OOM risk). The
+	//    temp file lives until the deferred RemoveAll above runs.
+	targetLoc, err := policy.Sink.SavePartitionFromFile(partitionFilename, tempDBPath)
 	if err != nil {
 		return nil, rollback(fmt.Errorf("failed saving to sink %s: %w", policy.Sink.Name(), err))
 	}

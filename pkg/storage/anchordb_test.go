@@ -33,19 +33,19 @@ func TestAnchorDB_CreateAndQuery(t *testing.T) {
 	}
 
 	// Seed nodes
-	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
-	_, _ = db.AppendNode("sekolah", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}, 1)
-	_, _ = db.AppendNode("belajar", spatial.Point2D{X: 0.2, Y: -0.7}, [4]float32{0.2, 0.9, 0.5, 0.1}, 1)
+	_, _ = db.AppendNode("primary_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db.AppendNode("backup_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db.AppendNode("load_balancer", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
+	_, _ = db.AppendNode("service_mesh", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}, 1)
+	_, _ = db.AppendNode("database_cluster", spatial.Point2D{X: 0.2, Y: -0.7}, [4]float32{0.2, 0.9, 0.5, 0.1}, 1)
 
 	// Sync to disk
 	if err := db.Sync(); err != nil {
 		t.Fatalf("failed to sync db: %v", err)
 	}
 
-	// In-Storage Computational Query: ibu + ayah -> anak
-	results, anchor, err := db.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
+	// In-Storage Computational Query: primary_cluster + backup_cluster -> load_balancer
+	results, anchor, err := db.ExecuteGraphStep([]string{"primary_cluster", "backup_cluster"}, "test-down", 5)
 	if err != nil {
 		t.Fatalf("ExecuteGraphStep failed: %v", err)
 	}
@@ -54,8 +54,8 @@ func TestAnchorDB_CreateAndQuery(t *testing.T) {
 		t.Logf("Candidate [%d]: %s, Score: %f, t: %f, distSq: %f", i, res.Word, res.Score, res.T, res.DistSqPerp)
 	}
 
-	if results[0].Word != "anak" {
-		t.Fatalf("expected top result 'anak', got %q", results[0].Word)
+	if results[0].Word != "load_balancer" {
+		t.Fatalf("expected top result 'load_balancer', got %q", results[0].Word)
 	}
 
 	t.Logf("Anchor: (%.2f, %.2f), Top-1: %s (Score: %.4f, t: %.2f)",
@@ -76,9 +76,9 @@ func BenchmarkAnchorDB_ConstantTime_Scale(b *testing.B) {
 	}
 
 	// Seed key nodes
-	_, _ = db.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
+	_, _ = db.AppendNode("primary_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db.AppendNode("backup_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db.AppendNode("load_balancer", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
 
 	// Populate 50,000 synthetic random nodes across the spatial manifold
 	rng := rand.New(rand.NewSource(42))
@@ -94,7 +94,7 @@ func BenchmarkAnchorDB_ConstantTime_Scale(b *testing.B) {
 
 	_ = db.Sync()
 
-	inputs := []string{"ibu", "ayah"}
+	inputs := []string{"primary_cluster", "backup_cluster"}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -118,13 +118,13 @@ func TestAnchorDB_DiskPersistence(t *testing.T) {
 		t.Fatalf("failed to open anchordb: %v", err)
 	}
 
-	_ = db.SaveRecord("trip_jakarta_bandung", map[string]float32{
-		"jarak": 150.0,
-		"waktu": 2.5,
+	_ = db.SaveRecord("route_alpha", map[string]float32{
+		"distance": 150.0,
+		"duration": 2.5,
 	})
-	_ = db.SaveRecord("trip_jakarta_surabaya", map[string]float32{
-		"jarak": 780.0,
-		"waktu": 10.0,
+	_ = db.SaveRecord("route_beta", map[string]float32{
+		"distance": 780.0,
+		"duration": 10.0,
 	})
 
 	if err := db.Sync(); err != nil {
@@ -147,18 +147,18 @@ func TestAnchorDB_DiskPersistence(t *testing.T) {
 	}
 
 	// 3. Verify in-storage compute on restored data (GETTING + CALCULATING)
-	computed, err := db2.GetRecordWithCompute("trip_jakarta_bandung", map[string]ComputeOp{
-		"kecepatan": OpDivide{FieldA: "jarak", FieldB: "waktu"},
+	computed, err := db2.GetRecordWithCompute("route_alpha", map[string]ComputeOp{
+		"speed": OpDivide{FieldA: "distance", FieldB: "duration"},
 	})
 	if err != nil {
 		t.Fatalf("GetRecordWithCompute failed: %v", err)
 	}
 
-	if computed["jarak"] != 150.0 || computed["waktu"] != 2.5 || computed["kecepatan"] != 60.0 {
+	if computed["distance"] != 150.0 || computed["duration"] != 2.5 || computed["speed"] != 60.0 {
 		t.Fatalf("unexpected computed values: %v", computed)
 	}
-	t.Logf("Persisted data successfully restored & computed: jarak=%.1f, waktu=%.1f, kecepatan=%.1f",
-		computed["jarak"], computed["waktu"], computed["kecepatan"])
+	t.Logf("Persisted data successfully restored & computed: distance=%.1f, duration=%.1f, speed=%.1f",
+		computed["distance"], computed["duration"], computed["speed"])
 }
 
 func TestAnchorDB_ConstantTimePaging_100k(t *testing.T) {
@@ -236,9 +236,9 @@ func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	_, _ = db1.AppendNode("ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db1.AppendNode("ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
-	_, _ = db1.AppendNode("anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
+	_, _ = db1.AppendNode("primary_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db1.AppendNode("backup_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}, 1)
+	_, _ = db1.AppendNode("load_balancer", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}, 1)
 
 	if err := db1.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
@@ -255,28 +255,28 @@ func TestReopen_GraphQuery_PreservesWords(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// CRITICAL CHECK: ExecuteGraphStep must return non-empty word string "anak", not ""!
-	results, _, err := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
+	// CRITICAL CHECK: ExecuteGraphStep must return non-empty word string "load_balancer", not ""!
+	results, _, err := db2.ExecuteGraphStep([]string{"primary_cluster", "backup_cluster"}, "test-down", 5)
 	if err != nil {
 		t.Fatalf("ExecuteGraphStep after reopen failed: %v", err)
 	}
 	if len(results) == 0 {
 		t.Fatalf("expected at least 1 result after reopen, got 0")
 	}
-	if results[0].Word != "anak" {
-		t.Fatalf("CRITICAL BUG: word lost after reopen! expected 'anak', got %q", results[0].Word)
+	if results[0].Word != "load_balancer" {
+		t.Fatalf("CRITICAL BUG: word lost after reopen! expected 'load_balancer', got %q", results[0].Word)
 	}
 	t.Logf("[OK] Reopen graph query succeeded! Top-1 word preserved: %q (Score: %f)", results[0].Word, results[0].Score)
 
 	// Phase 3: Append new node to reopened DB and sync again
-	_, _ = db2.AppendNode("sekolah", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}, 1)
+	_, _ = db2.AppendNode("service_mesh", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}, 1)
 	if err := db2.Sync(); err != nil {
 		t.Fatalf("Sync after append on reopened db failed: %v", err)
 	}
 
 	// Verify all words still intact
-	resAfterAppend, _, _ := db2.ExecuteGraphStep([]string{"ibu", "ayah"}, "test-down", 5)
-	if len(resAfterAppend) == 0 || resAfterAppend[0].Word != "anak" {
+	resAfterAppend, _, _ := db2.ExecuteGraphStep([]string{"primary_cluster", "backup_cluster"}, "test-down", 5)
+	if len(resAfterAppend) == 0 || resAfterAppend[0].Word != "load_balancer" {
 		t.Fatalf("Word corrupted after appending to reopened db! got %q", resAfterAppend[0].Word)
 	}
 	t.Logf("[OK] String pool remains intact after subsequent append + sync on reopened db!")
@@ -299,9 +299,9 @@ func TestCompactRecord_MemoryFootprint(t *testing.T) {
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("vehicle_%d", i)
 		_ = db.SaveRecord(name, map[string]float32{
-			"jarak":   float32(100 + i),
-			"waktu":   2.5,
-			"tanggal": 20740, // 2026-10-14
+			"distance": float32(100 + i),
+			"duration": 2.5,
+			"date":     20740, // 2026-10-14
 		})
 	}
 
@@ -326,19 +326,19 @@ func TestCompactRecord_MemoryFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get vehicle_500: %v", err)
 	}
-	if v500["jarak"] != 600 || v500["waktu"] != 2.5 {
+	if v500["distance"] != 600 || v500["duration"] != 2.5 {
 		t.Fatalf("data mismatch: got %v", v500)
 	}
 
 	// Verify fast projected query
 	items, _, err := reopened.ListRecordsWithPaging(QueryOptions{
-		Select: []string{"jarak"},
+		Select: []string{"distance"},
 		Limit:  10,
 	})
 	if err != nil || len(items) != 10 {
 		t.Fatalf("paging failed: items=%d, err=%v", len(items), err)
 	}
-	if items[0].Props["jarak"] != 100 || len(items[0].Props) != 1 {
+	if items[0].Props["distance"] != 100 || len(items[0].Props) != 1 {
 		t.Fatalf("projection failed: %v", items[0].Props)
 	}
 
@@ -743,7 +743,7 @@ func TestRelationsAreValidatedAndUnknownRelationRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, exists := db.Relation("keturunan"); exists {
+	if _, exists := db.Relation("dependency"); exists {
 		t.Fatal("core database must not install domain-specific relation defaults")
 	}
 	if err := db.SetRelation("custom", spatial.Point2D{X: 1}); err != nil {

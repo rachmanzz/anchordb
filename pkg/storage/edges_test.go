@@ -18,48 +18,50 @@ func TestEdgeAddQueryReplaceRemove(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.AddEdge("harga_cabai", "sebab", "inflasi_pangan", 0.8); err != nil {
+	// A rational causal graph: a crop failure and a fuel price rise both cause
+	// food inflation, and a crop failure can also trigger a food crisis.
+	if err := db.AddEdge("crop_failure", "causes", "food_inflation", 0.8); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("gagal_panen", "sebab", "inflasi_pangan", 0.5); err != nil {
+	if err := db.AddEdge("fuel_price_rise", "causes", "food_inflation", 0.5); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("harga_cabai", "akibat", "gagal_panen", 0.3); err != nil {
+	if err := db.AddEdge("crop_failure", "triggers", "food_crisis", 0.3); err != nil {
 		t.Fatal(err)
 	}
 
 	// Idempotent replace: same (source, relation, target) updates weight in place.
-	if err := db.AddEdge("harga_cabai", "sebab", "inflasi_pangan", 0.95); err != nil {
+	if err := db.AddEdge("crop_failure", "causes", "food_inflation", 0.95); err != nil {
 		t.Fatal(err)
 	}
 	if got := db.EdgeCount(); got != 3 {
 		t.Fatalf("EdgeCount = %d, want 3", got)
 	}
 
-	out := db.OutgoingEdges("harga_cabai", "")
+	out := db.OutgoingEdges("crop_failure", "")
 	if len(out) != 2 {
 		t.Fatalf("outgoing all = %d, want 2", len(out))
 	}
-	outSebab := db.OutgoingEdges("harga_cabai", "sebab")
-	if len(outSebab) != 1 || outSebab[0].Weight != 0.95 || outSebab[0].Target != "inflasi_pangan" {
-		t.Fatalf("outgoing sebab = %+v", outSebab)
+	outCauses := db.OutgoingEdges("crop_failure", "causes")
+	if len(outCauses) != 1 || outCauses[0].Weight != 0.95 || outCauses[0].Target != "food_inflation" {
+		t.Fatalf("outgoing causes = %+v", outCauses)
 	}
 
-	in := db.IncomingEdges("inflasi_pangan", "")
+	in := db.IncomingEdges("food_inflation", "")
 	if len(in) != 2 {
 		t.Fatalf("incoming = %d, want 2", len(in))
 	}
 
-	if err := db.RemoveEdge("harga_cabai", "sebab", "inflasi_pangan"); err != nil {
+	if err := db.RemoveEdge("crop_failure", "causes", "food_inflation"); err != nil {
 		t.Fatal(err)
 	}
 	if got := db.EdgeCount(); got != 2 {
 		t.Fatalf("EdgeCount after remove = %d, want 2", got)
 	}
-	if got := db.OutgoingEdges("harga_cabai", "sebab"); len(got) != 0 {
+	if got := db.OutgoingEdges("crop_failure", "causes"); len(got) != 0 {
 		t.Fatalf("removed edge still visible: %+v", got)
 	}
-	if err := db.RemoveEdge("harga_cabai", "sebab", "inflasi_pangan"); err == nil {
+	if err := db.RemoveEdge("crop_failure", "causes", "food_inflation"); err == nil {
 		t.Fatal("expected error removing missing edge")
 	}
 }
@@ -71,19 +73,19 @@ func TestEdgeValidation(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.AddEdge("", "sebab", "x", 1); err == nil {
+	if err := db.AddEdge("", "causes", "x", 1); err == nil {
 		t.Fatal("expected empty source error")
 	}
 	if err := db.AddEdge("a", "", "x", 1); err == nil {
 		t.Fatal("expected empty relation error")
 	}
-	if err := db.AddEdge("a", "sebab", "", 1); err == nil {
+	if err := db.AddEdge("a", "causes", "", 1); err == nil {
 		t.Fatal("expected empty target error")
 	}
-	if err := db.AddEdge("a", "sebab", "x", float32(math.NaN())); err == nil {
+	if err := db.AddEdge("a", "causes", "x", float32(math.NaN())); err == nil {
 		t.Fatal("expected NaN weight error")
 	}
-	if err := db.AddEdge("a", "sebab", "x", float32(math.Inf(1))); err == nil {
+	if err := db.AddEdge("a", "causes", "x", float32(math.Inf(1))); err == nil {
 		t.Fatal("expected Inf weight error")
 	}
 }
@@ -97,10 +99,10 @@ func TestEdgePersistenceAcrossSyncReopen(t *testing.T) {
 	if _, err := db.AppendNode("a", spatial.Point2D{}, [4]float32{}, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("a", "sebab", "b", 0.7); err != nil {
+	if err := db.AddEdge("a", "causes", "b", 0.7); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("b", "sebab", "c", 0.4); err != nil {
+	if err := db.AddEdge("b", "causes", "c", 0.4); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(); err != nil {
@@ -121,7 +123,7 @@ func TestEdgePersistenceAcrossSyncReopen(t *testing.T) {
 	if got := reopened.EdgeCount(); got != 2 {
 		t.Fatalf("EdgeCount after reopen = %d, want 2", got)
 	}
-	if got := reopened.OutgoingEdges("a", "sebab"); len(got) != 1 || got[0].Target != "b" || got[0].Weight != 0.7 {
+	if got := reopened.OutgoingEdges("a", "causes"); len(got) != 1 || got[0].Target != "b" || got[0].Weight != 0.7 {
 		t.Fatalf("edge a->b lost: %+v", got)
 	}
 }
@@ -132,10 +134,10 @@ func TestEdgeWALRecoveryWithoutSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("x", "sebab", "y", 0.6); err != nil {
+	if err := db.AddEdge("x", "causes", "y", 0.6); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("z", "sebab", "y", 0.2); err != nil {
+	if err := db.AddEdge("z", "causes", "y", 0.2); err != nil {
 		t.Fatal(err)
 	}
 	// Close WITHOUT Sync: recovery must come from WAL replay alone.
@@ -151,7 +153,7 @@ func TestEdgeWALRecoveryWithoutSync(t *testing.T) {
 	if got := reopened.EdgeCount(); got != 2 {
 		t.Fatalf("EdgeCount from WAL = %d, want 2", got)
 	}
-	if got := reopened.IncomingEdges("y", "sebab"); len(got) != 2 {
+	if got := reopened.IncomingEdges("y", "causes"); len(got) != 2 {
 		t.Fatalf("incoming y from WAL = %d, want 2", len(got))
 	}
 }
@@ -162,13 +164,13 @@ func TestEdgeRemovalPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("a", "sebab", "b", 1); err != nil {
+	if err := db.AddEdge("a", "causes", "b", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("a", "sebab", "c", 1); err != nil {
+	if err := db.AddEdge("a", "causes", "c", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RemoveEdge("a", "sebab", "b"); err != nil {
+	if err := db.RemoveEdge("a", "causes", "b"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(); err != nil {
@@ -183,7 +185,7 @@ func TestEdgeRemovalPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	out := reopened.OutgoingEdges("a", "sebab")
+	out := reopened.OutgoingEdges("a", "causes")
 	if len(out) != 1 || out[0].Target != "c" {
 		t.Fatalf("after reopen outgoing = %+v, want only a->c", out)
 	}
@@ -197,10 +199,10 @@ func TestEdgeClosedDatabase(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddEdge("a", "sebab", "b", 1); !errors.Is(err, ErrDatabaseClosed) {
+	if err := db.AddEdge("a", "causes", "b", 1); !errors.Is(err, ErrDatabaseClosed) {
 		t.Fatalf("AddEdge on closed db = %v, want ErrDatabaseClosed", err)
 	}
-	if err := db.RemoveEdge("a", "sebab", "b"); !errors.Is(err, ErrDatabaseClosed) {
+	if err := db.RemoveEdge("a", "causes", "b"); !errors.Is(err, ErrDatabaseClosed) {
 		t.Fatalf("RemoveEdge on closed db = %v, want ErrDatabaseClosed", err)
 	}
 }
@@ -212,44 +214,45 @@ func TestExecuteCausalStepAndChain(t *testing.T) {
 	}
 	defer db.Close()
 
-	// cabai -> inflasi (0.9); gagal_panen -> inflasi (0.4); inflasi -> krisis (0.7)
+	// crop_failure -> food_inflation (0.9); fuel_price_rise -> food_inflation (0.4);
+	// food_inflation -> food_crisis (0.7).
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	must(db.AddEdge("cabai", "sebab", "inflasi", 0.9))
-	must(db.AddEdge("gagal_panen", "sebab", "inflasi", 0.4))
-	must(db.AddEdge("inflasi", "sebab", "krisis", 0.7))
+	must(db.AddEdge("crop_failure", "causes", "food_inflation", 0.9))
+	must(db.AddEdge("fuel_price_rise", "causes", "food_inflation", 0.4))
+	must(db.AddEdge("food_inflation", "causes", "food_crisis", 0.7))
 
-	step, err := db.ExecuteCausalStep(context.Background(), []string{"cabai", "gagal_panen"}, "sebab", 10)
+	step, err := db.ExecuteCausalStep(context.Background(), []string{"crop_failure", "fuel_price_rise"}, "causes", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(step) != 1 || step[0].Word != "inflasi" {
-		t.Fatalf("causal step = %+v, want [inflasi]", step)
+	if len(step) != 1 || step[0].Word != "food_inflation" {
+		t.Fatalf("causal step = %+v, want [food_inflation]", step)
 	}
 	// Duplicate target collapses to the highest-weight incoming edge (0.9).
 	if step[0].Score != 0.9 {
 		t.Fatalf("collapsed score = %v, want 0.9", step[0].Score)
 	}
 
-	chain, err := db.ExecuteCausalChain(context.Background(), []string{"cabai"}, []string{"sebab", "sebab"}, 10)
+	chain, err := db.ExecuteCausalChain(context.Background(), []string{"crop_failure"}, []string{"causes", "causes"}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chain) != 1 || chain[0].Word != "krisis" {
-		t.Fatalf("causal chain = %+v, want [krisis]", chain)
+	if len(chain) != 1 || chain[0].Word != "food_crisis" {
+		t.Fatalf("causal chain = %+v, want [food_crisis]", chain)
 	}
 	if math.Abs(float64(chain[0].Score)-0.63) > 1e-6 {
 		t.Fatalf("chain score = %v, want 0.63", chain[0].Score)
 	}
 
-	if _, err := db.ExecuteCausalStep(context.Background(), []string{"cabai"}, "sebab", -1); err == nil {
+	if _, err := db.ExecuteCausalStep(context.Background(), []string{"crop_failure"}, "causes", -1); err == nil {
 		t.Fatal("expected negative limitK error")
 	}
-	if _, err := db.ExecuteCausalStep(context.Background(), []string{"cabai"}, "", 10); err == nil {
+	if _, err := db.ExecuteCausalStep(context.Background(), []string{"crop_failure"}, "", 10); err == nil {
 		t.Fatal("expected empty relation error")
 	}
 }
@@ -264,7 +267,7 @@ func TestLegacyReplayIgnoresEdges(t *testing.T) {
 	if err := wal.WriteSave("saved", CompactRecord{Operation: OpStatusActive}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wal.WriteEdge("a", "sebab", "b", 0.5); err != nil {
+	if err := wal.WriteEdge("a", "causes", "b", 0.5); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,7 +332,7 @@ func TestOpenLegacyVersion2File(t *testing.T) {
 		t.Fatalf("legacy file should have 0 edges, got %d", got)
 	}
 	// New edges can be added to an upgraded file and persisted.
-	if err := db.AddEdge("a", "sebab", "b", 1); err != nil {
+	if err := db.AddEdge("a", "causes", "b", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(); err != nil {

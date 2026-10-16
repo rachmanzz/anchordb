@@ -29,8 +29,9 @@ func ParseMemoryBytes(s string) (int64, error) {
 		return 0, fmt.Errorf("empty memory limit string")
 	}
 
-	// Multipliers (powers of 1024 as per IEC/standard systems practice for RAM)
-	var multiplier int64 = 1
+	// Multipliers (powers of 1024 as per IEC/standard systems practice for RAM).
+	// Every branch below assigns it before use.
+	var multiplier int64
 	var numStr string
 
 	if strings.HasSuffix(s, "TIB") || strings.HasSuffix(s, "TB") {

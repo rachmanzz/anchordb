@@ -349,7 +349,7 @@ func (p *Pool) checkMemory() error {
 // that ignored cancellation) is refused to avoid overlapping workers.
 func (p *Pool) Start() {
 	if !p.cfg.Enabled {
-		log.Println("[WORKER] Worker pool dinonaktifkan oleh konfigurasi.")
+		log.Println("[WORKER] Worker pool disabled by configuration.")
 		return
 	}
 	p.lifecycleMu.Lock()
@@ -359,7 +359,7 @@ func (p *Pool) Start() {
 	}
 	if p.stopped.Load() {
 		if p.forced.Load() {
-			log.Println("[WORKER] Tidak bisa restart setelah shutdown paksa (task bandel masih berjalan).")
+			log.Println("[WORKER] Cannot restart after forced shutdown (stubborn task still running).")
 			return
 		}
 		p.chanMu.Lock()
@@ -382,7 +382,7 @@ func (p *Pool) Start() {
 		p.wg.Add(1)
 		go p.workerLoop(taskCh, quitCh)
 	}
-	log.Printf("[WORKER] Worker pool aktif dengan %d goroutine pekerja (antrean: %d)",
+	log.Printf("[WORKER] Worker pool active with %d worker goroutines (queue: %d)",
 		p.cfg.Concurrency, p.cfg.QueueSize)
 }
 
@@ -436,7 +436,7 @@ func (p *Pool) executeJob(t Task, quitCh <-chan struct{}) {
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUKSES (attempt %d/%d, durasi: %v)", t.Name, i+1, attempts, time.Since(start))
+			log.Printf("[WORKER] Task %q SUCCEEDED (attempt %d/%d, duration: %v)", t.Name, i+1, attempts, time.Since(start))
 			return
 		}
 
@@ -462,7 +462,7 @@ func (p *Pool) executeJob(t Task, quitCh <-chan struct{}) {
 				case <-timer.C:
 				}
 			}
-			log.Printf("[WORKER] Task %q GAGAL (attempt %d/%d): %v; retry...", t.Name, i+1, attempts, err)
+			log.Printf("[WORKER] Task %q FAILED (attempt %d/%d): %v; retrying...", t.Name, i+1, attempts, err)
 			continue
 		}
 		break
@@ -496,7 +496,7 @@ FINAL:
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUKSES via FALLBACK (durasi: %v)", t.Name, time.Since(start))
+			log.Printf("[WORKER] Task %q SUCCEEDED via FALLBACK (duration: %v)", t.Name, time.Since(start))
 			return
 		}
 		finalErr = fbErr
@@ -513,7 +513,7 @@ FINAL:
 			t.OnError(ctx, finalErr)
 		}()
 	}
-	log.Printf("[WORKER] Task %q GAGAL (all attempts): %v (durasi: %v)", t.Name, finalErr, time.Since(start))
+	log.Printf("[WORKER] Task %q FAILED (all attempts): %v (duration: %v)", t.Name, finalErr, time.Since(start))
 }
 
 // Dispatch submits an async task to the worker pool. If pool is disabled or not running, runs synchronously.
@@ -644,7 +644,7 @@ func (p *Pool) executeJobSync(t Task) {
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUKSES (sync, attempt %d/%d, durasi: %v)", t.Name, i+1, attempts, time.Since(start))
+			log.Printf("[WORKER] Task %q SUCCEEDED (sync, attempt %d/%d, duration: %v)", t.Name, i+1, attempts, time.Since(start))
 			return
 		}
 		lastErr = err
@@ -665,7 +665,7 @@ func (p *Pool) executeJobSync(t Task) {
 				case <-timer.C:
 				}
 			}
-			log.Printf("[WORKER] Task %q GAGAL (sync, attempt %d/%d): %v; retry...", t.Name, i+1, attempts, err)
+			log.Printf("[WORKER] Task %q FAILED (sync, attempt %d/%d): %v; retrying...", t.Name, i+1, attempts, err)
 			continue
 		}
 		break
@@ -698,7 +698,7 @@ FINALSYNC:
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUKSES via FALLBACK (sync, durasi: %v)", t.Name, time.Since(start))
+			log.Printf("[WORKER] Task %q SUCCEEDED via FALLBACK (sync, duration: %v)", t.Name, time.Since(start))
 			return
 		}
 		finalErr = fbErr
@@ -714,7 +714,7 @@ FINALSYNC:
 			t.OnError(ctx, finalErr)
 		}()
 	}
-	log.Printf("[WORKER] Task %q GAGAL (sync, all attempts): %v (durasi: %v)", t.Name, finalErr, time.Since(start))
+	log.Printf("[WORKER] Task %q FAILED (sync, all attempts): %v (duration: %v)", t.Name, finalErr, time.Since(start))
 }
 
 // Stats returns a telemetry snapshot of the worker pool
@@ -732,10 +732,7 @@ func (p *Pool) Stats() PoolStats {
 	}
 
 	usage, source := processMemoryUsage()
-	pressure := false
-	if limit > 0 && int64(usage) >= int64(thresh) {
-		pressure = true
-	}
+	pressure := limit > 0 && int64(usage) >= int64(thresh)
 
 	return PoolStats{
 		Enabled:        p.cfg.Enabled,
@@ -903,7 +900,7 @@ func (p *Pool) reportCanceled(t Task) {
 			t.OnError(ctx, ErrCanceled)
 		}()
 	}
-	log.Printf("[WORKER] Task %q DIBATALKAN sebelum eksekusi (antrean dibersihkan).", t.Name)
+	log.Printf("[WORKER] Task %q CANCELED before execution (queue cleared).", t.Name)
 }
 
 // Shutdown gracefully drains the queue and stops the pool. It first stops
@@ -920,7 +917,7 @@ func (p *Pool) Shutdown() error {
 	if !p.running.CompareAndSwap(true, false) {
 		return nil
 	}
-	log.Println("[WORKER] Menghentikan worker pool...")
+	log.Println("[WORKER] Stopping worker pool...")
 	p.draining.Store(true)
 
 	// Close the task channel: workers finish buffered jobs, then exit on !ok.
@@ -941,7 +938,7 @@ func (p *Pool) Shutdown() error {
 	case <-done:
 		p.stopped.Store(true)
 		p.forced.Store(false)
-		log.Println("[WORKER] Worker pool berhasil dihentikan secara bersih (antrean ter-drain).")
+		log.Println("[WORKER] Worker pool stopped cleanly (queue drained).")
 		return nil
 	case <-time.After(p.cfg.ShutdownTimeout):
 		// Force workers out (abort retry backoff / unblock workerLoop selects).
@@ -956,12 +953,12 @@ func (p *Pool) Shutdown() error {
 		case <-done:
 			p.stopped.Store(true)
 			p.forced.Store(false)
-			log.Println("[WORKER] Shutdown selesai setelah sinyal paksa (sebagian task mungkin terpotong).")
+			log.Println("[WORKER] Shutdown finished after forced signal (some tasks may be truncated).")
 			return nil
 		case <-time.After(p.cfg.ShutdownTimeout):
 			p.stopped.Store(true)
 			p.forced.Store(true)
-			log.Println("[WORKER] Shutdown melebihi batas waktu; ada task yang mengabaikan pembatalan. Pool ditandai berhenti paksa.")
+			log.Println("[WORKER] Shutdown exceeded timeout; a task ignored cancellation. Pool marked forcibly stopped.")
 			return ErrShutdownTimeout
 		}
 	}

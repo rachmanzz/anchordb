@@ -45,8 +45,11 @@ func createFastTestServer(t *testing.T) (*Server, string) {
 func TestRateLimiterTokenBucket(t *testing.T) {
 	rl := newRateLimiter(0.0001, 2) // effectively no refill within the test
 
-	if !rl.allow("a") || !rl.allow("a") {
-		t.Fatal("expected first two requests to be allowed (burst=2)")
+	if !rl.allow("a") {
+		t.Fatal("expected first request to be allowed (burst=2)")
+	}
+	if !rl.allow("a") {
+		t.Fatal("expected second request to be allowed (burst=2)")
 	}
 	if rl.allow("a") {
 		t.Fatal("expected third request to be rejected")

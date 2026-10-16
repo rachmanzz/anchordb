@@ -20,6 +20,6 @@ data/partitions/
 .DS_Store
 Thumbs.db
 
-# Local knowledge base (semua isi diabaikan tanpa kecuali)
+# Local knowledge base (all contents ignored without exception)
 .knowledges/
 .knowledges/**

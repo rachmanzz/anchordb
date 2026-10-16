@@ -21,32 +21,32 @@ func main() {
 	dbFile := filepath.Join("data", "world.anchordb")
 	_ = os.Remove(dbFile) // Start fresh for demo
 
-	// 1. Membuka koneksi via Dedicated Driver SDK
+	// 1. Open connection via Dedicated Driver SDK
 	t0 := time.Now()
 	client, err := driver.Connect("anchordb://" + dbFile + "?mode=mmap")
 	if err != nil {
-		log.Fatalf("Gagal menghubungkan ke AnchorDB: %v", err)
+		log.Fatalf("Failed to connect to AnchorDB: %v", err)
 	}
 	defer client.Close()
-	fmt.Printf("[OK] Terhubung ke AnchorDB via Driver dalam %v (mmap zero-copy)\n", time.Since(t0))
+	fmt.Printf("[OK] Connected to AnchorDB via Driver in %v (mmap zero-copy)\n", time.Since(t0))
 
-	// 2. Populasi Node Awal ke File Biner (Fixed-Size 40 Bytes / Node)
+	// 2. Populate initial nodes into binary storage (Fixed-size 40 bytes / node)
 	db := client.DB()
 	nodes := []struct {
 		word  string
 		coord spatial.Point2D
 		roles [4]float32
 	}{
-		{"ibu", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
-		{"ayah", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
-		{"anak", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}},
-		{"sekolah", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}},
-		{"belajar", spatial.Point2D{X: 0.2, Y: -0.7}, [4]float32{0.2, 0.9, 0.5, 0.1}},
-		{"buku", spatial.Point2D{X: 0.6, Y: -0.7}, [4]float32{0.1, 0.1, 0.9, 0.2}},
-		{"pintar", spatial.Point2D{X: 0.8, Y: -0.9}, [4]float32{0.2, 0.1, 0.95, 0.4}},
-		{"air", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.8, 0.1, 0.2, 0.1}},
-		{"dingin", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.1, 0.1, 0.2, 0.9}},
-		{"es", spatial.Point2D{X: -0.5, Y: -0.2}, [4]float32{0.2, 0.1, 0.95, 0.3}},
+		{"primary_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
+		{"backup_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
+		{"load_balancer", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}},
+		{"service_mesh", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}},
+		{"database_cluster", spatial.Point2D{X: 0.2, Y: -0.7}, [4]float32{0.2, 0.9, 0.5, 0.1}},
+		{"cache_layer", spatial.Point2D{X: 0.6, Y: -0.7}, [4]float32{0.1, 0.1, 0.9, 0.2}},
+		{"analytics_engine", spatial.Point2D{X: 0.8, Y: -0.9}, [4]float32{0.2, 0.1, 0.95, 0.4}},
+		{"edge_gateway", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.8, 0.1, 0.2, 0.1}},
+		{"waf_service", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.1, 0.1, 0.2, 0.9}},
+		{"dns_resolver", spatial.Point2D{X: -0.5, Y: -0.2}, [4]float32{0.2, 0.1, 0.95, 0.3}},
 	}
 
 	for _, n := range nodes {
@@ -54,150 +54,150 @@ func main() {
 			log.Fatalf("failed to append node %q: %v", n.word, err)
 		}
 	}
-	if err := db.SetRelation("demo-down", spatial.Point2D{Y: -1}); err != nil {
+	if err := db.SetRelation("route-down", spatial.Point2D{Y: -1}); err != nil {
 		log.Fatalf("failed to configure demo relation: %v", err)
 	}
 	_ = db.Sync()
 
 	fi, _ := os.Stat(dbFile)
-	fmt.Printf("[OK] File Biner .anchordb tersimpan: %d bytes (Ukuran Ultra-Padat!)\n\n", fi.Size())
+	fmt.Printf("[OK] Binary .anchordb file saved: %d bytes (Ultra-dense format!)\n\n", fi.Size())
 
 	ctx := context.Background()
 
-	// 3. Eksekusi Kueri Graf Menggunakan Fluent Builder Driver
+	// 3. Execute Graph Query using Fluent Builder Driver
 	fmt.Println("----------------------------------------------------------")
-	fmt.Println(">>> KUERI 1: In-Storage Pushdown Graph Step")
-	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Relate('demo-down').TopK(5).Execute()")
+	fmt.Println(">>> QUERY 1: In-Storage Pushdown Graph Step")
+	fmt.Println("Query: client.Graph().From('primary_cluster', 'backup_cluster').Relate('route-down').TopK(5).Execute()")
 
 	qStart := time.Now()
 	resp, err := client.Graph().
-		From("ibu", "ayah").
-		Relate("demo-down").
+		From("primary_cluster", "backup_cluster").
+		Relate("route-down").
 		BeamWidth(0.05).
 		TopK(5).
 		Execute(ctx)
 	qDuration := time.Since(qStart)
 
 	if err != nil {
-		log.Fatalf("Query gagal: %v", err)
+		log.Fatalf("Query failed: %v", err)
 	}
 
-	fmt.Printf("Titik Anchor Hasil Barycenter: (%.2f, %.2f)\n", resp.Anchor.X, resp.Anchor.Y)
-	fmt.Printf("Waktu Komputasi Internal DB: %v (Sub-Mikrodetik!)\n", qDuration)
-	fmt.Printf("Kandidat Teratas yang Lolos DDA Ray & Pythagoras:\n")
+	fmt.Printf("Barycenter Anchor Point: (%.2f, %.2f)\n", resp.Anchor.X, resp.Anchor.Y)
+	fmt.Printf("Internal DB Computation Time: %v (Sub-Microsecond!)\n", qDuration)
+	fmt.Printf("Top Candidates Passing DDA Ray & Pythagoras:\n")
 	for i, r := range resp.Results {
-		fmt.Printf("   [%d] '%s' | Jarak Sumbu t: %.2f | Deviasi d_perp: %.4f | Skor: %.4f\n",
+		fmt.Printf("   [%d] '%s' | Axis Distance t: %.2f | Perp Deviation d_perp: %.4f | Score: %.4f\n",
 			i+1, r.Word, r.T, r.DistSqPerp, r.Score)
 	}
 
-	// 4. Kueri 2: In-Storage Multi-Hop Chaining
+	// 4. Query 2: In-Storage Multi-Hop Chaining
 	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> KUERI 2: In-Storage Multi-Hop Chain Execution")
-	fmt.Println("Query: client.Graph().From('ibu', 'ayah').Chain('demo-down').ExecuteChain()")
+	fmt.Println(">>> QUERY 2: In-Storage Multi-Hop Chain Execution")
+	fmt.Println("Query: client.Graph().From('primary_cluster', 'backup_cluster').Chain('route-down').ExecuteChain()")
 
 	chainStart := time.Now()
 	chainResp, err := client.Graph().
-		From("ibu", "ayah").
-		Chain("demo-down").
+		From("primary_cluster", "backup_cluster").
+		Chain("route-down").
 		ExecuteChain(ctx)
 	chainDuration := time.Since(chainStart)
 
 	if err != nil {
-		log.Fatalf("Chain query gagal: %v", err)
+		log.Fatalf("Chain query failed: %v", err)
 	}
 
-	fmt.Printf("Hasil Penalaran Berantai: %v (Waktu: %v)\n", chainResp.Sequence, chainDuration)
+	fmt.Printf("Chained Traversal Result: %v (Duration: %v)\n", chainResp.Sequence, chainDuration)
 
-	// 5. Kueri 3: Kalkulasi Matematis Langsung di Dalam DB (Math Engine)
+	// 5. Query 3: Direct In-Storage Mathematical Calculations (Math Engine)
 	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> KUERI 3: Kalkulasi Matematis Langsung di Dalam Storage (Math Engine)")
+	fmt.Println(">>> QUERY 3: In-Storage Direct Mathematical Calculation (Math Engine)")
 
 	mathEng := client.Math()
 
-	// A. Jarak Euclidean Langsung
-	dist, _ := mathEng.Distance("ibu", "anak")
-	fmt.Printf("1. Jarak Spasial Langsung 'ibu' <-> 'anak': %.4f\n", dist)
+	// A. Direct Euclidean Distance
+	dist, _ := mathEng.Distance("primary_cluster", "load_balancer")
+	fmt.Printf("1. Direct Spatial Distance 'primary_cluster' <-> 'load_balancer': %.4f\n", dist)
 
-	// B. Pusat Massa (Centroid) Langsung
-	centroid, _ := mathEng.Centroid("ibu", "ayah", "anak")
-	fmt.Printf("2. Pusat Gravitasi (Centroid) ['ibu', 'ayah', 'anak']: (%.2f, %.2f)\n",
+	// B. Direct Centroid Calculation
+	centroid, _ := mathEng.Centroid("primary_cluster", "backup_cluster", "load_balancer")
+	fmt.Printf("2. Center of Gravity (Centroid) ['primary_cluster', 'backup_cluster', 'load_balancer']: (%.2f, %.2f)\n",
 		centroid.Coord.X, centroid.Coord.Y)
 
-	// C. Sudut Kosinus Keselarasan Peran Semantik
-	sim, _ := mathEng.CosineSimilarity("ibu", "ayah")
-	fmt.Printf("3. Kesamaan Kosinus Peran 'ibu' & 'ayah': %.4f (Identik)\n", sim)
+	// C. Semantic Role Cosine Similarity
+	sim, _ := mathEng.CosineSimilarity("primary_cluster", "backup_cluster")
+	fmt.Printf("3. Role Cosine Similarity 'primary_cluster' & 'backup_cluster': %.4f (Identical)\n", sim)
 
-	// D. Tetangga Spasial Terdekat
-	nearest, _ := mathEng.Nearest("ibu", 3)
-	fmt.Println("4. Tetangga Spasial Terdekat dari 'ibu':")
+	// D. Nearest Spatial Neighbors
+	nearest, _ := mathEng.Nearest("primary_cluster", 3)
+	fmt.Println("4. Nearest Spatial Neighbors of 'primary_cluster':")
 	for i, n := range nearest {
-		fmt.Printf("   [%d] '%s' (Jarak: %.4f)\n", i+1, n.Word, n.T)
+		fmt.Printf("   [%d] '%s' (Distance: %.4f)\n", i+1, n.Word, n.T)
 	}
 
-	// 6. Kueri 4: SAVING, GETTING, dan CALCULATING (Contoh Jarak, Waktu -> Kecepatan)
+	// 6. Query 4: SAVING, GETTING, and CALCULATING (Example: Distance, Duration -> Speed)
 	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> KUERI 4: FUNGSI UTAMA DATABASE (SAVING & GETTING + CALCULATING)")
-	fmt.Println("Contoh: Simpan jarak & waktu, ambil dan hitung kecepatan = jarak / waktu")
+	fmt.Println(">>> QUERY 4: CORE DATABASE ENGINE (SAVING & GETTING + CALCULATING)")
+	fmt.Println("Example: Save distance & duration, retrieve and calculate speed = distance / duration")
 
-	// 1. SAVING: Simpan Data Mentah
-	_ = client.Save("perjalanan_mobil", map[string]float32{
-		"jarak": 100.0, // km
-		"waktu": 2.0,   // jam
+	// 1. SAVING: Save Raw Data
+	_ = client.Save("vehicle_trip", map[string]float32{
+		"distance": 100.0, // km
+		"duration": 2.0,   // hours
 	})
-	fmt.Println("1. SAVING: Data tersimpan -> 'perjalanan_mobil' {jarak: 100.0, waktu: 2.0}")
+	fmt.Println("1. SAVING: Data saved -> 'vehicle_trip' {distance: 100.0, duration: 2.0}")
 
-	// 2. GETTING: Ambil Data Murni
-	rawEntity, _ := client.Get("perjalanan_mobil").Execute(ctx)
-	fmt.Printf("2. GETTING: Data terambil murni -> %v\n", rawEntity.All())
+	// 2. GETTING: Retrieve Pure Data
+	rawEntity, _ := client.Get("vehicle_trip").Execute(ctx)
+	fmt.Printf("2. GETTING: Pure retrieved data -> %v\n", rawEntity.All())
 
-	// 3. CALCULATING: Ambil + Hitung Kecepatan secara internal saat retrieval
-	calcEntity, _ := client.Get("perjalanan_mobil").
-		Compute("kecepatan", driver.Divide("jarak", "waktu")).
+	// 3. CALCULATING: Retrieve + Compute Speed internally during retrieval
+	calcEntity, _ := client.Get("vehicle_trip").
+		Compute("speed", driver.Divide("distance", "duration")).
 		Execute(ctx)
 
-	fmt.Printf("3. CALCULATING (In-DB Compute): Jarak = %.1f km, Waktu = %.1f jam ==> Kecepatan = %.1f km/jam\n",
-		calcEntity.Get("jarak"), calcEntity.Get("waktu"), calcEntity.Get("kecepatan"))
-	fmt.Printf("   Return Lengkap dari DB: %v\n", calcEntity.All())
+	fmt.Printf("3. CALCULATING (In-DB Compute): Distance = %.1f km, Duration = %.1f hours ==> Speed = %.1f km/h\n",
+		calcEntity.Get("distance"), calcEntity.Get("duration"), calcEntity.Get("speed"))
+	fmt.Printf("   Full Return from DB: %v\n", calcEntity.All())
 
-	// 7. Kueri 5: LIST, WHERE, COMPUTE, dan PAGING (WAKTU KONSTAN)
+	// 7. Query 5: LIST, WHERE, COMPUTE, and PAGING (CONSTANT TIME)
 	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> KUERI 5: LIST + WHERE + COMPUTE + PAGING (KONSTAN O(Limit))")
-	fmt.Println("Filter jarak >= 50, hitung kecepatan, filter kecepatan > 50, Limit 2 per halaman")
+	fmt.Println(">>> QUERY 5: LIST + WHERE + COMPUTE + PAGING (CONSTANT O(Limit))")
+	fmt.Println("Filter distance >= 50, compute speed, filter speed > 50, Limit 2 per page")
 
-	_ = client.Save("trip_jakarta_bandung", map[string]float32{"jarak": 150, "waktu": 2})  // v = 75
-	_ = client.Save("trip_surabaya_malang", map[string]float32{"jarak": 90, "waktu": 1.5}) // v = 60
-	_ = client.Save("trip_keliling_komplek", map[string]float32{"jarak": 10, "waktu": 1})  // v = 10 (ditolak filter)
-	_ = client.Save("trip_tol_trans_jawa", map[string]float32{"jarak": 400, "waktu": 4})   // v = 100
+	_ = client.Save("route_express_1", map[string]float32{"distance": 150, "duration": 2})    // v = 75
+	_ = client.Save("route_regional_2", map[string]float32{"distance": 90, "duration": 1.5})  // v = 60
+	_ = client.Save("route_local_loop", map[string]float32{"distance": 10, "duration": 1})    // v = 10 (filtered out)
+	_ = client.Save("route_interstate_4", map[string]float32{"distance": 400, "duration": 4}) // v = 100
 
-	// Halaman 1
+	// Page 1
 	p1, _ := client.List().
-		Where("jarak", ">=", 50).
-		Compute("kecepatan", driver.Divide("jarak", "waktu")).
-		Where("kecepatan", ">", 50).
+		Where("distance", ">=", 50).
+		Compute("speed", driver.Divide("distance", "duration")).
+		Where("speed", ">", 50).
 		Page(1, 2).
 		Execute(ctx)
 
-	fmt.Println("--- HALAMAN 1 (Limit: 2) ---")
+	fmt.Println("--- PAGE 1 (Limit: 2) ---")
 	for i, item := range p1.Items {
-		fmt.Printf("   [%d] %-22s | Jarak: %5.0f km | Waktu: %3.1f jam | Kecepatan: %5.0f km/jam\n",
-			i+1, item.Name, item.Get("jarak"), item.Get("waktu"), item.Get("kecepatan"))
+		fmt.Printf("   [%d] %-22s | Distance: %5.0f km | Duration: %3.1f h | Speed: %5.0f km/h\n",
+			i+1, item.Name, item.Get("distance"), item.Get("duration"), item.Get("speed"))
 	}
 	fmt.Printf("   HasMore: %v\n", p1.HasMore)
 
-	// Halaman 2
+	// Page 2
 	p2, _ := client.List().
-		Where("jarak", ">=", 50).
-		Compute("kecepatan", driver.Divide("jarak", "waktu")).
-		Where("kecepatan", ">", 50).
+		Where("distance", ">=", 50).
+		Compute("speed", driver.Divide("distance", "duration")).
+		Where("speed", ">", 50).
 		Page(2, 2).
 		Execute(ctx)
 
-	fmt.Println("--- HALAMAN 2 (Next Page) ---")
+	fmt.Println("--- PAGE 2 (Next Page) ---")
 	for i, item := range p2.Items {
-		fmt.Printf("   [%d] %-22s | Jarak: %5.0f km | Waktu: %3.1f jam | Kecepatan: %5.0f km/jam\n",
-			i+1, item.Name, item.Get("jarak"), item.Get("waktu"), item.Get("kecepatan"))
+		fmt.Printf("   [%d] %-22s | Distance: %5.0f km | Duration: %3.1f h | Speed: %5.0f km/h\n",
+			i+1, item.Name, item.Get("distance"), item.Get("duration"), item.Get("speed"))
 	}
-	fmt.Printf("   HasMore: %v (Paging Selesai!)\n", p2.HasMore)
+	fmt.Printf("   HasMore: %v (Paging Complete!)\n", p2.HasMore)
 
 	fmt.Println("==========================================================")
 }

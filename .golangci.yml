@@ -1,0 +1,12 @@
+# golangci-lint v2 configuration.
+#
+# The std-error-handling preset excludes idiomatic patterns that are safe to
+# ignore here, e.g. unchecked error returns of `defer x.Close()` and
+# `defer os.RemoveAll(...)` in cleanup paths.
+version: "2"
+
+linters:
+  default: standard
+  exclusions:
+    presets:
+      - std-error-handling

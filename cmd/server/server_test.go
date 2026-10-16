@@ -387,13 +387,13 @@ func TestEdgeAndCausalEndpoints(t *testing.T) {
 	// 1. Add two causal edges
 	rec := post("/v1/edge", map[string]interface{}{
 		"model": "causal", "action": "add",
-		"source": "cabai", "relation": "sebab", "target": "inflasi", "weight": 0.9,
+		"source": "fuel_shortage", "relation": "causes", "target": "inflation", "weight": 0.9,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("add edge status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	rec = post("/v1/edge", map[string]interface{}{
-		"model": "causal", "source": "gagal_panen", "relation": "sebab", "target": "inflasi", "weight": 0.4,
+		"model": "causal", "source": "crop_failure", "relation": "causes", "target": "inflation", "weight": 0.4,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("add edge status = %d body=%s", rec.Code, rec.Body.String())
@@ -401,7 +401,7 @@ func TestEdgeAndCausalEndpoints(t *testing.T) {
 
 	// 2. Single-hop causal query
 	rec = post("/v1/causal", map[string]interface{}{
-		"model": "causal", "seeds": []string{"cabai", "gagal_panen"}, "relation": "sebab", "limit_k": 5,
+		"model": "causal", "seeds": []string{"fuel_shortage", "crop_failure"}, "relation": "causes", "limit_k": 5,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("causal status = %d body=%s", rec.Code, rec.Body.String())
@@ -416,14 +416,14 @@ func TestEdgeAndCausalEndpoints(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode causal response: %v", err)
 	}
-	if !resp.Success || len(resp.Results) != 1 || resp.Results[0].Word != "inflasi" || resp.Results[0].Score != 0.9 {
+	if !resp.Success || len(resp.Results) != 1 || resp.Results[0].Word != "inflation" || resp.Results[0].Score != 0.9 {
 		t.Fatalf("unexpected causal response: %+v", resp)
 	}
 
 	// 3. Remove an edge
 	rec = post("/v1/edge", map[string]interface{}{
 		"model": "causal", "action": "remove",
-		"source": "gagal_panen", "relation": "sebab", "target": "inflasi",
+		"source": "crop_failure", "relation": "causes", "target": "inflation",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("remove edge status = %d body=%s", rec.Code, rec.Body.String())

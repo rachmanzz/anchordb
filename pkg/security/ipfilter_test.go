@@ -123,3 +123,20 @@ func TestIPFilter_TrustedProxyWalksForwardedChainFromRight(t *testing.T) {
 		t.Fatalf("expected first untrusted address in proxy chain, got %v", got)
 	}
 }
+
+// A malformed X-Forwarded-For must not cause a fallback to the client-supplied
+// X-Real-IP header, which would let a client spoof its address to bypass both
+// the whitelist and the rate limiter.
+func TestIPFilter_MalformedXFFDoesNotFallBackToXRealIP(t *testing.T) {
+	filter, err := NewIPFilter("10.0.0.5", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/", nil)
+	request.RemoteAddr = "127.0.0.1:8080" // trusted local proxy
+	request.Header.Set("X-Forwarded-For", "not-an-ip, 10.0.0.5")
+	request.Header.Set("X-Real-IP", "10.0.0.5")
+	if got := filter.ExtractClientIP(request); got == nil || !got.Equal(net.ParseIP("127.0.0.1")) {
+		t.Fatalf("malformed XFF must not fall back to X-Real-IP; got %v", got)
+	}
+}
