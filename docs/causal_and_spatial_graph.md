@@ -109,7 +109,7 @@ During multi-hop chain execution:
 AnchorDB enforces a strict architectural boundary between graph inputs and query outputs:
 * **Graph Input (`weight`)**: When defining directed edges via `client.Link(source, relation, target, weight)`, the transition parameter is named `weight` $\in (0.0, 1.0]$.
 * **Query Output (`Score`)**: When executing traversals or multi-hop chains (`Causal`, `CausalChain`), the aggregated cumulative affinity is canonically exposed as **`Score`** (`result.Score`).
-* **Deprecation Notice**: The struct field `CausalResult.Weight` is a legacy alias retained exclusively for backward compatibility and is scheduled for removal in AnchorDB v4.0. All new applications must use `result.Score`.
+* **Deprecation Notice**: The struct field `CausalResult.Weight` is a legacy alias retained exclusively for backward compatibility and is scheduled for removal in a future release. All new applications must use `result.Score`.
 
 ---
 

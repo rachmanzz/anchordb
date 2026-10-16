@@ -31,8 +31,9 @@ type CausalResult struct {
 	Relation string  `json:"relation"`
 	Score    float32 `json:"score"`
 
-	// Deprecated: Weight is a legacy v1 alias retained only for backward compatibility.
-	// It is scheduled for removal in AnchorDB v4.0. Use Score instead.
+	// Deprecated: Use Score instead.
+	// Weight is retained only for backward compatibility
+	// and will be removed in a future release.
 	Weight float32 `json:"weight"`
 }
 
@@ -239,7 +240,7 @@ func (db *AnchorDB) ExecuteCausalStep(ctx context.Context, seeds []string, relat
 				continue
 			}
 			if cur, ok := best[e.Target]; !ok || e.Weight > cur.Score {
-				best[e.Target] = CausalResult{Word: e.Target, Relation: e.Relation, Weight: e.Weight, Score: e.Weight}
+				best[e.Target] = CausalResult{Word: e.Target, Relation: e.Relation, Score: e.Weight, Weight: e.Weight}
 			}
 		}
 	}
@@ -292,7 +293,7 @@ func (db *AnchorDB) ExecuteCausalChain(ctx context.Context, seeds []string, rela
 	}
 	best := make(map[string]CausalResult, len(last))
 	for word, score := range last {
-		best[word] = CausalResult{Word: word, Relation: relations[len(relations)-1], Weight: score, Score: score}
+		best[word] = CausalResult{Word: word, Relation: relations[len(relations)-1], Score: score, Weight: score}
 	}
 	return rankCausal(best, limitK), nil
 
