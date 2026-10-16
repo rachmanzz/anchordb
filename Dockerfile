@@ -9,7 +9,7 @@ RUN go mod download
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /anchordb-server cmd/server/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /anchordb-server ./cmd/server
 
 # Final runtime image
 FROM alpine:3.22
