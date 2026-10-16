@@ -78,6 +78,14 @@ func main() {
 	fmt.Println("--------------------------------------------------------------------------------")
 	runColdDataArchivalTest(ctx)
 
+	// -------------------------------------------------------------------------
+	// (f) Schema Attachment & Strict Immutability Stress Verification
+	// -------------------------------------------------------------------------
+	fmt.Println("\n--------------------------------------------------------------------------------")
+	fmt.Println(" (F) SCHEMA ATTACHMENT & STRICT IMMUTABILITY STRESS VERIFICATION")
+	fmt.Println("--------------------------------------------------------------------------------")
+	runSchemaStressTest(ctx)
+
 	fmt.Println("\n================================================================================")
 	fmt.Println(" [ALL TESTS PASSED] Container validation completed successfully with 100% integrity!")
 	fmt.Println("================================================================================")
@@ -621,3 +629,201 @@ func runColdDataArchivalTest(ctx context.Context) {
 	fmt.Printf("      -> Cold Archive Query (Engine Authenticated): %s found in %s! (moisture=%.1f) [OK]\n",
 		coldRec.Name, coldPartitionFile, coldRec.Get("moisture"))
 }
+
+// -----------------------------------------------------------------------------
+// Phase (F): Schema Attachment & Strict Immutability Stress Verification
+// -----------------------------------------------------------------------------
+
+func runSchemaStressTest(ctx context.Context) {
+	schemaModel := "plant_schema_stress"
+
+	// 1. Initial Attachment
+	fmt.Println("[1/6] Attaching strict schema with primitives & 1D array to model...")
+	client, err := driver.ConnectRemote(baseURL,
+		driver.WithToken(authToken),
+		driver.WithModel(schemaModel),
+	)
+	if err != nil {
+		log.Fatalf("failed to connect: %v", err)
+	}
+	defer client.Close()
+
+	schema := driver.Schema{
+		"voltage":     "float",
+		"current":     "float",
+		"status":      "int",
+		"temperature": "float?",
+		"tags":        "string[]?",
+	}
+	if err := client.Attach(schema); err != nil {
+		log.Fatalf("client.Attach failed: %v", err)
+	}
+	fmt.Println("      -> Schema attached and permanently locked into container engine [OK]")
+
+	// 2. High-Concurrency Valid Writes (5,000 writes across 50 goroutines)
+	const (
+		numWorkers      = 50
+		writesPerWorker = 100
+		totalValidWrites = numWorkers * writesPerWorker
+	)
+	fmt.Printf("[2/6] Executing %d valid concurrent writes across %d parallel goroutines...\n", totalValidWrites, numWorkers)
+	t0 := time.Now()
+	var wg sync.WaitGroup
+	var validSuccess atomic.Int64
+	var validFailures atomic.Int64
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			wClient, wErr := driver.ConnectRemote(baseURL,
+				driver.WithToken(authToken),
+				driver.WithModel(schemaModel),
+			)
+			if wErr != nil {
+				validFailures.Add(int64(writesPerWorker))
+				return
+			}
+			defer wClient.Close()
+
+			for i := 0; i < writesPerWorker; i++ {
+				recName := fmt.Sprintf("meter_valid_%02d_%04d", workerID, i)
+				props := map[string]float32{
+					"voltage": 220.0 + float32(i%10),
+					"current": 5.0 + float32(i%5),
+					"status":  1,
+				}
+				if i%2 == 0 {
+					props["temperature"] = 28.5
+				}
+				if err := wClient.Save(recName, props); err != nil {
+					validFailures.Add(1)
+				} else {
+					validSuccess.Add(1)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	dur := time.Since(t0)
+	throughput := float64(totalValidWrites) / dur.Seconds()
+	fmt.Printf("      -> Completed in %v (%.0f writes/sec) | Success: %d, Failures: %d [OK]\n",
+		dur, throughput, validSuccess.Load(), validFailures.Load())
+	if validFailures.Load() > 0 {
+		log.Fatalf("unexpected failures during valid schema writes: %d", validFailures.Load())
+	}
+
+	// 3. High-Concurrency Invalid Writes Rejection (Missing required fields & Unknown fields)
+	const (
+		invalidWorkers    = 20
+		attemptsPerWorker = 50
+		totalInvalid      = invalidWorkers * attemptsPerWorker
+	)
+	fmt.Printf("[3/6] Stressing fail-fast rejection: sending %d invalid payloads across %d goroutines...\n", totalInvalid, invalidWorkers)
+	var rejectedCount atomic.Int64
+	var leakedWrites atomic.Int64
+
+	for w := 0; w < invalidWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			wClient, wErr := driver.ConnectRemote(baseURL,
+				driver.WithToken(authToken),
+				driver.WithModel(schemaModel),
+			)
+			if wErr != nil {
+				return
+			}
+			defer wClient.Close()
+
+			for i := 0; i < attemptsPerWorker; i++ {
+				recName := fmt.Sprintf("meter_invalid_%02d_%04d", workerID, i)
+				var props map[string]float32
+				if i%2 == 0 {
+					// Missing required "voltage"
+					props = map[string]float32{
+						"current": 5.0,
+						"status":  1,
+					}
+				} else {
+					// Unknown extra field "hacker_val"
+					props = map[string]float32{
+						"voltage":    220.0,
+						"current":    5.0,
+						"status":     1,
+						"hacker_val": 99.9,
+					}
+				}
+				if err := wClient.Save(recName, props); err != nil {
+					rejectedCount.Add(1)
+				} else {
+					leakedWrites.Add(1)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	fmt.Printf("      -> %d out of %d invalid writes rejected immediately (0 leaks) [VERIFIED]\n",
+		rejectedCount.Load(), totalInvalid)
+	if leakedWrites.Load() > 0 {
+		log.Fatalf("SECURITY VIOLATION: %d invalid payloads bypassed schema validator!", leakedWrites.Load())
+	}
+
+	// 4. Incompatible Schema Re-Attachment Rejection Under Load
+	fmt.Println("[4/6] Verifying schema immutability: re-attaching mismatched schema must fail...")
+	conflictingSchema := driver.Schema{
+		"voltage": "int", // changed from float
+		"current": "float",
+		"status":  "int",
+	}
+	if err := client.Attach(conflictingSchema); err == nil {
+		log.Fatalf("Expected schema mismatch rejection, but Attach succeeded!")
+	} else {
+		fmt.Printf("      -> Rejected as expected: %v [IMMUTABLE]\n", err)
+	}
+
+	// 5. ConnectRemote with Matching vs Mismatched Schema
+	fmt.Println("[5/6] Testing ConnectRemote WithAttachSchema contract enforcement...")
+	// 5a. Matching schema connects cleanly
+	goodClient, err := driver.ConnectRemote(baseURL,
+		driver.WithToken(authToken),
+		driver.WithModel(schemaModel),
+		driver.WithAttachSchema(schema),
+	)
+	if err != nil {
+		log.Fatalf("ConnectRemote with matching schema failed: %v", err)
+	}
+	goodClient.Close()
+	fmt.Println("      -> Connect with matching schema succeeded [OK]")
+
+	// 5b. Mismatched schema rejected on connect
+	_, err = driver.ConnectRemote(baseURL,
+		driver.WithToken(authToken),
+		driver.WithModel(schemaModel),
+		driver.WithAttachSchema(driver.Schema{"random_field": "string"}),
+	)
+	if err == nil {
+		log.Fatalf("Expected connection rejection on mismatched schema, but succeeded!")
+	}
+	fmt.Printf("      -> Connect with mismatched schema rejected at handshake: %v [OK]\n", err)
+
+	// 6. Administrative Reset & Re-Attach Under Load
+	fmt.Println("[6/6] Testing administrative hard reset (confirm: true)...")
+	if err := client.ResetModel(ctx, true); err != nil {
+		log.Fatalf("client.ResetModel failed: %v", err)
+	}
+	// After reset, schema is unmounted
+	_, err = client.GetSchema(ctx)
+	if err == nil {
+		log.Fatalf("Expected GetSchema to return error after reset!")
+	}
+	// Attach brand new schema
+	replacementSchema := driver.Schema{
+		"new_metric": "float",
+	}
+	if err := client.Attach(replacementSchema); err != nil {
+		log.Fatalf("Attaching new schema after reset failed: %v", err)
+	}
+	fmt.Println("      -> Model schema successfully reset and re-attached with new contract [OK]")
+}
+

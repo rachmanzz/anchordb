@@ -12,6 +12,18 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
+// Schema defines the contract for an AnchorDB model (e.g. {"color": "string", "age": "int", "brand": "string?"}).
+type Schema = storage.ModelSchema
+
+// Export schema error constants from storage for client convenience
+var (
+	ErrSchemaMismatch       = storage.ErrSchemaMismatch
+	ErrSchemaLocked         = storage.ErrSchemaLocked
+	ErrMissingRequiredField = storage.ErrMissingRequiredField
+	ErrUnknownField         = storage.ErrUnknownField
+	ErrInvalidFieldType     = storage.ErrInvalidFieldType
+)
+
 // Client is the official AnchorDB client instance supporting both remote engine
 // connections and local embedded storage.
 type Client struct {
@@ -83,7 +95,14 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
+		c := &Client{backend: backend, model: cfg.model, dsn: dsn}
+		if len(cfg.schema) > 0 {
+			if err := c.Attach(cfg.schema); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+		}
+		return c, nil
 	}
 
 	// 2. embedded:// scheme
@@ -144,7 +163,14 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
+		c := &Client{backend: backend, model: cfg.model, dsn: dsn}
+		if len(cfg.schema) > 0 {
+			if err := c.Attach(cfg.schema); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+		}
+		return c, nil
 	}
 
 	// 4. Local directory or file path directly
@@ -173,7 +199,14 @@ func OpenEmbedded(dataDir string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{backend: backend, model: cfg.model, dsn: dataDir}, nil
+	c := &Client{backend: backend, model: cfg.model, dsn: dataDir}
+	if len(cfg.schema) > 0 {
+		if err := c.Attach(cfg.schema); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // OpenLocal opens a local AnchorDB file directly.
@@ -199,7 +232,14 @@ func ConnectRemote(baseURL string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{backend: backend, model: cfg.model, dsn: baseURL}, nil
+	c := &Client{backend: backend, model: cfg.model, dsn: baseURL}
+	if len(cfg.schema) > 0 {
+		if err := c.Attach(cfg.schema); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 // Model returns a shallow copy of the client targeting a different model database.
@@ -261,6 +301,39 @@ func (c *Client) InspectPartitionRecord(ctx context.Context, partitionFile, reco
 		return nil, err
 	}
 	return &EntityResult{Name: recordName, props: res.Props}, nil
+}
+
+// Attach locks the specified schema contract into the currently active model.
+// If the model already has a locked schema, it verifies compatibility.
+// If the schemas match, Attach succeeds; if they mismatch, it returns storage.ErrSchemaMismatch.
+func (c *Client) Attach(schema Schema) error {
+	return c.AttachContext(context.Background(), schema)
+}
+
+// AttachContext locks the specified schema into the model with a context.
+func (c *Client) AttachContext(ctx context.Context, schema Schema) error {
+	return c.backend.Attach(ctx, c.model, schema)
+}
+
+// AttachModel returns a shallow copy of the client targeting the specified model,
+// and attaches the provided schema contract to it immediately.
+func (c *Client) AttachModel(modelName string, schema Schema) (*Client, error) {
+	cl := c.Model(modelName)
+	if err := cl.Attach(schema); err != nil {
+		return nil, err
+	}
+	return cl, nil
+}
+
+// GetSchema returns the registered schema contract for the active model.
+func (c *Client) GetSchema(ctx context.Context) (Schema, error) {
+	return c.backend.GetSchema(ctx, c.model)
+}
+
+// ResetModel resets and unregisters the active model's schema.
+// Requires confirm: true for administrative safety.
+func (c *Client) ResetModel(ctx context.Context, confirm bool) error {
+	return c.backend.ResetModel(ctx, c.model, confirm)
 }
 
 // Graph returns a new fluent query builder for spatial ray casting and multi-hop reasoning.

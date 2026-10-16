@@ -65,6 +65,9 @@ type backend interface {
 	IsRemote() bool
 	ListPartitions(ctx context.Context) ([]PartitionMeta, error)
 	InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error)
+	Attach(ctx context.Context, model string, schema storage.ModelSchema) error
+	GetSchema(ctx context.Context, model string) (storage.ModelSchema, error)
+	ResetModel(ctx context.Context, model string, confirm bool) error
 }
 
 // -----------------------------------------------------------------------------
@@ -313,6 +316,34 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 		Records:       out,
 		Count:         len(out),
 	}, nil
+}
+
+func (b *localBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return b.db.AttachSchema(schema)
+}
+
+func (b *localBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s, ok := b.db.GetSchema()
+	if !ok {
+		return nil, fmt.Errorf("no schema attached to model")
+	}
+	return s, nil
+}
+
+func (b *localBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !confirm {
+		return fmt.Errorf("confirm must be true to reset model schema")
+	}
+	return b.db.ResetSchema()
 }
 
 // -----------------------------------------------------------------------------
@@ -754,6 +785,46 @@ func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, r
 	}, nil
 }
 
+func (b *embeddedBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return err
+	}
+	return db.AttachSchema(schema)
+}
+
+func (b *embeddedBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	s, ok := db.GetSchema()
+	if !ok {
+		return nil, fmt.Errorf("no schema attached to model %q", model)
+	}
+	return s, nil
+}
+
+func (b *embeddedBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !confirm {
+		return fmt.Errorf("confirm must be true to reset model schema")
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return err
+	}
+	return db.ResetSchema()
+}
+
 // -----------------------------------------------------------------------------
 // Remote Backend (HTTP Engine Client)
 // -----------------------------------------------------------------------------
@@ -1192,6 +1263,56 @@ func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, rec
 		Records:       resp.Records,
 		Count:         resp.Count,
 	}, nil
+}
+
+func (b *remoteBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
+	req := map[string]interface{}{
+		"model":  model,
+		"schema": schema,
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Model   string `json:"model"`
+		Status  string `json:"status"`
+	}
+	err := b.doJSON(ctx, http.MethodPost, "/v1/model/attach", req, &resp)
+	if err != nil {
+		if strings.Contains(err.Error(), "schema_mismatch") || strings.Contains(err.Error(), "schema mismatch") {
+			return fmt.Errorf("%w: %v", storage.ErrSchemaMismatch, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (b *remoteBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
+	endpoint := "/v1/model/schema"
+	if model != "" {
+		endpoint += "?model=" + url.QueryEscape(model)
+	}
+	var resp struct {
+		Success bool                `json:"success"`
+		Model   string              `json:"model"`
+		Locked  bool                `json:"locked"`
+		Schema  storage.ModelSchema `json:"schema"`
+	}
+	if err := b.doJSON(ctx, http.MethodGet, endpoint, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Schema, nil
+}
+
+func (b *remoteBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
+	req := map[string]interface{}{
+		"model":   model,
+		"confirm": confirm,
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Model   string `json:"model"`
+		Message string `json:"message"`
+	}
+	return b.doJSON(ctx, http.MethodPost, "/v1/model/reset", req, &resp)
 }
 
 // -----------------------------------------------------------------------------

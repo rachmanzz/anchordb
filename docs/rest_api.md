@@ -253,9 +253,93 @@ Cancels queued jobs before execution:
 
 ---
 
-## 6. Design Boundaries & Limitations
+## 6. Model Schema Management Endpoints
+
+AnchorDB provides strict contract immutability endpoints for model schema registration, validation, and administrative resetting.
+
+### `POST /v1/model/attach`
+Attaches and permanently locks a schema contract into a model. If the model already has a locked schema, compares incoming fields, types, and modifiers (`?` optional, `[]` 1D array).
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "schema": {
+    "voltage": "float",
+    "status": "int",
+    "brand": "string?",
+    "tags": "string[]?"
+  }
+}
+```
+
+**Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "model": "vehicles",
+  "status": "LOCKED",
+  "message": "model schema attached and locked successfully"
+}
+```
+
+**Rejection on Incompatible Schema (`409 Conflict`)**:
+```json
+{
+  "success": false,
+  "error": "schema_mismatch",
+  "model": "vehicles",
+  "message": "schema mismatch: incoming schema does not match registered model contract: field \"voltage\" mismatch (expected float, got int)"
+}
+```
+
+### `GET /v1/model/schema`
+Retrieves the locked schema contract for a specified model.
+
+**Query Parameters**:
+* `model`: Target model name (default: `"default"`).
+
+**Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "model": "vehicles",
+  "locked": true,
+  "schema": {
+    "voltage": "float",
+    "status": "int",
+    "brand": "string?",
+    "tags": "string[]?"
+  }
+}
+```
+
+### `POST /v1/model/reset`
+Administrative hard reset that unmounts and deletes the model's locked schema contract. Requires explicit confirmation.
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "confirm": true
+}
+```
+
+**Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "model": "vehicles",
+  "message": "model schema reset successfully"
+}
+```
+
+---
+
+## 7. Design Boundaries & Limitations
 
 1. **Protocol Transport**: All engine communication utilizes HTTP/1.1 REST JSON. Persistent connections are maintained via standard HTTP Keep-Alive.
 2. **Model Parameter**: Endpoints accept `"model"` in the request payload or `?model=` query string. If omitted, the engine routes requests to the `"default"` model file.
 3. **Internal Partition Storage**: Partition archive files stored under `/data/partitions` are inaccessible directly over the network; they must be queried via `/v1/partition/inspect`.
+4. **Schema Enforcement Fail-Fast**: When a model is locked, `POST /v1/save` and `POST /v1/update` return HTTP `400 Bad Request` if mandatory fields are omitted, if unknown fields are provided, or if data types conflict with the schema contract.
 

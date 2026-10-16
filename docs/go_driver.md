@@ -91,7 +91,72 @@ fmt.Println("Active model:", greenhouseClient.ModelName()) // "greenhouse_zone_1
 
 ---
 
-## 4. Reading & Writing Entities
+## 4. Schema Attachment & Contract Enforcement (`client.Attach`)
+
+AnchorDB supports strict schema immutability to prevent schema drift, accidental property typos, and invalid data types across distributed microservices.
+
+### Defining a Schema
+Schemas are defined using `driver.Schema` (a mapping of field names to type strings):
+
+```go
+schema := driver.Schema{
+    "voltage":          "float",       // Required float32
+    "current":          "float",       // Required float32
+    "status":           "int",         // Required integer
+    "brand":            "string?",     // Optional string (trailing ?)
+    "tags":             "string[]?",   // Optional 1D string array
+    "vector_embedding": "float[]",     // Required 1D float vector
+}
+```
+
+#### Supported Field Types & Modifiers:
+- **Primitives**: `string`, `int`, `float`, `bool`, `date` (YYYY-MM-DD epoch day)
+- **1D Arrays**: `string[]`, `int[]`, `float[]`, `bool[]`, `date[]`
+- **Required (Default)**: Omission of `?` makes the field strictly mandatory during writes.
+- **Optional (`?`)**: Suffix `?` marks the field as optional.
+
+### Attaching and Locking a Schema
+Once attached, the schema is **permanently locked** into the model file header and sidecar:
+
+```go
+// 1. Attach to active model
+err := client.Attach(schema)
+if err != nil {
+    // Fails with driver.ErrSchemaMismatch if an incompatible schema was already locked
+    log.Fatalf("Attach rejected: %v", err)
+}
+
+// 2. Or attach when spawning a new model client:
+deviceClient, err := client.AttachModel("devices_zone_1", schema)
+
+// 3. Or enforce schema attachment during initial connection:
+client, err := driver.ConnectRemote("http://localhost:7447",
+    driver.WithToken("token"),
+    driver.WithModel("devices_zone_1"),
+    driver.WithAttachSchema(schema),
+)
+```
+
+### Inspecting & Resetting Schemas
+
+```go
+// Retrieve active locked schema
+lockedSchema, err := client.GetSchema(ctx)
+fmt.Println("Locked fields:", lockedSchema)
+
+// Administrative hard reset (requires confirm: true)
+err = client.ResetModel(ctx, true)
+```
+
+### Fail-Fast Error Guarantees
+- `driver.ErrSchemaMismatch`: Returned on `Attach` or `Connect` if incoming schema conflicts with the model's locked contract.
+- `driver.ErrMissingRequiredField`: Returned on `Save` or `Update` if a required field is omitted.
+- `driver.ErrUnknownField`: Returned on `Save` or `Update` if an undeclared property is passed.
+- `driver.ErrInvalidFieldType`: Returned if a field value does not conform to its type specification.
+
+---
+
+## 5. Reading & Writing Entities
 
 ### Saving Records
 ```go
@@ -128,7 +193,7 @@ fmt.Printf("Speed: %.2f km/h\n", record.Get("speed"))
 
 ---
 
-## 5. Filtering & Pagination (`ListBuilder`)
+## 6. Filtering & Pagination (`ListBuilder`)
 
 The `List()` builder supports numeric ranges, date comparisons, and server-side pagination.
 
@@ -156,7 +221,7 @@ if results.HasMore {
 
 ---
 
-## 6. Batch Updates (`UpdateBuilder`)
+## 7. Batch Updates (`UpdateBuilder`)
 
 Apply atomic in-place arithmetic updates matching filter criteria:
 
@@ -176,7 +241,7 @@ fmt.Printf("Updated %d records\n", count)
 
 ---
 
-## 7. Spatial Graph & Ray-Casting
+## 8. Spatial Graph & Ray-Casting
 
 Register concept nodes and directional vector relations, then cast rays through 2D space:
 
@@ -202,7 +267,7 @@ for _, res := range graphResp.Results {
 
 ---
 
-## 8. Direct Math Engine
+## 9. Direct Math Engine
 
 Perform high-performance geometric and vector math across nodes:
 
@@ -224,7 +289,7 @@ neighbors, _ := math.Nearest("sensor_hub", 5)
 
 ---
 
-## 9. Causal Graph Traversal
+## 10. Causal Graph Traversal
 
 Link directed, weighted edges for cause-and-effect reasoning:
 
@@ -247,13 +312,13 @@ for _, step := range chain {
 
 ---
 
-## 10. Context & Timeouts
+## 11. Context & Timeouts
 
 All builder execution methods (`.Execute(ctx)`) strictly honor `context.Context` cancellation and deadlines. If a request is canceled or times out, execution halts immediately and returns `ctx.Err()`.
 
 ---
 
-## 11. Cold Partition Inspection
+## 12. Cold Partition Inspection
 
 Archived partition files are inspected through the engine API without exposing raw filesystem descriptors:
 
@@ -279,7 +344,7 @@ for _, item := range res.Records {
 
 ---
 
-## 12. Design Boundaries & Limitations
+## 13. Design Boundaries & Limitations
 
 1. **One Model = One File**: Each named model (`sensors`, `telemetry`) is an isolated binary file with its own lock and WAL. AnchorDB does not support cross-model relational JOINs.
 2. **Numeric Property Vectors**: Record attributes are optimized for computational floating-point metrics (`float32`) and Epoch Days dates (`MustDate("YYYY-MM-DD")`).

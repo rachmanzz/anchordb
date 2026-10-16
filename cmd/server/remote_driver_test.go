@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"testing"
 
@@ -299,5 +300,128 @@ func TestRemoteDriver_ModelIsolationAndAuth(t *testing.T) {
 	_, err = betaClient.Get("node_in_alpha").Execute(ctx)
 	if err == nil {
 		t.Fatalf("expected node_in_alpha not to exist in model_beta")
+	}
+}
+
+func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	s.authToken = "secret-token-schema"
+	ts := httptest.NewServer(s.Routes())
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. Connect without schema
+	client, err := driver.ConnectRemote(ts.URL,
+		driver.WithToken("secret-token-schema"),
+		driver.WithModel("inventory"),
+	)
+	if err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	defer client.Close()
+
+	// 2. Attach schema
+	schema := driver.Schema{
+		"quantity": "int",
+		"price":    "float",
+		"sku":      "string",
+		"tags":     "string[]?",
+	}
+	if err := client.Attach(schema); err != nil {
+		t.Fatalf("client.Attach failed: %v", err)
+	}
+
+	// 3. GetSchema should return the attached schema
+	gotSchema, err := client.GetSchema(ctx)
+	if err != nil {
+		t.Fatalf("client.GetSchema failed: %v", err)
+	}
+	if gotSchema["quantity"] != "int" || gotSchema["price"] != "float" {
+		t.Fatalf("retrieved schema mismatch: %v", gotSchema)
+	}
+
+	// 4. Attach identical schema -> success
+	identical := driver.Schema{
+		"quantity": "int",
+		"price":    "float",
+		"sku":      "string",
+		"tags":     "string[]?",
+	}
+	if err := client.Attach(identical); err != nil {
+		t.Fatalf("re-attaching identical schema failed: %v", err)
+	}
+
+	// 5. Attach mismatched schema -> fails with ErrSchemaMismatch
+	mismatched := driver.Schema{
+		"quantity": "float", // mismatched type
+		"price":    "float",
+		"sku":      "string",
+	}
+	err = client.Attach(mismatched)
+	if err == nil {
+		t.Fatalf("expected ErrSchemaMismatch, got nil")
+	}
+	if !errors.Is(err, driver.ErrSchemaMismatch) {
+		t.Fatalf("expected ErrSchemaMismatch, got %v", err)
+	}
+
+	// 6. Save valid record obeying schema
+	err = client.Save("item_1", map[string]float32{
+		"quantity": 10,
+		"price":    99.95,
+		"sku":      1,
+	})
+	if err != nil {
+		t.Fatalf("client.Save valid record failed: %v", err)
+	}
+
+	// 7. Save record missing required field -> fails
+	err = client.Save("item_bad", map[string]float32{
+		"price": 99.95, // missing quantity and sku
+	})
+	if err == nil {
+		t.Fatalf("expected save error due to missing fields, got nil")
+	}
+
+	// 8. Connect with WithAttachSchema option:
+	// 8a. Matching schema -> success
+	clientMatching, err := driver.ConnectRemote(ts.URL,
+		driver.WithToken("secret-token-schema"),
+		driver.WithModel("inventory"),
+		driver.WithAttachSchema(schema),
+	)
+	if err != nil {
+		t.Fatalf("ConnectRemote with matching schema failed: %v", err)
+	}
+	clientMatching.Close()
+
+	// 8b. Mismatched schema -> rejected on connect
+	_, err = driver.ConnectRemote(ts.URL,
+		driver.WithToken("secret-token-schema"),
+		driver.WithModel("inventory"),
+		driver.WithAttachSchema(driver.Schema{"category": "string"}),
+	)
+	if err == nil {
+		t.Fatalf("expected ConnectRemote rejection on mismatched schema, got nil")
+	}
+
+	// 9. Reset model schema
+	err = client.ResetModel(ctx, false)
+	if err == nil {
+		t.Fatalf("expected error without confirm=true, got nil")
+	}
+
+	err = client.ResetModel(ctx, true)
+	if err != nil {
+		t.Fatalf("client.ResetModel failed: %v", err)
+	}
+
+	// 10. After reset, GetSchema returns error / 404
+	_, err = client.GetSchema(ctx)
+	if err == nil {
+		t.Fatalf("expected error after reset when getting schema, got nil")
 	}
 }

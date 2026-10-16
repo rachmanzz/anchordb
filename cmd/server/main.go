@@ -182,6 +182,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
 	mux.HandleFunc("/v1/worker/status", s.authMiddleware(s.handleWorkerStatus))
 	mux.HandleFunc("/v1/worker/cancel", s.authMiddleware(s.handleWorkerCancel))
+	mux.HandleFunc("/v1/model/attach", s.authMiddleware(s.handleModelAttach))
+	mux.HandleFunc("/v1/model/schema", s.authMiddleware(s.handleModelSchema))
+	mux.HandleFunc("/v1/model/reset", s.authMiddleware(s.handleModelReset))
 	// recoverMiddleware is outermost so a panic in any layer yields a clean 500
 	// instead of dropping the connection with a stack trace.
 	return recoverMiddleware(s.rateLimitMiddleware(s.ipFilter.Middleware(mux)))
@@ -953,6 +956,12 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(req.Props) > 0 {
 			if _, err := db.SaveRecordWithIDAndOp(effectiveName, opStatus, req.Props); err != nil {
+				if errors.Is(err, storage.ErrMissingRequiredField) ||
+					errors.Is(err, storage.ErrUnknownField) ||
+					errors.Is(err, storage.ErrInvalidFieldType) {
+					http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+					return
+				}
 				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -960,6 +969,12 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	} else {
 		name, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
 		if err != nil {
+			if errors.Is(err, storage.ErrMissingRequiredField) ||
+				errors.Is(err, storage.ErrUnknownField) ||
+				errors.Is(err, storage.ErrInvalidFieldType) {
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+				return
+			}
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -1166,6 +1181,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		Limit:          req.Limit,
 	})
 	if err != nil {
+		if errors.Is(err, storage.ErrUnknownField) {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -2024,6 +2043,137 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, `{"error":"Scoped cancellation required. Provide 'job_id', 'model', or 'all: true' for global cancellation"}`, http.StatusBadRequest)
+}
+
+type ModelAttachRequest struct {
+	Model  string              `json:"model"`
+	Schema storage.ModelSchema `json:"schema"`
+}
+
+func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req ModelAttachRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+	modelName := strings.TrimSpace(req.Model)
+	if modelName == "" {
+		modelName = "default"
+	}
+	if len(req.Schema) == 0 {
+		http.Error(w, `{"error":"schema is required and cannot be empty"}`, http.StatusBadRequest)
+		return
+	}
+
+	db, err := s.getModel(modelName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err := db.AttachSchema(req.Schema); err != nil {
+		if errors.Is(err, storage.ErrSchemaMismatch) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "schema_mismatch",
+				"model":   modelName,
+				"message": err.Error(),
+			})
+			return
+		}
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"model":   modelName,
+		"status":  "LOCKED",
+		"message": "model schema attached and locked successfully",
+	})
+}
+
+func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	modelName := strings.TrimSpace(r.URL.Query().Get("model"))
+	if modelName == "" {
+		modelName = "default"
+	}
+	db, err := s.getModel(modelName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	schema, ok := db.GetSchema()
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "no schema attached to model",
+			"model":   modelName,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"model":   modelName,
+		"locked":  true,
+		"schema":  schema,
+	})
+}
+
+type ModelResetRequest struct {
+	Model   string `json:"model"`
+	Confirm bool   `json:"confirm"`
+}
+
+func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req ModelResetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+	if !req.Confirm {
+		http.Error(w, `{"error":"confirm must be true to reset model schema"}`, http.StatusBadRequest)
+		return
+	}
+	modelName := strings.TrimSpace(req.Model)
+	if modelName == "" {
+		modelName = "default"
+	}
+
+	db, err := s.getModel(modelName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err := db.ResetSchema(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"model":   modelName,
+		"message": "model schema reset successfully",
+	})
 }
 
 // Environment / flag resolution helpers

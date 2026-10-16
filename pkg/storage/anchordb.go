@@ -199,6 +199,9 @@ type AnchorDB struct {
 	entitySectionEnd int
 
 	filePath string
+
+	schema       ModelSchema
+	schemaLocked bool
 }
 
 // SetRelation registers or replaces a query direction vector safely.
@@ -758,6 +761,11 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		return nil, err
 	}
 
+	if err := db.loadSchemaLocked(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to load model schema: %w", err)
+	}
+
 	return db, nil
 }
 
@@ -1095,6 +1103,12 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
 	}
 
+	if db.schemaLocked && db.schema != nil {
+		if err := db.schema.ValidateProps(props); err != nil {
+			return "", err
+		}
+	}
+
 	attrs := make([]AttrEntry, 0, len(props))
 	for k, v := range props {
 		attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
@@ -1336,6 +1350,14 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 
 	if len(opts.Mutations) == 0 {
 		return 0, nil
+	}
+
+	if db.schemaLocked && db.schema != nil {
+		for outField := range opts.Mutations {
+			if _, exists := db.schema[outField]; !exists {
+				return 0, fmt.Errorf("%w: field %q is not defined in model schema", ErrUnknownField, outField)
+			}
+		}
 	}
 
 	updatedCount := 0

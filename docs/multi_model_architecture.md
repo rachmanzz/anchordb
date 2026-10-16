@@ -130,3 +130,15 @@ coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_sensors_part1.anc
 1. **No Cross-Model Joins**: Because models are independent binary storage units, AnchorDB intentionally does not support relational JOIN queries across multiple models. Aggregations across models must be handled at the application layer.
 2. **Single-Writer per Model File**: Each model file is protected by `flock`. While concurrent reads and internal concurrent worker pipelines are fully supported, two distinct OS processes cannot open the same model file in embedded write mode simultaneously.
 3. **Property Typing**: Attributes within records are optimized for computational floating-point metrics (`float32`). AnchorDB is not intended for storing arbitrary large binary blobs or nested document trees.
+
+---
+
+## 6. Strict Schema Registration Contract
+
+For applications requiring strict schema immutability and contract enforcement, AnchorDB defines the **Register Model** specification:
+- **One-Time Registration**: Schema is declared once and locked into the file header.
+- **Attach Verification**: When clients attach to a model, the engine compares declared schemas; mismatches are rejected immediately, blocking all subsequent insert/update operations.
+- **Lock Permanence**: The schema cannot be detached or altered dynamically until an explicit administrative reset.
+
+For detailed design specifications, see the **[PRD: Register Model & Strict Schema Immutability](prd_register_model.md)**.
+

@@ -3,7 +3,7 @@
 AnchorDB includes three independent tiers of verification and performance measurement:
 1. **Standalone Bare-Metal CLI Benchmark (`cmd/benchmark`)**: Instant zero-dependency evaluation of arithmetic compute, spatial grid DDA, causal graphs, and embedded engine throughput without requiring Docker.
 2. **Native Go Microbenchmark Suite (`pkg/storage/bench_test.go`)**: Standard Go testing benchmarks measuring allocations and ns/op.
-3. **End-to-End Container Verification Suite (`cmd/container_verifier`)**: Full 5-phase integration test verifying container lifecycles, concurrency ramp-up with Little's Law, crash durability, background cron scheduling, and partition archival.
+3. **End-to-End Container Verification Suite (`cmd/container_verifier`)**: Full 6-phase integration test verifying container lifecycles, concurrency ramp-up with Little's Law, crash durability, background cron scheduling, partition archival, and strict schema immutability.
 
 ---
 
@@ -76,7 +76,7 @@ go run ./cmd/container_verifier
 
 ## 3. What the Verification Suite Tests
 
-The suite runs **5 rigorous phases** verifying data integrity, durability, and mathematical consistency:
+The suite runs **6 rigorous phases** verifying data integrity, durability, and mathematical consistency:
 
 ### Phase (A): Comprehensive Engine Operation Stress
 Executes all engine subsystems under load:
@@ -127,6 +127,17 @@ Tests that data, WAL recovery, and file locks survive abrupt daemon restarts:
 2. Triggers partition archival via `/v1/partition/run` with a 60-day retention cutoff.
 3. Confirms cold records were pruned from the active hot database while active records remain intact.
 4. Inspects the archived partition file **strictly through the Engine API** (`/v1/partition/list` and `/v1/partition/inspect`), ensuring cold data is retrieved securely without raw file exposure.
+
+---
+
+### Phase (F): Schema Attachment & Strict Immutability Stress
+Stresses the engine's contract enforcement and validation layers under heavy parallel load:
+1. **Schema Attachment**: Locks a model schema with primitives (`float`, `int`), optional modifiers (`?`), and 1D arrays (`string[]?`).
+2. **High-Concurrency Valid Ingestion**: 5,000 valid records ingested across 50 parallel goroutines (~13,900 writes/sec with 0 failures).
+3. **Fail-Fast Rejection Stress**: 1,000 invalid payloads (omitted required fields and undeclared unknown fields) sent across 20 goroutines; verifies 100% rejection with 0 leaks into storage.
+4. **Immutability Enforcement**: Re-attaching a conflicting schema under load fails with `ErrSchemaMismatch` (HTTP 409).
+5. **Connection Handshake Enforcement**: `ConnectRemote` with mismatched schema rejected at connection handshake.
+6. **Administrative Reset**: Confirms hard reset unmounts the contract and allows a clean schema replacement.
 
 ---
 

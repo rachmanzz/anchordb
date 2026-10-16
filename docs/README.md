@@ -57,4 +57,9 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
    * Pre-compiled standalone archives for Linux and macOS.
    * Go driver client installation and compiling from source.
 
+11. **[PRD: Register Model & Strict Schema Immutability](prd_register_model.md)**
+   * One-time model schema registration.
+   * Attach/connect schema verification, comparison, and fail-fast rejection.
+   * Permanent lock lifecycle and administrative hard reset contract.
+
 

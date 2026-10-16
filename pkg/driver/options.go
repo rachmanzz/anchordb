@@ -16,6 +16,7 @@ type clientConfig struct {
 	syncInterval      time.Duration
 	workerConcurrency int
 	enableScheduler   bool
+	schema            Schema
 }
 
 func defaultClientConfig() clientConfig {
@@ -82,4 +83,16 @@ func WithScheduler(enable bool) Option {
 	return func(c *clientConfig) {
 		c.enableScheduler = enable
 	}
+}
+
+// WithAttachSchema specifies a schema that must be attached and verified against the model contract.
+func WithAttachSchema(schema Schema) Option {
+	return func(c *clientConfig) {
+		c.schema = schema
+	}
+}
+
+// WithSchema is an alias for WithAttachSchema.
+func WithSchema(schema Schema) Option {
+	return WithAttachSchema(schema)
 }
