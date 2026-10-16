@@ -140,3 +140,34 @@ func TestIPFilter_MalformedXFFDoesNotFallBackToXRealIP(t *testing.T) {
 		t.Fatalf("malformed XFF must not fall back to X-Real-IP; got %v", got)
 	}
 }
+
+func TestIPFilter_EmptyRuleAllowsAll(t *testing.T) {
+	filter, err := NewIPFilter("", false)
+	if err != nil {
+		t.Fatalf("NewIPFilter with empty rule failed: %v", err)
+	}
+	if !filter.IsAllowed(net.ParseIP("1.2.3.4")) {
+		t.Error("expected empty rule filter to allow any IP")
+	}
+	if !filter.IsAllowed(net.ParseIP("::1")) {
+		t.Error("expected empty rule filter to allow IPv6 loopback")
+	}
+}
+
+func TestIPFilter_InvalidRulesReturnErrors(t *testing.T) {
+	invalidRules := []string{
+		"192.168.1.500/24",
+		"10.0.0.1-not-an-ip",
+		"10.0.0.50-10.0.0.10",
+		"not-an-ip-address",
+	}
+
+	for _, rule := range invalidRules {
+		t.Run(rule, func(t *testing.T) {
+			_, err := NewIPFilter(rule, false)
+			if err == nil {
+				t.Errorf("expected NewIPFilter(%q) to fail, got nil", rule)
+			}
+		})
+	}
+}

@@ -106,7 +106,7 @@ The update builder modifies stored records across the dataset or within specific
 // Add 10 to distance for up to 5,000 matching vehicles
 updatedCount, err := client.Update().
     Where("distance", "<", 1000.0).
-    Set("distance", driver.Add("distance", "10")).
+    Set("distance", driver.AddConst("distance", 10.0)).
     Limit(5000).
     Execute(ctx)
 

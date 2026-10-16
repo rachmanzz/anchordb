@@ -156,7 +156,7 @@ Apply atomic in-place arithmetic updates matching filter criteria:
 // Atomic in-place increment matching filtered records
 count, err := client.Update().
     Where("status", "=", 1.0).
-    Set("reconnect_attempts", driver.Add("reconnect_attempts", "1")).
+    Set("reconnect_attempts", driver.AddConst("reconnect_attempts", 1.0)).
     Limit(1000).
     Execute(ctx)
 if err != nil {

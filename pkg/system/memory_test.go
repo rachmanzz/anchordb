@@ -77,3 +77,40 @@ func TestApplyMemoryLimit(t *testing.T) {
 		t.Errorf("expected stats.LimitHuman == '1.00 GB', got %q", stats.LimitHuman)
 	}
 }
+
+func TestDetectCgroupMemoryLimit_NonCrashing(t *testing.T) {
+	// DetectCgroupMemoryLimit reads host/container cgroup paths.
+	// In local dev/CI, it either returns a positive byte limit or an error, but must never panic.
+	limit, err := DetectCgroupMemoryLimit()
+	if err == nil {
+		if limit <= 0 {
+			t.Errorf("expected positive cgroup limit if err is nil, got %d", limit)
+		}
+	} else {
+		if limit != 0 {
+			t.Errorf("expected limit = 0 on error, got %d", limit)
+		}
+	}
+}
+
+func TestFormatBytes_BoundaryValues(t *testing.T) {
+	tests := []struct {
+		input int64
+		want  string
+	}{
+		{0, "Unlimited"},
+		{-1, "Unlimited"},
+		{500, "500 B"},
+		{1024, "1.00 KB"},
+		{1024 * 1024, "1.00 MB"},
+		{1024 * 1024 * 1024, "1.00 GB"},
+		{math.MaxInt64, "Unlimited"},
+	}
+
+	for _, tt := range tests {
+		got := FormatBytes(tt.input)
+		if got != tt.want {
+			t.Errorf("FormatBytes(%d) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}

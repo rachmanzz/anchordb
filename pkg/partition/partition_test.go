@@ -251,3 +251,50 @@ func TestPartition_S3Sink_FailSafe(t *testing.T) {
 	}
 	t.Logf("[OK] Subsequent partition retry successfully picked up OpStatusRetry records and archived them!")
 }
+
+func TestPartition_NoMatchingRecords(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "fresh.anchordb")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Add record from today (younger than 180 days cutoff)
+	nowDays := float32(time.Now().Unix() / 86400)
+	_ = db.SaveRecord("today_record", map[string]float32{"date": nowDays})
+	_ = db.Sync()
+
+	res, err := ExecutePartition(db, PartitionPolicy{
+		ModelName:     "metrics",
+		DateField:     "date",
+		RetentionDays: 180,
+		Sink:          NewLocalDiskSink(filepath.Join(tmpDir, "partitions")),
+	})
+	if err != nil {
+		t.Fatalf("ExecutePartition: %v", err)
+	}
+	if res.ArchivedCount != 0 {
+		t.Fatalf("expected 0 archived records, got %d", res.ArchivedCount)
+	}
+	if len(db.EntityStore) != 1 {
+		t.Fatalf("expected record to remain in hot db, got %d", len(db.EntityStore))
+	}
+}
+
+func TestFormatPartitionFilename_Variations(t *testing.T) {
+	dateStr := "2026-10-16"
+
+	// Default template "{date}_{uuid}.anchordb"
+	name1 := FormatPartitionFilename(dateStr, "")
+	if !strings.HasPrefix(name1, "2026-10-16_") || !strings.HasSuffix(name1, ".anchordb") {
+		t.Errorf("unexpected default filename: %q", name1)
+	}
+
+	// Custom template without uuid
+	name2 := FormatPartitionFilename(dateStr, "partition_{date}.db")
+	if name2 != "partition_2026-10-16.db" {
+		t.Errorf("unexpected custom filename: %q", name2)
+	}
+}
