@@ -29,14 +29,15 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 ## Feature Documentation
 
-Comprehensive guides for individual AnchorDB subsystems:
-- **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, projections, and batch updates.
+- **[Multi-Model Architecture: One Model = One File](docs/multi_model_architecture.md)**: Independent storage files, failure isolation, and memory-mapped model routing.
+- **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, attribute projections, and batch updates.
 - **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, and weighted causal chains.
 - **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
 - **[Data Partitioning & Record Lifecycle](docs/partitioning_and_lifecycle.md)**: 4-state lifecycle machine, archival sinks, and tombstone collection.
 - **[Background Subsystems: Scheduler & Worker Pool](docs/background_subsystems.md)**: Wall-clock cron scheduler and bounded async worker pool.
 - **[REST API Reference](docs/rest_api.md)**: HTTP daemon configuration, authentication, telemetry, and endpoints.
 - **[Go Driver SDK Guide](docs/go_driver.md)**: Connection setup, query builders, and integration examples.
+
 
 ---
 
@@ -142,8 +143,10 @@ services:
 ## Using the Go Driver SDK
 
 AnchorDB includes an official client driver in `pkg/driver`. It operates in two modes:
-1. **Remote Engine Mode (Production)**: Connects to a running AnchorDB engine daemon over HTTP, leveraging background schedulers, worker pools, central file locking, token authentication, and multi-model routing.
-2. **Local Embedded Mode (Testing / Embedded)**: Opens a `.anchordb` file directly in-process via `driver.OpenLocal(...)`.
+1. **Remote Engine Mode (`driver.ConnectRemote`)**: Connects to a running AnchorDB engine server over HTTP/REST, leveraging background schedulers, worker pools, central file locking, token authentication, and multi-model routing.
+2. **Embedded Engine Mode (`driver.OpenEmbedded`)**: Runs the full in-process AnchorDB engine runtime (WAL, file locking, multi-model routing, worker pool, and optional background sync) directly in RAM with zero network overhead.
+
+> **Raw File Exposure Notice**: The `.anchordb` binary file is strictly an internal storage engine artifact. Never open or manipulate `.anchordb` files directly outside the engine.
 
 ### 1. Connecting to the Engine
 
@@ -154,12 +157,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
 )
 
 func main() {
-	// Remote Engine Mode (Production)
+	// Mode A: Remote Engine (Client-Server over HTTP)
 	client, err := driver.ConnectRemote("http://localhost:7447",
 		driver.WithToken("your_auth_token"),
 		driver.WithModel("plant_iot"),
@@ -169,8 +173,12 @@ func main() {
 	}
 	defer client.Close()
 
-	// For local unit testing or standalone embedded CLI tools:
-	// client, err := driver.OpenLocal("./data/app.anchordb")
+	// Mode B: Embedded Engine (In-Process Runtime, No TCP Port)
+	// embeddedClient, err := driver.OpenEmbedded("./data",
+	// 	driver.WithModel("plant_iot"),
+	// 	driver.WithSyncInterval(5 * time.Second),
+	// )
+
 
 	ctx := context.Background()
 
@@ -327,7 +335,19 @@ Settings can be specified through command-line flags or environment variables:
 
 ---
 
+## Design Boundaries & Limitations
+
+AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D spatial indexing, and directed causal reasoning. It is designed with clear architectural trade-offs:
+
+1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. There are no tables, schemas, migrations, or cross-model relational `JOIN` operations.
+2. **Numeric Property Vectors**: Record properties are stored as `float32` values. AnchorDB is ideal for telemetry, IoT sensors, numerical attributes, and dates (Epoch Days), rather than arbitrary text documents or binary blobs.
+3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (Remote HTTP Server or Embedded In-Process Engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
+4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
+
+---
+
 ## Development & Testing
+
 
 Run the test suite and verification tools:
 

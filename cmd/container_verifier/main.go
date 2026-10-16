@@ -8,9 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -24,7 +22,6 @@ const (
 	baseURL       = "http://localhost:7447"
 	authToken     = "test_secret_token_live"
 	containerName = "anchordb-live-test"
-	hostDataDir   = "/tmp/anchordb_container_test_data"
 	testModel     = "iot_plant"
 )
 
@@ -39,7 +36,7 @@ func main() {
 	if err := waitForHealth(15 * time.Second); err != nil {
 		log.Fatalf("[FATAL] Container is not ready: %v", err)
 	}
-	fmt.Println("[READY] AnchorDB Container is healthy and responding on :7447\n")
+	fmt.Println("[READY] AnchorDB Container is healthy and responding on :7447")
 
 	// -------------------------------------------------------------------------
 	// (a) Stress Testing All Operations
@@ -607,28 +604,20 @@ func runColdDataArchivalTest(ctx context.Context) {
 	}
 	fmt.Printf("      -> sensor_active_recent remains in hot DB (moisture=%.1f) [ACTIVE]\n", recRecent.Get("moisture"))
 
-	// 4. Verify cold partition file on host volume mount
-	fmt.Println("[4/4] Locating and verifying cold data partition file on host volume...")
-	coldDir := filepath.Join(hostDataDir, "partitions")
-	files, err := os.ReadDir(coldDir)
-	if err != nil || len(files) == 0 {
-		log.Fatalf("No cold partition files found in %s: %v", coldDir, err)
+	// 4. Verify cold partition through Engine API (no raw file access)
+	fmt.Println("[4/4] Locating and verifying cold data partition through the Engine API...")
+	partitions, err := hotClient.ListPartitions(ctx)
+	if err != nil || len(partitions) == 0 {
+		log.Fatalf("No cold partition files returned by engine: %v", err)
 	}
-	coldFilePath := filepath.Join(coldDir, files[0].Name())
-	// Ensure host process has permissions on container-generated partition files
-	_ = exec.Command("podman", "exec", containerName, "chmod", "-R", "0777", "/data/partitions").Run()
+	coldPartitionFile := partitions[0].Name
+	fmt.Printf("      -> Engine detected partition archive: %s (%d bytes, modTime: %s)\n",
+		coldPartitionFile, partitions[0].SizeBytes, partitions[0].ModTime.Format(time.RFC3339))
 
-	// Open the cold partition file using driver.OpenLocal
-	coldClient, err := driver.OpenLocal(coldFilePath)
+	coldRec, err := hotClient.InspectPartitionRecord(ctx, coldPartitionFile, "sensor_archive_old_1")
 	if err != nil {
-		log.Fatalf("Failed to open cold partition directly: %v", err)
+		log.Fatalf("Failed to retrieve record from cold archive via engine: %v", err)
 	}
-	defer coldClient.Close()
-
-	coldRec, err := coldClient.Get("sensor_archive_old_1").Execute(ctx)
-	if err != nil {
-		log.Fatalf("Failed to retrieve record from cold archive: %v", err)
-	}
-	fmt.Printf("      -> Cold Archive Query: %s found in cold partition file! (moisture=%.1f) [OK]\n",
-		coldRec.Name, coldRec.Get("moisture"))
+	fmt.Printf("      -> Cold Archive Query (Engine Authenticated): %s found in %s! (moisture=%.1f) [OK]\n",
+		coldRec.Name, coldPartitionFile, coldRec.Get("moisture"))
 }

@@ -45,18 +45,29 @@ You can also connect using standard URI DSN strings:
 client, err := driver.Connect("anchordb://user:secret@localhost:7447/plant_iot")
 ```
 
-### Option B: Local Embedded Client (Unit Testing / Single-Process Tools)
+### Option B: Embedded Engine Mode (In-Process Runtime, Zero Network Overhead)
+
+For embedded applications, command-line utilities, or local unit tests that do not want to run a separate network server:
 
 ```go
-// Open an embedded local database file directly
-client, err := driver.OpenLocal("./data/plant_iot.anchordb")
+// Open an in-process AnchorDB engine targeting a local data directory.
+// Runs the full engine runtime (WAL, file locking, multi-model routing, worker pool,
+// and optional background sync) directly in-process with zero network overhead.
+client, err := driver.OpenEmbedded("./data",
+    driver.WithModel("plant_iot"),
+    driver.WithSyncInterval(5 * time.Second),
+    driver.WithWorkerConcurrency(4),
+)
 if err != nil {
-    log.Fatalf("failed to open local database: %v", err)
+    log.Fatalf("failed to initialize embedded engine: %v", err)
 }
 defer client.Close()
 ```
 
+> **Important — Raw File Exposure Notice**: The `.anchordb` binary file is strictly an internal storage engine format. Direct raw file opening (`OpenLocal`) is deprecated in favor of `OpenEmbedded(dataDir)`. Accessing raw `.anchordb` files bypasses WAL durability, file locking, background scheduler tasks, and lifecycle transitions.
+>
 > **Note on `?mode=mmap`**: AnchorDB core storage is always memory-mapped via zero-copy `mmap(MAP_SHARED)`. Redundant query flags like `?mode=mmap` are unnecessary and stripped automatically for backward compatibility.
+
 
 ---
 
@@ -229,3 +240,38 @@ for _, step := range chain {
 ## 10. Context & Timeouts
 
 All builder execution methods (`.Execute(ctx)`) strictly honor `context.Context` cancellation and deadlines. If a request is canceled or times out, execution halts immediately and returns `ctx.Err()`.
+
+---
+
+## 11. Cold Partition Inspection
+
+Archived partition files are inspected through the engine API without exposing raw filesystem descriptors:
+
+```go
+// 1. List available cold partition archives
+partitions, err := client.ListPartitions(ctx)
+for _, p := range partitions {
+    fmt.Printf("Archive: %s (%d bytes, modified %s)\n", p.Name, p.SizeBytes, p.ModTime)
+}
+
+// 2. Inspect a specific record from a cold archive
+coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
+if err == nil {
+    fmt.Printf("Archived sensor moisture: %.1f\n", coldRec.Get("moisture"))
+}
+
+// 3. Paginate through archived records
+res, err := client.InspectPartition(ctx, "2026-10-16_part1.anchordb", "", 25)
+for _, item := range res.Records {
+    fmt.Println("Archived Record:", item.Name, item.Props)
+}
+```
+
+---
+
+## 12. Design Boundaries & Limitations
+
+1. **One Model = One File**: Each named model (`sensors`, `telemetry`) is an isolated binary file with its own lock and WAL. AnchorDB does not support cross-model relational JOINs.
+2. **Numeric Property Vectors**: Record attributes are optimized for computational floating-point metrics (`float32`) and Epoch Days dates (`MustDate("YYYY-MM-DD")`).
+3. **Engine-Only Invariant Access**: Never attempt to open, copy, or mutate an active `.anchordb` file outside the engine. Always access data via `driver.ConnectRemote(...)` or `driver.OpenEmbedded(...)`.
+

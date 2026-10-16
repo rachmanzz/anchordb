@@ -17,7 +17,8 @@ The file begins with a 64-byte fixed-size header:
 | `4..7` | 4 | Version | Database format version (`3`) |
 | `8..11` | 4 | Node Count | Total number of spatial nodes |
 | `12..15` | 4 | Relation Count | Number of predefined geometric relations |
-| `16..23` | 8 | Causal Section Offset | Byte offset to causal edge table (`EDG3`) |
+| `16..23` | 8 | Causal Section Offset | Byte offset to causal edge section (`EDG3`) |
+
 | `24..63` | 40 | Reserved | Padding for future structural extensions |
 
 ### Record Layout
@@ -95,3 +96,12 @@ if err != nil {
     log.Fatalf("repair failed: %v", err)
 }
 ```
+
+---
+
+## 6. Design Boundaries & Limitations
+
+1. **File-Level Failure Isolation**: Each model file `{model}.anchordb` and its corresponding `{model}.wal` are completely independent. A power failure or filesystem corruption on one model file cannot corrupt other model files.
+2. **Single-Process Exclusive Lock**: An active model file cannot be opened by two distinct processes at the same time. Concurrency is scaled via multiple worker threads/goroutines inside a single engine process or through the Remote Engine HTTP server.
+3. **No Direct External Mutation**: The `.anchordb` file format relies on in-memory address translation and synchronized WAL states. Any external modification to the binary file while the engine is running results in undefined behavior or crash recovery rollbacks.
+

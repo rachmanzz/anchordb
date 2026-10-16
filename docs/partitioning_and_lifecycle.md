@@ -89,3 +89,38 @@ curl -X POST http://localhost:7447/v1/collector/run \
 ```
 
 The collector removes references from `EntityStore`, updates the spatial index, and flushes changes to disk.
+
+---
+
+## 5. Cold Partition Inspection Through Engine
+
+Archived partitions are structured `.anchordb` binary files, but they are never meant to be opened directly by client file descriptors. The AnchorDB Engine exposes authenticated inspection endpoints and driver methods:
+
+```go
+// List available partition files
+partitions, err := client.ListPartitions(ctx)
+
+// Inspect a specific cold record via the engine
+coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
+```
+
+Or via REST:
+```bash
+# List partitions
+curl -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" http://localhost:7447/v1/partition/list
+
+# Inspect record
+curl -X POST http://localhost:7447/v1/partition/inspect \
+  -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"partition_file": "2026-10-16_part1.anchordb", "name": "sensor_archive_old_1"}'
+```
+
+---
+
+## 6. Design Boundaries & Limitations
+
+1. **Immutable Partition Archives**: Once written and finalized, partition files are read-only historical archives. Mutations, inserts, and in-place updates are not supported on archived partition files.
+2. **Date Field Requirement**: Automated partition archival requires an integer or float32 epoch-day attribute (e.g. `MustDate("YYYY-MM-DD")`). Records without a recognizable date attribute are not eligible for automated date-cutoff archival.
+3. **Engine-Mediated Inspection**: Direct host volume mounts of `/data/partitions` must not be read with raw file open calls; queries should always be routed through `client.InspectPartition` or `/v1/partition/inspect`.
+

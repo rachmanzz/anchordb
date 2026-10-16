@@ -55,7 +55,7 @@ fmt.Println("New Date:", updated.GetDate("start_date"))
 
 When reading entities using `Get` or `List`, computed values can be generated dynamically without persisting them to disk.
 
-### Selective Column Projection
+### Selective Attribute Projection
 Unselected attributes can be excluded from the returned payload by calling `.Select(...)`:
 
 ```go
@@ -70,8 +70,9 @@ record, err := client.Get("vehicle_route_1").
 fmt.Println(record.All()) // map[distance:100 duration:2 speed:50]
 ```
 
-### Filtering on Computed Columns (`List`)
+### Filtering on Computed Attributes (`List`)
 Computed fields can also be used in query predicates:
+
 
 ```go
 // Filter distance >= 50, compute speed, and filter speed > 50
@@ -137,3 +138,12 @@ In-storage calculations can be triggered over the HTTP REST API.
   }
 }
 ```
+
+---
+
+## 6. Design Boundaries & Limitations
+
+1. **Numeric Precision**: AnchorDB optimizes attribute storage as IEEE 754 single-precision floats (`float32`). It is tailored for telemetry, IoT, metrics, and spatial coordinates, rather than arbitrary-precision banking decimals.
+2. **Deterministic Binary Operations**: Supported operators are limited to arithmetic (`+`, `-`, `*`, `/`) and date offsets (`+days`, `-days`, `days_between`). AnchorDB intentionally avoids embedding a general-purpose programming language (e.g. Lua or JavaScript) in storage to maintain zero-GPU, sub-microsecond latency.
+3. **Division by Zero Protection**: Division operations automatically yield `0.0` with logged warnings rather than aborting the transaction or generating hardware traps.
+

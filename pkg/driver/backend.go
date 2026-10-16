@@ -8,13 +8,42 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
+	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
-// backend defines the internal execution contract shared by local and remote engine drivers.
+// PartitionMeta represents metadata for an archived partition file.
+type PartitionMeta struct {
+	Name      string    `json:"name"`
+	SizeBytes int64     `json:"size_bytes"`
+	ModTime   time.Time `json:"mod_time"`
+}
+
+// PartitionRecord represents an entity record inside an archived partition.
+type PartitionRecord struct {
+	Name  string             `json:"name"`
+	Props map[string]float32 `json:"props"`
+}
+
+// PartitionInspectResult represents the response when inspecting an archived partition file.
+type PartitionInspectResult struct {
+	Success       bool               `json:"success"`
+	PartitionFile string             `json:"partition_file"`
+	Name          string             `json:"name,omitempty"`
+	Props         map[string]float32 `json:"props,omitempty"`
+	Records       []PartitionRecord  `json:"records,omitempty"`
+	Count         int                `json:"count,omitempty"`
+}
+
+// backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
 type backend interface {
 	Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error)
 	Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error)
@@ -34,6 +63,8 @@ type backend interface {
 	Close() error
 	DB() *storage.AnchorDB
 	IsRemote() bool
+	ListPartitions(ctx context.Context) ([]PartitionMeta, error)
+	InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error)
 }
 
 // -----------------------------------------------------------------------------
@@ -41,7 +72,8 @@ type backend interface {
 // -----------------------------------------------------------------------------
 
 type localBackend struct {
-	db *storage.AnchorDB
+	filePath string
+	db       *storage.AnchorDB
 }
 
 func newLocalBackend(filePath string) (*localBackend, error) {
@@ -49,7 +81,7 @@ func newLocalBackend(filePath string) (*localBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open local AnchorDB at %s: %w", filePath, err)
 	}
-	return &localBackend{db: db}, nil
+	return &localBackend{filePath: filePath, db: db}, nil
 }
 
 func (b *localBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
@@ -207,6 +239,519 @@ func (b *localBackend) DB() *storage.AnchorDB {
 
 func (b *localBackend) IsRemote() bool {
 	return false
+}
+
+func (b *localBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	partDir := filepath.Join(filepath.Dir(b.filePath), "partitions")
+	entries, err := os.ReadDir(partDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []PartitionMeta{}, nil
+		}
+		return nil, fmt.Errorf("failed to read partitions directory: %w", err)
+	}
+	var out []PartitionMeta
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, PartitionMeta{
+			Name:      e.Name(),
+			SizeBytes: info.Size(),
+			ModTime:   info.ModTime(),
+		})
+	}
+	return out, nil
+}
+
+func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	cleanFilename := filepath.Base(partitionFile)
+	fullPath := filepath.Join(filepath.Dir(b.filePath), "partitions", cleanFilename)
+	if _, err := os.Stat(fullPath); err != nil {
+		return nil, fmt.Errorf("partition file not found: %s", cleanFilename)
+	}
+
+	pdb, err := storage.Open(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open partition: %w", err)
+	}
+	defer pdb.Close()
+
+	if recordName != "" {
+		props, err := pdb.GetRecord(recordName)
+		if err != nil {
+			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
+		}
+		return &PartitionInspectResult{
+			Success:       true,
+			PartitionFile: cleanFilename,
+			Name:          recordName,
+			Props:         props,
+		}, nil
+	}
+
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list records in partition: %w", err)
+	}
+
+	out := make([]PartitionRecord, len(records))
+	for i, r := range records {
+		out[i] = PartitionRecord{Name: r.Name, Props: r.Props}
+	}
+
+	return &PartitionInspectResult{
+		Success:       true,
+		PartitionFile: cleanFilename,
+		Records:       out,
+		Count:         len(out),
+	}, nil
+}
+
+// -----------------------------------------------------------------------------
+// Embedded Backend (In-Process Engine with WAL, Multi-Model, Scheduler & Workers)
+// -----------------------------------------------------------------------------
+
+type embeddedBackend struct {
+	mu         sync.RWMutex
+	dataDir    string
+	cfg        clientConfig
+	models     map[string]*storage.AnchorDB
+	workerPool *worker.Pool
+	scheduler  *scheduler.InternalScheduler
+	closed     bool
+}
+
+type embeddedSyncTask struct {
+	backend  *embeddedBackend
+	interval time.Duration
+}
+
+func (t *embeddedSyncTask) Schedule() string {
+	return fmt.Sprintf("@every %s", t.interval.String())
+}
+
+func (t *embeddedSyncTask) Execute(ctx context.Context) error {
+	return t.backend.Sync(ctx, "all")
+}
+
+func newEmbeddedBackend(dataDir string, cfg clientConfig) (*embeddedBackend, error) {
+	if dataDir == "" {
+		dataDir = "."
+	}
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory %s: %w", dataDir, err)
+	}
+
+	b := &embeddedBackend{
+		dataDir: dataDir,
+		cfg:     cfg,
+		models:  make(map[string]*storage.AnchorDB),
+	}
+
+	if cfg.workerConcurrency > 0 {
+		pool := worker.NewPool(worker.Config{
+			Concurrency: cfg.workerConcurrency,
+		})
+		pool.Start()
+		b.workerPool = pool
+	}
+
+	if cfg.enableScheduler || cfg.syncInterval > 0 {
+		sched := scheduler.NewInternalScheduler()
+		if cfg.syncInterval > 0 {
+			_ = sched.RegisterTask("embedded_periodic_sync", &embeddedSyncTask{backend: b, interval: cfg.syncInterval})
+		}
+		sched.Start()
+		b.scheduler = sched
+	}
+
+	if cfg.model != "" {
+		if _, err := b.getDB(cfg.model); err != nil {
+			_ = b.Close()
+			return nil, err
+		}
+	}
+
+	return b, nil
+}
+
+func (b *embeddedBackend) getDB(model string) (*storage.AnchorDB, error) {
+	if model == "" {
+		model = "default"
+	}
+	cleanModel := filepath.Base(model)
+	if cleanModel == "." || cleanModel == "/" || cleanModel == ".." {
+		cleanModel = "default"
+	}
+
+	b.mu.RLock()
+	db, ok := b.models[cleanModel]
+	closed := b.closed
+	b.mu.RUnlock()
+
+	if closed {
+		return nil, fmt.Errorf("embedded engine is closed")
+	}
+	if ok {
+		return db, nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return nil, fmt.Errorf("embedded engine is closed")
+	}
+	if db, ok := b.models[cleanModel]; ok {
+		return db, nil
+	}
+
+	filePath := filepath.Join(b.dataDir, cleanModel+".anchordb")
+	newDB, err := storage.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open embedded model %q at %s: %w", cleanModel, filePath, err)
+	}
+	b.models[cleanModel] = newDB
+	return newDB, nil
+}
+
+func (b *embeddedBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return "", err
+	}
+	opStatus := storage.OpStatusActive
+	if op != nil {
+		opStatus = *op
+	}
+	return db.SaveRecordWithIDAndOp(name, opStatus, props)
+}
+
+func (b *embeddedBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	var props map[string]float32
+	if len(computations) == 0 {
+		props, err = db.GetRecord(name, selectFields...)
+	} else {
+		props, err = db.GetRecordWithCompute(name, computations, selectFields...)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &EntityResult{Name: name, props: props}, nil
+}
+
+func (b *embeddedBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	opts.Context = ctx
+	records, hasMore, err := db.ListRecordsWithPaging(opts)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]EntityResult, len(records))
+	for i, r := range records {
+		items[i] = EntityResult{
+			Name:  r.Name,
+			props: r.Props,
+		}
+	}
+	return &PagedListResult{
+		Items:   items,
+		HasMore: hasMore,
+	}, nil
+}
+
+func (b *embeddedBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return 0, err
+	}
+	opts.Context = ctx
+	return db.UpdateRecords(opts)
+}
+
+func (b *embeddedBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	results, anchor, err := db.ExecuteGraphStepWithContext(ctx, inputs, relation, limitK, orderMode, beamWidth)
+	if err != nil {
+		return nil, err
+	}
+	return &GraphResponse{Anchor: anchor, Results: results}, nil
+}
+
+func (b *embeddedBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	steps, err := db.ExecuteGraphChainWithContext(ctx, inputs, relations, limitK, beamWidth)
+	if err != nil {
+		return nil, err
+	}
+	seq := make([]string, len(steps))
+	for i, step := range steps {
+		seq[i] = step.Word
+	}
+	return &ChainResponse{
+		Sequence: seq,
+		Steps:    steps,
+	}, nil
+}
+
+func (b *embeddedBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(action) {
+	case "remove", "delete", "unlink":
+		return db.RemoveEdge(source, relation, target)
+	default:
+		return db.AddEdge(source, relation, target, weight)
+	}
+}
+
+func (b *embeddedBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	if len(relations) > 0 {
+		return db.ExecuteCausalChain(ctx, seeds, relations, limitK)
+	}
+	return db.ExecuteCausalStep(ctx, seeds, relation, limitK)
+}
+
+func (b *embeddedBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
+	db, err := b.getDB(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.CalculateDistance(wordA, wordB)
+}
+
+func (b *embeddedBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
+	db, err := b.getDB(model)
+	if err != nil {
+		return CentroidResult{}, err
+	}
+	coord, roles, err := db.CalculateCentroid(words)
+	return CentroidResult{Coord: coord, Roles: roles}, err
+}
+
+func (b *embeddedBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
+	db, err := b.getDB(model)
+	if err != nil {
+		return 0, err
+	}
+	return db.CalculateCosineSimilarity(wordA, wordB)
+}
+
+func (b *embeddedBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	return db.FindNearestNeighbors(word, limitK)
+}
+
+func (b *embeddedBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return err
+	}
+	_, err = db.AppendNode(word, coord, roles, 1)
+	return err
+}
+
+func (b *embeddedBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return err
+	}
+	return db.SetRelation(name, direction)
+}
+
+func (b *embeddedBackend) Sync(ctx context.Context, model string) error {
+	if model != "" && model != "all" {
+		db, err := b.getDB(model)
+		if err != nil {
+			return err
+		}
+		return db.Sync()
+	}
+	b.mu.RLock()
+	dbs := make([]*storage.AnchorDB, 0, len(b.models))
+	for _, db := range b.models {
+		dbs = append(dbs, db)
+	}
+	b.mu.RUnlock()
+
+	var lastErr error
+	for _, db := range dbs {
+		if err := db.Sync(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func (b *embeddedBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+
+	if b.scheduler != nil {
+		b.scheduler.Stop()
+	}
+	if b.workerPool != nil {
+		_ = b.workerPool.Shutdown()
+	}
+
+	var lastErr error
+	for _, db := range b.models {
+		if err := db.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	b.models = make(map[string]*storage.AnchorDB)
+	return lastErr
+}
+
+func (b *embeddedBackend) DB() *storage.AnchorDB {
+	db, err := b.getDB(b.cfg.model)
+	if err != nil {
+		return nil
+	}
+	return db
+}
+
+func (b *embeddedBackend) IsRemote() bool {
+	return false
+}
+
+func (b *embeddedBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	partDir := filepath.Join(b.dataDir, "partitions")
+	entries, err := os.ReadDir(partDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []PartitionMeta{}, nil
+		}
+		return nil, fmt.Errorf("failed to read partitions directory: %w", err)
+	}
+	var out []PartitionMeta
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, PartitionMeta{
+			Name:      e.Name(),
+			SizeBytes: info.Size(),
+			ModTime:   info.ModTime(),
+		})
+	}
+	return out, nil
+}
+
+func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	cleanFilename := filepath.Base(partitionFile)
+	fullPath := filepath.Join(b.dataDir, "partitions", cleanFilename)
+	if _, err := os.Stat(fullPath); err != nil {
+		return nil, fmt.Errorf("partition file not found: %s", cleanFilename)
+	}
+
+	pdb, err := storage.Open(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open partition: %w", err)
+	}
+	defer pdb.Close()
+
+	if recordName != "" {
+		props, err := pdb.GetRecord(recordName)
+		if err != nil {
+			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
+		}
+		return &PartitionInspectResult{
+			Success:       true,
+			PartitionFile: cleanFilename,
+			Name:          recordName,
+			Props:         props,
+		}, nil
+	}
+
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list records in partition: %w", err)
+	}
+
+	out := make([]PartitionRecord, len(records))
+	for i, r := range records {
+		out[i] = PartitionRecord{Name: r.Name, Props: r.Props}
+	}
+
+	return &PartitionInspectResult{
+		Success:       true,
+		PartitionFile: cleanFilename,
+		Records:       out,
+		Count:         len(out),
+	}, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -604,6 +1149,49 @@ func (b *remoteBackend) DB() *storage.AnchorDB {
 
 func (b *remoteBackend) IsRemote() bool {
 	return true
+}
+
+func (b *remoteBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	var resp struct {
+		Success    bool            `json:"success"`
+		Partitions []PartitionMeta `json:"partitions"`
+	}
+	if err := b.doJSON(ctx, http.MethodGet, "/v1/partition/list", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Partitions, nil
+}
+
+func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	req := map[string]interface{}{
+		"partition_file": partitionFile,
+	}
+	if recordName != "" {
+		req["name"] = recordName
+	}
+	if limit > 0 {
+		req["limit"] = limit
+	}
+
+	var resp struct {
+		Success       bool               `json:"success"`
+		PartitionFile string             `json:"partition_file"`
+		Name          string             `json:"name,omitempty"`
+		Props         map[string]float32 `json:"props,omitempty"`
+		Records       []PartitionRecord  `json:"records,omitempty"`
+		Count         int                `json:"count,omitempty"`
+	}
+	if err := b.doJSON(ctx, http.MethodPost, "/v1/partition/inspect", req, &resp); err != nil {
+		return nil, err
+	}
+	return &PartitionInspectResult{
+		Success:       resp.Success,
+		PartitionFile: resp.PartitionFile,
+		Name:          resp.Name,
+		Props:         resp.Props,
+		Records:       resp.Records,
+		Count:         resp.Count,
+	}, nil
 }
 
 // -----------------------------------------------------------------------------

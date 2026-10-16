@@ -79,3 +79,12 @@ Use `GET /v1/worker/status` to monitor the pool:
   "memory_pressure_active": false
 }
 ```
+
+---
+
+## 3. Design Boundaries & Limitations
+
+1. **In-Memory Task Queue**: Worker queue items are held in memory. If the process is forcefully killed (`SIGKILL`), unstarted queued tasks are dropped. Critical durable tasks must be driven by WAL state or the recurring cron scheduler.
+2. **Single-Process Scope**: The scheduler and worker pool operate strictly within the running AnchorDB engine instance. They do not distribute tasks across multiple disparate machines.
+3. **No External Message Broker Dependency**: AnchorDB deliberately contains its own queue and scheduler to remain a zero-dependency, single-binary engine.
+

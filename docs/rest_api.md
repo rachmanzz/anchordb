@@ -66,7 +66,8 @@ Stores an entity with key-value properties.
 ```
 
 ### `POST /v1/get`
-Retrieves an entity by name with optional in-storage computations and selective column projection.
+Retrieves an entity by name with optional in-storage computations and selective attribute projection.
+
 
 **Request Payload**:
 ```json
@@ -188,6 +189,55 @@ Archives historical records older than the retention threshold.
 }
 ```
 
+### `GET /v1/partition/list`
+Lists available archived partition files in the partition storage directory.
+
+**Response**:
+```json
+{
+  "success": true,
+  "partitions": [
+    {
+      "name": "2026-10-16_transactions_part1.anchordb",
+      "size_bytes": 145020,
+      "mod_time": "2026-10-16T12:00:00Z"
+    }
+  ]
+}
+```
+
+### `POST /v1/partition/inspect`
+Safely inspects records inside an archived partition file without exposing raw storage files to clients.
+
+**Request Payload (Inspect Record)**:
+```json
+{
+  "partition_file": "2026-10-16_transactions_part1.anchordb",
+  "name": "tx_old_1092"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "partition_file": "2026-10-16_transactions_part1.anchordb",
+  "name": "tx_old_1092",
+  "props": {
+    "amount": 250.0,
+    "date": 20580.0
+  }
+}
+```
+
+**Request Payload (List Archived Records)**:
+```json
+{
+  "partition_file": "2026-10-16_transactions_part1.anchordb",
+  "limit": 10
+}
+```
+
 ### `POST /v1/collector/run`
 Purges records currently in the Tombstone state (`operation = 2`). Supports `"async": true`.
 
@@ -198,3 +248,12 @@ Cancels queued jobs before execution:
   "job_id": "a974c021-..."
 }
 ```
+
+---
+
+## 6. Design Boundaries & Limitations
+
+1. **Protocol Transport**: All engine communication utilizes HTTP/1.1 REST JSON. Persistent connections are maintained via standard HTTP Keep-Alive.
+2. **Model Parameter**: Endpoints accept `"model"` in the request payload or `?model=` query string. If omitted, the engine routes requests to the `"default"` model file.
+3. **Internal Partition Storage**: Partition archive files stored under `/data/partitions` are inaccessible directly over the network; they must be queried via `/v1/partition/inspect`.
+

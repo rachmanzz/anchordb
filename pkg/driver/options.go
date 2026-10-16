@@ -9,16 +9,21 @@ import (
 type Option func(*clientConfig)
 
 type clientConfig struct {
-	token      string
-	model      string
-	timeout    time.Duration
-	httpClient *http.Client
+	token             string
+	model             string
+	timeout           time.Duration
+	httpClient        *http.Client
+	syncInterval      time.Duration
+	workerConcurrency int
+	enableScheduler   bool
 }
 
 func defaultClientConfig() clientConfig {
 	return clientConfig{
-		model:   "default",
-		timeout: 30 * time.Second,
+		model:             "default",
+		timeout:           30 * time.Second,
+		workerConcurrency: 2,
+		enableScheduler:   false,
 	}
 }
 
@@ -53,5 +58,28 @@ func WithHTTPClient(client *http.Client) Option {
 		if client != nil {
 			c.httpClient = client
 		}
+	}
+}
+
+// WithSyncInterval configures automatic periodic sync in embedded engine mode.
+func WithSyncInterval(d time.Duration) Option {
+	return func(c *clientConfig) {
+		c.syncInterval = d
+	}
+}
+
+// WithWorkerConcurrency sets the concurrency limit for the embedded worker pool.
+func WithWorkerConcurrency(n int) Option {
+	return func(c *clientConfig) {
+		if n > 0 {
+			c.workerConcurrency = n
+		}
+	}
+}
+
+// WithScheduler enables the background task scheduler in embedded engine mode.
+func WithScheduler(enable bool) Option {
+	return func(c *clientConfig) {
+		c.enableScheduler = enable
 	}
 }

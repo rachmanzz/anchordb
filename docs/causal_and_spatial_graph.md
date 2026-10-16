@@ -109,7 +109,7 @@ During multi-hop chain execution:
 ## 3. Storage & Compaction
 
 * **Memory-Mapped Persistence**: Causal edges are serialized alongside spatial nodes in the `.anchordb` binary file and recorded in the Write-Ahead Log (`WalOpEdge`, `WalOpEdgeDelete`).
-* **Tombstone Compaction**: Deleted edges are flagged with tombstones for $O(1)$ removal. When tombstones exceed the active edge threshold, AnchorDB automatically compacts the edge set to preserve bounded memory consumption.
+* **Tombstone Tagging & Compaction**: Deleted edges are tagged with tombstones in $O(1)$ constant time without shifting array elements. When the number of tombstoned records exceeds the configured ratio threshold, an amortized $O(N)$ compaction pass reclaims fragmented slots and flushes clean contiguous storage to disk.
 
 ---
 
@@ -146,3 +146,12 @@ During multi-hop chain execution:
   ]
 }
 ```
+
+---
+
+## 5. Design Boundaries & Limitations
+
+1. **Cumulative Weights vs. Probabilities**: The aggregate score along a multi-hop causal chain is the product of transition edge weights ($\prod w_i$). It represents cumulative relational affinity, not a Bayesian conditional probability or formal causal DAG backdoor adjustment.
+2. **2D Spatial Coordinates**: Spatial indexing is specifically optimized for 2D Cartesian planes (e.g. facility layouts, IoT field grids, game maps). It is not designed to replace high-dimensional dense vector embeddings (e.g. 1536-dim OpenAI embeddings).
+3. **Bounded Beam Search**: Multi-hop traversals and ray casting evaluate candidates within bounded grid radius or beam width ($O(K)$ candidate evaluations), ensuring bounded latency rather than exhaustive graph exploration.
+

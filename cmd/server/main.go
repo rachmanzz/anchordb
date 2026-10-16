@@ -175,6 +175,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/math", s.authMiddleware(s.handleMath))
 	mux.HandleFunc("/v1/sync", s.authMiddleware(s.handleSync))
 	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
+	mux.HandleFunc("/v1/partition/list", s.authMiddleware(s.handlePartitionList))
+	mux.HandleFunc("/v1/partition/inspect", s.authMiddleware(s.handlePartitionInspect))
 	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
 	mux.HandleFunc("/v1/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
@@ -1651,6 +1653,131 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"results": results,
+	})
+}
+
+// handlePartitionList lists available partition archives in s.dataDir/partitions
+func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
+		return
+	}
+	partDir := filepath.Join(s.dataDir, "partitions")
+	entries, err := os.ReadDir(partDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":    true,
+				"partitions": []interface{}{},
+			})
+			return
+		}
+		http.Error(w, fmt.Sprintf(`{"error":"failed to read partitions directory: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	type PartitionMetaDTO struct {
+		Name      string    `json:"name"`
+		SizeBytes int64     `json:"size_bytes"`
+		ModTime   time.Time `json:"mod_time"`
+	}
+
+	var partitions []PartitionMetaDTO
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		partitions = append(partitions, PartitionMetaDTO{
+			Name:      e.Name(),
+			SizeBytes: info.Size(),
+			ModTime:   info.ModTime(),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"partitions": partitions,
+	})
+}
+
+type PartitionInspectRequest struct {
+	PartitionFile string `json:"partition_file"`
+	Name          string `json:"name,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+}
+
+// handlePartitionInspect safely reads records from an archived partition file via the engine.
+func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req PartitionInspectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.PartitionFile == "" {
+		http.Error(w, `{"error":"partition_file is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	cleanFilename := filepath.Base(req.PartitionFile)
+	fullPath := filepath.Join(s.dataDir, "partitions", cleanFilename)
+	if _, err := os.Stat(fullPath); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"partition file not found: %s"}`, cleanFilename), http.StatusNotFound)
+		return
+	}
+
+	pdb, err := storage.Open(fullPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"failed to open partition: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer pdb.Close()
+
+	if req.Name != "" {
+		props, err := pdb.GetRecord(req.Name)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"record %q not found in partition"}`, req.Name), http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"partition_file": cleanFilename,
+			"name":           req.Name,
+			"props":          props,
+		})
+		return
+	}
+
+	limit := req.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"failed to list records in partition: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	type RecordDTO struct {
+		Name  string             `json:"name"`
+		Props map[string]float32 `json:"props"`
+	}
+	out := make([]RecordDTO, len(records))
+	for i, r := range records {
+		out[i] = RecordDTO{Name: r.Name, Props: r.Props}
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"partition_file": cleanFilename,
+		"records":        out,
+		"count":          len(out),
 	})
 }
 

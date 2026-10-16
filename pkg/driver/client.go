@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -29,10 +30,18 @@ type Client struct {
 //     "anchordb://localhost:7447"
 //     "anchordb://token@localhost:7447/model_name"
 //
-//   - Local Embedded File (Testing / Standalone):
-//     "./data/app.anchordb"
-//     "/var/data/app.anchordb"
-//     "anchordb://./data/app.anchordb"
+//   - Remote Engine (Production / HTTP REST):
+//     "http://localhost:7447"
+//     "https://localhost:7447"
+//     "anchordb://localhost:7447"
+//     "anchordb://token@localhost:7447/model_name"
+//
+//   - Embedded Engine Mode (In-Process Runtime, Zero Network):
+//     "./data"
+//     "/var/data/anchordb"
+//     "embedded://./data"
+//     "anchordb://./data"
+//     "./data/plant_iot.anchordb"
 func Connect(dsn string, opts ...Option) (*Client, error) {
 	cfg := defaultClientConfig()
 	for _, opt := range opts {
@@ -77,22 +86,33 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
 	}
 
-	// 2. anchordb:// scheme
+	// 2. embedded:// scheme
+	if strings.HasPrefix(dsn, "embedded://") {
+		cleanPath := strings.TrimPrefix(dsn, "embedded://")
+		if idx := strings.Index(cleanPath, "?"); idx != -1 {
+			cleanPath = cleanPath[:idx]
+		}
+		return OpenEmbedded(cleanPath, opts...)
+	}
+
+	// 3. anchordb:// scheme
 	if strings.HasPrefix(dsn, "anchordb://") {
 		raw := strings.TrimPrefix(dsn, "anchordb://")
 
-		// Check if it's a file path
+		// Check if it's a file or directory path
 		if strings.HasPrefix(raw, ".") || strings.HasPrefix(raw, "/") ||
 			(strings.Contains(raw, ".anchordb") && !strings.Contains(raw, ":7447")) {
 			cleanPath := raw
 			if idx := strings.Index(cleanPath, "?"); idx != -1 {
 				cleanPath = cleanPath[:idx]
 			}
-			backend, err := newLocalBackend(cleanPath)
-			if err != nil {
-				return nil, err
+			if !strings.HasSuffix(cleanPath, ".anchordb") {
+				return OpenEmbedded(cleanPath, opts...)
 			}
-			return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
+			dir := filepath.Dir(cleanPath)
+			model := strings.TrimSuffix(filepath.Base(cleanPath), ".anchordb")
+			allOpts := append([]Option{WithModel(model)}, opts...)
+			return OpenEmbedded(dir, allOpts...)
 		}
 
 		// Otherwise, parse as network host
@@ -127,19 +147,37 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
 	}
 
-	// 3. Local file path directly (strip any trailing query parameters)
+	// 4. Local directory or file path directly
 	cleanPath := dsn
 	if idx := strings.Index(cleanPath, "?"); idx != -1 {
 		cleanPath = cleanPath[:idx]
 	}
-	backend, err := newLocalBackend(cleanPath)
+	if !strings.HasSuffix(cleanPath, ".anchordb") {
+		return OpenEmbedded(cleanPath, opts...)
+	}
+	dir := filepath.Dir(cleanPath)
+	model := strings.TrimSuffix(filepath.Base(cleanPath), ".anchordb")
+	allOpts := append([]Option{WithModel(model)}, opts...)
+	return OpenEmbedded(dir, allOpts...)
+}
+
+// OpenEmbedded initializes an in-process AnchorDB engine targeting dataDir.
+// It runs the full engine runtime (WAL, file locking, multi-model routing, worker pool,
+// and optional background sync/scheduler) directly in-process with zero network overhead.
+func OpenEmbedded(dataDir string, opts ...Option) (*Client, error) {
+	cfg := defaultClientConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	backend, err := newEmbeddedBackend(dataDir, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{backend: backend, model: cfg.model, dsn: dsn}, nil
+	return &Client{backend: backend, model: cfg.model, dsn: dataDir}, nil
 }
 
-// OpenLocal opens a local AnchorDB file directly (embedded mode).
+// OpenLocal opens a local AnchorDB file directly.
+// Deprecated: Use OpenEmbedded(dataDir) to run the full in-process AnchorDB engine.
 func OpenLocal(filePath string) (*Client, error) {
 	if idx := strings.Index(filePath, "?"); idx != -1 {
 		filePath = filePath[:idx]
@@ -204,6 +242,25 @@ func (c *Client) Close() error {
 // Sync flushes modifications to disk.
 func (c *Client) Sync() error {
 	return c.backend.Sync(context.Background(), c.model)
+}
+
+// ListPartitions queries the engine to retrieve metadata on archived partition files.
+func (c *Client) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	return c.backend.ListPartitions(ctx)
+}
+
+// InspectPartition inspects an archived partition file through the engine runtime without exposing raw file descriptors.
+func (c *Client) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return c.backend.InspectPartition(ctx, partitionFile, recordName, limit)
+}
+
+// InspectPartitionRecord retrieves a single record from an archived partition file through the engine.
+func (c *Client) InspectPartitionRecord(ctx context.Context, partitionFile, recordName string) (*EntityResult, error) {
+	res, err := c.backend.InspectPartition(ctx, partitionFile, recordName, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &EntityResult{Name: recordName, props: res.Props}, nil
 }
 
 // Graph returns a new fluent query builder for spatial ray casting and multi-hop reasoning.
