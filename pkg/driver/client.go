@@ -394,6 +394,11 @@ func MustDate(dateStr string) float32 {
 	return d
 }
 
+// FormatDate converts numeric Epoch Days back to a "YYYY-MM-DD" string.
+func FormatDate(epochDays float32) string {
+	return storage.FormatDate(epochDays)
+}
+
 // AddDays creates an in-storage operator to add N days to a date field.
 func AddDays(field string, days float32) storage.ComputeOp {
 	return storage.OpAddDays{Field: field, Days: days}
