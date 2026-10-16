@@ -119,7 +119,7 @@ func TestDriver_FluentBuilder(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "driver_test.anchordb")
 
 	// 1. Connect via Driver DSN
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("failed to connect via driver: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestDriver_MultiHopChain(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_chain.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("failed to connect: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestDriver_DirectMathAndOrdering(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_math.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestDriver_SaveGetCompute_SpeedExample(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_physics.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestDriver_List_Where_Compute_Paging(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_list_page.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestDriver_SessionPersistence(t *testing.T) {
 	dbFile := filepath.Join(tmpDir, "persist_client.anchordb")
 
 	// Session 1: Connect, Save, Sync, Close
-	c1, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	c1, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("Session 1 connect failed: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestDriver_SessionPersistence(t *testing.T) {
 	_ = c1.Close()
 
 	// Session 2: Reconnect to same file, Get and Compute
-	c2, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	c2, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("Session 2 connect failed: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestDriver_SelectProjection_UserScenario(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbFile := filepath.Join(tmpDir, "select_test.anchordb")
 
-	client, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestDriver_BatchUpdate10k_AddDistance(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbFile := filepath.Join(tmpDir, "batch_update_10k.anchordb")
 
-	client, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestDriver_SequentialAddTen_UserExample(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbFile := filepath.Join(tmpDir, "sequential_add10.anchordb")
 
-	client, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestDriver_DateMath_Add45Days_UserScenario(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbFile := filepath.Join(tmpDir, "date_test.anchordb")
 
-	client, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestDriver_RichRangeAndDateFilters(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbFile := filepath.Join(tmpDir, "rich_filters.anchordb")
 
-	client, err := Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbFile)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestDriver_ScheduledDeactivation_15Days(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "users_deactivation.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -876,7 +876,7 @@ func TestDriver_HighConcurrencyParallelConnections(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "parallel_stress.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -944,7 +944,7 @@ func TestDriver_SaveAutoID(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_autouuid.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("failed to connect via driver: %v", err)
 	}
@@ -984,7 +984,7 @@ func TestDriver_CausalEdgesRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "driver_causal.anchordb")
 
-	client, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	client, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
@@ -1030,7 +1030,7 @@ func TestDriver_CausalEdgesRoundTrip(t *testing.T) {
 		t.Fatalf("close failed: %v", err)
 	}
 
-	reopened, err := Connect("anchordb://" + dbPath + "?mode=mmap")
+	reopened, err := Connect("anchordb://" + dbPath)
 	if err != nil {
 		t.Fatalf("reconnect failed: %v", err)
 	}

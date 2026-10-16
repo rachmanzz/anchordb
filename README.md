@@ -141,9 +141,11 @@ services:
 
 ## Using the Go Driver SDK
 
-AnchorDB includes a Go client driver in `pkg/driver`.
+AnchorDB includes an official client driver in `pkg/driver`. It operates in two modes:
+1. **Remote Engine Mode (Production)**: Connects to a running AnchorDB engine daemon over HTTP, leveraging background schedulers, worker pools, central file locking, token authentication, and multi-model routing.
+2. **Local Embedded Mode (Testing / Embedded)**: Opens a `.anchordb` file directly in-process via `driver.OpenLocal(...)`.
 
-### 1. Connecting to a Database
+### 1. Connecting to the Engine
 
 ```go
 package main
@@ -157,16 +159,23 @@ import (
 )
 
 func main() {
-	client, err := driver.Connect("anchordb://./data/app.anchordb?mode=mmap")
+	// Remote Engine Mode (Production)
+	client, err := driver.ConnectRemote("http://localhost:7447",
+		driver.WithToken("your_auth_token"),
+		driver.WithModel("plant_iot"),
+	)
 	if err != nil {
 		log.Fatalf("connection failed: %v", err)
 	}
 	defer client.Close()
 
+	// For local unit testing or standalone embedded CLI tools:
+	// client, err := driver.OpenLocal("./data/app.anchordb")
+
 	ctx := context.Background()
 
 	// Save record
-	err = client.Save("vehicle_1", map[string]float32{
+	err = client.Save("sensor_zone_1", map[string]float32{
 		"distance": 120.0,
 		"duration": 2.0,
 	})
@@ -175,7 +184,7 @@ func main() {
 	}
 
 	// Retrieve with in-storage computation
-	record, err := client.Get("vehicle_1").
+	record, err := client.Get("sensor_zone_1").
 		Select("distance", "duration", "speed").
 		Compute("speed", driver.Divide("distance", "duration")).
 		Execute(ctx)

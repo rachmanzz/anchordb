@@ -29,6 +29,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/partition"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/security"
+	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 	"github.com/rachmanzz/anchordb/pkg/system"
 	"github.com/rachmanzz/anchordb/pkg/worker"
@@ -171,6 +172,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/graph", s.authMiddleware(s.handleGraph))
 	mux.HandleFunc("/v1/edge", s.authMiddleware(s.handleEdge))
 	mux.HandleFunc("/v1/causal", s.authMiddleware(s.handleCausal))
+	mux.HandleFunc("/v1/math", s.authMiddleware(s.handleMath))
 	mux.HandleFunc("/v1/sync", s.authMiddleware(s.handleSync))
 	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
 	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
@@ -737,6 +739,8 @@ type SaveRequest struct {
 	Name      string             `json:"name"`
 	Operation *uint8             `json:"operation,omitempty"`
 	Props     map[string]float32 `json:"props"`
+	Coord     *spatial.Point2D   `json:"coord,omitempty"`
+	Roles     *[4]float32        `json:"roles,omitempty"`
 }
 
 type GetRequest struct {
@@ -776,21 +780,26 @@ type UpdateRequest struct {
 }
 
 type GraphRequest struct {
-	Model    string   `json:"model"`
-	Inputs   []string `json:"inputs"`
-	Relation string   `json:"relation"`
-	LimitK   int      `json:"limit_k"`
+	Model     string              `json:"model"`
+	Inputs    []string            `json:"inputs"`
+	Relation  string              `json:"relation"`
+	Relations []string            `json:"relations,omitempty"`
+	BeamWidth float32             `json:"beam_width,omitempty"`
+	LimitK    int                 `json:"limit_k"`
+	OrderBy   storage.OrderByMode `json:"order_by,omitempty"`
 }
 
 // EdgeRequest registers or removes an explicit directed edge
-// (source --relation--> target) used for cause-and-effect links.
+// (source --relation--> target) used for cause-and-effect links,
+// or configures directional vector relations ("set_relation").
 type EdgeRequest struct {
-	Model    string  `json:"model"`
-	Action   string  `json:"action"` // "add" (default) or "remove"
-	Source   string  `json:"source"`
-	Relation string  `json:"relation"`
-	Target   string  `json:"target"`
-	Weight   float32 `json:"weight"`
+	Model     string           `json:"model"`
+	Action    string           `json:"action"` // "add", "remove", "set_relation"
+	Source    string           `json:"source"`
+	Relation  string           `json:"relation"`
+	Target    string           `json:"target"`
+	Weight    float32          `json:"weight"`
+	Direction *spatial.Point2D `json:"direction,omitempty"`
 }
 
 // CausalRequest traverses explicit edges. A single relation performs one hop;
@@ -801,6 +810,14 @@ type CausalRequest struct {
 	Relation  string   `json:"relation"`
 	Relations []string `json:"relations"`
 	LimitK    int      `json:"limit_k"`
+}
+
+// MathRequest triggers direct numerical and geometric operations on the graph.
+type MathRequest struct {
+	Model  string   `json:"model"`
+	Op     string   `json:"op"` // "distance", "centroid", "cosine_similarity", "nearest"
+	Words  []string `json:"words"`
+	LimitK int      `json:"limit_k,omitempty"`
 }
 
 // parseComputeOp converts a string expression like "distance / duration", "distance + 10", "0", or "-5" to ComputeOp
@@ -915,10 +932,36 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		opStatus = *req.Operation
 	}
 
-	effectiveName, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
-		return
+	effectiveName := req.Name
+	if req.Coord != nil || req.Roles != nil {
+		coord := spatial.Point2D{}
+		if req.Coord != nil {
+			coord = *req.Coord
+		}
+		var roles [4]float32
+		if req.Roles != nil {
+			roles = *req.Roles
+		}
+		if effectiveName == "" {
+			effectiveName = uuid.New().String()
+		}
+		if _, err := db.AppendNode(effectiveName, coord, roles, uint16(opStatus)); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		if len(req.Props) > 0 {
+			if _, err := db.SaveRecordWithIDAndOp(effectiveName, opStatus, req.Props); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+		}
+	} else {
+		name, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		effectiveName = name
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1151,8 +1194,34 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 5
 	}
+	beamWidth := req.BeamWidth
+	if beamWidth <= 0 {
+		beamWidth = 0.05
+	}
 
-	results, anchor, err := db.ExecuteGraphStep(req.Inputs, req.Relation, limit)
+	if len(req.Relations) > 0 {
+		steps, err := db.ExecuteGraphChainWithContext(r.Context(), req.Inputs, req.Relations, limit, beamWidth)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		seq := make([]string, len(steps))
+		for i, s := range steps {
+			seq[i] = s.Word
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"sequence": seq,
+			"steps":    steps,
+		})
+		return
+	}
+
+	orderMode := req.OrderBy
+	if orderMode == 0 {
+		orderMode = storage.OrderByCompositeDesc
+	}
+	results, anchor, err := db.ExecuteGraphStepWithContext(r.Context(), req.Inputs, req.Relation, limit, orderMode, beamWidth)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -1165,7 +1234,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleEdge adds or removes an explicit causal edge.
+// handleEdge adds or removes an explicit causal edge or sets a directional relation vector.
 func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -1193,8 +1262,17 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
+	case "set_relation", "relation":
+		if req.Direction == nil {
+			http.Error(w, `{"error":"direction is required for set_relation"}`, http.StatusBadRequest)
+			return
+		}
+		if err := db.SetRelation(req.Relation, *req.Direction); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 	default:
-		http.Error(w, `{"error":"action must be add or remove"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"action must be add, remove, or set_relation"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -1244,8 +1322,91 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req MathRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	db, err := s.getModel(req.Model)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	switch strings.ToLower(strings.TrimSpace(req.Op)) {
+	case "distance":
+		if len(req.Words) < 2 {
+			http.Error(w, `{"error":"distance requires at least 2 words"}`, http.StatusBadRequest)
+			return
+		}
+		dist, err := db.CalculateDistance(req.Words[0], req.Words[1])
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"distance": dist,
+		})
+	case "centroid":
+		if len(req.Words) < 1 {
+			http.Error(w, `{"error":"centroid requires at least 1 word"}`, http.StatusBadRequest)
+			return
+		}
+		coord, roles, err := db.CalculateCentroid(req.Words)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"coord":   coord,
+			"roles":   roles,
+		})
+	case "cosine_similarity", "similarity":
+		if len(req.Words) < 2 {
+			http.Error(w, `{"error":"cosine_similarity requires at least 2 words"}`, http.StatusBadRequest)
+			return
+		}
+		sim, err := db.CalculateCosineSimilarity(req.Words[0], req.Words[1])
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"similarity": sim,
+		})
+	case "nearest":
+		if len(req.Words) < 1 {
+			http.Error(w, `{"error":"nearest requires at least 1 word"}`, http.StatusBadRequest)
+			return
+		}
+		limit := req.LimitK
+		if limit <= 0 {
+			limit = 5
+		}
+		neighbors, err := db.FindNearestNeighbors(req.Words[0], limit)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"neighbors": neighbors,
+		})
+	default:
+		http.Error(w, fmt.Sprintf(`{"error":"unsupported math op %q"}`, req.Op), http.StatusBadRequest)
+	}
+}
+
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost, http.MethodGet) {
 		return
 	}
 	modelName := r.URL.Query().Get("model")

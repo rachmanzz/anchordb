@@ -21,11 +21,11 @@ func main() {
 	dbFile := filepath.Join("data", "world.anchordb")
 	_ = os.Remove(dbFile) // Start fresh for demo
 
-	// 1. Open connection via Dedicated Driver SDK
+	// 1. Open local connection via Dedicated Driver SDK (embedded demo mode)
 	t0 := time.Now()
-	client, err := driver.Connect("anchordb://" + dbFile + "?mode=mmap")
+	client, err := driver.OpenLocal(dbFile)
 	if err != nil {
-		log.Fatalf("Failed to connect to AnchorDB: %v", err)
+		log.Fatalf("Failed to open local AnchorDB: %v", err)
 	}
 	defer client.Close()
 	fmt.Printf("[OK] Connected to AnchorDB via Driver in %v (mmap zero-copy)\n", time.Since(t0))

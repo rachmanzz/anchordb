@@ -23,7 +23,8 @@ type ChainResponse struct {
 
 // GraphBuilder provides a fluent builder interface for graph queries
 type GraphBuilder struct {
-	db         *storage.AnchorDB
+	backend    backend
+	model      string
 	inputs     []string
 	relation   string
 	relations  []string // for chaining
@@ -33,10 +34,21 @@ type GraphBuilder struct {
 	isChaining bool
 }
 
-// NewGraphBuilder initializes a new builder
+// NewGraphBuilder initializes a new builder from local storage (for backward compatibility).
 func NewGraphBuilder(db *storage.AnchorDB) *GraphBuilder {
 	return &GraphBuilder{
-		db:        db,
+		backend:   &localBackend{db: db},
+		model:     "default",
+		beamWidth: 0.05,
+		limitK:    10,
+		orderMode: storage.OrderByCompositeDesc,
+	}
+}
+
+func newGraphBuilder(b backend, model string) *GraphBuilder {
+	return &GraphBuilder{
+		backend:   b,
+		model:     model,
 		beamWidth: 0.05,
 		limitK:    10,
 		orderMode: storage.OrderByCompositeDesc,
@@ -80,7 +92,7 @@ func (b *GraphBuilder) TopK(k int) *GraphBuilder {
 	return b
 }
 
-// Execute triggers internal in-storage numerical compute
+// Execute triggers in-storage numerical compute
 func (b *GraphBuilder) Execute(ctx context.Context) (*GraphResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -95,15 +107,7 @@ func (b *GraphBuilder) Execute(ctx context.Context) (*GraphResponse, error) {
 		return nil, fmt.Errorf("BeamWidth must be finite and greater than zero")
 	}
 
-	results, anchor, err := b.db.ExecuteGraphStepWithContext(ctx, b.inputs, b.relation, b.limitK, b.orderMode, b.beamWidth)
-	if err != nil {
-		return nil, err
-	}
-
-	return &GraphResponse{
-		Anchor:  anchor,
-		Results: results,
-	}, nil
+	return b.backend.Graph(ctx, b.model, b.inputs, b.relation, b.limitK, b.orderMode, b.beamWidth)
 }
 
 // ExecuteChain executes multi-hop reasoning directly inside AnchorDB
@@ -124,18 +128,5 @@ func (b *GraphBuilder) ExecuteChain(ctx context.Context) (*ChainResponse, error)
 		return nil, fmt.Errorf("BeamWidth must be finite and greater than zero")
 	}
 
-	steps, err := b.db.ExecuteGraphChainWithContext(ctx, b.inputs, b.relations, b.limitK, b.beamWidth)
-	if err != nil {
-		return nil, err
-	}
-
-	seq := make([]string, len(steps))
-	for i, step := range steps {
-		seq[i] = step.Word
-	}
-
-	return &ChainResponse{
-		Sequence: seq,
-		Steps:    steps,
-	}, nil
+	return b.backend.GraphChain(ctx, b.model, b.inputs, b.relations, b.limitK, b.beamWidth)
 }
