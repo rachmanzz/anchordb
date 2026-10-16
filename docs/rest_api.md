@@ -1,0 +1,200 @@
+# REST API Reference
+
+The AnchorDB HTTP server daemon operates on port `7447` by default. All API endpoints accept and return JSON payloads.
+
+---
+
+## 1. Authentication & Security
+
+* **Bearer Token**: All endpoints under `/v1/*` require an `Authorization: Bearer <token>` header matching `ANCHORDB_AUTH_TOKEN`.
+* **Insecure Mode**: Set `ANCHORDB_ALLOW_INSECURE=true` to disable authentication for local testing.
+* **Public Endpoints**: `/health` (liveness check) and `/metrics` (Prometheus) are unauthenticated.
+* **Rate Limiting**: Configurable request rate per client IP with standard HTTP `429 Too Many Requests` responses.
+* **IP Whitelisting**: Restricts traffic to defined IP addresses or CIDR blocks (`ANCHORDB_IP_WHITELIST`).
+* **Reverse Proxy Trust**: When running behind Nginx, Caddy, or an AWS ALB, set `ANCHORDB_TRUST_PROXY=true` to parse client IPs from `X-Forwarded-For`.
+
+---
+
+## 2. Telemetry & Monitoring
+
+### `GET /health`
+Returns server operational health. Unauthenticated requests receive basic status; authenticated requests receive full memory, scheduler, and worker metrics.
+
+```json
+{
+  "status": "ok",
+  "engine": "AnchorDB",
+  "version": "3",
+  "uptime_sec": 3600,
+  "loaded_models": ["transactions", "analytics"]
+}
+```
+
+### `GET /metrics`
+Exports metrics formatted for Prometheus scrapers:
+* `anchordb_uptime_seconds`
+* `anchordb_goroutines`
+* `anchordb_heap_alloc_bytes`
+* `anchordb_worker_tasks_total`
+
+---
+
+## 3. Data & Mutation Endpoints
+
+### `POST /v1/save`
+Stores an entity with key-value properties.
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "name": "vehicle_101",
+  "props": {
+    "distance": 150.0,
+    "duration": 2.5,
+    "start_date": 20740.0
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "status": "saved",
+  "id": "vehicle_101"
+}
+```
+
+### `POST /v1/get`
+Retrieves an entity by name with optional in-storage computations and selective column projection.
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "name": "vehicle_101",
+  "select": ["distance", "duration", "speed"],
+  "computations": {
+    "speed": {
+      "op": "divide",
+      "field_a": "distance",
+      "field_b": "duration"
+    }
+  }
+}
+```
+
+### `POST /v1/list`
+Queries records matching attribute ranges or date criteria with pagination.
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "where": [
+    {"field": "distance", "op": ">=", "val": 100}
+  ],
+  "page": 1,
+  "limit": 20
+}
+```
+
+### `POST /v1/update`
+Executes in-place batch arithmetic mutations.
+
+**Request Payload**:
+```json
+{
+  "model": "vehicles",
+  "where": [
+    {"field": "distance", "op": "<", "val": 1000}
+  ],
+  "set": {
+    "distance": {
+      "op": "add",
+      "field_a": "distance",
+      "field_b": "10"
+    }
+  },
+  "limit": 500
+}
+```
+
+---
+
+## 4. Graph & Causal Endpoints
+
+### `POST /v1/edge`
+Registers or unlinks a directed causal edge.
+
+**Request Payload**:
+```json
+{
+  "model": "events",
+  "source": "fuel_shortage",
+  "relation": "causes",
+  "target": "inflation",
+  "weight": 0.9,
+  "action": "add"
+}
+```
+
+### `POST /v1/causal`
+Queries causal connections from seed nodes.
+
+**Request Payload**:
+```json
+{
+  "model": "events",
+  "seeds": ["fuel_shortage"],
+  "relations": ["causes", "causes"],
+  "limit": 5
+}
+```
+
+### `POST /v1/graph`
+Executes 2D spatial ray-projection queries.
+
+**Request Payload**:
+```json
+{
+  "model": "topology",
+  "from": ["primary_cluster", "backup_cluster"],
+  "relate": "route-down",
+  "beam_width": 0.05,
+  "top_k": 5
+}
+```
+
+---
+
+## 5. Maintenance & Lifecycle Endpoints
+
+### `GET /v1/sync?model={name}`
+Flushes uncommitted memory-mapped modifications to disk. Adding `?async=true` offloads the operation to the worker pool.
+
+### `POST /v1/partition/run`
+Archives historical records older than the retention threshold.
+
+**Request Payload**:
+```json
+{
+  "model": "transactions",
+  "retention_days": 180,
+  "date_field": "date",
+  "sink_type": "local",
+  "sink_path": "./data/partitions",
+  "async": true
+}
+```
+
+### `POST /v1/collector/run`
+Purges records currently in the Tombstone state (`operation = 2`). Supports `"async": true`.
+
+### `POST /v1/worker/cancel`
+Cancels queued jobs before execution:
+```json
+{
+  "job_id": "a974c021-..."
+}
+```

@@ -27,6 +27,19 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 ---
 
+## Feature Documentation
+
+Comprehensive guides for individual AnchorDB subsystems:
+- **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, projections, and batch updates.
+- **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, and weighted causal chains.
+- **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
+- **[Data Partitioning & Record Lifecycle](docs/partitioning_and_lifecycle.md)**: 4-state lifecycle machine, archival sinks, and tombstone collection.
+- **[Background Subsystems: Scheduler & Worker Pool](docs/background_subsystems.md)**: Wall-clock cron scheduler and bounded async worker pool.
+- **[REST API Reference](docs/rest_api.md)**: HTTP daemon configuration, authentication, telemetry, and endpoints.
+- **[Go Driver SDK Guide](docs/go_driver.md)**: Connection setup, query builders, and integration examples.
+
+---
+
 ## Architecture
 
 ```

@@ -1,0 +1,139 @@
+# In-Storage Computations & Date Math
+
+AnchorDB features an in-storage compute engine that evaluates arithmetic formulas and date manipulations directly during record retrieval and batch mutation passes. Performing computations inside the storage engine avoids the latency, serialization, and memory overhead of fetching raw fields into application memory for client-side processing.
+
+---
+
+## 1. Supported Computation Operators
+
+AnchorDB provides arithmetic and assignment operators defined in `pkg/storage` and exposed via `pkg/driver`.
+
+| Operator | Driver Function | Description | Example |
+| :--- | :--- | :--- | :--- |
+| **Divide** | `driver.Divide(fieldA, fieldB)` | Divides `fieldA` by `fieldB` or literal constant. Division by zero yields `0`. | `driver.Divide("distance", "duration")` |
+| **Multiply** | `driver.Multiply(fieldA, fieldB)` | Multiplies `fieldA` by `fieldB` or literal constant. | `driver.Multiply("unit_price", "quantity")` |
+| **Add** | `driver.Add(fieldA, fieldB)` | Adds `fieldA` and `fieldB` (or numeric constant). | `driver.Add("base_score", "10")` |
+| **Subtract** | `driver.Subtract(fieldA, fieldB)` | Subtracts `fieldB` from `fieldA`. | `driver.Subtract("gross_revenue", "tax")` |
+| **Assign** | `driver.Value(val)` | Directly assigns a constant value to a field. | `driver.Value(100.0)` |
+
+---
+
+## 2. Date Mathematics
+
+Dates in AnchorDB are stored internally as IEEE 754 `float32` numbers representing **Epoch Days** (the number of days elapsed since January 1, 1970 UTC). This representation allows calendar arithmetic to be executed as fast, single-cycle floating point additions and subtractions.
+
+### Date Functions
+
+* **`driver.MustDate(dateStr string) float32`**: Converts an ISO-8601 date string (`"YYYY-MM-DD"`) into float32 epoch days. Panics on malformed format; suitable for static literals.
+* **`driver.Date(dateStr string) (float32, error)`**: Converts a date string into epoch days with explicit error handling for user inputs.
+* **`driver.FormatDate(epochDays float32) string`**: Formats an epoch days value back into `"YYYY-MM-DD"`.
+* **`driver.AddDays(field string, days float32)`**: Adds an integer number of days to a stored date field.
+* **`driver.SubtractDays(field string, days float32)`**: Subtracts days from a stored date field.
+* **`driver.DaysBetween(fieldA, fieldB string)`**: Calculates the elapsed duration in days between two date fields (`fieldA - fieldB`).
+
+### Example: Date Arithmetic
+```go
+// Store an entity with a start date (2026-10-14)
+_ = client.Save("project_contract", map[string]float32{
+    "start_date": driver.MustDate("2026-10-14"),
+})
+
+// Add 45 days during a batch update
+_, err := client.Update().
+    In("project_contract").
+    Set("start_date", driver.AddDays("start_date", 45)).
+    Execute(ctx)
+
+// Result is 2026-11-28
+updated, _ := client.Get("project_contract").Execute(ctx)
+fmt.Println("New Date:", updated.GetDate("start_date"))
+```
+
+---
+
+## 3. Read-Time Projection & Computation (`Compute` & `Select`)
+
+When reading entities using `Get` or `List`, computed values can be generated dynamically without persisting them to disk.
+
+### Selective Column Projection
+Unselected attributes can be excluded from the returned payload by calling `.Select(...)`:
+
+```go
+// Entity has: distance, duration, temperature, humidity
+// We only want: distance, duration, and calculated speed
+record, err := client.Get("vehicle_route_1").
+    Select("distance", "duration", "speed").
+    Compute("speed", driver.Divide("distance", "duration")).
+    Execute(ctx)
+
+// 'temperature' and 'humidity' are omitted from the result
+fmt.Println(record.All()) // map[distance:100 duration:2 speed:50]
+```
+
+### Filtering on Computed Columns (`List`)
+Computed fields can also be used in query predicates:
+
+```go
+// Filter distance >= 50, compute speed, and filter speed > 50
+result, err := client.List().
+    Where("distance", ">=", 50.0).
+    Compute("speed", driver.Divide("distance", "duration")).
+    Where("speed", ">", 50.0).
+    Page(1, 10).
+    Execute(ctx)
+
+for _, item := range result.Items {
+    fmt.Printf("%s -> distance: %.0f, speed: %.1f\n", item.Name, item.Get("distance"), item.Get("speed"))
+}
+```
+
+---
+
+## 4. In-Place Batch Updates (`Update`)
+
+The update builder modifies stored records across the dataset or within specific filtered sets:
+
+```go
+// Add 10 to distance for up to 5,000 matching vehicles
+updatedCount, err := client.Update().
+    Where("distance", "<", 1000.0).
+    Set("distance", driver.Add("distance", "10")).
+    Limit(5000).
+    Execute(ctx)
+
+fmt.Printf("Updated %d records\n", updatedCount)
+```
+
+---
+
+## 5. REST API Usage
+
+In-storage calculations can be triggered over the HTTP REST API.
+
+### `POST /v1/get` with Computations
+```json
+{
+  "name": "vehicle_route_1",
+  "select": ["distance", "duration", "speed"],
+  "computations": {
+    "speed": {
+      "op": "divide",
+      "field_a": "distance",
+      "field_b": "duration"
+    }
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "name": "vehicle_route_1",
+  "operation": 1,
+  "props": {
+    "distance": 100,
+    "duration": 2,
+    "speed": 50
+  }
+}
+```
