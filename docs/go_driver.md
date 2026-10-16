@@ -235,6 +235,8 @@ for _, step := range chain {
 }
 ```
 
+> **Field Deprecation Notice**: Query results canonically return `step.Score`. The legacy `step.Weight` field is deprecated and scheduled for removal in AnchorDB v4.0.
+
 ---
 
 ## 10. Context & Timeouts

@@ -30,7 +30,9 @@ type CausalResult struct {
 	Word     string  `json:"word"`
 	Relation string  `json:"relation"`
 	Score    float32 `json:"score"`
-	// Weight is a backward-compatible alias for Score. Deprecated: use Score instead.
+
+	// Deprecated: Weight is a legacy v1 alias retained only for backward compatibility.
+	// It is scheduled for removal in AnchorDB v4.0. Use Score instead.
 	Weight float32 `json:"weight"`
 }
 
