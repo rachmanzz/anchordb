@@ -19,12 +19,14 @@ type GraphNode struct {
 
 func main() {
 	phase := flag.String("phase", "populate", "Execution phase: 'populate' or 'verify'")
-	url := flag.String("url", "http://localhost:7447", "AnchorDB server URL")
+	url := flag.String("url", "http://localhost:7447", "AnchorDB server URL: http(s)://host:7447 or wire://host:7448")
 	flag.Parse()
 
 	ctx := context.Background()
 
-	client, err := driver.ConnectRemote(*url, driver.WithModel("infra_causal"))
+	// driver.Connect auto-detects the transport: http(s):// uses the HTTP REST
+	// engine, wire:// (or tcp://, anchordb+wire://) uses AnchorWire.
+	client, err := driver.Connect(*url, driver.WithModel("infra_causal"))
 	if err != nil {
 		fmt.Printf("Connection error to %s: %v\n", *url, err)
 		os.Exit(1)

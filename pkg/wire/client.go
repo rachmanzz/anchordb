@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
@@ -328,7 +329,12 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 
 // Get retrieves an entity's properties and operation lifecycle state.
 func (c *Client) Get(name string) (map[string]float32, uint8, error) {
-	resp, err := c.call(OpGet, EncodeGetPayload(name))
+	return c.GetWithOptions(GetRequest{Name: name})
+}
+
+// GetWithOptions retrieves an entity's properties with optional projection and computations.
+func (c *Client) GetWithOptions(req GetRequest) (map[string]float32, uint8, error) {
+	resp, err := c.call(OpGet, EncodeGetRequest(req))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -342,6 +348,12 @@ func (c *Client) Edge(action, source, relation, target string, weight float32) e
 	return err
 }
 
+// SetRelation registers or replaces a query direction vector on the active model.
+func (c *Client) SetRelation(name string, direction spatial.Point2D) error {
+	_, err := c.call(OpEdge, EncodeEdgePayloadWithDirection("set_relation", "", name, "", 0, &direction))
+	return err
+}
+
 // Causal executes a causal step traversal over graph edges.
 func (c *Client) Causal(seeds []string, relation string, limitK int) ([]storage.CausalResult, error) {
 	resp, err := c.call(OpCausal, EncodeCausalPayload(seeds, relation, limitK))
@@ -349,6 +361,76 @@ func (c *Client) Causal(seeds []string, relation string, limitK int) ([]storage.
 		return nil, err
 	}
 	return DecodeCausalResultPayload(resp.Payload)
+}
+
+// List executes a structured query returning records matching filters and computations.
+func (c *Client) List(req ListRequest) (ListResponse, error) {
+	resp, err := c.call(OpList, EncodeListRequest(req))
+	if err != nil {
+		return ListResponse{}, err
+	}
+	return DecodeListResponse(resp.Payload)
+}
+
+// Update applies atomic mutations to records matching filter conditions.
+func (c *Client) Update(req UpdateRequest) (int, error) {
+	resp, err := c.call(OpUpdate, EncodeUpdateRequest(req))
+	if err != nil {
+		return 0, err
+	}
+	return DecodeUpdateResponse(resp.Payload)
+}
+
+// Graph executes a beam search step along spatial graph edges.
+func (c *Client) Graph(req GraphRequest) (GraphResponsePayload, error) {
+	resp, err := c.call(OpGraph, EncodeGraphRequest(req))
+	if err != nil {
+		return GraphResponsePayload{}, err
+	}
+	return DecodeGraphResponsePayload(resp.Payload)
+}
+
+// GraphChain executes a multi-hop graph chain traversal across specified relations.
+func (c *Client) GraphChain(req GraphChainRequest) ([]storage.GraphQueryResult, error) {
+	resp, err := c.call(OpGraphChain, EncodeGraphChainRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	payload, err := DecodeGraphResponsePayload(resp.Payload)
+	if err != nil {
+		return nil, err
+	}
+	return payload.Results, nil
+}
+
+// AttachSchema registers a fixed schema definition for the active model.
+func (c *Client) AttachSchema(schemaJSON string) error {
+	_, err := c.call(OpAttachSchema, EncodeAttachSchemaPayload(schemaJSON))
+	return err
+}
+
+// GetSchema returns the attached schema definition JSON for the active model.
+func (c *Client) GetSchema() (string, error) {
+	resp, err := c.call(OpGetSchema, nil)
+	if err != nil {
+		return "", err
+	}
+	return DecodeGetSchemaPayload(resp.Payload)
+}
+
+// ResetModel resets schema locks on the active model.
+func (c *Client) ResetModel(confirm bool) error {
+	_, err := c.call(OpResetModel, EncodeResetModelPayload(confirm))
+	return err
+}
+
+// Math performs in-engine geometric or spatial math operations (distance, centroid, cosine_similarity, nearest).
+func (c *Client) Math(req MathRequest) (MathResponse, error) {
+	resp, err := c.call(OpMath, EncodeMathRequest(req))
+	if err != nil {
+		return MathResponse{}, err
+	}
+	return DecodeMathResponse(resp.Payload)
 }
 
 // Sync requests a disk flush on the active model.

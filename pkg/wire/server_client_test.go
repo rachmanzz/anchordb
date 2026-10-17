@@ -263,3 +263,212 @@ func TestWire_AdaptiveMemoryNegotiation_EndToEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestWire_FullFeatureParity_EndToEnd(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend := &mockBackend{
+		dataDir:   tmpDir,
+		models:    make(map[string]*storage.AnchorDB),
+		authToken: "parity_secret",
+	}
+	defer backend.CloseAll()
+
+	server := NewServer(backend)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic port: %v", err)
+	}
+	addr := listener.Addr().String()
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer server.Close()
+
+	client, err := Connect(addr,
+		WithClientToken("parity_secret"),
+		WithClientModel("logistics"),
+		WithClientTimeout(5*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	// 1. Schema attachment and retrieval
+	schemaJSON := `{"distance":"float","duration":"float"}`
+	if err := client.AttachSchema(schemaJSON); err != nil {
+		t.Fatalf("AttachSchema failed: %v", err)
+	}
+	gotSchema, err := client.GetSchema()
+	if err != nil {
+		t.Fatalf("GetSchema failed: %v", err)
+	}
+	if gotSchema == "" {
+		t.Fatalf("expected non-empty schema")
+	}
+
+	// 2. SetRelation (directional spatial ray)
+	downDir := spatial.Point2D{X: 0, Y: -1}
+	if err := client.SetRelation("downlink", downDir); err != nil {
+		t.Fatalf("SetRelation failed: %v", err)
+	}
+
+	// 3. Save records with geometry (AppendNode equivalent)
+	truck1 := storage.BatchRecordItem{
+		Name:      "truck_alpha",
+		Operation: storage.OpStatusActive,
+		Props: map[string]float32{
+			"distance": 120.0,
+			"duration": 2.0,
+		},
+		Coord: &spatial.Point2D{X: 0.0, Y: 1.0},
+		Roles: &[4]float32{1.0, 0.0, 0.0, 0.0},
+	}
+	if _, err := client.Save(truck1); err != nil {
+		t.Fatalf("Save truck1 failed: %v", err)
+	}
+
+	truck2 := storage.BatchRecordItem{
+		Name:      "truck_beta",
+		Operation: storage.OpStatusActive,
+		Props: map[string]float32{
+			"distance": 200.0,
+			"duration": 4.0,
+		},
+		Coord: &spatial.Point2D{X: 0.0, Y: 0.0},
+		Roles: &[4]float32{1.0, 0.0, 0.0, 0.0},
+	}
+	if _, err := client.Save(truck2); err != nil {
+		t.Fatalf("Save truck2 failed: %v", err)
+	}
+
+	// 4. GetWithOptions with calculations and projections
+	getReq := GetRequest{
+		Name:   "truck_alpha",
+		Select: []string{"distance", "duration", "speed"},
+		Computations: map[string]storage.ComputeOp{
+			"speed": storage.OpDivide{FieldA: "distance", FieldB: "duration"},
+		},
+	}
+	props, _, err := client.GetWithOptions(getReq)
+	if err != nil {
+		t.Fatalf("GetWithOptions failed: %v", err)
+	}
+	if props["speed"] != 60.0 {
+		t.Fatalf("expected speed 60, got %f", props["speed"])
+	}
+
+	// 5. List with filtering, computations, select, and paging
+	listReq := ListRequest{
+		Limit:  10,
+		Offset: 0,
+		Select: []string{"distance", "duration", "speed"},
+		Filters: []storage.FilterCondition{
+			{Field: "distance", Operator: ">=", Value: 100.0},
+		},
+		Computations: map[string]storage.ComputeOp{
+			"speed": storage.OpDivide{FieldA: "distance", FieldB: "duration"},
+		},
+	}
+	listResp, err := client.List(listReq)
+	if err != nil {
+		t.Fatalf("List query failed: %v", err)
+	}
+	if len(listResp.Items) != 2 {
+		t.Fatalf("expected 2 items from List, got %d", len(listResp.Items))
+	}
+
+	// 6. Bulk Update with mutations
+	upReq := UpdateRequest{
+		Limit: 10,
+		Filters: []storage.FilterCondition{
+			{Field: "distance", Operator: "=", Value: 120.0},
+		},
+		Mutations: map[string]storage.ComputeOp{
+			"distance": storage.OpAdd{FieldA: "distance", FieldB: "duration"},
+		},
+	}
+	updatedCount, err := client.Update(upReq)
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+	if updatedCount != 1 {
+		t.Fatalf("expected 1 record updated, got %d", updatedCount)
+	}
+	// Verify updated value (120 + 2 = 122)
+	updatedProps, _, _ := client.Get("truck_alpha")
+	if updatedProps["distance"] != 122.0 {
+		t.Fatalf("expected distance 122, got %f", updatedProps["distance"])
+	}
+
+	// 7. Math operations: distance, centroid, cosine similarity, nearest
+	distResp, err := client.Math(MathRequest{
+		Op:    "distance",
+		Words: []string{"truck_alpha", "truck_beta"},
+	})
+	if err != nil {
+		t.Fatalf("Math distance failed: %v", err)
+	}
+	if distResp.Value <= 0 {
+		t.Fatalf("expected distance > 0, got %f", distResp.Value)
+	}
+
+	centroidResp, err := client.Math(MathRequest{
+		Op:    "centroid",
+		Words: []string{"truck_alpha", "truck_beta"},
+	})
+	if err != nil {
+		t.Fatalf("Math centroid failed: %v", err)
+	}
+	if centroidResp.Coord.Y != 0.5 {
+		t.Fatalf("expected centroid Y=0.5, got %f", centroidResp.Coord.Y)
+	}
+
+	simResp, err := client.Math(MathRequest{
+		Op:    "cosine_similarity",
+		Words: []string{"truck_alpha", "truck_beta"},
+	})
+	if err != nil {
+		t.Fatalf("Math cosine similarity failed: %v", err)
+	}
+	if simResp.Value != 1.0 {
+		t.Fatalf("expected cosine similarity 1.0, got %f", simResp.Value)
+	}
+
+	nearestResp, err := client.Math(MathRequest{
+		Op:     "nearest",
+		Words:  []string{"truck_alpha"},
+		LimitK: 2,
+	})
+	if err != nil {
+		t.Fatalf("Math nearest failed: %v", err)
+	}
+	if len(nearestResp.Neighbors) == 0 {
+		t.Fatalf("expected nearest neighbors, got 0")
+	}
+
+	// 8. Graph Step along configured relation
+	graphResp, err := client.Graph(GraphRequest{
+		Inputs:    []string{"truck_alpha"},
+		Relation:  "downlink",
+		LimitK:    5,
+		OrderMode: uint8(storage.OrderByDistanceAsc),
+		BeamWidth: 2.0,
+	})
+	if err != nil {
+		t.Fatalf("Graph beam step failed: %v", err)
+	}
+	if len(graphResp.Results) == 0 {
+		t.Fatalf("expected graph step results along downlink relation")
+	}
+
+	// 9. ResetModel
+	if err := client.ResetModel(true); err != nil {
+		t.Fatalf("ResetModel failed: %v", err)
+	}
+	// After reset, schema should no longer exist
+	if _, err := client.GetSchema(); err == nil {
+		t.Fatalf("expected GetSchema to error after reset, got nil")
+	}
+}

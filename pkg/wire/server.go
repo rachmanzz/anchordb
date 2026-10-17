@@ -2,6 +2,7 @@ package wire
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -307,13 +308,22 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 
 		case OpGet:
-			name, dErr := DecodeGetPayload(req.Payload)
+			getReq, dErr := DecodeGetRequest(req.Payload)
 			if dErr != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
 			}
-			props, op, err := db.GetRecordWithOperation(name)
+			var props map[string]float32
+			var op uint8
+			if len(getReq.Computations) > 0 || len(getReq.Select) > 0 {
+				props, err = db.GetRecordWithCompute(getReq.Name, getReq.Computations, getReq.Select...)
+				if err == nil {
+					_, op, _ = db.GetRecordWithOperation(getReq.Name)
+				}
+			} else {
+				props, op, err = db.GetRecordWithOperation(getReq.Name)
+			}
 			if err != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(404, err.Error())
@@ -323,15 +333,22 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 
 		case OpEdge:
-			action, src, rel, tgt, weight, dErr := DecodeEdgePayload(req.Payload)
+			action, src, rel, tgt, weight, direction, dErr := DecodeEdgePayloadWithDirection(req.Payload)
 			if dErr != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
 			}
-			if action == "remove" {
+			switch action {
+			case "remove":
 				err = db.RemoveEdge(src, rel, tgt)
-			} else {
+			case "set_relation":
+				if direction == nil {
+					err = errors.New("direction is required for set_relation")
+				} else {
+					err = db.SetRelation(rel, *direction)
+				}
+			default:
 				err = db.AddEdge(src, rel, tgt, weight)
 			}
 			if err != nil {
@@ -365,6 +382,214 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload("synced")
+			}
+
+		case OpList:
+			listReq, dErr := DecodeListRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			opts := storage.QueryOptions{
+				Context:              context.Background(),
+				Limit:                listReq.Limit,
+				Offset:               listReq.Offset,
+				IncludeAllOperations: listReq.IncludeAllOperations,
+				OperationFilter:      listReq.OperationFilter,
+				AllowedOperations:    listReq.AllowedOperations,
+				Select:               listReq.Select,
+				Filters:              listReq.Filters,
+				Computations:         listReq.Computations,
+			}
+			items, hasMore, err := db.ListRecordsWithPaging(opts)
+			if err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeListResponse(ListResponse{
+					TotalCount: len(items),
+					HasMore:    hasMore,
+					Items:      items,
+				})
+			}
+
+		case OpUpdate:
+			upReq, dErr := DecodeUpdateRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			opts := storage.UpdateOptions{
+				Context:        context.Background(),
+				Limit:          upReq.Limit,
+				Offset:         upReq.Offset,
+				TargetEntities: upReq.TargetEntities,
+				Filters:        upReq.Filters,
+				Mutations:      upReq.Mutations,
+			}
+			updatedCount, err := db.UpdateRecords(opts)
+			if err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeUpdateResponse(updatedCount)
+			}
+
+		case OpGraph:
+			gReq, dErr := DecodeGraphRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			results, anchor, err := db.ExecuteGraphStepWithOptions(gReq.Inputs, gReq.Relation, gReq.LimitK, storage.OrderByMode(gReq.OrderMode), gReq.BeamWidth)
+			if err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
+					Anchor:  anchor,
+					Results: results,
+				})
+			}
+
+		case OpGraphChain:
+			cReq, dErr := DecodeGraphChainRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			results, err := db.ExecuteGraphChainWithOptions(cReq.Inputs, cReq.RelationChain, cReq.LimitK, cReq.BeamWidth)
+			if err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
+					Results: results,
+				})
+			}
+
+		case OpAttachSchema:
+			schemaRaw, dErr := DecodeAttachSchemaPayload(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			var ms storage.ModelSchema
+			if err := json.Unmarshal([]byte(schemaRaw), &ms); err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, fmt.Sprintf("invalid schema JSON: %v", err))
+				break
+			}
+			if err := db.AttachSchema(ms); err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeOKPayload("schema attached")
+			}
+
+		case OpGetSchema:
+			ms, ok := db.GetSchema()
+			if !ok {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(404, "no schema attached to model")
+			} else {
+				data, _ := json.Marshal(ms)
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeGetSchemaPayload(string(data))
+			}
+
+		case OpMath:
+			mReq, dErr := DecodeMathRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			switch mReq.Op {
+			case "distance":
+				if len(mReq.Words) < 2 {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(400, "distance requires 2 words")
+					break
+				}
+				dist, err := db.CalculateDistance(mReq.Words[0], mReq.Words[1])
+				if err != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(404, err.Error())
+				} else {
+					resp.OpCode = OpResponseOK
+					resp.Payload = EncodeMathResponse(MathResponse{Value: dist})
+				}
+			case "centroid":
+				coord, roles, err := db.CalculateCentroid(mReq.Words)
+				if err != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(404, err.Error())
+				} else {
+					resp.OpCode = OpResponseOK
+					resp.Payload = EncodeMathResponse(MathResponse{Coord: coord, Roles: roles})
+				}
+			case "cosine_similarity":
+				if len(mReq.Words) < 2 {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(400, "cosine_similarity requires 2 words")
+					break
+				}
+				sim, err := db.CalculateCosineSimilarity(mReq.Words[0], mReq.Words[1])
+				if err != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(404, err.Error())
+				} else {
+					resp.OpCode = OpResponseOK
+					resp.Payload = EncodeMathResponse(MathResponse{Value: sim})
+				}
+			case "nearest":
+				if len(mReq.Words) < 1 {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(400, "nearest requires 1 word")
+					break
+				}
+				neighbors, err := db.FindNearestNeighbors(mReq.Words[0], mReq.LimitK)
+				if err != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(404, err.Error())
+				} else {
+					resp.OpCode = OpResponseOK
+					resp.Payload = EncodeMathResponse(MathResponse{Neighbors: neighbors})
+				}
+			default:
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, "unsupported math op: "+mReq.Op)
+			}
+
+		case OpResetModel:
+			confirm, dErr := DecodeResetModelPayload(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			if !confirm {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, "confirm must be true to reset model schema")
+				break
+			}
+			if err := db.ResetSchema(); err != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeOKPayload("schema reset")
 			}
 
 		default:

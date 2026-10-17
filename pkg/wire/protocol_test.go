@@ -211,3 +211,223 @@ func TestWire_MemoryNegotiationPayload(t *testing.T) {
 		t.Fatalf("negotiation response mismatch: got %+v, want %+v", dResp, resp)
 	}
 }
+
+func TestWire_GetRequestPayload(t *testing.T) {
+	req := GetRequest{
+		Name:   "item_speed",
+		Select: []string{"distance", "duration", "speed"},
+		Computations: map[string]storage.ComputeOp{
+			"speed": storage.OpDivide{FieldA: "distance", FieldB: "duration"},
+		},
+	}
+	encoded := EncodeGetRequest(req)
+	dReq, err := DecodeGetRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeGetRequest failed: %v", err)
+	}
+	if dReq.Name != req.Name || len(dReq.Select) != 3 || len(dReq.Computations) != 1 {
+		t.Fatalf("unexpected decoded get request: %+v", dReq)
+	}
+}
+
+func TestWire_ListRequestPayload(t *testing.T) {
+	opVal := uint8(storage.OpStatusActive)
+	req := ListRequest{
+		Limit:                25,
+		Offset:               50,
+		IncludeAllOperations: true,
+		OperationFilter:      &opVal,
+		AllowedOperations:    []uint8{storage.OpStatusActive, storage.OpStatusTombstone},
+		Select:               []string{"price", "stock", "revenue"},
+		Filters: []storage.FilterCondition{
+			{Field: "price", Operator: ">", Value: 10.0},
+			{Field: "stock", Operator: "BETWEEN", Value: 5.0, ValueHigh: 100.0},
+		},
+		Computations: map[string]storage.ComputeOp{
+			"revenue": storage.OpMultiply{FieldA: "price", FieldB: "stock"},
+		},
+	}
+	encoded := EncodeListRequest(req)
+	dReq, err := DecodeListRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeListRequest failed: %v", err)
+	}
+	if dReq.Limit != 25 || dReq.Offset != 50 || !dReq.IncludeAllOperations {
+		t.Fatalf("header fields mismatch: %+v", dReq)
+	}
+	if dReq.OperationFilter == nil || *dReq.OperationFilter != opVal {
+		t.Fatalf("operation filter mismatch: %+v", dReq.OperationFilter)
+	}
+	if len(dReq.AllowedOperations) != 2 || len(dReq.Select) != 3 || len(dReq.Filters) != 2 || len(dReq.Computations) != 1 {
+		t.Fatalf("slices/maps mismatch in list request: %+v", dReq)
+	}
+
+	resp := ListResponse{
+		TotalCount: 1,
+		HasMore:    true,
+		Items: []storage.EntityRecord{
+			{
+				Name:      "item_1",
+				Operation: storage.OpStatusActive,
+				Props:     map[string]float32{"price": 10.5, "stock": 50},
+			},
+		},
+	}
+	respBytes := EncodeListResponse(resp)
+	dResp, err := DecodeListResponse(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeListResponse failed: %v", err)
+	}
+	if dResp.TotalCount != 1 || !dResp.HasMore || len(dResp.Items) != 1 || dResp.Items[0].Props["price"] != 10.5 {
+		t.Fatalf("unexpected list response: %+v", dResp)
+	}
+}
+
+func TestWire_UpdateRequestPayload(t *testing.T) {
+	req := UpdateRequest{
+		Limit:          100,
+		Offset:         0,
+		TargetEntities: []string{"user_1", "user_2"},
+		Filters: []storage.FilterCondition{
+			{Field: "points", Operator: ">=", Value: 50},
+		},
+		Mutations: map[string]storage.ComputeOp{
+			"points": storage.OpAdd{FieldA: "points", FieldB: "bonus"},
+		},
+	}
+	encoded := EncodeUpdateRequest(req)
+	dReq, err := DecodeUpdateRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeUpdateRequest failed: %v", err)
+	}
+	if dReq.Limit != 100 || len(dReq.TargetEntities) != 2 || len(dReq.Filters) != 1 || len(dReq.Mutations) != 1 {
+		t.Fatalf("unexpected update request: %+v", dReq)
+	}
+
+	resBytes := EncodeUpdateResponse(42)
+	dCount, err := DecodeUpdateResponse(resBytes)
+	if err != nil || dCount != 42 {
+		t.Fatalf("unexpected update response: count=%d, err=%v", dCount, err)
+	}
+}
+
+func TestWire_GraphPayload(t *testing.T) {
+	req := GraphRequest{
+		Inputs:    []string{"seed_a", "seed_b"},
+		Relation:  "route",
+		LimitK:    5,
+		OrderMode: uint8(storage.OrderByScoreDesc),
+		BeamWidth: 0.75,
+	}
+	encoded := EncodeGraphRequest(req)
+	dReq, err := DecodeGraphRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeGraphRequest failed: %v", err)
+	}
+	if len(dReq.Inputs) != 2 || dReq.Relation != "route" || dReq.LimitK != 5 || dReq.BeamWidth != 0.75 {
+		t.Fatalf("unexpected graph request: %+v", dReq)
+	}
+
+	resp := GraphResponsePayload{
+		Anchor: spatial.Point2D{X: 1.5, Y: 2.5},
+		Results: []storage.GraphQueryResult{
+			{Word: "tgt_1", Score: 0.9, T: 1.2, DistSqPerp: 0.05, Coord: spatial.Point2D{X: 3.0, Y: 4.0}},
+		},
+	}
+	respBytes := EncodeGraphResponsePayload(resp)
+	dResp, err := DecodeGraphResponsePayload(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeGraphResponsePayload failed: %v", err)
+	}
+	if dResp.Anchor.X != 1.5 || len(dResp.Results) != 1 || dResp.Results[0].Word != "tgt_1" || dResp.Results[0].T != 1.2 {
+		t.Fatalf("unexpected graph response: %+v", dResp)
+	}
+}
+
+func TestWire_GraphChainPayload(t *testing.T) {
+	req := GraphChainRequest{
+		Inputs:        []string{"start_hub"},
+		RelationChain: []string{"routes_to", "supplies"},
+		LimitK:        3,
+		BeamWidth:     0.5,
+	}
+	encoded := EncodeGraphChainRequest(req)
+	dReq, err := DecodeGraphChainRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeGraphChainRequest failed: %v", err)
+	}
+	if len(dReq.Inputs) != 1 || len(dReq.RelationChain) != 2 || dReq.LimitK != 3 || dReq.BeamWidth != 0.5 {
+		t.Fatalf("unexpected graph chain request: %+v", dReq)
+	}
+}
+
+func TestWire_SchemaPayload(t *testing.T) {
+	schemaJSON := `{"price":"float","quantity":"int"}`
+	encoded := EncodeAttachSchemaPayload(schemaJSON)
+	dSchema, err := DecodeAttachSchemaPayload(encoded)
+	if err != nil || dSchema != schemaJSON {
+		t.Fatalf("unexpected attach schema payload: got %q, want %q", dSchema, schemaJSON)
+	}
+
+	getEncoded := EncodeGetSchemaPayload(schemaJSON)
+	dGetSchema, err := DecodeGetSchemaPayload(getEncoded)
+	if err != nil || dGetSchema != schemaJSON {
+		t.Fatalf("unexpected get schema payload: got %q, want %q", dGetSchema, schemaJSON)
+	}
+}
+
+func TestWire_MathPayload(t *testing.T) {
+	req := MathRequest{
+		Op:     "nearest",
+		Words:  []string{"cluster_node"},
+		LimitK: 10,
+	}
+	encoded := EncodeMathRequest(req)
+	dReq, err := DecodeMathRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeMathRequest failed: %v", err)
+	}
+	if dReq.Op != "nearest" || len(dReq.Words) != 1 || dReq.LimitK != 10 {
+		t.Fatalf("unexpected math request: %+v", dReq)
+	}
+
+	resp := MathResponse{
+		Value: 3.14,
+		Coord: spatial.Point2D{X: 10, Y: 20},
+		Roles: [4]float32{1, 2, 3, 4},
+		Neighbors: []storage.GraphQueryResult{
+			{Word: "neighbor_1", Score: 0.88, T: 0.5, DistSqPerp: 0.1, Coord: spatial.Point2D{X: 11, Y: 21}},
+		},
+	}
+	respBytes := EncodeMathResponse(resp)
+	dResp, err := DecodeMathResponse(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeMathResponse failed: %v", err)
+	}
+	if dResp.Value != 3.14 || dResp.Coord.X != 10 || len(dResp.Neighbors) != 1 || dResp.Neighbors[0].Word != "neighbor_1" {
+		t.Fatalf("unexpected math response: %+v", dResp)
+	}
+}
+
+func TestWire_ResetModelPayload(t *testing.T) {
+	b := EncodeResetModelPayload(true)
+	val, err := DecodeResetModelPayload(b)
+	if err != nil || !val {
+		t.Fatalf("unexpected reset model payload: got %v, err %v", val, err)
+	}
+}
+
+func TestWire_EdgeWithDirectionPayload(t *testing.T) {
+	dir := spatial.Point2D{X: 0, Y: -1}
+	encoded := EncodeEdgePayloadWithDirection("set_relation", "", "down", "", 0, &dir)
+	act, src, rel, tgt, w, dDir, err := DecodeEdgePayloadWithDirection(encoded)
+	if err != nil {
+		t.Fatalf("DecodeEdgePayloadWithDirection failed: %v", err)
+	}
+	if act != "set_relation" || rel != "down" || dDir == nil || dDir.Y != -1 {
+		t.Fatalf("unexpected edge direction payload: act=%s, rel=%s, dir=%+v", act, rel, dDir)
+	}
+	_ = src
+	_ = tgt
+	_ = w
+}

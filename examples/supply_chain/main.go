@@ -47,8 +47,8 @@ type DisruptionAnalysisResult struct {
 }
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine) or 'remote' (HTTP server / container)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in remote mode)")
+	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine) or 'remote' (HTTP engine, container, or AnchorWire)")
+	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in remote mode): http(s)://host:7447 or wire://host:7448")
 	authToken := flag.String("token", "", "Bearer auth token for remote mode (if required)")
 	modelName := flag.String("model", "supply_chain", "Model name to isolate supply chain data")
 	dataDir := flag.String("data-dir", "", "Storage directory for embedded mode (default: temporary directory)")
@@ -691,7 +691,9 @@ func setupClient(mode, serverURL, authToken, modelName, dataDir string) (*driver
 		if authToken != "" {
 			opts = append(opts, driver.WithToken(authToken))
 		}
-		client, err := driver.ConnectRemote(serverURL, opts...)
+		// driver.Connect auto-detects the transport: http(s):// uses the HTTP
+		// REST engine, wire:// (or tcp://, anchordb+wire://) uses AnchorWire.
+		client, err := driver.Connect(serverURL, opts...)
 		if err != nil {
 			fmt.Printf("FATAL: Failed to connect to remote AnchorDB server (%s): %v\n", serverURL, err)
 			os.Exit(1)

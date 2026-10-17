@@ -35,12 +35,20 @@ const (
 	OpNegotiateMemory byte = 0x05
 
 	// Mutations & Queries
-	OpSave      byte = 0x10
-	OpSaveBatch byte = 0x11
-	OpGet       byte = 0x12
-	OpEdge      byte = 0x13
-	OpCausal    byte = 0x14
-	OpSync      byte = 0x15
+	OpSave         byte = 0x10
+	OpSaveBatch    byte = 0x11
+	OpGet          byte = 0x12
+	OpEdge         byte = 0x13
+	OpCausal       byte = 0x14
+	OpSync         byte = 0x15
+	OpList         byte = 0x16
+	OpUpdate       byte = 0x17
+	OpGraph        byte = 0x18
+	OpGraphChain   byte = 0x19
+	OpAttachSchema byte = 0x1A
+	OpGetSchema    byte = 0x1B
+	OpMath         byte = 0x1C
+	OpResetModel   byte = 0x1D
 
 	// Responses
 	OpResponseOK    byte = 0x80
@@ -338,6 +346,76 @@ func DecodeSaveBatchPayload(data []byte) ([]storage.BatchRecordItem, error) {
 	return records, nil
 }
 
+// GetRequest specifies a get query with optional field projection and computations.
+type GetRequest struct {
+	Name         string
+	Select       []string
+	Computations map[string]storage.ComputeOp
+}
+
+// EncodeGetRequest serializes GetRequest for OpGet.
+func EncodeGetRequest(req GetRequest) []byte {
+	buf := appendString(nil, req.Name)
+	if len(req.Select) == 0 && len(req.Computations) == 0 {
+		return buf
+	}
+	var countBytes [2]byte
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Select)))
+	buf = append(buf, countBytes[:]...)
+	for _, s := range req.Select {
+		buf = appendString(buf, s)
+	}
+
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Computations)))
+	buf = append(buf, countBytes[:]...)
+	for k, comp := range req.Computations {
+		buf = appendString(buf, k)
+		buf = appendComputeOp(buf, comp)
+	}
+	return buf
+}
+
+// DecodeGetRequest deserializes GetRequest from OpGet.
+func DecodeGetRequest(data []byte) (GetRequest, error) {
+	name, offset, err := readString(data, 0)
+	if err != nil {
+		return GetRequest{}, err
+	}
+	req := GetRequest{Name: name}
+	if offset+2 <= len(data) {
+		selectCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		for i := 0; i < selectCount; i++ {
+			s, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return req, err
+			}
+			req.Select = append(req.Select, s)
+			offset = nextOffset
+		}
+	}
+	if offset+2 <= len(data) {
+		compCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if compCount > 0 {
+			req.Computations = make(map[string]storage.ComputeOp, compCount)
+			for i := 0; i < compCount; i++ {
+				outField, nextOffset, err := readString(data, offset)
+				if err != nil {
+					return req, err
+				}
+				op, nextOffset, err := readComputeOp(data, nextOffset)
+				if err != nil {
+					return req, err
+				}
+				req.Computations[outField] = op
+				offset = nextOffset
+			}
+		}
+	}
+	return req, nil
+}
+
 // EncodeGetPayload serializes record name for OpGet
 func EncodeGetPayload(name string) []byte {
 	return appendString(nil, name)
@@ -391,11 +469,16 @@ func DecodeGetResultPayload(data []byte) (uint8, map[string]float32, error) {
 	return opStatus, props, nil
 }
 
-// EncodeEdgePayload serializes edge data for OpEdge
-func EncodeEdgePayload(action, source, relation, target string, weight float32) []byte {
+// EncodeEdgePayloadWithDirection serializes edge mutation or relation vector configuration for OpEdge.
+func EncodeEdgePayloadWithDirection(action, source, relation, target string, weight float32, direction *spatial.Point2D) []byte {
 	var actByte byte
-	if action == "remove" {
+	switch action {
+	case "remove":
 		actByte = 1
+	case "set_relation":
+		actByte = 2
+	default:
+		actByte = 0
 	}
 	buf := []byte{actByte}
 	buf = appendString(buf, source)
@@ -404,37 +487,63 @@ func EncodeEdgePayload(action, source, relation, target string, weight float32) 
 	var wBytes [4]byte
 	binary.LittleEndian.PutUint32(wBytes[:], math.Float32bits(weight))
 	buf = append(buf, wBytes[:]...)
+	if direction != nil {
+		var dirBytes [8]byte
+		binary.LittleEndian.PutUint32(dirBytes[0:4], math.Float32bits(direction.X))
+		binary.LittleEndian.PutUint32(dirBytes[4:8], math.Float32bits(direction.Y))
+		buf = append(buf, dirBytes[:]...)
+	}
 	return buf
 }
 
-// DecodeEdgePayload deserializes edge data from OpEdge
-func DecodeEdgePayload(data []byte) (action, source, relation, target string, weight float32, err error) {
+// EncodeEdgePayload serializes edge data for OpEdge
+func EncodeEdgePayload(action, source, relation, target string, weight float32) []byte {
+	return EncodeEdgePayloadWithDirection(action, source, relation, target, weight, nil)
+}
+
+// DecodeEdgePayloadWithDirection deserializes edge data including optional direction from OpEdge
+func DecodeEdgePayloadWithDirection(data []byte) (action, source, relation, target string, weight float32, direction *spatial.Point2D, err error) {
 	if len(data) < 1 {
-		return "", "", "", "", 0, errors.New("truncated edge payload")
+		return "", "", "", "", 0, nil, errors.New("truncated edge payload")
 	}
-	if data[0] == 1 {
+	switch data[0] {
+	case 1:
 		action = "remove"
-	} else {
+	case 2:
+		action = "set_relation"
+	default:
 		action = "add"
 	}
 	offset := 1
 	source, offset, err = readString(data, offset)
 	if err != nil {
-		return "", "", "", "", 0, err
+		return "", "", "", "", 0, nil, err
 	}
 	relation, offset, err = readString(data, offset)
 	if err != nil {
-		return "", "", "", "", 0, err
+		return "", "", "", "", 0, nil, err
 	}
 	target, offset, err = readString(data, offset)
 	if err != nil {
-		return "", "", "", "", 0, err
+		return "", "", "", "", 0, nil, err
 	}
 	if offset+4 > len(data) {
-		return "", "", "", "", 0, errors.New("truncated edge weight")
+		return "", "", "", "", 0, nil, errors.New("truncated edge weight")
 	}
 	weight = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
-	return action, source, relation, target, weight, nil
+	offset += 4
+	if offset+8 <= len(data) {
+		dx := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		dy := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		direction = &spatial.Point2D{X: dx, Y: dy}
+	}
+	return action, source, relation, target, weight, direction, nil
+}
+
+// DecodeEdgePayload deserializes edge data from OpEdge
+func DecodeEdgePayload(data []byte) (action, source, relation, target string, weight float32, err error) {
+	action, source, relation, target, weight, _, err = DecodeEdgePayloadWithDirection(data)
+	return action, source, relation, target, weight, err
 }
 
 // EncodeCausalPayload serializes causal query input
@@ -612,4 +721,896 @@ func DecodeMemoryNegotiationResponse(data []byte) (MemoryNegotiationResponse, er
 		AllocatedBatchSize: binary.LittleEndian.Uint32(data[10:14]),
 		ReleaseIntervalMs:  binary.LittleEndian.Uint32(data[14:18]),
 	}, nil
+}
+
+// --- FILTER & COMPUTATION CODECS ---
+
+func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
+	buf = appendString(buf, f.Field)
+	buf = appendString(buf, f.Operator)
+	var valBytes [8]byte
+	binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(f.Value))
+	binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(f.ValueHigh))
+	return append(buf, valBytes[:]...)
+}
+
+func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int, error) {
+	field, nextOffset, err := readString(data, offset)
+	if err != nil {
+		return storage.FilterCondition{}, offset, err
+	}
+	op, nextOffset, err := readString(data, nextOffset)
+	if err != nil {
+		return storage.FilterCondition{}, offset, err
+	}
+	if nextOffset+8 > len(data) {
+		return storage.FilterCondition{}, offset, errors.New("truncated filter values")
+	}
+	val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+	valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+	return storage.FilterCondition{
+		Field:     field,
+		Operator:  op,
+		Value:     val,
+		ValueHigh: valHigh,
+	}, nextOffset + 8, nil
+}
+
+func appendComputeOp(buf []byte, op storage.ComputeOp) []byte {
+	switch v := op.(type) {
+	case storage.OpDivide:
+		buf = append(buf, 1)
+		buf = appendString(buf, v.FieldA)
+		buf = appendString(buf, v.FieldB)
+	case storage.OpMultiply:
+		buf = append(buf, 2)
+		buf = appendString(buf, v.FieldA)
+		buf = appendString(buf, v.FieldB)
+	case storage.OpAdd:
+		buf = append(buf, 3)
+		buf = appendString(buf, v.FieldA)
+		buf = appendString(buf, v.FieldB)
+	case storage.OpSubtract:
+		buf = append(buf, 4)
+		buf = appendString(buf, v.FieldA)
+		buf = appendString(buf, v.FieldB)
+	case storage.OpAddDays:
+		buf = append(buf, 5)
+		buf = appendString(buf, v.Field)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(v.Days))
+		buf = append(buf, b[:]...)
+	case storage.OpSubtractDays:
+		buf = append(buf, 6)
+		buf = appendString(buf, v.Field)
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], math.Float32bits(v.Days))
+		buf = append(buf, b[:]...)
+	case storage.OpDaysBetween:
+		buf = append(buf, 7)
+		buf = appendString(buf, v.FieldA)
+		buf = appendString(buf, v.FieldB)
+	case storage.OpAssign:
+		buf = append(buf, 8)
+		buf = appendString(buf, v.Value)
+	default:
+		buf = append(buf, 0)
+	}
+	return buf
+}
+
+func readComputeOp(data []byte, offset int) (storage.ComputeOp, int, error) {
+	if offset+1 > len(data) {
+		return nil, offset, errors.New("truncated compute op tag")
+	}
+	tag := data[offset]
+	offset++
+	switch tag {
+	case 1:
+		fA, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		fB, nextOffset, err := readString(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpDivide{FieldA: fA, FieldB: fB}, nextOffset, nil
+	case 2:
+		fA, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		fB, nextOffset, err := readString(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpMultiply{FieldA: fA, FieldB: fB}, nextOffset, nil
+	case 3:
+		fA, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		fB, nextOffset, err := readString(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpAdd{FieldA: fA, FieldB: fB}, nextOffset, nil
+	case 4:
+		fA, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		fB, nextOffset, err := readString(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpSubtract{FieldA: fA, FieldB: fB}, nextOffset, nil
+	case 5:
+		field, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		if nextOffset+4 > len(data) {
+			return nil, offset, errors.New("truncated days")
+		}
+		days := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+		return storage.OpAddDays{Field: field, Days: days}, nextOffset + 4, nil
+	case 6:
+		field, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		if nextOffset+4 > len(data) {
+			return nil, offset, errors.New("truncated days")
+		}
+		days := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+		return storage.OpSubtractDays{Field: field, Days: days}, nextOffset + 4, nil
+	case 7:
+		fA, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		fB, nextOffset, err := readString(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpDaysBetween{FieldA: fA, FieldB: fB}, nextOffset, nil
+	case 8:
+		val, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		return storage.OpAssign{Value: val}, nextOffset, nil
+	default:
+		return nil, offset, fmt.Errorf("unknown compute op tag %d", tag)
+	}
+}
+
+// --- LIST CODECS ---
+
+// ListRequest specifies QueryOptions in wire format.
+type ListRequest struct {
+	Limit                int
+	Offset               int
+	IncludeAllOperations bool
+	OperationFilter      *uint8
+	AllowedOperations    []uint8
+	Select               []string
+	Filters              []storage.FilterCondition
+	Computations         map[string]storage.ComputeOp
+}
+
+// ListResponse specifies the results of an OpList query.
+type ListResponse struct {
+	TotalCount int
+	HasMore    bool
+	Items      []storage.EntityRecord
+}
+
+// EncodeListRequest serializes ListRequest into wire bytes.
+func EncodeListRequest(req ListRequest) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(req.Limit))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(req.Offset))
+
+	flags := byte(0)
+	if req.IncludeAllOperations {
+		flags |= 1
+	}
+	if req.OperationFilter != nil {
+		flags |= 2
+	}
+	buf = append(buf, flags)
+	if req.OperationFilter != nil {
+		buf = append(buf, *req.OperationFilter)
+	}
+
+	buf = append(buf, byte(len(req.AllowedOperations)))
+	buf = append(buf, req.AllowedOperations...)
+
+	var countBytes [2]byte
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Select)))
+	buf = append(buf, countBytes[:]...)
+	for _, s := range req.Select {
+		buf = appendString(buf, s)
+	}
+
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Filters)))
+	buf = append(buf, countBytes[:]...)
+	for _, f := range req.Filters {
+		buf = appendFilterCondition(buf, f)
+	}
+
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Computations)))
+	buf = append(buf, countBytes[:]...)
+	for k, comp := range req.Computations {
+		buf = appendString(buf, k)
+		buf = appendComputeOp(buf, comp)
+	}
+
+	return buf
+}
+
+// DecodeListRequest deserializes ListRequest from wire bytes.
+func DecodeListRequest(data []byte) (ListRequest, error) {
+	if len(data) < 9 {
+		return ListRequest{}, errors.New("truncated list request header")
+	}
+	req := ListRequest{
+		Limit:  int(binary.LittleEndian.Uint32(data[0:4])),
+		Offset: int(binary.LittleEndian.Uint32(data[4:8])),
+	}
+	offset := 8
+	flags := data[offset]
+	offset++
+	req.IncludeAllOperations = (flags & 1) != 0
+
+	if (flags & 2) != 0 {
+		if offset >= len(data) {
+			return ListRequest{}, errors.New("truncated op filter")
+		}
+		opF := data[offset]
+		req.OperationFilter = &opF
+		offset++
+	}
+
+	if offset >= len(data) {
+		return ListRequest{}, errors.New("truncated allowed ops length")
+	}
+	allowedCount := int(data[offset])
+	offset++
+	if offset+allowedCount > len(data) {
+		return ListRequest{}, errors.New("truncated allowed ops")
+	}
+	if allowedCount > 0 {
+		req.AllowedOperations = make([]uint8, allowedCount)
+		copy(req.AllowedOperations, data[offset:offset+allowedCount])
+		offset += allowedCount
+	}
+
+	if offset+2 > len(data) {
+		return ListRequest{}, errors.New("truncated select count")
+	}
+	selectCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	for i := 0; i < selectCount; i++ {
+		s, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return ListRequest{}, err
+		}
+		req.Select = append(req.Select, s)
+		offset = nextOffset
+	}
+
+	if offset+2 > len(data) {
+		return ListRequest{}, errors.New("truncated filters count")
+	}
+	filterCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	for i := 0; i < filterCount; i++ {
+		fc, nextOffset, err := readFilterCondition(data, offset)
+		if err != nil {
+			return ListRequest{}, err
+		}
+		req.Filters = append(req.Filters, fc)
+		offset = nextOffset
+	}
+
+	if offset+2 <= len(data) {
+		compCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if compCount > 0 {
+			req.Computations = make(map[string]storage.ComputeOp, compCount)
+			for i := 0; i < compCount; i++ {
+				outField, nextOffset, err := readString(data, offset)
+				if err != nil {
+					return ListRequest{}, err
+				}
+				op, nextOffset, err := readComputeOp(data, nextOffset)
+				if err != nil {
+					return ListRequest{}, err
+				}
+				req.Computations[outField] = op
+				offset = nextOffset
+			}
+		}
+	}
+
+	return req, nil
+}
+
+// EncodeListResponse serializes ListResponse into wire bytes.
+func EncodeListResponse(resp ListResponse) []byte {
+	buf := make([]byte, 9)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(resp.TotalCount))
+	if resp.HasMore {
+		buf[4] = 1
+	} else {
+		buf[4] = 0
+	}
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(resp.Items)))
+
+	for _, item := range resp.Items {
+		buf = appendString(buf, item.Name)
+		buf = append(buf, item.Operation)
+		var countBytes [2]byte
+		binary.LittleEndian.PutUint16(countBytes[:], uint16(len(item.Props)))
+		buf = append(buf, countBytes[:]...)
+		for k, v := range item.Props {
+			buf = appendString(buf, k)
+			var valBytes [4]byte
+			binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
+			buf = append(buf, valBytes[:]...)
+		}
+	}
+	return buf
+}
+
+// DecodeListResponse deserializes ListResponse from wire bytes.
+func DecodeListResponse(data []byte) (ListResponse, error) {
+	if len(data) < 9 {
+		return ListResponse{}, errors.New("truncated list response header")
+	}
+	resp := ListResponse{
+		TotalCount: int(binary.LittleEndian.Uint32(data[0:4])),
+		HasMore:    data[4] == 1,
+	}
+	itemCount := int(binary.LittleEndian.Uint32(data[5:9]))
+	offset := 9
+
+	resp.Items = make([]storage.EntityRecord, 0, itemCount)
+	for i := 0; i < itemCount; i++ {
+		name, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return ListResponse{}, err
+		}
+		if nextOffset+3 > len(data) {
+			return ListResponse{}, errors.New("truncated item header")
+		}
+		op := data[nextOffset]
+		propCount := int(binary.LittleEndian.Uint16(data[nextOffset+1 : nextOffset+3]))
+		offset = nextOffset + 3
+
+		props := make(map[string]float32, propCount)
+		for p := 0; p < propCount; p++ {
+			k, nOffset, err := readString(data, offset)
+			if err != nil {
+				return ListResponse{}, err
+			}
+			if nOffset+4 > len(data) {
+				return ListResponse{}, errors.New("truncated property float value")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nOffset : nOffset+4]))
+			props[k] = val
+			offset = nOffset + 4
+		}
+
+		resp.Items = append(resp.Items, storage.EntityRecord{
+			Name:      name,
+			Operation: op,
+			Props:     props,
+		})
+	}
+
+	return resp, nil
+}
+
+// --- UPDATE CODECS ---
+
+// UpdateRequest specifies UpdateOptions in wire format.
+type UpdateRequest struct {
+	Limit          int
+	Offset         int
+	TargetEntities []string
+	Filters        []storage.FilterCondition
+	Mutations      map[string]storage.ComputeOp
+}
+
+// EncodeUpdateRequest serializes UpdateRequest into wire bytes.
+func EncodeUpdateRequest(req UpdateRequest) []byte {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(req.Limit))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(req.Offset))
+
+	var countBytes [4]byte
+	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(req.TargetEntities)))
+	buf = append(buf, countBytes[:]...)
+	for _, e := range req.TargetEntities {
+		buf = appendString(buf, e)
+	}
+
+	var count16 [2]byte
+	binary.LittleEndian.PutUint16(count16[:], uint16(len(req.Filters)))
+	buf = append(buf, count16[:]...)
+	for _, f := range req.Filters {
+		buf = appendFilterCondition(buf, f)
+	}
+
+	binary.LittleEndian.PutUint16(count16[:], uint16(len(req.Mutations)))
+	buf = append(buf, count16[:]...)
+	for k, m := range req.Mutations {
+		buf = appendString(buf, k)
+		buf = appendComputeOp(buf, m)
+	}
+
+	return buf
+}
+
+// DecodeUpdateRequest deserializes UpdateRequest from wire bytes.
+func DecodeUpdateRequest(data []byte) (UpdateRequest, error) {
+	if len(data) < 12 {
+		return UpdateRequest{}, errors.New("truncated update request")
+	}
+	req := UpdateRequest{
+		Limit:  int(binary.LittleEndian.Uint32(data[0:4])),
+		Offset: int(binary.LittleEndian.Uint32(data[4:8])),
+	}
+	targetCount := int(binary.LittleEndian.Uint32(data[8:12]))
+	offset := 12
+
+	for i := 0; i < targetCount; i++ {
+		ent, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return UpdateRequest{}, err
+		}
+		req.TargetEntities = append(req.TargetEntities, ent)
+		offset = nextOffset
+	}
+
+	if offset+2 > len(data) {
+		return UpdateRequest{}, errors.New("truncated filter count")
+	}
+	filterCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	for i := 0; i < filterCount; i++ {
+		fc, nextOffset, err := readFilterCondition(data, offset)
+		if err != nil {
+			return UpdateRequest{}, err
+		}
+		req.Filters = append(req.Filters, fc)
+		offset = nextOffset
+	}
+
+	if offset+2 <= len(data) {
+		mutCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if mutCount > 0 {
+			req.Mutations = make(map[string]storage.ComputeOp, mutCount)
+			for i := 0; i < mutCount; i++ {
+				outField, nextOffset, err := readString(data, offset)
+				if err != nil {
+					return UpdateRequest{}, err
+				}
+				op, nextOffset, err := readComputeOp(data, nextOffset)
+				if err != nil {
+					return UpdateRequest{}, err
+				}
+				req.Mutations[outField] = op
+				offset = nextOffset
+			}
+		}
+	}
+
+	return req, nil
+}
+
+// EncodeUpdateResponse serializes the updated count.
+func EncodeUpdateResponse(count int) []byte {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(count))
+	return b[:]
+}
+
+// DecodeUpdateResponse deserializes the updated count.
+func DecodeUpdateResponse(data []byte) (int, error) {
+	if len(data) < 4 {
+		return 0, errors.New("truncated update response")
+	}
+	return int(binary.LittleEndian.Uint32(data[0:4])), nil
+}
+
+// --- GRAPH & CHAIN CODECS ---
+
+// GraphRequest specifies a spatial graph beam step query in wire format.
+type GraphRequest struct {
+	Inputs    []string
+	Relation  string
+	LimitK    int
+	OrderMode uint8
+	BeamWidth float32
+}
+
+// GraphResponsePayload holds the results of OpGraph.
+type GraphResponsePayload struct {
+	Anchor  spatial.Point2D
+	Results []storage.GraphQueryResult
+}
+
+// EncodeGraphRequest serializes GraphRequest.
+func EncodeGraphRequest(req GraphRequest) []byte {
+	buf := appendString(nil, req.Relation)
+	var b [9]byte
+	binary.LittleEndian.PutUint32(b[0:4], uint32(req.LimitK))
+	b[4] = req.OrderMode
+	binary.LittleEndian.PutUint32(b[5:9], math.Float32bits(req.BeamWidth))
+	buf = append(buf, b[:]...)
+
+	var countBytes [2]byte
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Inputs)))
+	buf = append(buf, countBytes[:]...)
+	for _, in := range req.Inputs {
+		buf = appendString(buf, in)
+	}
+	return buf
+}
+
+// DecodeGraphRequest deserializes GraphRequest.
+func DecodeGraphRequest(data []byte) (GraphRequest, error) {
+	rel, offset, err := readString(data, 0)
+	if err != nil {
+		return GraphRequest{}, err
+	}
+	if offset+11 > len(data) {
+		return GraphRequest{}, errors.New("truncated graph request header")
+	}
+	limitK := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	orderMode := data[offset+4]
+	beamWidth := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+5 : offset+9]))
+	inputCount := int(binary.LittleEndian.Uint16(data[offset+9 : offset+11]))
+	offset += 11
+
+	inputs := make([]string, 0, inputCount)
+	for i := 0; i < inputCount; i++ {
+		in, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return GraphRequest{}, err
+		}
+		inputs = append(inputs, in)
+		offset = nextOffset
+	}
+
+	return GraphRequest{
+		Inputs:    inputs,
+		Relation:  rel,
+		LimitK:    limitK,
+		OrderMode: orderMode,
+		BeamWidth: beamWidth,
+	}, nil
+}
+
+// EncodeGraphResponsePayload serializes GraphResponsePayload.
+func EncodeGraphResponsePayload(resp GraphResponsePayload) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint32(b[0:4], math.Float32bits(resp.Anchor.X))
+	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(resp.Anchor.Y))
+	buf := append([]byte(nil), b[:]...)
+
+	var countBytes [4]byte
+	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(resp.Results)))
+	buf = append(buf, countBytes[:]...)
+
+	for _, r := range resp.Results {
+		buf = appendString(buf, r.Word)
+		var valBytes [20]byte
+		binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(r.Score))
+		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(r.T))
+		binary.LittleEndian.PutUint32(valBytes[8:12], math.Float32bits(r.DistSqPerp))
+		binary.LittleEndian.PutUint32(valBytes[12:16], math.Float32bits(r.Coord.X))
+		binary.LittleEndian.PutUint32(valBytes[16:20], math.Float32bits(r.Coord.Y))
+		buf = append(buf, valBytes[:]...)
+	}
+	return buf
+}
+
+// DecodeGraphResponsePayload deserializes GraphResponsePayload.
+func DecodeGraphResponsePayload(data []byte) (GraphResponsePayload, error) {
+	if len(data) < 12 {
+		return GraphResponsePayload{}, errors.New("truncated graph response header")
+	}
+	anchor := spatial.Point2D{
+		X: math.Float32frombits(binary.LittleEndian.Uint32(data[0:4])),
+		Y: math.Float32frombits(binary.LittleEndian.Uint32(data[4:8])),
+	}
+	resultCount := int(binary.LittleEndian.Uint32(data[8:12]))
+	offset := 12
+
+	results := make([]storage.GraphQueryResult, 0, resultCount)
+	for i := 0; i < resultCount; i++ {
+		word, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return GraphResponsePayload{}, err
+		}
+		if nextOffset+20 > len(data) {
+			return GraphResponsePayload{}, errors.New("truncated graph result item")
+		}
+		score := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+		tVal := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+		distSqPerp := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+8 : nextOffset+12]))
+		x := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+12 : nextOffset+16]))
+		y := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+16 : nextOffset+20]))
+		offset = nextOffset + 20
+
+		results = append(results, storage.GraphQueryResult{
+			Word:       word,
+			Score:      score,
+			T:          tVal,
+			DistSqPerp: distSqPerp,
+			Coord:      spatial.Point2D{X: x, Y: y},
+		})
+	}
+
+	return GraphResponsePayload{Anchor: anchor, Results: results}, nil
+}
+
+// GraphChainRequest specifies a multi-hop graph chain query.
+type GraphChainRequest struct {
+	Inputs        []string
+	RelationChain []string
+	LimitK        int
+	BeamWidth     float32
+}
+
+// EncodeGraphChainRequest serializes GraphChainRequest.
+func EncodeGraphChainRequest(req GraphChainRequest) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint32(b[0:4], uint32(req.LimitK))
+	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(req.BeamWidth))
+	buf := append([]byte(nil), b[:]...)
+
+	var countBytes [2]byte
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Inputs)))
+	buf = append(buf, countBytes[:]...)
+	for _, in := range req.Inputs {
+		buf = appendString(buf, in)
+	}
+
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.RelationChain)))
+	buf = append(buf, countBytes[:]...)
+	for _, rel := range req.RelationChain {
+		buf = appendString(buf, rel)
+	}
+	return buf
+}
+
+// DecodeGraphChainRequest deserializes GraphChainRequest.
+func DecodeGraphChainRequest(data []byte) (GraphChainRequest, error) {
+	if len(data) < 10 {
+		return GraphChainRequest{}, errors.New("truncated graph chain header")
+	}
+	limitK := int(binary.LittleEndian.Uint32(data[0:4]))
+	beamWidth := math.Float32frombits(binary.LittleEndian.Uint32(data[4:8]))
+	inputCount := int(binary.LittleEndian.Uint16(data[8:10]))
+	offset := 10
+
+	inputs := make([]string, 0, inputCount)
+	for i := 0; i < inputCount; i++ {
+		in, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return GraphChainRequest{}, err
+		}
+		inputs = append(inputs, in)
+		offset = nextOffset
+	}
+
+	if offset+2 > len(data) {
+		return GraphChainRequest{}, errors.New("truncated relation chain count")
+	}
+	relCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+
+	relations := make([]string, 0, relCount)
+	for i := 0; i < relCount; i++ {
+		rel, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return GraphChainRequest{}, err
+		}
+		relations = append(relations, rel)
+		offset = nextOffset
+	}
+
+	return GraphChainRequest{
+		Inputs:        inputs,
+		RelationChain: relations,
+		LimitK:        limitK,
+		BeamWidth:     beamWidth,
+	}, nil
+}
+
+// --- SCHEMA CODECS ---
+
+// EncodeAttachSchemaPayload serializes a raw schema definition string.
+func EncodeAttachSchemaPayload(schemaJSON string) []byte {
+	return appendString(nil, schemaJSON)
+}
+
+// DecodeAttachSchemaPayload deserializes a raw schema definition string.
+func DecodeAttachSchemaPayload(data []byte) (string, error) {
+	s, _, err := readString(data, 0)
+	return s, err
+}
+
+// EncodeGetSchemaPayload encodes schema response string.
+func EncodeGetSchemaPayload(schemaJSON string) []byte {
+	return appendString(nil, schemaJSON)
+}
+
+// DecodeGetSchemaPayload decodes schema response string.
+func DecodeGetSchemaPayload(data []byte) (string, error) {
+	s, _, err := readString(data, 0)
+	return s, err
+}
+
+// --- MATH CODECS ---
+
+// MathRequest specifies an in-storage math computation.
+type MathRequest struct {
+	Op     string // "distance", "centroid", "cosine_similarity", "nearest"
+	Words  []string
+	LimitK int
+}
+
+// MathResponse holds the result of OpMath.
+type MathResponse struct {
+	Value     float32
+	Coord     spatial.Point2D
+	Roles     [4]float32
+	Neighbors []storage.GraphQueryResult
+}
+
+// EncodeMathRequest serializes MathRequest.
+func EncodeMathRequest(req MathRequest) []byte {
+	buf := appendString(nil, req.Op)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(req.LimitK))
+	buf = append(buf, b[:]...)
+
+	var countBytes [2]byte
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Words)))
+	buf = append(buf, countBytes[:]...)
+	for _, w := range req.Words {
+		buf = appendString(buf, w)
+	}
+	return buf
+}
+
+// DecodeMathRequest deserializes MathRequest.
+func DecodeMathRequest(data []byte) (MathRequest, error) {
+	op, offset, err := readString(data, 0)
+	if err != nil {
+		return MathRequest{}, err
+	}
+	if offset+6 > len(data) {
+		return MathRequest{}, errors.New("truncated math request")
+	}
+	limitK := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	wordCount := int(binary.LittleEndian.Uint16(data[offset+4 : offset+6]))
+	offset += 6
+
+	words := make([]string, 0, wordCount)
+	for i := 0; i < wordCount; i++ {
+		w, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return MathRequest{}, err
+		}
+		words = append(words, w)
+		offset = nextOffset
+	}
+
+	return MathRequest{Op: op, Words: words, LimitK: limitK}, nil
+}
+
+// EncodeMathResponse serializes MathResponse.
+func EncodeMathResponse(resp MathResponse) []byte {
+	var b [28]byte
+	binary.LittleEndian.PutUint32(b[0:4], math.Float32bits(resp.Value))
+	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(resp.Coord.X))
+	binary.LittleEndian.PutUint32(b[8:12], math.Float32bits(resp.Coord.Y))
+	for i := 0; i < 4; i++ {
+		binary.LittleEndian.PutUint32(b[12+i*4:16+i*4], math.Float32bits(resp.Roles[i]))
+	}
+	buf := append([]byte(nil), b[:]...)
+
+	var countBytes [4]byte
+	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(resp.Neighbors)))
+	buf = append(buf, countBytes[:]...)
+	for _, n := range resp.Neighbors {
+		buf = appendString(buf, n.Word)
+		var nb [20]byte
+		binary.LittleEndian.PutUint32(nb[0:4], math.Float32bits(n.Score))
+		binary.LittleEndian.PutUint32(nb[4:8], math.Float32bits(n.T))
+		binary.LittleEndian.PutUint32(nb[8:12], math.Float32bits(n.DistSqPerp))
+		binary.LittleEndian.PutUint32(nb[12:16], math.Float32bits(n.Coord.X))
+		binary.LittleEndian.PutUint32(nb[16:20], math.Float32bits(n.Coord.Y))
+		buf = append(buf, nb[:]...)
+	}
+	return buf
+}
+
+// DecodeMathResponse deserializes MathResponse.
+func DecodeMathResponse(data []byte) (MathResponse, error) {
+	if len(data) < 32 {
+		return MathResponse{}, errors.New("truncated math response")
+	}
+	val := math.Float32frombits(binary.LittleEndian.Uint32(data[0:4]))
+	coord := spatial.Point2D{
+		X: math.Float32frombits(binary.LittleEndian.Uint32(data[4:8])),
+		Y: math.Float32frombits(binary.LittleEndian.Uint32(data[8:12])),
+	}
+	var roles [4]float32
+	for i := 0; i < 4; i++ {
+		roles[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[12+i*4 : 16+i*4]))
+	}
+	neighborCount := int(binary.LittleEndian.Uint32(data[28:32]))
+	offset := 32
+
+	neighbors := make([]storage.GraphQueryResult, 0, neighborCount)
+	for i := 0; i < neighborCount; i++ {
+		w, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return MathResponse{}, err
+		}
+		if nextOffset+20 > len(data) {
+			return MathResponse{}, errors.New("truncated math neighbor item")
+		}
+		sc := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+		tVal := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+		distSq := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+8 : nextOffset+12]))
+		x := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+12 : nextOffset+16]))
+		y := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+16 : nextOffset+20]))
+		offset = nextOffset + 20
+
+		neighbors = append(neighbors, storage.GraphQueryResult{
+			Word:       w,
+			Score:      sc,
+			T:          tVal,
+			DistSqPerp: distSq,
+			Coord:      spatial.Point2D{X: x, Y: y},
+		})
+	}
+
+	return MathResponse{
+		Value:     val,
+		Coord:     coord,
+		Roles:     roles,
+		Neighbors: neighbors,
+	}, nil
+}
+
+// --- RESET MODEL CODECS ---
+
+// EncodeResetModelPayload encodes the confirm flag for OpResetModel.
+func EncodeResetModelPayload(confirm bool) []byte {
+	if confirm {
+		return []byte{1}
+	}
+	return []byte{0}
+}
+
+// DecodeResetModelPayload decodes the confirm flag for OpResetModel.
+func DecodeResetModelPayload(data []byte) (bool, error) {
+	if len(data) < 1 {
+		return false, errors.New("truncated reset model payload")
+	}
+	return data[0] == 1, nil
 }

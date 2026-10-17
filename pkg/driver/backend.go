@@ -1477,7 +1477,11 @@ func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields 
 	if model != "" && model != b.wireClient.ModelName() {
 		_ = b.wireClient.SelectModel(model)
 	}
-	props, _, err := b.wireClient.Get(name)
+	props, _, err := b.wireClient.GetWithOptions(wire.GetRequest{
+		Name:         name,
+		Select:       selectFields,
+		Computations: computations,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1488,19 +1492,102 @@ func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields 
 }
 
 func (b *wireBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
-	return nil, fmt.Errorf("list query is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	req := wire.ListRequest{
+		Limit:                opts.Limit,
+		Offset:               opts.Offset,
+		IncludeAllOperations: opts.IncludeAllOperations,
+		OperationFilter:      opts.OperationFilter,
+		AllowedOperations:    opts.AllowedOperations,
+		Select:               opts.Select,
+		Filters:              opts.Filters,
+		Computations:         opts.Computations,
+	}
+	resp, err := b.wireClient.List(req)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]EntityResult, len(resp.Items))
+	for i, r := range resp.Items {
+		items[i] = EntityResult{
+			Name:  r.Name,
+			props: r.Props,
+		}
+	}
+	return &PagedListResult{
+		Items:   items,
+		HasMore: resp.HasMore,
+	}, nil
 }
 
 func (b *wireBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
-	return 0, fmt.Errorf("bulk update is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	req := wire.UpdateRequest{
+		Limit:          opts.Limit,
+		Offset:         opts.Offset,
+		TargetEntities: opts.TargetEntities,
+		Filters:        opts.Filters,
+		Mutations:      opts.Mutations,
+	}
+	return b.wireClient.Update(req)
 }
 
 func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
-	return nil, fmt.Errorf("graph step query is not supported over AnchorWire binary transport; use Causal query or HTTP engine")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	req := wire.GraphRequest{
+		Inputs:    inputs,
+		Relation:  relation,
+		LimitK:    limitK,
+		OrderMode: uint8(orderMode),
+		BeamWidth: beamWidth,
+	}
+	resp, err := b.wireClient.Graph(req)
+	if err != nil {
+		return nil, err
+	}
+	return &GraphResponse{Anchor: resp.Anchor, Results: resp.Results}, nil
 }
 
 func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
-	return nil, fmt.Errorf("graph chain query is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	req := wire.GraphChainRequest{
+		Inputs:        inputs,
+		RelationChain: relations,
+		LimitK:        limitK,
+		BeamWidth:     beamWidth,
+	}
+	results, err := b.wireClient.GraphChain(req)
+	if err != nil {
+		return nil, err
+	}
+	seq := make([]string, len(results))
+	for i, step := range results {
+		seq[i] = step.Word
+	}
+	return &ChainResponse{
+		Sequence: seq,
+		Steps:    results,
+	}, nil
 }
 
 func (b *wireBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
@@ -1520,32 +1607,121 @@ func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, 
 	if model != "" && model != b.wireClient.ModelName() {
 		_ = b.wireClient.SelectModel(model)
 	}
+	if len(relations) > 0 {
+		currentSeeds := seeds
+		var finalResults []storage.CausalResult
+		for _, rel := range relations {
+			stepRes, err := b.wireClient.Causal(currentSeeds, rel, limitK)
+			if err != nil {
+				return nil, err
+			}
+			finalResults = append(finalResults, stepRes...)
+			currentSeeds = make([]string, len(stepRes))
+			for i, r := range stepRes {
+				currentSeeds[i] = r.Word
+			}
+			if len(currentSeeds) == 0 {
+				break
+			}
+		}
+		return finalResults, nil
+	}
 	return b.wireClient.Causal(seeds, relation, limitK)
 }
 
 func (b *wireBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
-	return 0, fmt.Errorf("distance computation is not supported over AnchorWire binary transport; use embedded mode")
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	resp, err := b.wireClient.Math(wire.MathRequest{
+		Op:    "distance",
+		Words: []string{wordA, wordB},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Value, nil
 }
 
 func (b *wireBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
-	return CentroidResult{}, fmt.Errorf("centroid computation is not supported over AnchorWire binary transport; use embedded mode")
+	if err := ctx.Err(); err != nil {
+		return CentroidResult{}, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	resp, err := b.wireClient.Math(wire.MathRequest{
+		Op:    "centroid",
+		Words: words,
+	})
+	if err != nil {
+		return CentroidResult{}, err
+	}
+	return CentroidResult{Coord: resp.Coord, Roles: resp.Roles}, nil
 }
 
 func (b *wireBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
-	return 0, fmt.Errorf("cosine similarity is not supported over AnchorWire binary transport; use embedded mode")
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	resp, err := b.wireClient.Math(wire.MathRequest{
+		Op:    "cosine_similarity",
+		Words: []string{wordA, wordB},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Value, nil
 }
 
 func (b *wireBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
-	return nil, fmt.Errorf("nearest search is not supported over AnchorWire binary transport; use embedded mode")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	resp, err := b.wireClient.Math(wire.MathRequest{
+		Op:     "nearest",
+		Words:  []string{word},
+		LimitK: limitK,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Neighbors, nil
 }
 
 func (b *wireBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
-	_, err := b.Save(ctx, model, word, nil, nil)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	_, err := b.wireClient.Save(storage.BatchRecordItem{
+		Name:      word,
+		Operation: storage.OpStatusActive,
+		Coord:     &coord,
+		Roles:     &roles,
+	})
 	return err
 }
 
 func (b *wireBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
-	return fmt.Errorf("set relation is not supported over AnchorWire binary transport; use embedded mode")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.SetRelation(name, direction)
 }
 
 func (b *wireBackend) Sync(ctx context.Context, model string) error {
@@ -1579,13 +1755,43 @@ func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recor
 }
 
 func (b *wireBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	return b.wireClient.AttachSchema(string(data))
 }
 
 func (b *wireBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
-	return nil, fmt.Errorf("schema inspection is not supported over AnchorWire binary transport; use HTTP engine")
+	if err := ctx.Err(); err != nil {
+		return storage.ModelSchema{}, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	raw, err := b.wireClient.GetSchema()
+	if err != nil {
+		return storage.ModelSchema{}, err
+	}
+	var ms storage.ModelSchema
+	if err := json.Unmarshal([]byte(raw), &ms); err != nil {
+		return storage.ModelSchema{}, err
+	}
+	return ms, nil
 }
 
 func (b *wireBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
-	return fmt.Errorf("reset model is not supported over AnchorWire binary transport; use HTTP engine")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.ResetModel(confirm)
 }
