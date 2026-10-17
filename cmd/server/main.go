@@ -2575,41 +2575,17 @@ func main() {
 		log.Fatalf("[FATAL] Failed to start AnchorDB Server: %v", err)
 	}
 
-	fmt.Println("==========================================================")
-	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
-	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
-	fmt.Println("             Licensed under Apache-2.0                    ")
-	fmt.Printf("   Port Dedicated : %s (HTTP REST API)\n", portStr)
+	fmt.Println("AnchorDB Server")
+	fmt.Printf("  HTTP REST   : :%s\n", portStr)
 	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
-		fmt.Printf("   Wire Port (TCP): %s (AnchorWire Binary Protocol)\n", wirePortStr)
-	} else {
-		fmt.Println("   Wire Port (TCP): DISABLED")
+		fmt.Printf("  AnchorWire  : :%s (TCP)\n", wirePortStr)
 	}
-	fmt.Printf("   Memory Limit   : %s\n", memSummary)
-	if authToken == "" {
-		fmt.Println("   Auth           : DISABLED (ANCHORDB_ALLOW_INSECURE=true)")
+	fmt.Printf("  Data Dir    : %s\n", dataDir)
+	if authToken != "" {
+		fmt.Println("  Auth        : Enabled")
 	} else {
-		fmt.Println("   Auth           : ENABLED (Bearer token required)")
+		fmt.Println("  Auth        : Disabled")
 	}
-	if server.ipFilter.IsEmpty() {
-		fmt.Println("   IP Whitelist   : OPEN (All client IPs allowed)")
-	} else {
-		fmt.Printf("   IP Whitelist   : RESTRICTED (%s)\n", ipWhitelist)
-	}
-	if cronEnabled {
-		fmt.Printf("   Cron Engine    : ENABLED (Schedule: %s, Retention: %.0fd, Sync: %s, Timeout: %v, Jitter: %v)\n",
-			partitionSched, retentionDays, syncInterval, server.scheduler.TaskTimeout(), server.scheduler.Jitter())
-	} else {
-		fmt.Println("   Cron Engine    : DISABLED")
-	}
-	if workerEnabled {
-		fmt.Printf("   Worker Pool    : ENABLED (Concurrency: %d, Queue: %d)\n", workerConcurrency, workerQueueSize)
-	} else {
-		fmt.Println("   Worker Pool    : DISABLED")
-	}
-	fmt.Println("   Architecture   : Minimal Dependencies (Pure Go, Zero External Broker)")
-	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
-	fmt.Println("==========================================================")
 
 	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
 		wireAddr := ":" + wirePortStr

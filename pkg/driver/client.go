@@ -65,7 +65,7 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("empty DSN or target address")
 	}
 
-	// 0. AnchorWire Binary TCP remote URL (Maximum Performance)
+	// 0. AnchorWire Binary TCP remote URL
 	if strings.HasPrefix(dsn, "wire://") || strings.HasPrefix(dsn, "tcp://") || strings.HasPrefix(dsn, "anchordb+wire://") {
 		return ConnectWire(dsn, opts...)
 	}

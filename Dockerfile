@@ -1,5 +1,4 @@
-# Multi-stage production build for AnchorDB (Minimal Dependencies, Zero CGO, 100% CPU, non-root, < 15 MB)
-# Use the latest 1.27.x patch so the image ships a patched standard library.
+# Multi-stage build for AnchorDB (Alpine runtime, non-root user)
 FROM golang:1.27-alpine AS builder
 
 WORKDIR /src
