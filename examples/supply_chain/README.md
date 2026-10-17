@@ -85,7 +85,7 @@ If $\text{Days to Stockout} \le 30.0$, the engine triggers an **ALERT (<30 Days)
 
 ```
 examples/supply_chain/
-├── main.go               # Complete Go program (Embedded & Remote modes, 6-Hop Causal Graph, 30-Day Math, Crash-Test, 5M Benchmark)
+├── main.go               # Complete Go program (Embedded & Remote modes, 6-Hop Causal Graph, 30-Day Math, Crash-Test, 5M-Entity Benchmark)
 ├── docker-compose.yml    # Container service definition with persistent volume & WAL sync
 └── README.md             # Complete technical guide & operational instructions (this file)
 ```
@@ -105,23 +105,23 @@ go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
 #### Real Execution Output:
 ```text
 >>> [PHASE 4] Executing Multi-Hop Causal Disruption Traversal (Hop 1 to Hop 6)
-    ▶ Hop 1 (supplies_t1) -> Reached 4 downstream targets [Latency: 4.39µs]
-    ▶ Hop 2 (supplies_t1 → subassembles) -> Reached 3 downstream targets [Latency: 2.79µs]
-    ▶ Hop 3 (supplies_t1 → subassembles → fabricates) -> Reached 3 downstream targets [Latency: 3.04µs]
-    ▶ Hop 4 (supplies_t1 → ... → transports) -> Reached 3 downstream targets [Latency: 11.33µs]
-    ▶ Hop 5 (supplies_t1 → ... → distributes) -> Reached 5 downstream targets [Latency: 4.46µs]
-    ▶ Hop 6 (supplies_t1 → ... → stocks_sku) -> Reached 6 downstream targets [Latency: 13.59µs]
+    ▶ Hop 1 (supplies_t1) -> Reached 4 downstream targets [Latency: 45.2µs]
+    ▶ Hop 2 (supplies_t1 → subassembles) -> Reached 3 downstream targets [Latency: 2.2µs]
+    ▶ Hop 3 (supplies_t1 → subassembles → fabricates) -> Reached 3 downstream targets [Latency: 2.2µs]
+    ▶ Hop 4 (supplies_t1 → ... → transports) -> Reached 3 downstream targets [Latency: 13.5µs]
+    ▶ Hop 5 (supplies_t1 → ... → distributes) -> Reached 5 downstream targets [Latency: 3.6µs]
+    ▶ Hop 6 (supplies_t1 → ... → stocks_sku) -> Reached 6 downstream targets [Latency: 11.6µs]
 
-┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────┬────────────────────────────────┐
-│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status   │ Action Recommendation          │
-├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────┼────────────────────────────────┤
-│ sku_ultrabook_pro_16in    │       150 u │     12.0/d │       12.5 d │       76.6% │ ALERT    │ EMERGENCY: Reroute air freight │
-│ sku_smartphone_pro_1tb    │       240 u │     14.0/d │       17.1 d │       79.0% │ ALERT    │ EMERGENCY: Reroute air freight │
-│ sku_smartwatch_fit_band   │       190 u │      9.0/d │       21.1 d │       71.1% │ ALERT    │ Allocate backup stock          │
-│ sku_smartphone_base_128gb │       520 u │     20.0/d │       26.0 d │       75.0% │ ALERT    │ Allocate backup stock          │
-│ sku_tablet_air_11in       │       480 u │     10.0/d │       48.0 d │       72.6% │ SAFE     │ Monitor normal replenishment   │
-│ sku_smartwatch_ultra_49mm │       650 u │     11.0/d │       59.1 d │       70.3% │ SAFE     │ Monitor normal replenishment   │
-└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────┴────────────────────────────────┘
+┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────────┬──────────────────────────────────┐
+│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status       │ Action Recommendation            │
+├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────────┼──────────────────────────────────┤
+│ sku_ultrabook_pro_16in    │        150 u │     12.0/d │       12.5 d │       76.6% │ ALERT (<30d) │ EMERGENCY: Reroute air freight   │
+│ sku_smartphone_pro_1tb    │        240 u │     14.0/d │       17.1 d │       79.0% │ ALERT (<30d) │ EMERGENCY: Reroute air freight   │
+│ sku_smartwatch_fit_band   │        190 u │      9.0/d │       21.1 d │       71.1% │ ALERT (<30d) │ Allocate backup warehouse stock  │
+│ sku_smartphone_base_128gb │        520 u │     20.0/d │       26.0 d │       75.0% │ ALERT (<30d) │ Allocate backup warehouse stock  │
+│ sku_tablet_air_11in       │        480 u │     10.0/d │       48.0 d │       72.6% │ SAFE (>30d)  │ Monitor normal replenishment     │
+│ sku_smartwatch_ultra_49mm │        650 u │     11.0/d │       59.1 d │       70.3% │ SAFE (>30d)  │ Monitor normal replenishment     │
+└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────────┴──────────────────────────────────┘
 
 >>> ANALYSIS FINDINGS: Detected 4 SKUs RUNNING OUT OF STOCK WITHIN 30 DAYS due to Vietnam flood!
  [1] sku_ultrabook_pro_16in:
@@ -133,7 +133,19 @@ go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
      - Days of Stock Remaining: 17.1 DAYS (Stock: 240 units, Burn Rate: 14.0 units/day)
      - Supply Chain Disruption Probability: 79.05%
      - Component Criticality: SINGLE SOURCE BOTTLENECK (Composite Risk Score: 6.54)
+
+ [3] sku_smartwatch_fit_band:
+     - Days of Stock Remaining: 21.1 DAYS (Stock: 190 units, Burn Rate: 9.0 units/day)
+     - Supply Chain Disruption Probability: 71.11%
+     - Component Criticality: DUAL SOURCE (Composite Risk Score: 3.22)
+
+ [4] sku_smartphone_base_128gb:
+     - Days of Stock Remaining: 26.0 DAYS (Stock: 520 units, Burn Rate: 20.0 units/day)
+     - Supply Chain Disruption Probability: 74.99%
+     - Component Criticality: DUAL SOURCE (Composite Risk Score: 2.78)
 ```
+
+> Disruption probabilities and days-to-stockout are deterministic. Latency figures are indicative only; the Hop 1 value includes first-call warm-up (JIT, mmap page-in) and drops into single-digit microseconds on subsequent runs.
 
 ---
 
@@ -234,22 +246,30 @@ Output confirms zero data loss:
 
 ---
 
-## 9. Large-Scale Stress Testing (Up to 5 Million Entities & Edges)
+## 9. Large-Scale Stress Testing (Up to 5 Million Entities)
 
-To validate AnchorDB under massive enterprise supply chain topologies (e.g., 100,000 to 5,000,000 global parts and SKUs):
+To validate AnchorDB under massive enterprise supply chain topologies (e.g., 100,000 to 5,000,000 global parts and SKUs), the `benchmark` scenario ingests `-scale` entities into the model.
 
-### Run 100,000 Record Benchmark:
+> **Scale Boundary**: Only **entities** scale with `-scale`. The benchmark graph always links a fixed **50,000** causal edges (see `numEdges` in `main.go`), independent of `-scale`. The "5 million" figure refers to entities, not edges. (The CLI banner prints `records/edges` as a legacy label; only the entity count reflects `-scale`.)
+
+### Run 100,000 Entity Benchmark:
 ```bash
 go run ./examples/supply_chain/main.go -scenario=benchmark -scale=100000
 ```
-- **Ingestion Throughput**: ~181,000 writes/sec
-- **Graph Link Throughput**: ~141,000 edges/sec
-- **Multi-Hop Query Latency**: ~244 microseconds (**Sub-Millisecond!**)
+- **Entities Ingested**: 100,000 in ~0.57s (**~174,000 writes/sec**)
+- **Causal Edges**: 50,000 (fixed) in ~0.36s (**~137,000 edges/sec**)
+- **Multi-Hop Query Latency**: ~237 microseconds (**Sub-Millisecond!**)
 
-### Run Full 5,000,000 Record Stress Test:
+### Run Full 5,000,000 Entity Stress Test:
 ```bash
 go run ./examples/supply_chain/main.go -scenario=benchmark -scale=5000000
 ```
+Measured on an 8-logical-core host in embedded mode:
+- **Entities Ingested**: 5,000,000 in ~34s (**~147,000 writes/sec**)
+- **Causal Edges**: 50,000 (fixed) in ~0.39s (~128,000 edges/sec)
+- **Multi-Hop Query Latency**: ~232 microseconds/query (~4,300 queries/sec)
+- **Point Compute Latency**: ~11 microseconds
+- **Storage (WAL)**: ~586 MB
 
 > **Memory Architecture Note**:
 > AnchorDB uses zero-copy memory mapping (`mmap`). The streaming ingestion pipeline operates in concurrent batches without allocating millions of heap objects into the Go runtime garbage collector, preserving stable RAM usage and eliminating GC pause spikes.

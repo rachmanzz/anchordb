@@ -6,7 +6,7 @@ It showcases:
 1. **Schema Contract Enforcement**: Declaring and locking typed node properties (`severity`, `impact_usd`, `latency_ms`, `is_critical`).
 2. **Multi-Branching DAG Network**: Constructing 35 weighted directed causal edges across 5 relational tiers (`triggers`, `propagates`, `degrades`, `disrupts`, `escalates`) with path fan-out and re-convergent bottlenecks.
 3. **Multi-Hop Traversal (1-Hop to 5-Hops)**: Computing cumulative path probabilities ($Score = \prod Weight$) with automatic frontier deduplication (`highest incoming score`).
-4. **Concurrent Stress Testing**: Measuring read-lock traversal throughput and latency under high-concurrency multi-worker loads (>1.5 million traversals/second).
+4. **Concurrent Stress Testing**: Measuring read-lock traversal throughput and latency under high-concurrency multi-worker loads (hundreds of thousands of traversals/second; scales with available CPU cores).
 5. **Schema-Enforced Resolution**: Inspecting reached nodes using `client.Get()` and performing in-storage arithmetic filtering using `client.List().Compute()`.
 
 ---
@@ -27,7 +27,7 @@ In AnchorDB, **Schema** and **Graph Traversal** have an orthogonal separation of
 +-------------------------------+               +-------------------------------+
 | • Governs internal attributes |               | • Governs cause & effect      |
 | • Enforces types: int, float, |               | • Directed edges: S -> R -> T |
-|   bool, date, 1D arrays       |               | • Floating-point weights [0,1]|
+|   bool, date                  |               | • Floating-point weights [0,1]|
 | • Blocks typos and corruption |               | • Multi-hop chain reasoning   |
 | • Evaluated on Save / Update  |               | • Evaluated on CausalChain    |
 +-------------------------------+               +-------------------------------+
@@ -123,7 +123,7 @@ schema := driver.Schema{
     "impact_usd":  "float",   // Required float32 (monetary impact)
     "latency_ms":  "float",   // Required float32 (latency degradation)
     "is_critical": "bool",    // Required bool (1.0 or 0.0)
-    "tier":        "string?", // Optional string attribute
+    "tier":        "int?",    // Optional integer attribute
 }
 
 err := client.Attach(schema)
@@ -177,20 +177,24 @@ list, _ := client.List().
 
 | Hop Depth | Relations Traversed | Nodes Reached | Top Target | Cumulative Score | Latency |
 | :---: | :--- | :---: | :--- | :---: | :---: |
-| **Hop 1** | `["triggers"]` | 4 nodes | `ups_alpha_failure` | **0.9500** | **~1.9 µs** |
-| **Hop 2** | `[... "propagates"]` | 7 nodes | `rack_alpha_blackout` | **0.9025** | **~1.8 µs** |
-| **Hop 3** | `[... "degrades"]` | 6 nodes | `db_primary_crash` | **0.8574** | **~2.4 µs** |
-| **Hop 4** | `[... "disrupts"]` | 5 nodes | `checkout_api_down` | **0.8402** | **~2.5 µs** |
-| **Hop 5** | `[... "escalates"]`| 4 nodes | `direct_revenue_loss` | **0.7982** | **~7.4 µs** |
+| **Hop 1** | `["triggers"]` | 4 nodes | `ups_alpha_failure` | **0.9500** | **~5.5 µs** |
+| **Hop 2** | `[... "propagates"]` | 7 nodes | `rack_alpha_blackout` | **0.9025** | **~4.2 µs** |
+| **Hop 3** | `[... "degrades"]` | 6 nodes | `db_primary_crash` | **0.8574** | **~4.9 µs** |
+| **Hop 4** | `[... "disrupts"]` | 5 nodes | `checkout_api_down` | **0.8402** | **~6.1 µs** |
+| **Hop 5** | `[... "escalates"]`| 4 nodes | `direct_revenue_loss` | **0.7982** | **~11.3 µs** |
+
+> Scores and node counts are deterministic. Latency figures are indicative only and vary with host hardware, Go runtime version, and cache warm-up state.
 
 ### 2. Multi-Worker Concurrent Throughput (100,000 Queries)
 
 | Goroutines (Workers) | Total Queries | Latency | Traversal Throughput |
 | :---: | :---: | :---: | :---: |
-| **1 Worker** | 100,000 | 1.70 µs / op | **589,102 ops/sec** |
-| **4 Workers** | 100,000 | 0.68 µs / op | **1,473,727 ops/sec** |
-| **16 Workers** | 100,000 | 0.66 µs / op | **1,505,298 ops/sec** *(Peak)* |
-| **64 Workers** | 100,000 | 0.76 µs / op | **1,314,856 ops/sec** |
+| **1 Worker** | 100,000 | 4.50 µs / op | **222,433 ops/sec** |
+| **4 Workers** | 100,000 | 1.45 µs / op | **689,019 ops/sec** |
+| **16 Workers** | 100,000 | 1.26 µs / op | **796,563 ops/sec** |
+| **64 Workers** | ~100,000 | 1.02 µs / op | **978,147 ops/sec** *(Peak)* |
+
+> Measured on an 8-logical-core host. Throughput scales roughly with the number of available cores; counts at high worker counts may be a few queries short of the target because the final in-flight batch can still be draining when the timer stops.
 
 ### 3. Schema-Guaranteed Resolution Tables
 
@@ -198,24 +202,33 @@ list, _ := client.List().
 ```
 Entity Name                  | Severity | Impact (USD) | Latency (ms) | Is Critical
 ---------------------------------------------------------------------------------
-payment_gateway_v2_fail      | 5        | $450,000.00  | 6,000.0 ms   | 1 (true)
-db_primary_crash             | 5        | $180,000.00  | 2,500.0 ms   | 1 (true)
-direct_revenue_loss          | 5        | $980,000.00  | 0.0 ms       | 1 (true)
-sla_penalty_breach           | 5        | $750,000.00  | 0.0 ms       | 1 (true)
+payment_gateway_v2_fail      | 5        | $450000.00   | 6000.0       | 1
+db_primary_crash             | 5        | $180000.00   | 2500.0       | 1
+direct_revenue_loss          | 5        | $980000.00   | 0.0          | 1
+sla_penalty_breach           | 5        | $750000.00   | 0.0          | 1
 ```
 
 #### In-Storage Arithmetic List Query (`impact_usd * severity`):
+`Where("severity", ">=", 4.0).Compute("risk_index", Multiply("impact_usd","severity")).Page(1, 15)`
+
 ```
+Matching Entities Count: 15 (HasMore: true)
+
 Entity Name                  | Severity | Impact (USD) | Risk Index (Math) | Is Critical
 ----------------------------------------------------------------------------------------
-dc_power_trip                | 5        | $250,000.00  | $1,250,000.00     | 1 (true)
-checkout_api_down            | 5        | $300,000.00  | $1,500,000.00     | 1 (true)
-db_primary_crash             | 5        | $180,000.00  | $900,000.00       | 1 (true)
-san_io_lockup                | 5        | $140,000.00  | $700,000.00       | 1 (true)
-ups_alpha_failure            | 5        | $120,000.00  | $600,000.00       | 1 (true)
-kafka_broker_loss            | 5        | $110,000.00  | $550,000.00       | 1 (true)
-san_storage_bus_fault        | 5        | $95,000.00   | $475,000.00       | 1 (true)
-rack_alpha_blackout          | 5        | $80,000.00   | $400,000.00       | 1 (true)
-ups_beta_failure             | 4        | $90,000.00   | $360,000.00       | 1 (true)
-hvac_cooling_shutdown        | 4        | $75,000.00   | $300,000.00       | 1 (true)
+dc_power_trip                | 5        | $250000.00   | $1250000.00    | 1
+ups_alpha_failure            | 5        | $120000.00   | $600000.00     | 1
+ups_beta_failure             | 4        | $90000.00    | $360000.00     | 1
+hvac_cooling_shutdown        | 4        | $75000.00    | $300000.00     | 1
+rack_alpha_blackout          | 5        | $80000.00    | $400000.00     | 1
+rack_beta_blackout           | 4        | $65000.00    | $260000.00     | 1
+spine_switch_restart         | 4        | $50000.00    | $200000.00     | 1
+cooling_loop_failure         | 4        | $45000.00    | $180000.00     | 1
+san_storage_bus_fault        | 5        | $95000.00    | $475000.00     | 1
+db_primary_crash             | 5        | $180000.00   | $900000.00     | 1
+db_replica_desync            | 4        | $60000.00    | $240000.00     | 1
+kafka_broker_loss            | 5        | $110000.00   | $550000.00     | 1
+san_io_lockup                | 5        | $140000.00   | $700000.00     | 1
+ingress_api_timeout          | 4        | $55000.00    | $220000.00     | 1
+checkout_api_down            | 5        | $300000.00   | $1500000.00    | 1
 ```

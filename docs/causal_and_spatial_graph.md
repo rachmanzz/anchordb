@@ -28,7 +28,9 @@ Every spatial node in AnchorDB consists of:
 AnchorDB arranges spatial nodes into a 2D integer cell grid. When projecting a query from a set of anchor nodes:
 1. **Barycenter Calculation**: The geometric center $(\bar{X}, \bar{Y})$ of the source entities is computed.
 2. **Directional Ray Casting (DDA)**: A directional ray is projected along a relation vector.
-3. **Beam Search & Perpendicular Deviation**: Candidate nodes within the beam width ($d_{\perp}^2 \le \text{beam\_width}$) are scored using axis projection distance ($t$), perpendicular deviation, and role cosine similarity.
+3. **Beam Search & Perpendicular Deviation**: Candidate nodes within the beam width ($d_{\perp}^2 \le 4 \cdot \text{beam\_width}^2$) are ranked by a composite score that combines exponential beam energy, a role-fit term, and forward-distance attenuation:
+   $$\text{score} = e^{-d_\perp^2 / (2\,\text{beam\_width}^2)} \times \frac{1 + 1.5 \cdot \text{roleFit}}{1 + 0.5 \cdot t}$$
+   where $t$ is the forward projection distance along the ray and `roleFit` is the dot product of the node's 4D role vector with the anchor role deficit (target equilibrium `[1, 1, 1, 0]`).
 
 ### Spatial Math Helpers
 The Go driver provides direct geometric routines via `client.Math()`:

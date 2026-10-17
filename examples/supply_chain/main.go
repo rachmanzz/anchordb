@@ -340,9 +340,9 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 	})
 
 	// Print executive summary table
-	fmt.Println("┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────┬────────────────────────┐")
-	fmt.Println("│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status   │ Action Recommendation  │")
-	fmt.Println("├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────┼────────────────────────┤")
+	fmt.Println("┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────────┬──────────────────────────────────┐")
+	fmt.Println("│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status       │ Action Recommendation            │")
+	fmt.Println("├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────────┼──────────────────────────────────┤")
 
 	for _, item := range analysisTable {
 		statusStr := "SAFE (>30d)"
@@ -356,7 +356,7 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 			}
 		}
 
-		fmt.Printf("│ %-25s │ %9.0f u │ %8.1f/d │ %10.1f d │ %10.1f%% │ %-8s │ %-22s │\n",
+		fmt.Printf("│ %-25s │ %10.0f u │ %8.1f/d │ %10.1f d │ %10.1f%% │ %-12s │ %-32s │\n",
 			item.SKU,
 			item.CurrentStock,
 			item.DailyBurn,
@@ -366,7 +366,7 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 			actionStr,
 		)
 	}
-	fmt.Println("└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────┴────────────────────────┘")
+	fmt.Println("└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────────┴──────────────────────────────────┘")
 	fmt.Println()
 
 	// Highlight actionable answer to the exact business prompt

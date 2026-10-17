@@ -168,7 +168,7 @@ go run ./examples/podman_durability -phase=verify
 ==========================================================================
    PODMAN STEP 3: Verifying Schema, Traversal, Get & List After Restart
 ==========================================================================
-    [✓] Schema Contract Restored from disk: map[impact_usd:float is_critical:bool latency_ms:float severity:int tier:string?]
+    [✓] Schema Contract Restored from disk: map[impact_usd:float is_critical:bool latency_ms:float severity:int tier:int?]
 
     --- [A] Causal Traversal Verification Across All Hops (Post-Restart) ---
     ▶ Hop 1 (triggers  ) -> 4 nodes reached. Top Target: ups_alpha_failure          | Score: 0.9500

@@ -655,7 +655,7 @@ func runSchemaStressTest(ctx context.Context) {
 	schemaModel := "plant_schema_stress"
 
 	// 1. Initial Attachment
-	fmt.Println("[1/6] Attaching strict schema with primitives & 1D array to model...")
+	fmt.Println("[1/6] Attaching strict schema with scalar primitives to model...")
 	client, err := driver.ConnectRemote(baseURL,
 		driver.WithToken(authToken),
 		driver.WithModel(schemaModel),
