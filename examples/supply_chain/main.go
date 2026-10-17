@@ -574,7 +574,9 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 	}
 
 	recordsPerWorker := totalRecords / numWorkers
+	remainder := totalRecords % numWorkers
 	var wg sync.WaitGroup
+	var errorCount atomic.Int64
 
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
@@ -582,7 +584,16 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 		go func() {
 			defer wg.Done()
 			startIdx := workerID * recordsPerWorker
-			endIdx := startIdx + recordsPerWorker
+			if workerID < remainder {
+				startIdx += workerID
+			} else {
+				startIdx += remainder
+			}
+			count := recordsPerWorker
+			if workerID < remainder {
+				count++
+			}
+			endIdx := startIdx + count
 
 			for i := startIdx; i < endIdx; i++ {
 				entityName := fmt.Sprintf("sku_auto_%08d", i)
@@ -594,8 +605,11 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 					"is_critical":     float32(i % 2),
 				}
 				if err := client.Save(entityName, props); err != nil {
-					fmt.Printf("Worker error saving %s: %v\n", entityName, err)
-					return
+					errs := errorCount.Add(1)
+					if errs <= 5 {
+						fmt.Printf("Worker %d error saving %s: %v\n", workerID, entityName, err)
+					}
+					continue
 				}
 				done := counter.Add(1)
 				if done%100000 == 0 || done == int64(totalRecords) {
@@ -608,9 +622,16 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 	}
 	wg.Wait()
 	durIngest := time.Since(t0)
-	throughput := float64(totalRecords) / durIngest.Seconds()
+	savedCount := counter.Load()
+	totalErrors := errorCount.Load()
+	throughput := float64(savedCount) / durIngest.Seconds()
+	if totalErrors > 0 {
+		fmt.Printf("    [!] Ingestion Completed with %d ERRORS: %s / %s records saved in %v (%.0f writes/sec)\n\n",
+			totalErrors, formatNumber(int(savedCount)), formatNumber(totalRecords), durIngest, throughput)
+		os.Exit(1)
+	}
 	fmt.Printf("    [✓] Ingestion Completed: %s records in %v (%.0f writes/sec)\n\n",
-		formatNumber(totalRecords), durIngest, throughput)
+		formatNumber(int(savedCount)), durIngest, throughput)
 
 	// 3. Connect Mesh Causal Chains (Multi-tier edges)
 	const numEdges = 50000

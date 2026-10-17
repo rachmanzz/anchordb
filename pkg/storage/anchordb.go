@@ -1192,6 +1192,128 @@ func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[st
 	return name, nil
 }
 
+// BatchRecordItem represents an entity record inside a batch save operation.
+type BatchRecordItem struct {
+	Name      string             `json:"name"`
+	Operation uint8              `json:"operation,omitempty"`
+	Props     map[string]float32 `json:"props"`
+	Coord     *spatial.Point2D   `json:"coord,omitempty"`
+	Roles     *[4]float32        `json:"roles,omitempty"`
+}
+
+// SaveRecordsBatch saves multiple entity records atomically under a single database lock
+// and a single WAL flush.
+func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	names := make([]string, len(items))
+	batchSaves := make([]BatchSaveItem, len(items))
+	crs := make([]CompactRecord, len(items))
+
+	for i, item := range items {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = uuid.NewString()
+		}
+		names[i] = name
+
+		opStatus := item.Operation
+		if opStatus == 0 {
+			opStatus = OpStatusActive
+		}
+		if opStatus == OpStatusSafeDelete {
+			return nil, fmt.Errorf("cannot save record with internal partition-lock status")
+		}
+		if db.partitionLocks[name] {
+			return nil, fmt.Errorf("%w: %q", ErrRecordLocked, name)
+		}
+
+		if db.schemaLocked && db.schema != nil {
+			if err := db.schema.ValidateProps(item.Props); err != nil {
+				return nil, fmt.Errorf("record %q: %w", name, err)
+			}
+		}
+
+		if item.Coord != nil || item.Roles != nil {
+			coord := spatial.Point2D{}
+			if item.Coord != nil {
+				coord = *item.Coord
+			}
+			var roles [4]float32
+			if item.Roles != nil {
+				roles = *item.Roles
+			}
+			if err := validateNodeGeometry(coord, roles); err != nil {
+				return nil, fmt.Errorf("record %q geometry: %w", name, err)
+			}
+		}
+
+		attrs := make([]AttrEntry, 0, len(item.Props))
+		for k, v := range item.Props {
+			attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
+		}
+		cr := CompactRecord{
+			Operation: opStatus,
+			Attrs:     attrs,
+		}
+		crs[i] = cr
+		batchSaves[i] = BatchSaveItem{
+			Name:     name,
+			CR:       cr,
+			Coord:    item.Coord,
+			Roles:    item.Roles,
+			DomainID: uint16(opStatus),
+		}
+	}
+
+	if db.wal != nil {
+		if err := db.wal.WriteSaveBatch(batchSaves); err != nil {
+			return nil, fmt.Errorf("failed to write batch to wal: %w", err)
+		}
+	}
+
+	for i, item := range items {
+		name := names[i]
+		cr := crs[i]
+
+		if _, exists := db.EntityStore[name]; !exists {
+			db.EntityOrder = append(db.EntityOrder, name)
+		}
+		db.EntityStore[name] = cr
+
+		if item.Coord != nil || item.Roles != nil {
+			coord := spatial.Point2D{}
+			if item.Coord != nil {
+				coord = *item.Coord
+			}
+			var roles [4]float32
+			if item.Roles != nil {
+				roles = *item.Roles
+			}
+			db.appendNodeLocked(name, coord, roles, uint16(cr.Operation))
+		} else {
+			if _, exists := db.Lexicon[name]; !exists {
+				angle := float32(len(name)) * 0.5
+				coord := spatial.Point2D{
+					X: float32(math.Cos(float64(angle))) * 0.5,
+					Y: float32(math.Sin(float64(angle))) * 0.5,
+				}
+				db.appendNodeLocked(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
+			}
+		}
+	}
+
+	return names, nil
+}
+
 // SaveRecordWithID stores an entity with default OpStatusActive (1).
 func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (string, error) {
 	return db.SaveRecordWithIDAndOp(name, OpStatusActive, props)

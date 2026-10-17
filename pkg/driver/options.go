@@ -62,6 +62,22 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
+// WithHTTPTransport sets a custom RoundTripper on the HTTP client used for remote engine calls.
+func WithHTTPTransport(transport http.RoundTripper) Option {
+	return func(c *clientConfig) {
+		if transport != nil {
+			if c.httpClient == nil {
+				c.httpClient = &http.Client{
+					Transport: transport,
+					Timeout:   c.timeout,
+				}
+			} else {
+				c.httpClient.Transport = transport
+			}
+		}
+	}
+}
+
 // WithSyncInterval configures automatic periodic sync in embedded engine mode.
 func WithSyncInterval(d time.Duration) Option {
 	return func(c *clientConfig) {

@@ -166,6 +166,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/save", s.authMiddleware(s.handleSave))
+	mux.HandleFunc("/v1/save_batch", s.authMiddleware(s.handleSaveBatch))
 	mux.HandleFunc("/v1/get", s.authMiddleware(s.handleGet))
 	mux.HandleFunc("/v1/list", s.authMiddleware(s.handleList))
 	mux.HandleFunc("/v1/update", s.authMiddleware(s.handleUpdate))
@@ -760,6 +761,11 @@ type SaveRequest struct {
 	Roles     *[4]float32        `json:"roles,omitempty"`
 }
 
+type SaveBatchRequest struct {
+	Model   string                    `json:"model"`
+	Records []storage.BatchRecordItem `json:"records"`
+}
+
 type GetRequest struct {
 	Model        string            `json:"model"`
 	Name         string            `json:"name"`
@@ -1001,6 +1007,48 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		"name":      effectiveName,
 		"operation": opStatus,
 		"message":   "record saved",
+	})
+}
+
+func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req SaveBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(req.Records) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "records array cannot be empty")
+		return
+	}
+
+	db, err := s.getModel(req.Model)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	names, err := db.SaveRecordsBatch(req.Records)
+	if err != nil {
+		if errors.Is(err, storage.ErrMissingRequiredField) ||
+			errors.Is(err, storage.ErrUnknownField) ||
+			errors.Is(err, storage.ErrInvalidFieldType) ||
+			errors.Is(err, storage.ErrSchemaMismatch) ||
+			errors.Is(err, storage.ErrRecordLocked) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(names),
+		"names":   names,
+		"message": "batch records saved",
 	})
 }
 

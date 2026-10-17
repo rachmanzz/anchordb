@@ -53,11 +53,11 @@ func main() {
 	// -------------------------------------------------------------------------
 	fmt.Println(">>> [PHASE 1] Schema Registration & Contract Locking")
 	schema := driver.Schema{
-		"severity":    "int",     // Required integer: 1 (info) to 5 (critical)
-		"impact_usd":  "float",   // Required float: economic impact
-		"latency_ms":  "float",   // Required float: latency impact
-		"is_critical": "bool", // Required bool: 1.0 (true) or 0.0 (false)
-		"tier":        "int?", // Optional int tag
+		"severity":    "int",   // Required integer: 1 (info) to 5 (critical)
+		"impact_usd":  "float", // Required float: economic impact
+		"latency_ms":  "float", // Required float: latency impact
+		"is_critical": "bool",  // Required bool: 1.0 (true) or 0.0 (false)
+		"tier":        "int?",  // Optional int tag
 	}
 
 	if err := client.Attach(schema); err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,6 +47,7 @@ type PartitionInspectResult struct {
 // backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
 type backend interface {
 	Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error)
+	SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error)
 	Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error)
 	List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error)
 	Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error)
@@ -96,6 +98,13 @@ func (b *localBackend) Save(ctx context.Context, model, name string, op *uint8, 
 		opStatus = *op
 	}
 	return b.db.SaveRecordWithIDAndOp(name, opStatus, props)
+}
+
+func (b *localBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return b.db.SaveRecordsBatch(records)
 }
 
 func (b *localBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
@@ -469,6 +478,17 @@ func (b *embeddedBackend) Save(ctx context.Context, model, name string, op *uint
 	return db.SaveRecordWithIDAndOp(name, opStatus, props)
 }
 
+func (b *embeddedBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return nil, err
+	}
+	return db.SaveRecordsBatch(records)
+}
+
 func (b *embeddedBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -840,6 +860,19 @@ func newRemoteBackend(baseURL string, cfg clientConfig) (*remoteBackend, error) 
 	client := cfg.httpClient
 	if client == nil {
 		client = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          1024,
+				MaxIdleConnsPerHost:   256,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
 			Timeout: cfg.timeout,
 		}
 	}
@@ -923,6 +956,24 @@ func (b *remoteBackend) Save(ctx context.Context, model, name string, op *uint8,
 		return "", err
 	}
 	return resp.Name, nil
+}
+
+func (b *remoteBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
+	req := map[string]interface{}{
+		"model":   model,
+		"records": records,
+	}
+
+	var resp struct {
+		Success bool     `json:"success"`
+		Count   int      `json:"count"`
+		Names   []string `json:"names"`
+		Message string   `json:"message"`
+	}
+	if err := b.doJSON(ctx, http.MethodPost, "/v1/save_batch", req, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Names, nil
 }
 
 func (b *remoteBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {

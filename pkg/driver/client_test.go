@@ -249,3 +249,105 @@ func TestDriver_PartitionInspection(t *testing.T) {
 		t.Errorf("expected 2 records in partition, got %d", len(listRes.Records))
 	}
 }
+
+func TestDriver_RemoteTransport_Tuning(t *testing.T) {
+	client, err := ConnectRemote("http://127.0.0.1:7447")
+	if err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	defer client.Close()
+
+	rem, ok := client.backend.(*remoteBackend)
+	if !ok {
+		t.Fatalf("expected remoteBackend, got %T", client.backend)
+	}
+	tr, ok := rem.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", rem.httpClient.Transport)
+	}
+	if tr.MaxIdleConnsPerHost != 256 {
+		t.Errorf("expected MaxIdleConnsPerHost=256, got %d", tr.MaxIdleConnsPerHost)
+	}
+	if tr.MaxIdleConns != 1024 {
+		t.Errorf("expected MaxIdleConns=1024, got %d", tr.MaxIdleConns)
+	}
+	if tr.IdleConnTimeout != 90*time.Second {
+		t.Errorf("expected IdleConnTimeout=90s, got %v", tr.IdleConnTimeout)
+	}
+}
+
+func TestDriver_SaveBatch_Embedded(t *testing.T) {
+	tmpDir := t.TempDir()
+	client, err := OpenEmbedded(tmpDir, WithModel("batch_embedded"))
+	if err != nil {
+		t.Fatalf("OpenEmbedded failed: %v", err)
+	}
+	defer client.Close()
+
+	batch := []BatchRecord{
+		{
+			Name: "sku_001",
+			Props: map[string]float32{
+				"inventory": 500,
+				"price":     25.5,
+			},
+		},
+		{
+			Name: "sku_002",
+			Props: map[string]float32{
+				"inventory": 1200,
+				"price":     10.0,
+			},
+		},
+	}
+
+	names, err := client.SaveBatch(batch)
+	if err != nil {
+		t.Fatalf("SaveBatch failed: %v", err)
+	}
+	if len(names) != 2 || names[0] != "sku_001" || names[1] != "sku_002" {
+		t.Fatalf("unexpected names returned: %+v", names)
+	}
+
+	rec1, err := client.Get("sku_001").Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Get sku_001 failed: %v", err)
+	}
+	if rec1.Get("inventory") != 500 {
+		t.Errorf("expected inventory=500, got %f", rec1.Get("inventory"))
+	}
+}
+
+func TestDriver_SaveBatch_RemoteMock(t *testing.T) {
+	var receivedBatch bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/save_batch" {
+			receivedBatch = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"count":2,"names":["sku_1","sku_2"],"message":"batch records saved"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	client, err := ConnectRemote(ts.URL)
+	if err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	defer client.Close()
+
+	names, err := client.SaveBatch([]BatchRecord{
+		{Name: "sku_1", Props: map[string]float32{"p": 1}},
+		{Name: "sku_2", Props: map[string]float32{"p": 2}},
+	})
+	if err != nil {
+		t.Fatalf("SaveBatch remote failed: %v", err)
+	}
+	if !receivedBatch {
+		t.Errorf("server never received /v1/save_batch request")
+	}
+	if len(names) != 2 || names[0] != "sku_1" {
+		t.Errorf("unexpected names: %+v", names)
+	}
+}

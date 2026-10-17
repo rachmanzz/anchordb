@@ -438,3 +438,81 @@ func TestEdgeAndCausalEndpoints(t *testing.T) {
 		t.Fatalf("invalid action status = %d, want 400", rec.Code)
 	}
 }
+
+func TestServer_SaveBatch(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	handler := s.Routes()
+	post := func(path string, payload interface{}) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(payload)
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Batch save 3 records
+	batchReq := map[string]interface{}{
+		"model": "batch_test",
+		"records": []map[string]interface{}{
+			{
+				"name":  "item_1",
+				"props": map[string]float32{"price": 10.5, "stock": 100},
+			},
+			{
+				"name":  "item_2",
+				"props": map[string]float32{"price": 20.0, "stock": 50},
+			},
+			{
+				"name":  "item_3",
+				"props": map[string]float32{"price": 5.25, "stock": 500},
+			},
+		},
+	}
+
+	rec := post("/v1/save_batch", batchReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save_batch status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	var batchResp struct {
+		Success bool     `json:"success"`
+		Count   int      `json:"count"`
+		Names   []string `json:"names"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &batchResp); err != nil {
+		t.Fatalf("decode save_batch response: %v", err)
+	}
+	if !batchResp.Success || batchResp.Count != 3 || len(batchResp.Names) != 3 {
+		t.Fatalf("unexpected save_batch response: %+v", batchResp)
+	}
+
+	// 2. Verify with /v1/get
+	rec = post("/v1/get", map[string]interface{}{
+		"model": "batch_test",
+		"name":  "item_2",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get item_2 status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var getResp struct {
+		Success bool               `json:"success"`
+		Props   map[string]float32 `json:"props"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if getResp.Props["price"] != 20.0 || getResp.Props["stock"] != 50 {
+		t.Fatalf("unexpected props for item_2: %+v", getResp.Props)
+	}
+
+	// 3. Empty batch should be rejected
+	rec = post("/v1/save_batch", map[string]interface{}{
+		"model":   "batch_test",
+		"records": []map[string]interface{}{},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty batch, got %d", rec.Code)
+	}
+}

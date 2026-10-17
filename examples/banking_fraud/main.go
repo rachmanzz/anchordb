@@ -344,7 +344,9 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	}
 
 	recordsPerWorker := totalRecords / numWorkers
+	remainder := totalRecords % numWorkers
 	var counter atomic.Int64
+	var errorCount atomic.Int64
 	var wg sync.WaitGroup
 
 	fmt.Printf("[1/3] Streaming %s bank account records across %d parallel workers...\n",
@@ -357,7 +359,16 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 		go func() {
 			defer wg.Done()
 			startIdx := workerID * recordsPerWorker
-			endIdx := startIdx + recordsPerWorker
+			if workerID < remainder {
+				startIdx += workerID
+			} else {
+				startIdx += remainder
+			}
+			count := recordsPerWorker
+			if workerID < remainder {
+				count++
+			}
+			endIdx := startIdx + count
 
 			for i := startIdx; i < endIdx; i++ {
 				accName := fmt.Sprintf("acc_enterprise_%08d", i)
@@ -373,8 +384,11 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 					"kyc_tier":          float32(1 + (i % 3)),
 				}
 				if err := client.Save(accName, props); err != nil {
-					fmt.Printf("Save error on %s: %v\n", accName, err)
-					return
+					errs := errorCount.Add(1)
+					if errs <= 5 {
+						fmt.Printf("Worker %d error saving %s: %v\n", workerID, accName, err)
+					}
+					continue
 				}
 				done := counter.Add(1)
 				if done%250000 == 0 || done == int64(totalRecords) {
@@ -387,9 +401,16 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	}
 	wg.Wait()
 	durIngest := time.Since(t0)
-	throughput := float64(totalRecords) / durIngest.Seconds()
+	savedCount := counter.Load()
+	totalErrors := errorCount.Load()
+	throughput := float64(savedCount) / durIngest.Seconds()
+	if totalErrors > 0 {
+		fmt.Printf("    [!] Ingestion Completed with %d ERRORS: %s / %s records saved in %v (%.0f writes/sec)\n\n",
+			totalErrors, formatNumber(int(savedCount)), formatNumber(totalRecords), durIngest, throughput)
+		os.Exit(1)
+	}
 	fmt.Printf("    [✓] Ingestion Completed: %s records in %v (%.0f writes/sec)\n\n",
-		formatNumber(totalRecords), durIngest, throughput)
+		formatNumber(int(savedCount)), durIngest, throughput)
 
 	// Connect Dense Transfer Chains (100,000 edges)
 	const numEdges = 100000

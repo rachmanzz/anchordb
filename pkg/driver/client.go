@@ -517,6 +517,24 @@ func (c *Client) SaveWithID(name string, props map[string]float32) (string, erro
 	return c.backend.Save(context.Background(), c.model, name, nil, props)
 }
 
+// BatchRecord represents a single record payload for high-throughput batch ingestion.
+type BatchRecord = storage.BatchRecordItem
+
+// SaveBatch stores multiple entity records in a single high-throughput operation.
+// In remote engine mode, this calls /v1/save_batch, eliminating per-record network roundtrips.
+// In embedded mode, all records are persisted under a single database lock and single WAL sync.
+func (c *Client) SaveBatch(records []BatchRecord) ([]string, error) {
+	return c.SaveBatchContext(context.Background(), records)
+}
+
+// SaveBatchContext stores multiple entity records with context cancellation support.
+func (c *Client) SaveBatchContext(ctx context.Context, records []BatchRecord) ([]string, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return c.backend.SaveBatch(ctx, c.model, records)
+}
+
 // Get creates a query builder to retrieve an entity and optionally compute derived fields.
 func (c *Client) Get(name string) *GetBuilder {
 	return &GetBuilder{

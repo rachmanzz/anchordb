@@ -394,6 +394,114 @@ func (w *WALManager) WriteSaveNode(name string, cr CompactRecord, coord spatial.
 	return w.writeEntry(WalOpSaveNode, append(node, save...))
 }
 
+// BatchSaveItem holds an entity and optional node geometry for batch WAL writing.
+type BatchSaveItem struct {
+	Name     string
+	CR       CompactRecord
+	Coord    *spatial.Point2D
+	Roles    *[4]float32
+	DomainID uint16
+}
+
+// WriteSaveBatch writes multiple entity save events to the WAL, syncing once at the end if SyncAlways.
+func (w *WALManager) WriteSaveBatch(items []BatchSaveItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return fmt.Errorf("wal file is not open")
+	}
+	if w.corrupt {
+		return fmt.Errorf("cannot write to corrupt wal: %w", w.syncErr)
+	}
+	if w.syncErr != nil {
+		return fmt.Errorf("wal background sync failed: %w", w.syncErr)
+	}
+
+	start, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek wal end: %w", err)
+	}
+
+	rollback := func(cause error) error {
+		if err := w.file.Truncate(start); err != nil {
+			return errors.Join(cause, fmt.Errorf("rollback partial wal batch: %w", err))
+		}
+		if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+			return errors.Join(cause, fmt.Errorf("seek wal after rollback: %w", err))
+		}
+		if err := w.file.Sync(); err != nil {
+			return errors.Join(cause, fmt.Errorf("sync wal after rollback: %w", err))
+		}
+		return cause
+	}
+
+	for _, it := range items {
+		var op byte
+		var payload []byte
+
+		if it.Coord != nil || it.Roles != nil {
+			coord := spatial.Point2D{}
+			if it.Coord != nil {
+				coord = *it.Coord
+			}
+			var roles [4]float32
+			if it.Roles != nil {
+				roles = *it.Roles
+			}
+			node, err := encodeWALNode(it.Name, coord, roles, it.DomainID)
+			if err != nil {
+				return rollback(err)
+			}
+			save, err := encodeWALSave(it.Name, it.CR)
+			if err != nil {
+				return rollback(err)
+			}
+			if len(node)+len(save) > maxWALPayloadSize {
+				return rollback(fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize))
+			}
+			op = WalOpSaveNode
+			payload = append(node, save...)
+		} else {
+			save, err := encodeWALSave(it.Name, it.CR)
+			if err != nil {
+				return rollback(err)
+			}
+			if len(save) > maxWALPayloadSize {
+				return rollback(fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize))
+			}
+			op = WalOpSave
+			payload = save
+		}
+
+		checksum := crc32.ChecksumIEEE(payload)
+		var hdr [11]byte
+		hdr[0] = walMagic
+		hdr[1] = walVer
+		hdr[2] = op
+		binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(hdr[7:11], checksum)
+
+		if _, err := w.file.Write(hdr[:]); err != nil {
+			return rollback(err)
+		}
+		if len(payload) > 0 {
+			if _, err := w.file.Write(payload); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+
+	if w.syncMode == SyncAlways {
+		if err := w.file.Sync(); err != nil {
+			return rollback(err)
+		}
+	}
+	return nil
+}
+
 func decodeWALNode(payload []byte) (WALEvent, error) {
 	if len(payload) < 28 {
 		return WALEvent{}, fmt.Errorf("truncated node payload")
