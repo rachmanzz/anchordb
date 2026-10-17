@@ -275,7 +275,12 @@ func (s *Server) handleConn(conn net.Conn) {
 				if item.Roles != nil {
 					roles = *item.Roles
 				}
-				savedName, err = db.SaveRecordWithNode(item.Name, opStatus, item.Props, coord, roles)
+				if len(item.Props) > 0 {
+					savedName, err = db.SaveRecordWithNode(item.Name, opStatus, item.Props, coord, roles)
+				} else {
+					savedName = item.Name
+					_, err = db.AppendNode(savedName, coord, roles, 1)
+				}
 			} else {
 				savedName, err = db.SaveRecordWithIDAndOp(item.Name, opStatus, item.Props)
 			}

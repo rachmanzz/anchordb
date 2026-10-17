@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,24 +13,51 @@ import (
 )
 
 func main() {
+	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
+	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
+	flag.Parse()
+
 	fmt.Println("==========================================================")
 	fmt.Println("    AnchorDB Example: 2D Spatial Grid & Raycasting DDA    ")
 	fmt.Println("==========================================================")
 
-	tmpDir, err := os.MkdirTemp("", "anchordb_spatial_*")
-	if err != nil {
-		log.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	var client *driver.Client
+	var cleanup func()
 
-	// 1. Open Embedded Engine in isolated temp directory
-	t0 := time.Now()
-	client, err := driver.OpenEmbedded(tmpDir, driver.WithModel("world"))
-	if err != nil {
-		log.Fatalf("Failed to open embedded AnchorDB: %v", err)
+	if *mode == "wire" {
+		if *serverURL == "http://localhost:7447" || *serverURL == "" {
+			*serverURL = "wire://localhost:7448"
+		}
+		*mode = "remote"
 	}
-	defer client.Close()
-	fmt.Printf("[OK] Connected to AnchorDB Embedded Engine in %v (mmap zero-copy)\n", time.Since(t0))
+
+	if *mode == "remote" {
+		t0 := time.Now()
+		c, err := driver.Connect(*serverURL, driver.WithModel("world"))
+		if err != nil {
+			log.Fatalf("Failed to connect to AnchorDB (%s): %v", *serverURL, err)
+		}
+		client = c
+		cleanup = func() { _ = client.Close() }
+		fmt.Printf("[OK] Connected to AnchorDB Remote Engine (%s) in %v\n", *serverURL, time.Since(t0))
+	} else {
+		tmpDir, err := os.MkdirTemp("", "anchordb_spatial_*")
+		if err != nil {
+			log.Fatalf("Failed to create temp dir: %v", err)
+		}
+		t0 := time.Now()
+		c, err := driver.OpenEmbedded(tmpDir, driver.WithModel("world"))
+		if err != nil {
+			log.Fatalf("Failed to open embedded AnchorDB: %v", err)
+		}
+		client = c
+		cleanup = func() {
+			_ = client.Close()
+			_ = os.RemoveAll(tmpDir)
+		}
+		fmt.Printf("[OK] Connected to AnchorDB Embedded Engine in %v (mmap zero-copy)\n", time.Since(t0))
+	}
+	defer cleanup()
 
 	// 2. Populate spatial cluster nodes
 	nodes := []struct {

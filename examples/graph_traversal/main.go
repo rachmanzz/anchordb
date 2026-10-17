@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"runtime"
@@ -22,6 +23,10 @@ type GraphNode struct {
 }
 
 func main() {
+	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
+	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
+	flag.Parse()
+
 	fmt.Println("==================================================================================")
 	fmt.Println("       AnchorDB Graph Traversal vs Schema: Multi-Thread (Mesh) Stress Test        ")
 	fmt.Println("==================================================================================")
@@ -30,21 +35,43 @@ func main() {
 	fmt.Println("----------------------------------------------------------------------------------")
 	fmt.Println()
 
-	// Create temporary directory for isolated test run
-	tmpDir, err := os.MkdirTemp("", "anchordb_graph_stress_*")
-	if err != nil {
-		fmt.Printf("Failed to create temp dir: %v\n", err)
-		return
-	}
-	defer os.RemoveAll(tmpDir)
+	var client *driver.Client
+	var cleanup func()
 
-	// Step 1: Initialize Embedded Engine
-	client, err := driver.OpenEmbedded(tmpDir, driver.WithModel("infra_causal"))
-	if err != nil {
-		fmt.Printf("Failed to open embedded engine: %v\n", err)
-		return
+	if *mode == "wire" {
+		if *serverURL == "http://localhost:7447" || *serverURL == "" {
+			*serverURL = "wire://localhost:7448"
+		}
+		*mode = "remote"
 	}
-	defer client.Close()
+
+	if *mode == "remote" {
+		c, err := driver.Connect(*serverURL, driver.WithModel("infra_causal"))
+		if err != nil {
+			fmt.Printf("Failed to connect to %s: %v\n", *serverURL, err)
+			return
+		}
+		client = c
+		cleanup = func() { _ = client.Close() }
+	} else {
+		tmpDir, err := os.MkdirTemp("", "anchordb_graph_stress_*")
+		if err != nil {
+			fmt.Printf("Failed to create temp dir: %v\n", err)
+			return
+		}
+		c, err := driver.OpenEmbedded(tmpDir, driver.WithModel("infra_causal"))
+		if err != nil {
+			fmt.Printf("Failed to open embedded engine: %v\n", err)
+			_ = os.RemoveAll(tmpDir)
+			return
+		}
+		client = c
+		cleanup = func() {
+			_ = client.Close()
+			_ = os.RemoveAll(tmpDir)
+		}
+	}
+	defer cleanup()
 
 	ctx := context.Background()
 

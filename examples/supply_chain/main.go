@@ -47,8 +47,8 @@ type DisruptionAnalysisResult struct {
 }
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine) or 'remote' (HTTP engine, container, or AnchorWire)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in remote mode): http(s)://host:7447 or wire://host:7448")
+	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
+	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
 	authToken := flag.String("token", "", "Bearer auth token for remote mode (if required)")
 	modelName := flag.String("model", "supply_chain", "Model name to isolate supply chain data")
 	dataDir := flag.String("data-dir", "", "Storage directory for embedded mode (default: temporary directory)")
@@ -684,6 +684,12 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 // ------------------------------------------------------------------------------------------------
 
 func setupClient(mode, serverURL, authToken, modelName, dataDir string) (*driver.Client, func()) {
+	if mode == "wire" {
+		if serverURL == "http://localhost:7447" || serverURL == "" {
+			serverURL = "wire://localhost:7448"
+		}
+		mode = "remote"
+	}
 	if mode == "remote" {
 		opts := []driver.Option{
 			driver.WithModel(modelName),
