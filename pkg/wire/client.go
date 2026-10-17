@@ -250,9 +250,24 @@ func (c *Client) GetNegotiation() *MemoryNegotiationResponse {
 
 // Save stores an entity record and returns its effective name.
 func (c *Client) Save(item storage.BatchRecordItem) (string, error) {
-	resp, err := c.call(OpSave, EncodeSavePayload(item))
+	var resp Frame
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		resp, err = c.call(OpSave, EncodeSavePayload(item))
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
+			time.Sleep(time.Duration(15*(attempt+1)) * time.Millisecond)
+			continue
+		}
+		return "", err
+	}
 	if err != nil {
 		return "", err
+	}
+	if resp.Flags&FlagMemoryPressure != 0 {
+		time.Sleep(5 * time.Millisecond)
 	}
 	return DecodeOKPayload(resp.Payload)
 }

@@ -256,6 +256,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		// 5. Dispatch Command
 		switch req.OpCode {
 		case OpSave:
+			headroom := system.GetMemoryHeadroom()
+			if headroom.UsedPercent >= 90 {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(507, fmt.Sprintf("storage admission control: container memory pressure %d%%", headroom.UsedPercent))
+				break
+			}
+			if headroom.UsedPercent >= 82 {
+				db.TriggerAutoSync()
+			}
+
 			item, dErr := DecodeSavePayload(req.Payload)
 			if dErr != nil {
 				resp.OpCode = OpResponseError
@@ -285,12 +295,8 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				savedName, err = db.SaveRecordWithIDAndOp(item.Name, opStatus, item.Props)
 			}
-			headroom := system.GetMemoryHeadroom()
 			if headroom.UsedPercent >= 80 {
 				resp.Flags |= FlagMemoryPressure
-			}
-			if headroom.UsedPercent >= 82 {
-				db.TriggerAutoSync()
 			}
 			if err != nil {
 				resp.OpCode = OpResponseError

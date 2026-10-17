@@ -297,8 +297,12 @@ type AnchorDB struct {
 	// Guarded by mu.
 	deletedNodeIdx map[uint32]bool
 
-	// Active string pool for newly appended nodes
-	stringPool []byte
+	// Zero-copy string pool:
+	// Synced node strings are read directly from mmapData without heap allocation.
+	// Pending node strings are newly appended words awaiting the next Sync().
+	syncedStringBytes uint32
+	pendingStringPool []byte
+	tempNodeWords     []string
 
 	// EntityStore stores key-value numerical attributes for entities: entityName -> CompactRecord
 	EntityStore map[string]CompactRecord
@@ -325,11 +329,13 @@ type AnchorDB struct {
 	entitySectionEnd int
 
 	// Entity zero-copy sync tracking
-	pendingEntitiesCount int64
-	isSyncing            bool
-	dirtyDuringSync      map[string]struct{}
-	autoSyncChan         chan struct{}
-	autoSyncDone         chan struct{}
+	syncedEntityCount      uint64
+	syncedEntitiesModified bool
+	pendingEntitiesCount   int64
+	isSyncing              bool
+	dirtyDuringSync        map[string]struct{}
+	autoSyncChan           chan struct{}
+	autoSyncDone           chan struct{}
 
 	filePath string
 
@@ -881,6 +887,8 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	db.syncedEntityCount = db.Header.EntityCount
+	db.syncedEntitiesModified = false
 
 	// Load the optional causal-edge section (format version >= 3)
 	if err := db.loadEdges(); err != nil {
@@ -977,6 +985,8 @@ func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
 	}
 	if _, exists := db.EntityStore[name]; !exists {
 		db.EntityOrder = append(db.EntityOrder, name)
+	} else {
+		db.syncedEntitiesModified = true
 	}
 	db.EntityStore[name] = CompactRecord{
 		Operation: cr.Operation,
@@ -995,6 +1005,7 @@ func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
 }
 
 func (db *AnchorDB) applyWALDeleteLocked(name string) {
+	db.syncedEntitiesModified = true
 	delete(db.EntityStore, name)
 	if nodeIdx, exists := db.Lexicon[name]; exists {
 		delete(db.Lexicon, name)
@@ -1077,15 +1088,17 @@ func (db *AnchorDB) buildIndex() error {
 	db.syncedNodeCount = uint64(nodeCount)
 	db.pendingNodes = nil
 
-	// Reconstruct string pool buffer from mmap so reopen preserves words and AppendNode can append cleanly
+	// Synced string pool is read directly from mmapData: zero heap copy
 	if db.Header.EntityOffset > db.Header.StringOffset && int(db.Header.EntityOffset) <= len(db.mmapData) {
-		poolSlice := db.mmapData[db.Header.StringOffset:db.Header.EntityOffset]
-		db.stringPool = make([]byte, len(poolSlice))
-		copy(db.stringPool, poolSlice)
+		db.syncedStringBytes = uint32(db.Header.EntityOffset - db.Header.StringOffset)
+	} else {
+		db.syncedStringBytes = 0
 	}
+	db.pendingStringPool = nil
 
 	// Zero-copy indexing: decode stack variable without heap duplication
 	var rec BinaryNodeRecord
+	nodeWords := make([]string, nodeCount)
 	for i := 0; i < nodeCount; i++ {
 		offset := int(db.Header.NodesOffset) + i*RecordSize
 		if offset+RecordSize > len(db.mmapData) {
@@ -1101,6 +1114,7 @@ func (db *AnchorDB) buildIndex() error {
 		wordLen := int(rec.WordLen)
 		word := string(db.mmapData[wordOffset : wordOffset+wordLen])
 		db.Lexicon[word] = uint32(i)
+		nodeWords[i] = word
 
 		// Insert into spatial grid cell
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
@@ -1108,6 +1122,7 @@ func (db *AnchorDB) buildIndex() error {
 		idx := CellIndex(cell, GridDim)
 		db.Grid[uint32(idx)] = append(db.Grid[uint32(idx)], uint32(i))
 	}
+	db.tempNodeWords = nodeWords
 
 	return nil
 }
@@ -1129,7 +1144,13 @@ func (db *AnchorDB) loadEntities() error {
 		if offset+nameLen > len(data) {
 			return fmt.Errorf("corrupt file: truncated entity name at entity %d", i)
 		}
-		name := string(data[offset : offset+nameLen])
+		nameBytes := data[offset : offset+nameLen]
+		var name string
+		if idx, exists := db.Lexicon[string(nameBytes)]; exists && int(idx) < len(db.tempNodeWords) {
+			name = db.tempNodeWords[idx]
+		} else {
+			name = string(nameBytes)
+		}
 		offset += nameLen
 
 		opStatus := OpStatusActive
@@ -1164,6 +1185,7 @@ func (db *AnchorDB) loadEntities() error {
 		db.EntityOrder = append(db.EntityOrder, name)
 		loaded++
 	}
+	db.tempNodeWords = nil
 	if loaded != db.Header.EntityCount {
 		return fmt.Errorf("corrupt file: loaded %d of %d entities", loaded, db.Header.EntityCount)
 	}
@@ -1201,7 +1223,12 @@ func (db *AnchorDB) remapEntitiesLocked() {
 		if offset+nameLen > len(data) {
 			break
 		}
-		name := string(data[offset : offset+nameLen])
+		var name string
+		if i < uint64(len(db.EntityOrder)) {
+			name = db.EntityOrder[i]
+		} else {
+			name = string(data[offset : offset+nameLen])
+		}
 		offset += nameLen
 
 		opStatus := OpStatusActive
@@ -1247,6 +1274,7 @@ func (db *AnchorDB) remapEntitiesLocked() {
 			}
 		}
 	}
+	db.entitySectionEnd = int(db.Header.EntityOffset) + offset
 	db.dirtyDuringSync = nil
 	db.isSyncing = false
 	db.compactAttrPoolLocked()
@@ -1299,8 +1327,8 @@ func (db *AnchorDB) appendNodeLocked(word string, coord spatial.Point2D, roles [
 
 	newID := uint64(db.totalNodes() + 1)
 	wordBytes := []byte(word)
-	wordOffset := uint32(len(db.stringPool))
-	db.stringPool = append(db.stringPool, wordBytes...)
+	wordOffset := db.syncedStringBytes + uint32(len(db.pendingStringPool))
+	db.pendingStringPool = append(db.pendingStringPool, wordBytes...)
 
 	rec := BinaryNodeRecord{
 		ID:         newID,
@@ -1374,6 +1402,8 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 
 	if _, exists := db.EntityStore[name]; !exists {
 		db.EntityOrder = append(db.EntityOrder, name)
+	} else {
+		db.syncedEntitiesModified = true
 	}
 	db.EntityStore[name] = cr
 	db.markEntityDirtyLocked(name)
@@ -1436,6 +1466,8 @@ func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[st
 	db.appendNodeLocked(name, coord, roles, uint16(opStatus))
 	if _, exists := db.EntityStore[name]; !exists {
 		db.EntityOrder = append(db.EntityOrder, name)
+	} else {
+		db.syncedEntitiesModified = true
 	}
 	db.EntityStore[name] = cr
 	db.markEntityDirtyLocked(name)
@@ -1540,6 +1572,8 @@ func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) 
 
 		if _, exists := db.EntityStore[name]; !exists {
 			db.EntityOrder = append(db.EntityOrder, name)
+		} else {
+			db.syncedEntitiesModified = true
 		}
 		db.EntityStore[name] = cr
 		db.markEntityDirtyLocked(name)
@@ -1869,6 +1903,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			}
 			db.EntityStore[name] = cr
 			db.markEntityDirtyLocked(name)
+			db.syncedEntitiesModified = true
 			updatedCount++
 		}
 		return updatedCount, nil
@@ -1940,6 +1975,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		}
 		db.EntityStore[name] = cr
 		db.markEntityDirtyLocked(name)
+		db.syncedEntitiesModified = true
 		updatedCount++
 	}
 
@@ -1977,6 +2013,7 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error
 		cr.Operation = status
 		db.EntityStore[name] = cr
 		db.markEntityDirtyLocked(name)
+		db.syncedEntitiesModified = true
 		updated++
 	}
 	return updated, nil
@@ -2007,6 +2044,7 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 		}
 		db.EntityStore[name] = cr
 		db.markEntityDirtyLocked(name)
+		db.syncedEntitiesModified = true
 		delete(db.partitionLocks, name)
 		updated++
 	}
@@ -2083,6 +2121,7 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 		}
 		db.EntityStore[record.Name] = updated
 		db.markEntityDirtyLocked(record.Name)
+		db.syncedEntitiesModified = true
 		db.partitionLocks[record.Name] = true
 		locked = append(locked, record)
 	}
@@ -2174,6 +2213,9 @@ func (db *AnchorDB) DeleteRecords(names []string) (int, error) {
 }
 
 func (db *AnchorDB) deleteEntityLocked(names map[string]bool) {
+	if len(names) > 0 {
+		db.syncedEntitiesModified = true
+	}
 	for name := range names {
 		delete(db.EntityStore, name)
 		db.markEntityDirtyLocked(name)
@@ -2204,6 +2246,11 @@ func (db *AnchorDB) removeEntityNamesLocked(deleted map[string]bool) int {
 	return removed
 }
 
+type entitySnapshotEntry struct {
+	Name string
+	CR   CompactRecord
+}
+
 // Sync flushes pending records to disk and truncates the WAL log up to the snapshot point.
 // Read and write queries are NOT blocked during disk serialization and kernel fsync.
 func (db *AnchorDB) Sync() error {
@@ -2216,47 +2263,81 @@ func (db *AnchorDB) Sync() error {
 		db.mu.Unlock()
 		return ErrDatabaseClosed
 	}
-	totNodes := db.totalNodes()
-	nodesSnapshot := make([]BinaryNodeRecord, totNodes)
-	for j := 0; j < totNodes; j++ {
-		nodesSnapshot[j] = db.getNode(uint32(j))
-	}
-	stringPoolSnapshot := make([]byte, len(db.stringPool))
-	copy(stringPoolSnapshot, db.stringPool)
 
-	entityOrderSnapshot := make([]string, len(db.EntityOrder))
-	copy(entityOrderSnapshot, db.EntityOrder)
+	syncedNodesToCopy := db.syncedNodeCount
+	pendingNodesSnapshot := slices.Clone(db.pendingNodes)
+	totNodes := int(syncedNodesToCopy) + len(pendingNodesSnapshot)
 
-	entityStoreSnapshot := make(map[string]CompactRecord, len(db.EntityStore))
-	for _, name := range entityOrderSnapshot {
-		cr := db.EntityStore[name]
-		var attrsCopy []AttrEntry
-		if len(cr.Attrs) > 0 {
-			attrsCopy = make([]AttrEntry, len(cr.Attrs))
-			copy(attrsCopy, cr.Attrs)
+	syncedStringBytes := db.syncedStringBytes
+	pendingStringsSnapshot := slices.Clone(db.pendingStringPool)
+	totStringSize := uint64(syncedStringBytes) + uint64(len(pendingStringsSnapshot))
+
+	canStreamSyncedEntities := !db.syncedEntitiesModified &&
+		db.syncedEntityCount > 0 &&
+		db.syncedEntityCount <= uint64(len(db.EntityOrder)) &&
+		db.entitySectionEnd > int(db.Header.EntityOffset) &&
+		db.entitySectionEnd <= len(db.mmapData)
+
+	var syncedEntityBytes int
+	var pendingEntitiesSnapshot []entitySnapshotEntry
+	var allEntitiesSnapshot []entitySnapshotEntry
+
+	if canStreamSyncedEntities {
+		syncedEntityBytes = db.entitySectionEnd - int(db.Header.EntityOffset)
+		pendingCount := len(db.EntityOrder) - int(db.syncedEntityCount)
+		if pendingCount > 0 {
+			pendingEntitiesSnapshot = make([]entitySnapshotEntry, pendingCount)
+			for i := 0; i < pendingCount; i++ {
+				name := db.EntityOrder[int(db.syncedEntityCount)+i]
+				cr := db.EntityStore[name]
+				var attrsCopy []AttrEntry
+				if len(cr.Attrs) > 0 {
+					attrsCopy = slices.Clone(cr.Attrs)
+				}
+				pendingEntitiesSnapshot[i] = entitySnapshotEntry{
+					Name: name,
+					CR: CompactRecord{
+						Operation: cr.Operation,
+						Attrs:     attrsCopy,
+						Raw:       cr.Raw,
+					},
+				}
+			}
 		}
-		entityStoreSnapshot[name] = CompactRecord{
-			Operation: cr.Operation,
-			Attrs:     attrsCopy,
-			Raw:       cr.Raw,
+	} else {
+		tot := len(db.EntityOrder)
+		allEntitiesSnapshot = make([]entitySnapshotEntry, tot)
+		for i, name := range db.EntityOrder {
+			cr := db.EntityStore[name]
+			var attrsCopy []AttrEntry
+			if len(cr.Attrs) > 0 {
+				attrsCopy = slices.Clone(cr.Attrs)
+			}
+			allEntitiesSnapshot[i] = entitySnapshotEntry{
+				Name: name,
+				CR: CompactRecord{
+					Operation: cr.Operation,
+					Attrs:     attrsCopy,
+					Raw:       cr.Raw,
+				},
+			}
 		}
 	}
+	totEntities := len(db.EntityOrder)
 
-	edgesSnapshot := make([]EdgeRecord, len(db.edges))
-	copy(edgesSnapshot, db.edges)
+	edgesSnapshot := slices.Clone(db.edges)
 
 	hdrSnapshot := db.Header
 	hdrSnapshot.Version = DBVersion // Ensure synced header carries the current format version
 	nodesOffset := uint64(HeaderSize)
 	nodesSize := uint64(totNodes * RecordSize)
 	stringOffset := nodesOffset + nodesSize
-	stringSize := uint64(len(stringPoolSnapshot))
-	entityOffset := stringOffset + stringSize
+	entityOffset := stringOffset + totStringSize
 
 	hdrSnapshot.NodesOffset = nodesOffset
 	hdrSnapshot.StringOffset = stringOffset
 	hdrSnapshot.NodeCount = uint64(totNodes)
-	hdrSnapshot.EntityCount = uint64(len(entityOrderSnapshot))
+	hdrSnapshot.EntityCount = uint64(totEntities)
 	hdrSnapshot.EntityOffset = entityOffset
 
 	snappedPending := db.pendingEntitiesCount
@@ -2308,25 +2389,46 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 
-	// 2. Nodes Array (written in 1024-node batches from snapshot)
-	const nodeBatchSize = 1024
-	for i := 0; i < totNodes; i += nodeBatchSize {
-		end := i + nodeBatchSize
-		if end > totNodes {
-			end = totNodes
+	// 2. Nodes Array (streamed: synced from mmap, pending from snapshot)
+	syncedNodeBytes := syncedNodesToCopy * RecordSize
+	if syncedNodeBytes > 0 && db.mmapData != nil {
+		nStart := int(db.Header.NodesOffset)
+		nEnd := nStart + int(syncedNodeBytes)
+		if nStart >= 0 && nEnd <= len(db.mmapData) {
+			if _, err := writer.Write(db.mmapData[nStart:nEnd]); err != nil {
+				return err
+			}
 		}
-		batch := make([]byte, (end-i)*RecordSize)
-		for j := i; j < end; j++ {
-			nodesSnapshot[j].Encode(batch[(j-i)*RecordSize : (j-i+1)*RecordSize])
-		}
-		if _, err := writer.Write(batch); err != nil {
-			return err
+	}
+	if len(pendingNodesSnapshot) > 0 {
+		var batch [1024 * RecordSize]byte
+		for i := 0; i < len(pendingNodesSnapshot); i += 1024 {
+			end := i + 1024
+			if end > len(pendingNodesSnapshot) {
+				end = len(pendingNodesSnapshot)
+			}
+			batchSlice := batch[:(end-i)*RecordSize]
+			for j := i; j < end; j++ {
+				pendingNodesSnapshot[j].Encode(batchSlice[(j-i)*RecordSize : (j-i+1)*RecordSize])
+			}
+			if _, err := writer.Write(batchSlice); err != nil {
+				return err
+			}
 		}
 	}
 
-	// 3. String Pool (streamed write from snapshot)
-	if len(stringPoolSnapshot) > 0 {
-		if _, err := writer.Write(stringPoolSnapshot); err != nil {
+	// 3. String Pool (streamed: synced from mmap, pending from snapshot)
+	if syncedStringBytes > 0 && db.mmapData != nil {
+		sStart := int(db.Header.StringOffset)
+		sEnd := sStart + int(syncedStringBytes)
+		if sStart >= 0 && sEnd <= len(db.mmapData) {
+			if _, err := writer.Write(db.mmapData[sStart:sEnd]); err != nil {
+				return err
+			}
+		}
+	}
+	if len(pendingStringsSnapshot) > 0 {
+		if _, err := writer.Write(pendingStringsSnapshot); err != nil {
 			return err
 		}
 	}
@@ -2335,20 +2437,16 @@ func (db *AnchorDB) Sync() error {
 	var lBuf [2]byte
 	var vBuf [4]byte
 	var opBuf [1]byte
-	for _, name := range entityOrderSnapshot {
-		cr := entityStoreSnapshot[name]
-		nameBytes := []byte(name)
 
-		// The binary format stores lengths as uint16; reject oversized values
-		// instead of silently truncating them into a corrupt file.
+	writeEntityEntry := func(entry entitySnapshotEntry) error {
+		nameBytes := []byte(entry.Name)
 		if len(nameBytes) > math.MaxUint16 {
-			return fmt.Errorf("entity name %q too long (%d bytes) for binary format", name, len(nameBytes))
+			return fmt.Errorf("entity name %q too long (%d bytes) for binary format", entry.Name, len(nameBytes))
 		}
-		if cr.AttrCount() > math.MaxUint16 {
-			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", name, cr.AttrCount())
+		if entry.CR.AttrCount() > math.MaxUint16 {
+			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", entry.Name, entry.CR.AttrCount())
 		}
 
-		// 2 bytes name length + name bytes
 		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
 		if _, err := writer.Write(lBuf[:]); err != nil {
 			return err
@@ -2357,27 +2455,24 @@ func (db *AnchorDB) Sync() error {
 			return err
 		}
 
-		// 1 byte operation status (DBVersion >= 2)
-		opBuf[0] = cr.Operation
+		opBuf[0] = entry.CR.Operation
 		if _, err := writer.Write(opBuf[:]); err != nil {
 			return err
 		}
 
-		if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
-			if _, err := writer.Write(cr.Raw); err != nil {
+		if len(entry.CR.Attrs) == 0 && len(entry.CR.Raw) >= 2 {
+			if _, err := writer.Write(entry.CR.Raw); err != nil {
 				return err
 			}
 		} else {
-			// 2 bytes attr count
-			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(cr.Attrs)))
+			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(entry.CR.Attrs)))
 			if _, err := writer.Write(lBuf[:]); err != nil {
 				return err
 			}
-
-			for _, attr := range cr.Attrs {
+			for _, attr := range entry.CR.Attrs {
 				kBytes := []byte(attr.Key)
 				if len(kBytes) > math.MaxUint16 {
-					return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), name)
+					return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), entry.Name)
 				}
 				binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
 				if _, err := writer.Write(lBuf[:]); err != nil {
@@ -2386,11 +2481,34 @@ func (db *AnchorDB) Sync() error {
 				if _, err := writer.Write(kBytes); err != nil {
 					return err
 				}
-
 				binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(attr.Value))
 				if _, err := writer.Write(vBuf[:]); err != nil {
 					return err
 				}
+			}
+		}
+		return nil
+	}
+
+	if canStreamSyncedEntities {
+		if syncedEntityBytes > 0 && db.mmapData != nil {
+			eStart := int(db.Header.EntityOffset)
+			eEnd := eStart + syncedEntityBytes
+			if eStart >= 0 && eEnd <= len(db.mmapData) {
+				if _, err := writer.Write(db.mmapData[eStart:eEnd]); err != nil {
+					return err
+				}
+			}
+		}
+		for _, entry := range pendingEntitiesSnapshot {
+			if err := writeEntityEntry(entry); err != nil {
+				return err
+			}
+		}
+	} else {
+		for _, entry := range allEntitiesSnapshot {
+			if err := writeEntityEntry(entry); err != nil {
+				return err
 			}
 		}
 	}
@@ -2418,10 +2536,6 @@ func (db *AnchorDB) Sync() error {
 	}
 	tempFile = nil // Prevent defer from removing the renamed file
 
-	// Fsync the parent directory so the rename is committed to filesystem
-	// metadata. If this fails we must NOT checkpoint the WAL below: a crash could
-	// otherwise roll the directory back to the pre-rename file while the WAL that
-	// carried the snapshot's mutations has already been truncated (silent data loss).
 	dirSyncErr := syncDir(filepath.Dir(db.filePath))
 
 	// Re-open newly synced file
@@ -2430,7 +2544,6 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 
-	// Re-mmap
 	fi, err := newF.Stat()
 	if err != nil {
 		_ = newF.Close()
@@ -2458,6 +2571,8 @@ func (db *AnchorDB) Sync() error {
 		db.pendingEntitiesCount = 0
 	}
 	db.remapEntitiesLocked()
+	db.syncedEntityCount = uint64(totEntities)
+	db.syncedEntitiesModified = false
 
 	if oldMapped && oldMmap != nil {
 		if err := syscall.Munmap(oldMmap); err != nil {
@@ -2473,20 +2588,26 @@ func (db *AnchorDB) Sync() error {
 	}
 
 	// Prune pending nodes that were captured in snapshot
-	if uint64(len(db.pendingNodes)) >= (uint64(totNodes) - db.syncedNodeCount) {
-		addedSince := uint64(totNodes) - db.syncedNodeCount
-		db.pendingNodes = db.pendingNodes[addedSince:]
+	addedNodes := len(pendingNodesSnapshot)
+	if len(db.pendingNodes) >= addedNodes {
+		db.pendingNodes = db.pendingNodes[addedNodes:]
 	} else {
 		db.pendingNodes = nil
 	}
-	db.syncedNodeCount = uint64(totNodes)
+	db.syncedNodeCount += uint64(addedNodes)
+
+	// Prune pending string pool that was captured in snapshot
+	addedStringBytes := len(pendingStringsSnapshot)
+	if len(db.pendingStringPool) >= addedStringBytes {
+		db.pendingStringPool = db.pendingStringPool[addedStringBytes:]
+	} else {
+		db.pendingStringPool = nil
+	}
+	db.syncedStringBytes += uint32(addedStringBytes)
 
 	// Re-apply tombstones recorded while db.mu was released during serialization
-	// so a delete that raced this Sync is not lost in the freshly mapped file.
 	db.reapplyDeletesLocked()
 
-	// Do not discard WAL entries until the replacement file is durable. If the
-	// directory fsync failed, keep the WAL so a crash can still replay mutations.
 	if dirSyncErr != nil {
 		return fmt.Errorf("database replaced but directory fsync failed; WAL retained for recovery: %w", dirSyncErr)
 	}
@@ -2856,10 +2977,18 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 }
 
 func (db *AnchorDB) getWord(offset uint32, length uint16) string {
-	if int(offset)+int(length) <= len(db.stringPool) {
-		return string(db.stringPool[offset : offset+uint32(length)])
+	if offset < db.syncedStringBytes {
+		absOffset := int(db.Header.StringOffset) + int(offset)
+		if absOffset+int(length) <= len(db.mmapData) {
+			return string(db.mmapData[absOffset : absOffset+int(length)])
+		}
+		return ""
 	}
-	// Fallback directly to mmap memory if stringPool slice is not yet initialized
+	pOffset := int(offset - db.syncedStringBytes)
+	if pOffset >= 0 && pOffset+int(length) <= len(db.pendingStringPool) {
+		return string(db.pendingStringPool[pOffset : pOffset+int(length)])
+	}
+	// Fallback directly to mmap memory if bounds match mmap
 	absOffset := int(db.Header.StringOffset) + int(offset)
 	if absOffset+int(length) <= len(db.mmapData) {
 		return string(db.mmapData[absOffset : absOffset+int(length)])
