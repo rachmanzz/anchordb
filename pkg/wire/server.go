@@ -9,6 +9,7 @@ import (
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
+	"github.com/rachmanzz/anchordb/pkg/system"
 )
 
 // Backend defines the storage interface wire.Server requires from AnchorDB.
@@ -181,6 +182,64 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		// 3.5. Handle OpNegotiateMemory
+		if req.OpCode == OpNegotiateMemory {
+			negoReq, dErr := DecodeMemoryNegotiationRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, "invalid memory negotiation request: "+dErr.Error())
+				_ = WriteFrame(conn, resp)
+				continue
+			}
+
+			headroom := system.GetMemoryHeadroom()
+			var status uint8
+			var releaseIntervalMs uint32
+			allocatedBatch := negoReq.ClientBatchSize
+			if allocatedBatch == 0 {
+				allocatedBatch = 1000
+			}
+
+			usedPct := headroom.UsedPercent
+			if usedPct < 60 {
+				status = MemoryStatusGranted
+				if allocatedBatch > 2000 {
+					allocatedBatch = 2000
+				}
+				releaseIntervalMs = 0
+			} else if usedPct < 80 {
+				// Moderate pressure (e.g. Neo4j consumes 60% host RAM)
+				status = MemoryStatusThrottled
+				if allocatedBatch > 500 {
+					allocatedBatch = 500
+				}
+				releaseIntervalMs = 15 // pace releases with 15ms delay per batch
+			} else {
+				// High pressure (>80% RAM consumed)
+				status = MemoryStatusHold
+				if allocatedBatch > 100 {
+					allocatedBatch = 100
+				}
+				releaseIntervalMs = 100 // hold releases
+			}
+
+			resp.OpCode = OpResponseOK
+			if status != MemoryStatusGranted {
+				resp.Flags |= FlagMemoryPressure
+			}
+			resp.Payload = EncodeMemoryNegotiationResponse(MemoryNegotiationResponse{
+				Status:             status,
+				HostUsedPct:        usedPct,
+				HeadroomBytes:      headroom.HeadroomBytes,
+				AllocatedBatchSize: allocatedBatch,
+				ReleaseIntervalMs:  releaseIntervalMs,
+			})
+			if err := WriteFrame(conn, resp); err != nil {
+				return
+			}
+			continue
+		}
+
 		// 4. Resolve Model Database
 		db, err := s.backend.GetModel(currentModel)
 		if err != nil {
@@ -233,6 +292,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
+			}
+			headroom := system.GetMemoryHeadroom()
+			if headroom.UsedPercent >= 80 {
+				resp.Flags |= FlagMemoryPressure
 			}
 			names, err := db.SaveRecordsBatch(items)
 			if err != nil {

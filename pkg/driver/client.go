@@ -280,6 +280,14 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 			if mdl := q.Get("model"); mdl != "" {
 				cfg.model = mdl
 			}
+			if p := q.Get("pacing"); p == "true" || p == "1" {
+				cfg.adaptivePacing = true
+			}
+			if tgt := q.Get("target"); tgt != "" {
+				if n, err := strconv.ParseUint(tgt, 10, 32); err == nil {
+					cfg.targetRecords = uint32(n)
+				}
+			}
 			pathModel := strings.Trim(u.Path, "/")
 			if pathModel != "" && cfg.model == "default" {
 				cfg.model = pathModel

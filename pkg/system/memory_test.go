@@ -114,3 +114,19 @@ func TestFormatBytes_BoundaryValues(t *testing.T) {
 		}
 	}
 }
+
+func TestGetMemoryHeadroom(t *testing.T) {
+	h := GetMemoryHeadroom()
+	if h.TotalBytes == 0 {
+		t.Errorf("expected TotalBytes > 0")
+	}
+	if h.AvailableBytes == 0 && h.HeadroomBytes == 0 {
+		t.Errorf("expected AvailableBytes or HeadroomBytes > 0")
+	}
+	if h.Source == "" {
+		t.Errorf("expected non-empty Source")
+	}
+	if h.UsedPercent > 100 {
+		t.Errorf("expected UsedPercent <= 100, got %d", h.UsedPercent)
+	}
+}

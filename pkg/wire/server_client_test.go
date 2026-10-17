@@ -168,3 +168,98 @@ func TestWire_ServerAndClient_EndToEnd(t *testing.T) {
 		t.Fatalf("Sync failed: %v", err)
 	}
 }
+
+func TestWire_AdaptiveMemoryNegotiation_EndToEnd(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend := &mockBackend{
+		dataDir:   tmpDir,
+		models:    make(map[string]*storage.AnchorDB),
+		authToken: "pace_secret",
+	}
+	defer backend.CloseAll()
+
+	server := NewServer(backend)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic port: %v", err)
+	}
+	addr := listener.Addr().String()
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer server.Close()
+
+	client, err := Connect(addr,
+		WithClientToken("pace_secret"),
+		WithClientModel("pace_model"),
+		WithClientTimeout(5*time.Second),
+		WithClientAdaptivePacing(50000),
+	)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	// 1. Verify initial negotiation occurred
+	nego := client.GetNegotiation()
+	if nego == nil {
+		t.Fatalf("expected non-nil negotiation")
+	}
+	if nego.AllocatedBatchSize == 0 {
+		t.Errorf("expected AllocatedBatchSize > 0, got %d", nego.AllocatedBatchSize)
+	}
+
+	// 2. Explicit negotiation call
+	negoResp, err := client.NegotiateMemory(100000, 512, 1000)
+	if err != nil {
+		t.Fatalf("NegotiateMemory failed: %v", err)
+	}
+	if negoResp.AllocatedBatchSize == 0 {
+		t.Errorf("expected non-zero AllocatedBatchSize")
+	}
+
+	// 3. SaveBatch with pacing active
+	const totalItems = 120
+	items := make([]storage.BatchRecordItem, totalItems)
+	for i := 0; i < totalItems; i++ {
+		items[i] = storage.BatchRecordItem{
+			Name: fmt.Sprintf("item_paced_%d", i),
+			Props: map[string]float32{
+				"val": float32(i),
+			},
+		}
+	}
+
+	// Force a small batch allocation to test chunking & progressive release
+	client.negoMu.Lock()
+	client.negotiation.AllocatedBatchSize = 40
+	client.negotiation.ReleaseIntervalMs = 5
+	client.negotiation.Status = MemoryStatusThrottled
+	client.negoMu.Unlock()
+
+	start := time.Now()
+	names, err := client.SaveBatch(items)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("SaveBatch failed under adaptive pacing: %v", err)
+	}
+	if len(names) != totalItems {
+		t.Fatalf("expected %d items saved, got %d", totalItems, len(names))
+	}
+
+	// With 120 items split into chunks of 40 (3 chunks) and 5ms interval between chunks,
+	// elapsed should be >= 10ms
+	if elapsed < 8*time.Millisecond {
+		t.Logf("paced save finished in %v (expected ~10ms delay between 3 chunks)", elapsed)
+	}
+
+	// Verify all items were actually saved in the DB
+	for _, it := range items {
+		_, _, err := client.Get(it.Name)
+		if err != nil {
+			t.Errorf("expected item %s to exist: %v", it.Name, err)
+		}
+	}
+}

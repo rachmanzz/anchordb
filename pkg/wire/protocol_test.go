@@ -177,3 +177,37 @@ func TestWire_ErrorPayload(t *testing.T) {
 		t.Errorf("error payload mismatch: got %d, %s", dCode, dMsg)
 	}
 }
+
+func TestWire_MemoryNegotiationPayload(t *testing.T) {
+	req := MemoryNegotiationRequest{
+		TargetRecords:            1000000,
+		EstimatedRecordSizeBytes: 512,
+		ClientBatchSize:          1000,
+	}
+
+	reqBytes := EncodeMemoryNegotiationRequest(req)
+	dReq, err := DecodeMemoryNegotiationRequest(reqBytes)
+	if err != nil {
+		t.Fatalf("DecodeMemoryNegotiationRequest failed: %v", err)
+	}
+	if dReq != req {
+		t.Fatalf("negotiation request mismatch: got %+v, want %+v", dReq, req)
+	}
+
+	resp := MemoryNegotiationResponse{
+		Status:             MemoryStatusThrottled,
+		HostUsedPct:        60,
+		HeadroomBytes:      5 * 1024 * 1024 * 1024,
+		AllocatedBatchSize: 500,
+		ReleaseIntervalMs:  15,
+	}
+
+	respBytes := EncodeMemoryNegotiationResponse(resp)
+	dResp, err := DecodeMemoryNegotiationResponse(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeMemoryNegotiationResponse failed: %v", err)
+	}
+	if dResp != resp {
+		t.Fatalf("negotiation response mismatch: got %+v, want %+v", dResp, resp)
+	}
+}

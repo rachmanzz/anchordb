@@ -17,6 +17,8 @@ type clientConfig struct {
 	workerConcurrency int
 	enableScheduler   bool
 	schema            Schema
+	adaptivePacing    bool
+	targetRecords     uint32
 }
 
 func defaultClientConfig() clientConfig {
@@ -111,4 +113,16 @@ func WithAttachSchema(schema Schema) Option {
 // WithSchema is an alias for WithAttachSchema.
 func WithSchema(schema Schema) Option {
 	return WithAttachSchema(schema)
+}
+
+// WithAdaptivePacing enables dynamic memory headroom negotiation and progressive batch release pacing.
+func WithAdaptivePacing(targetRecords int) Option {
+	return func(c *clientConfig) {
+		c.adaptivePacing = true
+		if targetRecords > 0 {
+			c.targetRecords = uint32(targetRecords)
+		} else {
+			c.targetRecords = 100000
+		}
+	}
 }

@@ -12,22 +12,27 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
-// Client is a high-speed AnchorWire TCP client.
+// Client is an AnchorWire TCP client with optional adaptive memory pacing.
 type Client struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	writer  *bufio.Writer
-	mu      sync.Mutex
-	seq     atomic.Uint32
-	model   string
-	timeout time.Duration
+	conn          net.Conn
+	reader        *bufio.Reader
+	writer        *bufio.Writer
+	mu            sync.Mutex
+	seq           atomic.Uint32
+	model         string
+	timeout       time.Duration
+	negoMu        sync.RWMutex
+	negotiation   *MemoryNegotiationResponse
+	pacingEnabled bool
 }
 
 // ClientConfig holds wire connection options.
 type ClientConfig struct {
-	Token   string
-	Model   string
-	Timeout time.Duration
+	Token         string
+	Model         string
+	Timeout       time.Duration
+	TargetRecords uint32
+	EnablePacing  bool
 }
 
 // ClientOption configures a wire Client.
@@ -51,6 +56,14 @@ func WithClientModel(model string) ClientOption {
 func WithClientTimeout(d time.Duration) ClientOption {
 	return func(c *ClientConfig) {
 		c.Timeout = d
+	}
+}
+
+// WithClientAdaptivePacing enables adaptive memory negotiation and pacing on the wire client.
+func WithClientAdaptivePacing(targetRecords uint32) ClientOption {
+	return func(c *ClientConfig) {
+		c.EnablePacing = true
+		c.TargetRecords = targetRecords
 	}
 }
 
@@ -92,6 +105,11 @@ func Connect(addr string, opts ...ClientOption) (*Client, error) {
 		}
 	}
 
+	if cfg.EnablePacing {
+		c.pacingEnabled = true
+		_, _ = c.NegotiateMemory(cfg.TargetRecords, 512, 1000)
+	}
+
 	return c, nil
 }
 
@@ -128,6 +146,27 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 		return Frame{}, fmt.Errorf("failed to read response frame: %w", err)
 	}
 
+	if resp.Flags&FlagMemoryPressure != 0 {
+		c.negoMu.Lock()
+		if c.negotiation == nil {
+			c.negotiation = &MemoryNegotiationResponse{
+				Status:             MemoryStatusHold,
+				HostUsedPct:        85,
+				AllocatedBatchSize: 100,
+				ReleaseIntervalMs:  100,
+			}
+		} else {
+			c.negotiation.Status = MemoryStatusHold
+			if c.negotiation.AllocatedBatchSize > 200 {
+				c.negotiation.AllocatedBatchSize = 200
+			}
+			if c.negotiation.ReleaseIntervalMs < 50 {
+				c.negotiation.ReleaseIntervalMs = 50
+			}
+		}
+		c.negoMu.Unlock()
+	}
+
 	if resp.OpCode == OpResponseError {
 		code, msg, _ := DecodeErrorPayload(resp.Payload)
 		return resp, fmt.Errorf("wire error (code %d): %s", code, msg)
@@ -159,9 +198,52 @@ func (c *Client) ModelName() string {
 func (c *Client) SelectModel(model string) error {
 	_, err := c.call(OpSelectModel, EncodeSelectModelPayload(model))
 	if err == nil {
+		c.mu.Lock()
 		c.model = model
+		c.mu.Unlock()
 	}
 	return err
+}
+
+// NegotiateMemory negotiates memory budget and ingestion pacing parameters with the server.
+func (c *Client) NegotiateMemory(targetRecords, estimatedRecordSizeBytes, preferredBatchSize uint32) (MemoryNegotiationResponse, error) {
+	req := MemoryNegotiationRequest{
+		TargetRecords:            targetRecords,
+		EstimatedRecordSizeBytes: estimatedRecordSizeBytes,
+		ClientBatchSize:          preferredBatchSize,
+	}
+	resp, err := c.call(OpNegotiateMemory, EncodeMemoryNegotiationRequest(req))
+	if err != nil {
+		return MemoryNegotiationResponse{}, err
+	}
+	nego, err := DecodeMemoryNegotiationResponse(resp.Payload)
+	if err != nil {
+		return MemoryNegotiationResponse{}, err
+	}
+
+	c.negoMu.Lock()
+	c.negotiation = &nego
+	c.negoMu.Unlock()
+
+	return nego, nil
+}
+
+// EnableAdaptivePacing turns on or off adaptive batch pacing.
+func (c *Client) EnableAdaptivePacing(enabled bool) {
+	c.negoMu.Lock()
+	c.pacingEnabled = enabled
+	c.negoMu.Unlock()
+}
+
+// GetNegotiation returns the current active memory negotiation response, if any.
+func (c *Client) GetNegotiation() *MemoryNegotiationResponse {
+	c.negoMu.RLock()
+	defer c.negoMu.RUnlock()
+	if c.negotiation == nil {
+		return nil
+	}
+	copy := *c.negotiation
+	return &copy
 }
 
 // Save stores an entity record and returns its effective name.
@@ -173,8 +255,65 @@ func (c *Client) Save(item storage.BatchRecordItem) (string, error) {
 	return DecodeOKPayload(resp.Payload)
 }
 
-// SaveBatch stores multiple records in a single high-throughput frame.
+// SaveBatch stores multiple records in a single high-throughput frame, automatically pacing if enabled.
 func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	c.negoMu.RLock()
+	pacing := c.pacingEnabled
+	var nego *MemoryNegotiationResponse
+	if c.negotiation != nil {
+		copy := *c.negotiation
+		nego = &copy
+	}
+	c.negoMu.RUnlock()
+
+	// If pacing is enabled and negotiation indicates throttled or hold status
+	if pacing && nego != nil {
+		// If server is in Hold status, hold/pause execution
+		if nego.Status == MemoryStatusHold {
+			delay := time.Duration(nego.ReleaseIntervalMs) * time.Millisecond
+			if delay < 20*time.Millisecond {
+				delay = 20 * time.Millisecond
+			}
+			time.Sleep(delay)
+		}
+
+		// Slicing into negotiated batch size
+		batchSize := int(nego.AllocatedBatchSize)
+		if batchSize <= 0 {
+			batchSize = 500
+		}
+
+		if len(records) > batchSize {
+			var allNames []string
+			for i := 0; i < len(records); i += batchSize {
+				end := i + batchSize
+				if end > len(records) {
+					end = len(records)
+				}
+				chunk := records[i:end]
+				resp, err := c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
+				if err != nil {
+					return allNames, err
+				}
+				for _, r := range chunk {
+					allNames = append(allNames, r.Name)
+				}
+				_ = resp
+
+				// Progressive release delay between slices
+				if nego.ReleaseIntervalMs > 0 && end < len(records) {
+					time.Sleep(time.Duration(nego.ReleaseIntervalMs) * time.Millisecond)
+				}
+			}
+			return allNames, nil
+		}
+	}
+
+	// Direct send (single chunk or unpaced)
 	resp, err := c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
 	if err != nil {
 		return nil, err

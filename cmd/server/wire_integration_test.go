@@ -103,4 +103,32 @@ func TestServer_AnchorWire_Integration(t *testing.T) {
 	if res2.Get("stock") != 105.0 {
 		t.Fatalf("expected stock=105.0, got %f", res2.Get("stock"))
 	}
+
+	// 6. Connect with Adaptive Pacing enabled
+	pacedClient, err := driver.ConnectWire(wireAddr,
+		driver.WithModel("wire_integration"),
+		driver.WithAdaptivePacing(10000),
+		driver.WithTimeout(5*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("ConnectWire with adaptive pacing failed: %v", err)
+	}
+	defer pacedClient.Close()
+
+	pacedBatch := make([]driver.BatchRecord, 25)
+	for i := 0; i < 25; i++ {
+		pacedBatch[i] = driver.BatchRecord{
+			Name: fmt.Sprintf("paced_item_%04d", i),
+			Props: map[string]float32{
+				"score": float32(i) * 1.2,
+			},
+		}
+	}
+	pacedNames, err := pacedClient.SaveBatch(pacedBatch)
+	if err != nil {
+		t.Fatalf("SaveBatch under adaptive pacing failed: %v", err)
+	}
+	if len(pacedNames) != 25 {
+		t.Fatalf("expected 25 paced items, got %d", len(pacedNames))
+	}
 }

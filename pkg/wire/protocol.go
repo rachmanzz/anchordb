@@ -28,10 +28,11 @@ const (
 // OpCodes
 const (
 	// Core & Session
-	OpPing        byte = 0x01
-	OpPong        byte = 0x02
-	OpAuth        byte = 0x03
-	OpSelectModel byte = 0x04
+	OpPing            byte = 0x01
+	OpPong            byte = 0x02
+	OpAuth            byte = 0x03
+	OpSelectModel     byte = 0x04
+	OpNegotiateMemory byte = 0x05
 
 	// Mutations & Queries
 	OpSave      byte = 0x10
@@ -48,9 +49,17 @@ const (
 
 // Flags
 const (
-	FlagNone       byte = 0x00
-	FlagCompressed byte = 0x01
-	FlagOneway     byte = 0x02
+	FlagNone           byte = 0x00
+	FlagCompressed     byte = 0x01
+	FlagOneway         byte = 0x02
+	FlagMemoryPressure byte = 0x04
+)
+
+// Memory Admission Status
+const (
+	MemoryStatusGranted   uint8 = 0 // RAM headroom is healthy (<60% used), normal ingestion
+	MemoryStatusThrottled uint8 = 1 // Moderate memory pressure (60%-80% used), paced drip-feed
+	MemoryStatusHold      uint8 = 2 // High memory pressure (>80% used), hold and pause ingestion
 )
 
 // Frame represents a single AnchorWire protocol packet.
@@ -541,4 +550,66 @@ func DecodeErrorPayload(data []byte) (uint16, string, error) {
 	code := binary.LittleEndian.Uint16(data[0:2])
 	msg, _, err := readString(data, 2)
 	return code, msg, err
+}
+
+// MemoryNegotiationRequest represents client's estimated ingestion workload.
+type MemoryNegotiationRequest struct {
+	TargetRecords            uint32
+	EstimatedRecordSizeBytes uint32
+	ClientBatchSize          uint32
+}
+
+// MemoryNegotiationResponse represents server's negotiated pacing strategy.
+type MemoryNegotiationResponse struct {
+	Status             uint8  // MemoryStatusGranted, MemoryStatusThrottled, MemoryStatusHold
+	HostUsedPct        uint8  // Percentage of host RAM in use (e.g. 60)
+	HeadroomBytes      uint64 // Available bytes before hitting threshold
+	AllocatedBatchSize uint32 // Negotiated batch size to release
+	ReleaseIntervalMs  uint32 // Delay to hold between batch releases
+}
+
+// EncodeMemoryNegotiationRequest serializes client's memory request.
+func EncodeMemoryNegotiationRequest(req MemoryNegotiationRequest) []byte {
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint32(buf[0:4], req.TargetRecords)
+	binary.LittleEndian.PutUint32(buf[4:8], req.EstimatedRecordSizeBytes)
+	binary.LittleEndian.PutUint32(buf[8:12], req.ClientBatchSize)
+	return buf
+}
+
+// DecodeMemoryNegotiationRequest deserializes client's memory request.
+func DecodeMemoryNegotiationRequest(data []byte) (MemoryNegotiationRequest, error) {
+	if len(data) < 12 {
+		return MemoryNegotiationRequest{}, errors.New("truncated memory negotiation request")
+	}
+	return MemoryNegotiationRequest{
+		TargetRecords:            binary.LittleEndian.Uint32(data[0:4]),
+		EstimatedRecordSizeBytes: binary.LittleEndian.Uint32(data[4:8]),
+		ClientBatchSize:          binary.LittleEndian.Uint32(data[8:12]),
+	}, nil
+}
+
+// EncodeMemoryNegotiationResponse serializes server's pacing strategy.
+func EncodeMemoryNegotiationResponse(resp MemoryNegotiationResponse) []byte {
+	buf := make([]byte, 18)
+	buf[0] = resp.Status
+	buf[1] = resp.HostUsedPct
+	binary.LittleEndian.PutUint64(buf[2:10], resp.HeadroomBytes)
+	binary.LittleEndian.PutUint32(buf[10:14], resp.AllocatedBatchSize)
+	binary.LittleEndian.PutUint32(buf[14:18], resp.ReleaseIntervalMs)
+	return buf
+}
+
+// DecodeMemoryNegotiationResponse deserializes server's pacing strategy.
+func DecodeMemoryNegotiationResponse(data []byte) (MemoryNegotiationResponse, error) {
+	if len(data) < 18 {
+		return MemoryNegotiationResponse{}, errors.New("truncated memory negotiation response")
+	}
+	return MemoryNegotiationResponse{
+		Status:             data[0],
+		HostUsedPct:        data[1],
+		HeadroomBytes:      binary.LittleEndian.Uint64(data[2:10]),
+		AllocatedBatchSize: binary.LittleEndian.Uint32(data[10:14]),
+		ReleaseIntervalMs:  binary.LittleEndian.Uint32(data[14:18]),
+	}, nil
 }

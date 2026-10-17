@@ -189,3 +189,139 @@ func GetMemoryStats() MemoryStats {
 		CgroupLimit:    cgroupLimit,
 	}
 }
+
+// MemoryHeadroom describes system-level and container-level memory headroom for admission control.
+type MemoryHeadroom struct {
+	TotalBytes     uint64 `json:"total_bytes"`
+	AvailableBytes uint64 `json:"available_bytes"`
+	UsedPercent    uint8  `json:"used_percent"`
+	HeadroomBytes  uint64 `json:"headroom_bytes"`
+	CgroupLimited  bool   `json:"cgroup_limited"`
+	Source         string `json:"source"`
+}
+
+// GetMemoryHeadroom detects the host and container memory availability.
+// It inspects /proc/meminfo for host availability and /sys/fs/cgroup for container caps.
+func GetMemoryHeadroom() MemoryHeadroom {
+	var hostTotal, hostAvailable uint64
+	var hasHostInfo bool
+
+	// 1. Try reading /proc/meminfo (Linux host/container)
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						hostTotal = kb * 1024
+					}
+				}
+			} else if strings.HasPrefix(line, "MemAvailable:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						hostAvailable = kb * 1024
+					}
+				}
+			}
+		}
+		if hostTotal > 0 && hostAvailable > 0 {
+			hasHostInfo = true
+		}
+	}
+
+	// 2. Check container cgroup limits
+	cgroupLimit, _ := DetectCgroupMemoryLimit()
+	cgroupCurrent, hasCgroupCurrent := readCgroupMemoryCurrent()
+
+	// 3. Synthesize effective memory headroom
+	if hasHostInfo {
+		hostUsed := hostTotal - hostAvailable
+		hostUsedPct := uint8((hostUsed * 100) / hostTotal)
+
+		if cgroupLimit > 0 && hasCgroupCurrent && uint64(cgroupLimit) > cgroupCurrent {
+			cgroupAvailable := uint64(cgroupLimit) - cgroupCurrent
+			cgroupUsedPct := uint8((cgroupCurrent * 100) / uint64(cgroupLimit))
+
+			// Pick the more constrained metric
+			effectiveUsedPct := hostUsedPct
+			if cgroupUsedPct > effectiveUsedPct {
+				effectiveUsedPct = cgroupUsedPct
+			}
+
+			effectiveHeadroom := hostAvailable
+			if cgroupAvailable < effectiveHeadroom {
+				effectiveHeadroom = cgroupAvailable
+			}
+
+			return MemoryHeadroom{
+				TotalBytes:     uint64(cgroupLimit),
+				AvailableBytes: effectiveHeadroom,
+				UsedPercent:    effectiveUsedPct,
+				HeadroomBytes:  effectiveHeadroom,
+				CgroupLimited:  true,
+				Source:         "cgroup+proc/meminfo",
+			}
+		}
+
+		return MemoryHeadroom{
+			TotalBytes:     hostTotal,
+			AvailableBytes: hostAvailable,
+			UsedPercent:    hostUsedPct,
+			HeadroomBytes:  hostAvailable,
+			CgroupLimited:  false,
+			Source:         "proc/meminfo",
+		}
+	}
+
+	// 4. Fallback for environments where /proc/meminfo is inaccessible
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	currentLimit := debug.SetMemoryLimit(-1)
+
+	if currentLimit > 0 && currentLimit < math.MaxInt64 && uint64(currentLimit) > m.Sys {
+		avail := uint64(currentLimit) - m.Sys
+		usedPct := uint8((m.Sys * 100) / uint64(currentLimit))
+		return MemoryHeadroom{
+			TotalBytes:     uint64(currentLimit),
+			AvailableBytes: avail,
+			UsedPercent:    usedPct,
+			HeadroomBytes:  avail,
+			CgroupLimited:  cgroupLimit > 0,
+			Source:         "runtime.GOMEMLIMIT",
+		}
+	}
+
+	// Safe conservative fallback
+	return MemoryHeadroom{
+		TotalBytes:     m.Sys * 2,
+		AvailableBytes: m.Sys,
+		UsedPercent:    50,
+		HeadroomBytes:  m.Sys,
+		CgroupLimited:  false,
+		Source:         "runtime.SysFallback",
+	}
+}
+
+func readCgroupMemoryCurrent() (uint64, bool) {
+	// Try cgroup v2
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.current"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "" && s != "max" {
+			if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+				return v, true
+			}
+		}
+	}
+	// Try cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "" {
+			if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+				return v, true
+			}
+		}
+	}
+	return 0, false
+}

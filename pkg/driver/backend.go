@@ -1428,6 +1428,9 @@ func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
 	if cfg.token != "" {
 		opts = append(opts, wire.WithClientToken(cfg.token))
 	}
+	if cfg.adaptivePacing {
+		opts = append(opts, wire.WithClientAdaptivePacing(cfg.targetRecords))
+	}
 	wc, err := wire.Connect(addr, opts...)
 	if err != nil {
 		return nil, err
