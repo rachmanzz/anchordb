@@ -1417,6 +1417,7 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 type wireBackend struct {
 	addr       string
 	cfg        clientConfig
+	mu         sync.Mutex
 	wireClient *wire.Client
 }
 
@@ -1442,45 +1443,58 @@ func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
 	}, nil
 }
 
-func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
+func (b *wireBackend) withModel(ctx context.Context, model string, fn func() error) error {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return err
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if model != "" && model != b.wireClient.ModelName() {
+		if err := b.wireClient.SelectModel(model); err != nil {
+			return err
+		}
+	}
+	return fn()
+}
+
+func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
 	opStatus := storage.OpStatusActive
 	if op != nil {
 		opStatus = *op
 	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.Save(storage.BatchRecordItem{
-		Name:      name,
-		Operation: opStatus,
-		Props:     props,
+	var res string
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		res, err = b.wireClient.Save(storage.BatchRecordItem{
+			Name:      name,
+			Operation: opStatus,
+			Props:     props,
+		})
+		return err
 	})
+	return res, err
 }
 
 func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.SaveBatch(records)
+	var names []string
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		names, err = b.wireClient.SaveBatch(records)
+		return err
+	})
+	return names, err
 }
 
 func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	props, _, err := b.wireClient.GetWithOptions(wire.GetRequest{
-		Name:         name,
-		Select:       selectFields,
-		Computations: computations,
+	var props map[string]float32
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		props, _, err = b.wireClient.GetWithOptions(wire.GetRequest{
+			Name:         name,
+			Select:       selectFields,
+			Computations: computations,
+		})
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -1492,12 +1506,6 @@ func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields 
 }
 
 func (b *wireBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
 	req := wire.ListRequest{
 		Limit:                opts.Limit,
 		Offset:               opts.Offset,
@@ -1508,7 +1516,12 @@ func (b *wireBackend) List(ctx context.Context, model string, opts storage.Query
 		Filters:              opts.Filters,
 		Computations:         opts.Computations,
 	}
-	resp, err := b.wireClient.List(req)
+	var resp wire.ListResponse
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		resp, err = b.wireClient.List(req)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1526,12 +1539,6 @@ func (b *wireBackend) List(ctx context.Context, model string, opts storage.Query
 }
 
 func (b *wireBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
 	req := wire.UpdateRequest{
 		Limit:          opts.Limit,
 		Offset:         opts.Offset,
@@ -1539,16 +1546,16 @@ func (b *wireBackend) Update(ctx context.Context, model string, opts storage.Upd
 		Filters:        opts.Filters,
 		Mutations:      opts.Mutations,
 	}
-	return b.wireClient.Update(req)
+	var count int
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		count, err = b.wireClient.Update(req)
+		return err
+	})
+	return count, err
 }
 
 func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
 	req := wire.GraphRequest{
 		Inputs:    inputs,
 		Relation:  relation,
@@ -1556,7 +1563,12 @@ func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, 
 		OrderMode: uint8(orderMode),
 		BeamWidth: beamWidth,
 	}
-	resp, err := b.wireClient.Graph(req)
+	var resp wire.GraphResponsePayload
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		resp, err = b.wireClient.Graph(req)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1564,19 +1576,18 @@ func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, 
 }
 
 func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
 	req := wire.GraphChainRequest{
 		Inputs:        inputs,
 		RelationChain: relations,
 		LimitK:        limitK,
 		BeamWidth:     beamWidth,
 	}
-	results, err := b.wireClient.GraphChain(req)
+	var results []storage.GraphQueryResult
+	err := b.withModel(ctx, model, func() error {
+		var err error
+		results, err = b.wireClient.GraphChain(req)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1591,150 +1602,131 @@ func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []str
 }
 
 func (b *wireBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.Edge(action, source, relation, target, weight)
+	return b.withModel(ctx, model, func() error {
+		return b.wireClient.Edge(action, source, relation, target, weight)
+	})
 }
 
 func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	if len(relations) > 0 {
-		currentSeeds := seeds
-		var finalResults []storage.CausalResult
-		for _, rel := range relations {
-			stepRes, err := b.wireClient.Causal(currentSeeds, rel, limitK)
-			if err != nil {
-				return nil, err
+	var finalResults []storage.CausalResult
+	err := b.withModel(ctx, model, func() error {
+		if len(relations) > 0 {
+			currentSeeds := seeds
+			for _, rel := range relations {
+				stepRes, err := b.wireClient.Causal(currentSeeds, rel, limitK)
+				if err != nil {
+					return err
+				}
+				finalResults = append(finalResults, stepRes...)
+				currentSeeds = make([]string, len(stepRes))
+				for i, r := range stepRes {
+					currentSeeds[i] = r.Word
+				}
+				if len(currentSeeds) == 0 {
+					break
+				}
 			}
-			finalResults = append(finalResults, stepRes...)
-			currentSeeds = make([]string, len(stepRes))
-			for i, r := range stepRes {
-				currentSeeds[i] = r.Word
-			}
-			if len(currentSeeds) == 0 {
-				break
-			}
+			return nil
 		}
-		return finalResults, nil
-	}
-	return b.wireClient.Causal(seeds, relation, limitK)
+		var err error
+		finalResults, err = b.wireClient.Causal(seeds, relation, limitK)
+		return err
+	})
+	return finalResults, err
 }
 
 func (b *wireBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	resp, err := b.wireClient.Math(wire.MathRequest{
-		Op:    "distance",
-		Words: []string{wordA, wordB},
+	var val float32
+	err := b.withModel(ctx, model, func() error {
+		resp, err := b.wireClient.Math(wire.MathRequest{
+			Op:    "distance",
+			Words: []string{wordA, wordB},
+		})
+		if err != nil {
+			return err
+		}
+		val = resp.Value
+		return nil
 	})
-	if err != nil {
-		return 0, err
-	}
-	return resp.Value, nil
+	return val, err
 }
 
 func (b *wireBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
-	if err := ctx.Err(); err != nil {
-		return CentroidResult{}, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	resp, err := b.wireClient.Math(wire.MathRequest{
-		Op:    "centroid",
-		Words: words,
+	var res CentroidResult
+	err := b.withModel(ctx, model, func() error {
+		resp, err := b.wireClient.Math(wire.MathRequest{
+			Op:    "centroid",
+			Words: words,
+		})
+		if err != nil {
+			return err
+		}
+		res = CentroidResult{Coord: resp.Coord, Roles: resp.Roles}
+		return nil
 	})
-	if err != nil {
-		return CentroidResult{}, err
-	}
-	return CentroidResult{Coord: resp.Coord, Roles: resp.Roles}, nil
+	return res, err
 }
 
 func (b *wireBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	resp, err := b.wireClient.Math(wire.MathRequest{
-		Op:    "cosine_similarity",
-		Words: []string{wordA, wordB},
+	var val float32
+	err := b.withModel(ctx, model, func() error {
+		resp, err := b.wireClient.Math(wire.MathRequest{
+			Op:    "cosine_similarity",
+			Words: []string{wordA, wordB},
+		})
+		if err != nil {
+			return err
+		}
+		val = resp.Value
+		return nil
 	})
-	if err != nil {
-		return 0, err
-	}
-	return resp.Value, nil
+	return val, err
 }
 
 func (b *wireBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	resp, err := b.wireClient.Math(wire.MathRequest{
-		Op:     "nearest",
-		Words:  []string{word},
-		LimitK: limitK,
+	var res []storage.GraphQueryResult
+	err := b.withModel(ctx, model, func() error {
+		resp, err := b.wireClient.Math(wire.MathRequest{
+			Op:     "nearest",
+			Words:  []string{word},
+			LimitK: limitK,
+		})
+		if err != nil {
+			return err
+		}
+		res = resp.Neighbors
+		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return resp.Neighbors, nil
+	return res, err
 }
 
 func (b *wireBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
-	if err := ctx.Err(); err != nil {
+	return b.withModel(ctx, model, func() error {
+		_, err := b.wireClient.Save(storage.BatchRecordItem{
+			Name:      word,
+			Operation: storage.OpStatusActive,
+			Coord:     &coord,
+			Roles:     &roles,
+		})
 		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	_, err := b.wireClient.Save(storage.BatchRecordItem{
-		Name:      word,
-		Operation: storage.OpStatusActive,
-		Coord:     &coord,
-		Roles:     &roles,
 	})
-	return err
 }
 
 func (b *wireBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.SetRelation(name, direction)
+	return b.withModel(ctx, model, func() error {
+		return b.wireClient.SetRelation(name, direction)
+	})
 }
 
 func (b *wireBackend) Sync(ctx context.Context, model string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.Sync()
+	return b.withModel(ctx, model, func() error {
+		return b.wireClient.Sync()
+	})
 }
 
 func (b *wireBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.wireClient.Close()
 }
 
@@ -1755,43 +1747,29 @@ func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recor
 }
 
 func (b *wireBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
 	data, err := json.Marshal(schema)
 	if err != nil {
 		return err
 	}
-	return b.wireClient.AttachSchema(string(data))
+	return b.withModel(ctx, model, func() error {
+		return b.wireClient.AttachSchema(string(data))
+	})
 }
 
 func (b *wireBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
-	if err := ctx.Err(); err != nil {
-		return storage.ModelSchema{}, err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	raw, err := b.wireClient.GetSchema()
-	if err != nil {
-		return storage.ModelSchema{}, err
-	}
 	var ms storage.ModelSchema
-	if err := json.Unmarshal([]byte(raw), &ms); err != nil {
-		return storage.ModelSchema{}, err
-	}
-	return ms, nil
+	err := b.withModel(ctx, model, func() error {
+		raw, err := b.wireClient.GetSchema()
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal([]byte(raw), &ms)
+	})
+	return ms, err
 }
 
 func (b *wireBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if model != "" && model != b.wireClient.ModelName() {
-		_ = b.wireClient.SelectModel(model)
-	}
-	return b.wireClient.ResetModel(confirm)
+	return b.withModel(ctx, model, func() error {
+		return b.wireClient.ResetModel(confirm)
+	})
 }

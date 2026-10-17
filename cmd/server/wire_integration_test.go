@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,3 +294,72 @@ func TestServer_AnchorWire_FullFeatureParity(t *testing.T) {
 		t.Fatalf("expected error from GetSchema after ResetModel, got nil")
 	}
 }
+
+func TestServer_AnchorWire_MultiModel_Isolation(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	wireListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind dynamic wire port: %v", err)
+	}
+	wireAddr := wireListener.Addr().String()
+
+	go func() {
+		_ = s.WireServer().Serve(wireListener)
+	}()
+
+	client, err := driver.Connect("wire://" + wireAddr + "?model=default")
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	clientM1 := client.Model("m1")
+	clientM2 := client.Model("m2")
+
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine 1 writes to m1
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			name := fmt.Sprintf("rec_m1_%03d", i)
+			_ = clientM1.Save(name, map[string]float32{"tag": 1.0})
+		}
+	}()
+
+	// Goroutine 2 writes to m2
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			name := fmt.Sprintf("rec_m2_%03d", i)
+			_ = clientM2.Save(name, map[string]float32{"tag": 2.0})
+		}
+	}()
+
+	wg.Wait()
+
+	// Verify all m1 records are in m1 and NONE in m2
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		name1 := fmt.Sprintf("rec_m1_%03d", i)
+		if _, err := clientM1.Get(name1).Execute(ctx); err != nil {
+			t.Errorf("record %s should be in m1, got err: %v", name1, err)
+		}
+		if _, err := clientM2.Get(name1).Execute(ctx); err == nil {
+			t.Errorf("record %s should NOT be in m2, but was found!", name1)
+		}
+
+		name2 := fmt.Sprintf("rec_m2_%03d", i)
+		if _, err := clientM2.Get(name2).Execute(ctx); err != nil {
+			t.Errorf("record %s should be in m2, got err: %v", name2, err)
+		}
+		if _, err := clientM1.Get(name2).Execute(ctx); err == nil {
+			t.Errorf("record %s should NOT be in m1, but was found!", name2)
+		}
+	}
+}
+
