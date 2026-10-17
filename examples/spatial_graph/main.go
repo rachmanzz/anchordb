@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
+	"strings"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
@@ -13,51 +13,35 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
+	wireURL := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or localhost:7448")
+	authToken := flag.String("token", "", "Optional auth token")
 	flag.Parse()
 
 	fmt.Println("==========================================================")
 	fmt.Println("    AnchorDB Example: 2D Spatial Grid & Raycasting DDA    ")
+	fmt.Println("             (AnchorWire Binary TCP Protocol)             ")
 	fmt.Println("==========================================================")
 
-	var client *driver.Client
-	var cleanup func()
-
-	if *mode == "wire" {
-		if *serverURL == "http://localhost:7447" || *serverURL == "" {
-			*serverURL = "wire://localhost:7448"
-		}
-		*mode = "remote"
+	target := *wireURL
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		log.Fatalf("[FATAL] HTTP is disabled in this example. Only AnchorWire binary TCP (wire://localhost:7448) is supported.")
+	}
+	if !strings.HasPrefix(target, "wire://") && !strings.HasPrefix(target, "tcp://") {
+		target = "wire://" + target
 	}
 
-	if *mode == "remote" {
-		t0 := time.Now()
-		c, err := driver.Connect(*serverURL, driver.WithModel("world"))
-		if err != nil {
-			log.Fatalf("Failed to connect to AnchorDB (%s): %v", *serverURL, err)
-		}
-		client = c
-		cleanup = func() { _ = client.Close() }
-		fmt.Printf("[OK] Connected to AnchorDB Remote Engine (%s) in %v\n", *serverURL, time.Since(t0))
-	} else {
-		tmpDir, err := os.MkdirTemp("", "anchordb_spatial_*")
-		if err != nil {
-			log.Fatalf("Failed to create temp dir: %v", err)
-		}
-		t0 := time.Now()
-		c, err := driver.OpenEmbedded(tmpDir, driver.WithModel("world"))
-		if err != nil {
-			log.Fatalf("Failed to open embedded AnchorDB: %v", err)
-		}
-		client = c
-		cleanup = func() {
-			_ = client.Close()
-			_ = os.RemoveAll(tmpDir)
-		}
-		fmt.Printf("[OK] Connected to AnchorDB Embedded Engine in %v (mmap zero-copy)\n", time.Since(t0))
+	opts := []driver.Option{driver.WithModel("world")}
+	if *authToken != "" {
+		opts = append(opts, driver.WithToken(*authToken))
 	}
-	defer cleanup()
+
+	t0 := time.Now()
+	client, err := driver.ConnectWire(target, opts...)
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.", target, err)
+	}
+	defer client.Close()
+	fmt.Printf("[OK] Connected via AnchorWire Binary TCP (%s) in %v\n", target, time.Since(t0))
 
 	// 2. Populate spatial cluster nodes
 	nodes := []struct {

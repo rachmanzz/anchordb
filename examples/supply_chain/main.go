@@ -47,36 +47,32 @@ type DisruptionAnalysisResult struct {
 }
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
-	authToken := flag.String("token", "", "Bearer auth token for remote mode (if required)")
+	wireURL := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or localhost:7448")
+	authToken := flag.String("token", "", "Bearer auth token for AnchorWire (if required)")
 	modelName := flag.String("model", "supply_chain", "Model name to isolate supply chain data")
-	dataDir := flag.String("data-dir", "", "Storage directory for embedded mode (default: temporary directory)")
 	scenario := flag.String("scenario", "analysis", "Scenario: 'analysis' (6-hop Vietnam flood query), 'crash-test' (durability validation), or 'benchmark' (up to 5M stress test)")
 	scale := flag.Int("scale", 100000, "Dataset scale for benchmark scenario (e.g. 100000, 1000000, 5000000)")
-	phase := flag.String("phase", "all", "For crash-test: 'populate', 'verify', or 'all' (auto in-process crash recovery)")
+	phase := flag.String("phase", "all", "For crash-test: 'populate', 'verify', or 'all' (auto wire durability verification)")
 	flag.Parse()
 
 	fmt.Println("==========================================================================================")
 	fmt.Println("       AnchorDB Real-World Case Study: Multi-Tier Supply Chain Disruption Analysis        ")
+	fmt.Println("                             (AnchorWire Binary TCP Protocol)                             ")
 	fmt.Println("==========================================================================================")
 	fmt.Printf("OS / Arch:       %s / %s\n", runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("Logical CPUs:    %d cores\n", runtime.NumCPU())
-	fmt.Printf("Execution Mode:  %s\n", strings.ToUpper(*mode))
+	fmt.Printf("Wire Server:     %s (Model: %s)\n", *wireURL, *modelName)
 	fmt.Printf("Active Scenario: %s\n", strings.ToUpper(*scenario))
-	if *mode == "remote" {
-		fmt.Printf("Remote Server:   %s (Model: %s)\n", *serverURL, *modelName)
-	}
 	fmt.Println("------------------------------------------------------------------------------------------")
 	fmt.Println()
 
 	switch *scenario {
 	case "analysis":
-		runSupplyChainAnalysis(*mode, *serverURL, *authToken, *modelName, *dataDir)
+		runSupplyChainAnalysis(*wireURL, *authToken, *modelName)
 	case "crash-test":
-		runCrashDurabilityTest(*mode, *serverURL, *authToken, *modelName, *dataDir, *phase)
+		runCrashDurabilityTest(*wireURL, *authToken, *modelName, *phase)
 	case "benchmark":
-		runLargeScaleBenchmark(*mode, *serverURL, *authToken, *modelName, *dataDir, *scale)
+		runLargeScaleBenchmark(*wireURL, *authToken, *modelName, *scale)
 	default:
 		fmt.Printf("Unknown scenario %q. Available: 'analysis', 'crash-test', 'benchmark'\n", *scenario)
 		os.Exit(1)
@@ -88,9 +84,9 @@ func main() {
 // "If the factory in Vietnam floods, which products run out of stock within 30 days?"
 // ------------------------------------------------------------------------------------------------
 
-func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir string) {
+func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 	ctx := context.Background()
-	client, cleanup := setupClient(mode, serverURL, authToken, modelName, dataDir)
+	client, cleanup := setupClient(serverURL, authToken, modelName)
 	defer cleanup()
 
 	// 1. Schema Registration & Contract Locking
@@ -397,7 +393,7 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 // SCENARIO 2: Crash Recovery & WAL Durability Test
 // ------------------------------------------------------------------------------------------------
 
-func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phase string) {
+func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 	fmt.Println("==========================================================================================")
 	fmt.Println("   SCENARIO: Crash Recovery & WAL Frame Durability on Multi-Hop Supply Network            ")
 	fmt.Println("==========================================================================================")
@@ -413,10 +409,10 @@ func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phas
 
 	switch phase {
 	case "populate":
-		client, cleanup := setupClient(mode, serverURL, authToken, modelName, dataDir)
+		client, cleanup := setupClient(serverURL, authToken, modelName)
 		defer cleanup()
 
-		fmt.Println("[STEP 1/3] Populating Schema, 6-Hop Links, and Sentinel Canary...")
+		fmt.Println("[STEP 1/3] Populating Schema, 6-Hop Links, and Sentinel Canary via AnchorWire...")
 		schema := driver.Schema{
 			"tier":            "int",
 			"inventory_units": "float",
@@ -440,13 +436,13 @@ func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phas
 			fmt.Printf("Sync error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("    [✓] Data written and synced to disk. Ready for container stop / abrupt SIGKILL.")
+		fmt.Println("    [✓] Data written and synced via AnchorWire. Ready for container stop / abrupt SIGKILL.")
 
 	case "verify":
-		client, cleanup := setupClient(mode, serverURL, authToken, modelName, dataDir)
+		client, cleanup := setupClient(serverURL, authToken, modelName)
 		defer cleanup()
 
-		fmt.Println("[STEP 2/3] Verifying Data & Graph Integrity Post-Crash...")
+		fmt.Println("[STEP 2/3] Verifying Data & Graph Integrity Post-Crash via AnchorWire...")
 		// 1. Schema must remain locked
 		sch, err := client.GetSchema(context.Background())
 		if err != nil {
@@ -477,20 +473,8 @@ func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phas
 		fmt.Println("==========================================================================================")
 
 	case "all":
-		// Auto in-process crash test (open -> populate -> kill handle -> reopen -> verify)
-		testDir, err := os.MkdirTemp("", "anchordb_supply_durability_*")
-		if err != nil {
-			fmt.Printf("Temp dir error: %v\n", err)
-			os.Exit(1)
-		}
-		defer os.RemoveAll(testDir)
-
-		fmt.Println("[STEP 1/3] Populating embedded engine with WAL sync=always...")
-		c1, err := driver.OpenEmbedded(testDir, driver.WithModel(modelName))
-		if err != nil {
-			fmt.Printf("Open error: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Println("[STEP 1/3] Connecting via AnchorWire & populating data...")
+		c1, cleanup1 := setupClient(serverURL, authToken, modelName)
 
 		schema := driver.Schema{
 			"tier":            "int",
@@ -504,21 +488,17 @@ func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phas
 		_ = c1.Link("factory_vietnam_bac_ninh", "supplies_t1", "supplier_t1_soc_processor", 0.96)
 		_ = c1.Sync()
 
-		// Simulate abrupt crash by closing the client handle
-		fmt.Println("[STEP 2/3] Simulating crash (unmounting and dropping process state)...")
-		_ = c1.Close()
+		// Disconnect client to test durability across sessions
+		fmt.Println("[STEP 2/3] Closing AnchorWire connection (verifying state persistence)...")
+		cleanup1()
 
-		fmt.Println("[STEP 3/3] Reopening database from disk & verifying crash replay...")
-		c2, err := driver.OpenEmbedded(testDir, driver.WithModel(modelName))
-		if err != nil {
-			fmt.Printf("FATAL: Failed to reopen after crash: %v\n", err)
-			os.Exit(1)
-		}
-		defer c2.Close()
+		fmt.Println("[STEP 3/3] Reconnecting via AnchorWire & verifying data integrity...")
+		c2, cleanup2 := setupClient(serverURL, authToken, modelName)
+		defer cleanup2()
 
 		sch, err := c2.GetSchema(context.Background())
 		if err != nil || len(sch) == 0 {
-			fmt.Printf("FATAL: Schema lost after crash: %v\n", err)
+			fmt.Printf("FATAL: Schema lost after session reconnect: %v\n", err)
 			os.Exit(1)
 		}
 		cRes, err := c2.Get(canaryKey).Execute(context.Background())
@@ -545,12 +525,12 @@ func runCrashDurabilityTest(mode, serverURL, authToken, modelName, dataDir, phas
 // SCENARIO 3: Large-Scale Benchmark Stress Test (Up to 5,000,000 Entities/Edges)
 // ------------------------------------------------------------------------------------------------
 
-func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir string, totalRecords int) {
+func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords int) {
 	fmt.Println("==========================================================================================")
 	fmt.Printf("   SCENARIO: Large-Scale Benchmark Stress Test (%s records/edges)\n", formatNumber(totalRecords))
 	fmt.Println("==========================================================================================")
 
-	client, cleanup := setupClient(mode, serverURL, authToken, modelName, dataDir)
+	client, cleanup := setupClient(serverURL, authToken, modelName)
 	defer cleanup()
 
 	// 1. Attach Schema
@@ -683,56 +663,29 @@ func runLargeScaleBenchmark(mode, serverURL, authToken, modelName, dataDir strin
 // HELPER FUNCTIONS
 // ------------------------------------------------------------------------------------------------
 
-func setupClient(mode, serverURL, authToken, modelName, dataDir string) (*driver.Client, func()) {
-	if mode == "wire" {
-		if serverURL == "http://localhost:7447" || serverURL == "" {
-			serverURL = "wire://localhost:7448"
-		}
-		mode = "remote"
-	}
-	if mode == "remote" {
-		opts := []driver.Option{
-			driver.WithModel(modelName),
-		}
-		if authToken != "" {
-			opts = append(opts, driver.WithToken(authToken))
-		}
-		// driver.Connect auto-detects the transport: http(s):// uses the HTTP
-		// REST engine, wire:// (or tcp://, anchordb+wire://) uses AnchorWire.
-		client, err := driver.Connect(serverURL, opts...)
-		if err != nil {
-			fmt.Printf("FATAL: Failed to connect to remote AnchorDB server (%s): %v\n", serverURL, err)
-			os.Exit(1)
-		}
-		return client, func() { _ = client.Close() }
-	}
-
-	// Embedded mode
-	targetDir := dataDir
-	var cleanupDir bool
-	if targetDir == "" {
-		tmp, err := os.MkdirTemp("", "anchordb_supply_chain_*")
-		if err != nil {
-			fmt.Printf("FATAL: Failed to create temp directory: %v\n", err)
-			os.Exit(1)
-		}
-		targetDir = tmp
-		cleanupDir = true
-	}
-
-	client, err := driver.OpenEmbedded(targetDir, driver.WithModel(modelName))
-	if err != nil {
-		fmt.Printf("FATAL: Failed to open embedded AnchorDB engine in %s: %v\n", targetDir, err)
+func setupClient(serverURL, authToken, modelName string) (*driver.Client, func()) {
+	target := serverURL
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		fmt.Printf("FATAL: HTTP is disabled. Only AnchorWire binary TCP (wire://localhost:7448) is supported.\n")
 		os.Exit(1)
 	}
-
-	cleanup := func() {
-		_ = client.Close()
-		if cleanupDir {
-			_ = os.RemoveAll(targetDir)
-		}
+	if !strings.HasPrefix(target, "wire://") && !strings.HasPrefix(target, "tcp://") {
+		target = "wire://" + target
 	}
-	return client, cleanup
+
+	opts := []driver.Option{
+		driver.WithModel(modelName),
+	}
+	if authToken != "" {
+		opts = append(opts, driver.WithToken(authToken))
+	}
+
+	client, err := driver.ConnectWire(target, opts...)
+	if err != nil {
+		fmt.Printf("FATAL: Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.\n", target, err)
+		os.Exit(1)
+	}
+	return client, func() { _ = client.Close() }
 }
 
 func formatNumber(n int) string {

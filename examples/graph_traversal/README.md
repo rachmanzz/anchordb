@@ -171,6 +171,16 @@ list, _ := client.List().
 
 ---
 
+## How to Run (AnchorWire Binary TCP Protocol)
+
+Ensure the AnchorDB server daemon is running with AnchorWire listening on port `7448`:
+
+```bash
+go run ./examples/graph_traversal -url=wire://localhost:7448
+```
+
+---
+
 ## Expected Output & Benchmark Results
 
 ### 1. Multi-Hop Traversal Scores & Latencies

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,55 +24,41 @@ type GraphNode struct {
 }
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
+	wireURL := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or localhost:7448")
+	authToken := flag.String("token", "", "Optional auth token")
 	flag.Parse()
 
 	fmt.Println("==================================================================================")
 	fmt.Println("       AnchorDB Graph Traversal vs Schema: Multi-Thread (Mesh) Stress Test        ")
+	fmt.Println("                        (AnchorWire Binary TCP Protocol)                          ")
 	fmt.Println("==================================================================================")
 	fmt.Printf("OS/Arch:       %s/%s\n", runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("Logical CPUs:  %d cores\n", runtime.NumCPU())
 	fmt.Println("----------------------------------------------------------------------------------")
 	fmt.Println()
 
-	var client *driver.Client
-	var cleanup func()
-
-	if *mode == "wire" {
-		if *serverURL == "http://localhost:7447" || *serverURL == "" {
-			*serverURL = "wire://localhost:7448"
-		}
-		*mode = "remote"
+	target := *wireURL
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		fmt.Printf("[FATAL] HTTP is disabled in this example. Only AnchorWire binary TCP (wire://localhost:7448) is supported.\n")
+		os.Exit(1)
+	}
+	if !strings.HasPrefix(target, "wire://") && !strings.HasPrefix(target, "tcp://") {
+		target = "wire://" + target
 	}
 
-	if *mode == "remote" {
-		c, err := driver.Connect(*serverURL, driver.WithModel("infra_causal"))
-		if err != nil {
-			fmt.Printf("Failed to connect to %s: %v\n", *serverURL, err)
-			return
-		}
-		client = c
-		cleanup = func() { _ = client.Close() }
-	} else {
-		tmpDir, err := os.MkdirTemp("", "anchordb_graph_stress_*")
-		if err != nil {
-			fmt.Printf("Failed to create temp dir: %v\n", err)
-			return
-		}
-		c, err := driver.OpenEmbedded(tmpDir, driver.WithModel("infra_causal"))
-		if err != nil {
-			fmt.Printf("Failed to open embedded engine: %v\n", err)
-			_ = os.RemoveAll(tmpDir)
-			return
-		}
-		client = c
-		cleanup = func() {
-			_ = client.Close()
-			_ = os.RemoveAll(tmpDir)
-		}
+	opts := []driver.Option{driver.WithModel("infra_causal")}
+	if *authToken != "" {
+		opts = append(opts, driver.WithToken(*authToken))
 	}
-	defer cleanup()
+
+	t0 := time.Now()
+	client, err := driver.ConnectWire(target, opts...)
+	if err != nil {
+		fmt.Printf("[FATAL] Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.\n", target, err)
+		os.Exit(1)
+	}
+	defer client.Close()
+	fmt.Printf("[OK] Connected via AnchorWire Binary TCP (%s) in %v\n\n", target, time.Since(t0))
 
 	ctx := context.Background()
 

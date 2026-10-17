@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
 )
@@ -19,16 +20,23 @@ type GraphNode struct {
 
 func main() {
 	phase := flag.String("phase", "populate", "Execution phase: 'populate' or 'verify'")
-	url := flag.String("url", "http://localhost:7447", "AnchorDB server URL: http(s)://host:7447 or wire://host:7448")
+	url := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or tcp://host:7448")
 	flag.Parse()
+
+	target := *url
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		fmt.Printf("[FATAL] HTTP is disabled in this example. Only AnchorWire binary TCP (wire://localhost:7448) is supported.\n")
+		os.Exit(1)
+	}
+	if !strings.HasPrefix(target, "wire://") && !strings.HasPrefix(target, "tcp://") {
+		target = "wire://" + target
+	}
 
 	ctx := context.Background()
 
-	// driver.Connect auto-detects the transport: http(s):// uses the HTTP REST
-	// engine, wire:// (or tcp://, anchordb+wire://) uses AnchorWire.
-	client, err := driver.Connect(*url, driver.WithModel("infra_causal"))
+	client, err := driver.ConnectWire(target, driver.WithModel("infra_causal"))
 	if err != nil {
-		fmt.Printf("Connection error to %s: %v\n", *url, err)
+		fmt.Printf("AnchorWire connection error to %s: %v\n", target, err)
 		os.Exit(1)
 	}
 	defer client.Close()

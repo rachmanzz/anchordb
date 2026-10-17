@@ -5,6 +5,11 @@ bin/
 *.dll
 *.so
 *.dylib
+banking_fraud
+graph_traversal
+podman_durability
+spatial_graph
+supply_chain
 
 # Database files
 *.anchordb

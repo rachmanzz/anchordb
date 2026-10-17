@@ -92,14 +92,13 @@ examples/supply_chain/
 
 ---
 
-## 7. How to Run
+## 7. How to Run (AnchorWire Binary TCP)
 
-### Mode A: Embedded Engine (In-Process Runtime, Zero Dependency)
-Runs AnchorDB directly in the Go process memory with zero network overhead and no Docker/server required:
+AnchorDB communicates via the high-performance **AnchorWire Binary TCP Protocol** (default port `7448`):
 
 ```bash
-# Run realistic Vietnam flood disruption analysis (6-Hop Causal + In-Storage Math)
-go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
+# Run realistic Vietnam flood disruption analysis via AnchorWire TCP
+go run ./examples/supply_chain/main.go -url=wire://localhost:7448 -scenario=analysis
 ```
 
 #### Real Execution Output:
@@ -149,9 +148,9 @@ go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
 
 ---
 
-### Mode B: Container Mode (Docker & Podman)
+### Container Deployment (Docker & Podman)
 
-Runs AnchorDB as an isolated daemon container on port `7447`, communicating via HTTP REST client driver (`driver.ConnectRemote`).
+Runs AnchorDB as an isolated daemon container exposing AnchorWire TCP on port `7448`:
 
 #### Step 1: Start AnchorDB Container
 Using **Docker Compose**:
@@ -165,24 +164,20 @@ Or using **Podman**:
 podman run -d \
   --name anchordb-supply-chain \
   -p 7447:7447 \
+  -p 7448:7448 \
   -v ./data:/data:Z \
   -e ANCHORDB_PORT=7447 \
+  -e ANCHORDB_WIRE_PORT=7448 \
   -e ANCHORDB_DATA_DIR=/data \
   -e ANCHORDB_AUTH_TOKEN="supply_chain_secret_token" \
   -e ANCHORDB_WAL_SYNC=always \
   anchordb:latest
 ```
 
-Verify container health:
-```bash
-curl -H "Authorization: Bearer supply_chain_secret_token" http://localhost:7447/health
-```
-
-#### Step 2: Execute Supply Chain Analysis via Remote Driver
+#### Step 2: Execute Supply Chain Analysis via AnchorWire
 ```bash
 go run ./examples/supply_chain/main.go \
-  -mode=remote \
-  -url=http://localhost:7447 \
+  -url=wire://localhost:7448 \
   -token=supply_chain_secret_token \
   -scenario=analysis
 ```
@@ -193,18 +188,17 @@ go run ./examples/supply_chain/main.go \
 
 AnchorDB utilizes a **Write-Ahead Log (WAL)** with CRC32 frame checksums and strict fsync commit semantics.
 
-### Automated In-Process Crash Test:
+### Automated AnchorWire Session Durability Test:
 ```bash
-go run ./examples/supply_chain/main.go -scenario=crash-test -phase=all
+go run ./examples/supply_chain/main.go -token=supply_chain_secret_token -scenario=crash-test -phase=all
 ```
 
 ### Live Container Crash Test (Abrupt SIGKILL & Reboot):
 
-1. **Populate initial graph & data in container**:
+1. **Populate initial graph & data in container via AnchorWire**:
    ```bash
    go run ./examples/supply_chain/main.go \
-     -mode=remote \
-     -url=http://localhost:7447 \
+     -url=wire://localhost:7448 \
      -token=supply_chain_secret_token \
      -scenario=crash-test \
      -phase=populate

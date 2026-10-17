@@ -76,10 +76,11 @@ It proves that:
 mkdir -p ./podman_test_data
 chmod -R 777 ./podman_test_data
 
-# 2. Run AnchorDB container in the background
+# 2. Run AnchorDB container in the background exposing AnchorWire on port 7448
 podman run -d \
   --name anchordb-podman-test \
   -p 7447:7447 \
+  -p 7448:7448 \
   -v $(pwd)/podman_test_data:/data:Z \
   -e ANCHORDB_ALLOW_INSECURE=true \
   -e ANCHORDB_DATA_DIR=/data \
@@ -89,12 +90,12 @@ podman run -d \
 curl -s http://localhost:7447/health
 ```
 
-### Step 2: Populate Schema, Nodes, and Graph Edges
+### Step 2: Populate Schema, Nodes, and Graph Edges via AnchorWire
 
-Run the population phase using the example runner:
+Run the population phase using the example runner via AnchorWire Binary TCP:
 
 ```bash
-go run ./examples/podman_durability -phase=populate
+go run ./examples/podman_durability -phase=populate -url=wire://localhost:7448
 ```
 
 **Expected Output:**
@@ -102,7 +103,7 @@ go run ./examples/podman_durability -phase=populate
 ==========================================================================
    PODMAN STEP 1: Populating Schema, Multi-Branch Graph, and Initial Run
 ==========================================================================
-    [✓] Schema attached and locked to model 'infra_causal' via REST API
+    [✓] Schema attached and locked to model 'infra_causal' via AnchorWire TCP
     [✓] Ingested 28 nodes into Podman container with schema validation
     [✓] Linked 35 directed causal edges across 5 relational tiers
 
@@ -160,7 +161,7 @@ curl -s http://localhost:7447/health
 Execute the verification phase:
 
 ```bash
-go run ./examples/podman_durability -phase=verify
+go run ./examples/podman_durability -phase=verify -url=wire://localhost:7448
 ```
 
 **Expected Output:**

@@ -8,8 +8,10 @@ services:
     restart: unless-stopped
     ports:
       - "7447:7447"
+      - "7448:7448"
     environment:
       - ANCHORDB_PORT=7447
+      - ANCHORDB_WIRE_PORT=7448
       - ANCHORDB_DATA_DIR=/data
       - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:-supply_chain_secret_token}
       - ANCHORDB_MEMORY_LIMIT=2GB

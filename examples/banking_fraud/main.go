@@ -45,11 +45,9 @@ type FraudDecision struct {
 }
 
 func main() {
-	mode := flag.String("mode", "embedded", "Execution mode: 'embedded' (in-process engine), 'wire' (AnchorWire binary TCP protocol on port 7448), or 'remote' (HTTP engine on port 7447)")
-	serverURL := flag.String("url", "http://localhost:7447", "AnchorDB server URL (used in wire/remote mode): wire://host:7448 or http(s)://host:7447")
-	authToken := flag.String("token", "", "Bearer auth token for remote mode (if required)")
+	wireURL := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or localhost:7448")
+	authToken := flag.String("token", "", "Bearer auth token for AnchorWire (if required)")
 	modelName := flag.String("model", "banking_fraud", "Model name to isolate banking fraud data")
-	dataDir := flag.String("data-dir", "", "Storage directory for embedded mode (default: temporary directory)")
 	scenario := flag.String("scenario", "all", "Scenario: 'all', 'mule-tracking', 'impossible-travel', or 'scale-benchmark'")
 	scale := flag.Int("scale", 1000000, "Dataset scale for benchmark (minimum 1,000,000 accounts)")
 	flag.Parse()
@@ -61,19 +59,17 @@ func main() {
 
 	fmt.Println("==========================================================================================")
 	fmt.Println("       AnchorDB Banking Fraud Detection & Real-Time AML Prevention Engine                 ")
+	fmt.Println("                             (AnchorWire Binary TCP Protocol)                             ")
 	fmt.Println("==========================================================================================")
 	fmt.Printf("OS / Arch:       %s / %s\n", runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("Logical CPUs:    %d cores\n", runtime.NumCPU())
-	fmt.Printf("Execution Mode:  %s\n", strings.ToUpper(*mode))
+	fmt.Printf("Wire Server:     %s (Model: %s)\n", *wireURL, *modelName)
 	fmt.Printf("Target Scenario: %s\n", strings.ToUpper(*scenario))
 	fmt.Printf("Dataset Scale:   %s accounts (Minimum 1 Million)\n", formatNumber(*scale))
-	if *mode == "remote" {
-		fmt.Printf("Remote Server:   %s (Model: %s)\n", *serverURL, *modelName)
-	}
 	fmt.Println("------------------------------------------------------------------------------------------")
 	fmt.Println()
 
-	client, cleanup := setupClient(*mode, *serverURL, *authToken, *modelName, *dataDir)
+	client, cleanup := setupClient(*wireURL, *authToken, *modelName)
 	defer cleanup()
 
 	// 1. Schema Registration & Strict Contract Locking
@@ -466,56 +462,29 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 // HELPER FUNCTIONS
 // ------------------------------------------------------------------------------------------------
 
-func setupClient(mode, serverURL, authToken, modelName, dataDir string) (*driver.Client, func()) {
-	if mode == "wire" {
-		if serverURL == "http://localhost:7447" || serverURL == "" {
-			serverURL = "wire://localhost:7448"
-		}
-		mode = "remote"
-	}
-	if mode == "remote" {
-		opts := []driver.Option{
-			driver.WithModel(modelName),
-		}
-		if authToken != "" {
-			opts = append(opts, driver.WithToken(authToken))
-		}
-		// driver.Connect auto-detects the transport: http(s):// uses the HTTP
-		// REST engine, wire:// (or tcp://, anchordb+wire://) uses AnchorWire.
-		client, err := driver.Connect(serverURL, opts...)
-		if err != nil {
-			fmt.Printf("FATAL: Failed to connect to remote AnchorDB server (%s): %v\n", serverURL, err)
-			os.Exit(1)
-		}
-		return client, func() { _ = client.Close() }
-	}
-
-	// Embedded mode
-	targetDir := dataDir
-	var cleanupDir bool
-	if targetDir == "" {
-		tmp, err := os.MkdirTemp("", "anchordb_banking_fraud_*")
-		if err != nil {
-			fmt.Printf("FATAL: Failed to create temp directory: %v\n", err)
-			os.Exit(1)
-		}
-		targetDir = tmp
-		cleanupDir = true
-	}
-
-	client, err := driver.OpenEmbedded(targetDir, driver.WithModel(modelName))
-	if err != nil {
-		fmt.Printf("FATAL: Failed to open embedded AnchorDB engine in %s: %v\n", targetDir, err)
+func setupClient(serverURL, authToken, modelName string) (*driver.Client, func()) {
+	target := serverURL
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		fmt.Printf("FATAL: HTTP is disabled. Only AnchorWire binary TCP (wire://localhost:7448) is supported.\n")
 		os.Exit(1)
 	}
-
-	cleanup := func() {
-		_ = client.Close()
-		if cleanupDir {
-			_ = os.RemoveAll(targetDir)
-		}
+	if !strings.HasPrefix(target, "wire://") && !strings.HasPrefix(target, "tcp://") {
+		target = "wire://" + target
 	}
-	return client, cleanup
+
+	opts := []driver.Option{
+		driver.WithModel(modelName),
+	}
+	if authToken != "" {
+		opts = append(opts, driver.WithToken(authToken))
+	}
+
+	client, err := driver.ConnectWire(target, opts...)
+	if err != nil {
+		fmt.Printf("FATAL: Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.\n", target, err)
+		os.Exit(1)
+	}
+	return client, func() { _ = client.Close() }
 }
 
 func formatNumber(n int) string {

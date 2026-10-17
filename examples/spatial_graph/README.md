@@ -6,7 +6,7 @@ This example demonstrates AnchorDB's **2D Spatial Indexing, Vector Ray-Casting (
 
 ## What This Example Demonstrates
 
-1. **Embedded Engine (`driver.OpenEmbedded`)**: Initializes an in-process AnchorDB engine with memory-mapped zero-copy storage.
+1. **AnchorWire Binary TCP Engine (`driver.ConnectWire`)**: Connects to AnchorDB via the high-throughput Custom Binary TCP Protocol on port `7448`.
 2. **2D Spatial Grid Indexing**: Inserts spatial nodes with coordinates `(X, Y)` and 4-dimensional semantic roles.
 3. **Fast Voxel DDA Raycasting**: Casts directional rays through the 256×256 discrete spatial grid and ranks candidates by a composite score (beam energy × role-fit, attenuated by forward projection distance).
 4. **Direct Math Engine**: Calculates Euclidean distance, spatial centroids, cosine similarity, and nearest neighbors without leaving storage.
@@ -16,8 +16,10 @@ This example demonstrates AnchorDB's **2D Spatial Indexing, Vector Ray-Casting (
 
 ## How to Run
 
+Ensure the AnchorDB server is running with AnchorWire listening on port `7448`:
+
 ```bash
-go run ./examples/spatial_graph
+go run ./examples/spatial_graph -url=wire://localhost:7448
 ```
 
 ---
@@ -26,9 +28,10 @@ go run ./examples/spatial_graph
 
 ```
 ==========================================================
-    AnchorDB Example: 2D Spatial Grid & Raycasting DDA
+    AnchorDB Example: 2D Spatial Grid & Raycasting DDA    
+             (AnchorWire Binary TCP Protocol)             
 ==========================================================
-[OK] Connected to AnchorDB Embedded Engine in 144.7µs (mmap zero-copy)
+[OK] Connected via AnchorWire Binary TCP (wire://localhost:7448) in 520.4µs
 ----------------------------------------------------------
 >>> QUERY 1: In-Storage Pushdown Spatial Graph Step
 Query: client.Graph().From('primary_cluster', 'backup_cluster').Relate('route-down').TopK(5).Execute()
