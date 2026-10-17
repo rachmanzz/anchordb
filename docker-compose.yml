@@ -7,9 +7,11 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
-      - "7447:7447" # Dedicated AnchorDB Port
+      - "7447:7447" # Dedicated AnchorDB HTTP Port
+      - "7448:7448" # Dedicated AnchorDB AnchorWire Binary TCP Port
     environment:
       - ANCHORDB_PORT=7447
+      - ANCHORDB_WIRE_PORT=7448
       - ANCHORDB_DATA_DIR=/data
       # SECURITY: a strong token is mandatory. Export it before `docker compose up`:
       #   export ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 32)"

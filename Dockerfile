@@ -19,8 +19,8 @@ RUN apk add --no-cache ca-certificates && mkdir -p /data /app && adduser -D -u 1
 
 COPY --from=builder /anchordb-server /app/anchordb-server
 
-# Standard Dedicated AnchorDB Port
-EXPOSE 7447
+# Standard Dedicated AnchorDB Ports (7447: HTTP/REST, 7448: AnchorWire Binary TCP)
+EXPOSE 7447 7448
 
 # Volume mount for persistent *.anchordb binary storage
 VOLUME ["/data"]
@@ -32,6 +32,7 @@ USER anchordb
 # ANCHORDB_ALLOW_INSECURE=true. Provide a strong token at runtime, e.g.
 #   docker run -e ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 32)" ...
 ENV ANCHORDB_PORT=7447 \
+    ANCHORDB_WIRE_PORT=7448 \
     ANCHORDB_DATA_DIR=/data \
     ANCHORDB_AUTH_TOKEN="" \
     ANCHORDB_ALLOW_INSECURE=false \
