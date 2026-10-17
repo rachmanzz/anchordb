@@ -283,9 +283,29 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 	if len(nameBytes) > math.MaxUint16 {
 		return nil, fmt.Errorf("wal record name exceeds %d bytes", math.MaxUint16)
 	}
-	if len(cr.Attrs) > math.MaxUint16 {
+	if cr.AttrCount() > math.MaxUint16 {
 		return nil, fmt.Errorf("wal record has more than %d attributes", math.MaxUint16)
 	}
+	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
+		payloadLen := 2 + len(nameBytes) + 1 + len(cr.Raw)
+		if payloadLen > maxWALPayloadSize {
+			return nil, fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+		}
+		buf := make([]byte, payloadLen)
+		offset := 0
+
+		binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(nameBytes)))
+		offset += 2
+		copy(buf[offset:], nameBytes)
+		offset += len(nameBytes)
+
+		buf[offset] = cr.Operation
+		offset += 1
+
+		copy(buf[offset:], cr.Raw)
+		return buf, nil
+	}
+
 	payloadLen := 2 + len(nameBytes) + 1 + 2
 	for _, attr := range cr.Attrs {
 		if len(attr.Key) > math.MaxUint16 {

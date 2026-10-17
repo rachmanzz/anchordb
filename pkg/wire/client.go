@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -296,14 +297,28 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 					end = len(records)
 				}
 				chunk := records[i:end]
-				resp, err := c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
+				var resp Frame
+				var err error
+				for attempt := 0; attempt < 4; attempt++ {
+					resp, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
+					if err == nil {
+						break
+					}
+					if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
+						time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+						continue
+					}
+					return allNames, err
+				}
 				if err != nil {
 					return allNames, err
 				}
 				for _, r := range chunk {
 					allNames = append(allNames, r.Name)
 				}
-				_ = resp
+				if resp.Flags&FlagMemoryPressure != 0 {
+					time.Sleep(15 * time.Millisecond)
+				}
 
 				// Progressive release delay between slices
 				if nego.ReleaseIntervalMs > 0 && end < len(records) {
@@ -315,7 +330,19 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	}
 
 	// Direct send (single chunk or unpaced)
-	resp, err := c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
+	var resp Frame
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		resp, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
+			time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+			continue
+		}
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +350,9 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	for i, r := range records {
 		names[i] = r.Name
 	}
-	_ = resp
+	if resp.Flags&FlagMemoryPressure != 0 {
+		time.Sleep(15 * time.Millisecond)
+	}
 	return names, nil
 }
 

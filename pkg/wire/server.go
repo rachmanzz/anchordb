@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -284,6 +285,13 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				savedName, err = db.SaveRecordWithIDAndOp(item.Name, opStatus, item.Props)
 			}
+			headroom := system.GetMemoryHeadroom()
+			if headroom.UsedPercent >= 80 {
+				resp.Flags |= FlagMemoryPressure
+			}
+			if headroom.UsedPercent >= 82 {
+				db.TriggerAutoSync()
+			}
 			if err != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(500, err.Error())
@@ -302,6 +310,20 @@ func (s *Server) handleConn(conn net.Conn) {
 			headroom := system.GetMemoryHeadroom()
 			if headroom.UsedPercent >= 80 {
 				resp.Flags |= FlagMemoryPressure
+			}
+			if headroom.UsedPercent >= 82 {
+				db.TriggerAutoSync()
+			}
+			if headroom.UsedPercent >= 88 {
+				_ = db.Sync()
+				runtime.GC()
+				headroom = system.GetMemoryHeadroom()
+				if headroom.UsedPercent >= 88 {
+					resp.OpCode = OpResponseError
+					resp.Flags |= FlagMemoryPressure
+					resp.Payload = EncodeErrorPayload(507, "memory limit exceeded; backpressure active")
+					break
+				}
 			}
 			names, err := db.SaveRecordsBatch(items)
 			if err != nil {

@@ -1101,6 +1101,116 @@ func TestUpdateRecordsDirectTargetsHonorsOffset(t *testing.T) {
 	}
 }
 
+func TestZeroCopyMmapEntities(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "zerocopy.anchordb")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Save records (pending in memory)
+	items := []BatchRecordItem{
+		{Name: "item_1", Props: map[string]float32{"price": 10.5, "stock": 50}},
+		{Name: "item_2", Props: map[string]float32{"price": 99.9, "stock": 10}},
+	}
+	if _, err := db.SaveRecordsBatch(items); err != nil {
+		t.Fatalf("SaveRecordsBatch failed: %v", err)
+	}
+
+	// In memory before sync, Attrs is populated, Raw is nil
+	cr1 := db.EntityStore["item_1"]
+	if len(cr1.Attrs) == 0 || len(cr1.Raw) != 0 {
+		t.Fatalf("expected pending record to have Attrs and nil Raw, got Attrs=%d, Raw=%d", len(cr1.Attrs), len(cr1.Raw))
+	}
+
+	// 2. Sync to disk
+	if err := db.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// After sync, EntityStore is remapped to mmapData: Attrs is nil, Raw points to mmap
+	cr1Synced := db.EntityStore["item_1"]
+	if len(cr1Synced.Attrs) != 0 {
+		t.Fatalf("expected synced record to have empty Attrs, got %d", len(cr1Synced.Attrs))
+	}
+	if len(cr1Synced.Raw) == 0 {
+		t.Fatalf("expected synced record to have non-empty Raw")
+	}
+
+	// 3. Verify zero-copy reads
+	price, exists := cr1Synced.Get("price")
+	if !exists || price != 10.5 {
+		t.Fatalf("expected price 10.5, got %v (exists=%v)", price, exists)
+	}
+	stock, exists := cr1Synced.Get("stock")
+	if !exists || stock != 50 {
+		t.Fatalf("expected stock 50, got %v (exists=%v)", stock, exists)
+	}
+	m := cr1Synced.ToMap()
+	if m["price"] != 10.5 || m["stock"] != 50 {
+		t.Fatalf("ToMap mismatch: %v", m)
+	}
+
+	// 4. In-memory mutation on synced record: expands Attrs
+	cr1Updated := cr1Synced.Set("discount", 0.2)
+	if len(cr1Updated.Attrs) != 3 {
+		t.Fatalf("expected expanded Attrs of length 3, got %d", len(cr1Updated.Attrs))
+	}
+	if len(cr1Updated.Raw) != 0 {
+		t.Fatalf("expected Raw cleared upon mutation, got %d bytes", len(cr1Updated.Raw))
+	}
+	disc, exists := cr1Updated.Get("discount")
+	if !exists || disc != 0.2 {
+		t.Fatalf("expected discount 0.2, got %v", disc)
+	}
+}
+
+func TestAutoSyncTrigger(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "autosync.anchordb")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.SaveRecordWithID("e1", map[string]float32{"a": 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Before sync, e1 has Attrs
+	if len(db.EntityStore["e1"].Attrs) == 0 {
+		t.Fatalf("expected Attrs populated before sync")
+	}
+
+	// Trigger auto sync
+	if !db.TriggerAutoSync() {
+		t.Fatalf("expected TriggerAutoSync to succeed")
+	}
+
+	// Wait up to 2 seconds for background sync to finish
+	deadline := time.Now().Add(2 * time.Second)
+	synced := false
+	for time.Now().Before(deadline) {
+		db.mu.RLock()
+		cr := db.EntityStore["e1"]
+		if len(cr.Raw) > 0 && len(cr.Attrs) == 0 {
+			synced = true
+			db.mu.RUnlock()
+			break
+		}
+		db.mu.RUnlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !synced {
+		t.Fatalf("auto-sync did not re-map entities to zero-copy Raw within deadline")
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)

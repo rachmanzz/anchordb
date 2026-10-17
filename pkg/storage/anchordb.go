@@ -60,22 +60,54 @@ type AttrEntry struct {
 	Value float32
 }
 
-// CompactRecord stores properties and operation lifecycle state in a compact structure
+// CompactRecord stores properties and operation lifecycle state in a compact structure.
+// For synced records, Raw points directly to the mmap byte slice ([2 bytes attrCount][keyLen, key, val]...),
+// eliminating heap slice allocations and GC pointer scanning.
+// For pending records, Attrs holds the active attribute list.
 type CompactRecord struct {
 	Operation uint8
 	Attrs     []AttrEntry
+	Raw       []byte
 }
 
 func (cr CompactRecord) Get(key string) (float32, bool) {
-	for i := range cr.Attrs {
-		if cr.Attrs[i].Key == key {
-			return cr.Attrs[i].Value, true
+	if len(cr.Attrs) > 0 {
+		for i := range cr.Attrs {
+			if cr.Attrs[i].Key == key {
+				return cr.Attrs[i].Value, true
+			}
+		}
+		return 0, false
+	}
+	if len(cr.Raw) >= 2 {
+		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+		offset := 2
+		for a := 0; a < attrCount; a++ {
+			if offset+2 > len(cr.Raw) {
+				break
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				break
+			}
+			kBytes := cr.Raw[offset : offset+kLen]
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			if string(kBytes) == key {
+				return math.Float32frombits(valBits), true
+			}
 		}
 	}
 	return 0, false
 }
 
 func (cr CompactRecord) Set(key string, val float32) CompactRecord {
+	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
+		cr.Attrs = cr.expandAttrs()
+		cr.Raw = nil
+	}
 	for i := range cr.Attrs {
 		if cr.Attrs[i].Key == key {
 			cr.Attrs[i].Value = val
@@ -86,12 +118,64 @@ func (cr CompactRecord) Set(key string, val float32) CompactRecord {
 	return cr
 }
 
-func (cr CompactRecord) ToMap() map[string]float32 {
-	m := make(map[string]float32, len(cr.Attrs))
-	for i := range cr.Attrs {
-		m[cr.Attrs[i].Key] = cr.Attrs[i].Value
+func (cr CompactRecord) expandAttrs() []AttrEntry {
+	if len(cr.Attrs) > 0 {
+		return cr.Attrs
 	}
-	return m
+	if len(cr.Raw) < 2 {
+		return nil
+	}
+	attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+	attrs := make([]AttrEntry, 0, attrCount)
+	offset := 2
+	for a := 0; a < attrCount; a++ {
+		if offset+2 > len(cr.Raw) {
+			break
+		}
+		kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+		offset += 2
+		if offset+kLen+4 > len(cr.Raw) {
+			break
+		}
+		kStr := string(cr.Raw[offset : offset+kLen])
+		offset += kLen
+		valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+		offset += 4
+		attrs = append(attrs, AttrEntry{Key: kStr, Value: math.Float32frombits(valBits)})
+	}
+	return attrs
+}
+
+func (cr CompactRecord) ToMap() map[string]float32 {
+	if len(cr.Attrs) > 0 {
+		m := make(map[string]float32, len(cr.Attrs))
+		for i := range cr.Attrs {
+			m[cr.Attrs[i].Key] = cr.Attrs[i].Value
+		}
+		return m
+	}
+	if len(cr.Raw) >= 2 {
+		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+		m := make(map[string]float32, attrCount)
+		offset := 2
+		for a := 0; a < attrCount; a++ {
+			if offset+2 > len(cr.Raw) {
+				break
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				break
+			}
+			kStr := string(cr.Raw[offset : offset+kLen])
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			m[kStr] = math.Float32frombits(valBits)
+		}
+		return m
+	}
+	return make(map[string]float32)
 }
 
 func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
@@ -105,6 +189,48 @@ func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
 		}
 	}
 	return m
+}
+
+func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
+	if len(cr.Attrs) > 0 {
+		for i := range cr.Attrs {
+			if !fn(cr.Attrs[i].Key, cr.Attrs[i].Value) {
+				return
+			}
+		}
+		return
+	}
+	if len(cr.Raw) >= 2 {
+		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+		offset := 2
+		for a := 0; a < attrCount; a++ {
+			if offset+2 > len(cr.Raw) {
+				break
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				break
+			}
+			kStr := string(cr.Raw[offset : offset+kLen])
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			if !fn(kStr, math.Float32frombits(valBits)) {
+				return
+			}
+		}
+	}
+}
+
+func (cr CompactRecord) AttrCount() int {
+	if len(cr.Attrs) > 0 {
+		return len(cr.Attrs)
+	}
+	if len(cr.Raw) >= 2 {
+		return int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+	}
+	return 0
 }
 
 // MatchesFilter evaluates a FilterCondition directly on CompactRecord without allocating a map on the heap.
@@ -198,11 +324,21 @@ type AnchorDB struct {
 	// v3 files, where the optional edge section begins). Populated while loading.
 	entitySectionEnd int
 
+	// Entity zero-copy sync tracking
+	pendingEntitiesCount int64
+	isSyncing            bool
+	dirtyDuringSync      map[string]struct{}
+	autoSyncChan         chan struct{}
+	autoSyncDone         chan struct{}
+
 	filePath string
 
 	schema       ModelSchema
 	schemaLocked bool
 }
+
+// AutoSyncPendingThreshold is the number of pending entity mutations that automatically triggers a background Sync.
+const AutoSyncPendingThreshold = 50000
 
 // SetRelation registers or replaces a query direction vector safely.
 func (db *AnchorDB) SetRelation(name string, direction spatial.Point2D) error {
@@ -534,6 +670,37 @@ func (db *AnchorDB) CompactAttrPool() {
 	db.compactAttrPoolLocked()
 }
 
+func (db *AnchorDB) markEntityDirtyLocked(name string) {
+	if db.isSyncing && db.dirtyDuringSync != nil {
+		db.dirtyDuringSync[name] = struct{}{}
+	}
+}
+
+// TriggerAutoSync requests an asynchronous background Sync to flush pending records
+// and remap in-memory entities to disk (zero-copy mmap), reclaiming heap memory.
+func (db *AnchorDB) TriggerAutoSync() bool {
+	if db == nil || db.autoSyncChan == nil {
+		return false
+	}
+	select {
+	case db.autoSyncChan <- struct{}{}:
+		return true
+	default:
+		return true
+	}
+}
+
+func (db *AnchorDB) autoSyncLoop() {
+	for {
+		select {
+		case <-db.autoSyncDone:
+			return
+		case <-db.autoSyncChan:
+			_ = db.Sync()
+		}
+	}
+}
+
 func (db *AnchorDB) totalNodes() int {
 	return int(db.syncedNodeCount) + len(db.pendingNodes)
 }
@@ -632,6 +799,8 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		adjOut:         make(map[string][]int),
 		adjIn:          make(map[string][]int),
 		filePath:       filePath,
+		autoSyncChan:   make(chan struct{}, 1),
+		autoSyncDone:   make(chan struct{}),
 	}
 
 	// Keep the lock on a sidecar rather than the database inode: Sync atomically
@@ -768,6 +937,8 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to load model schema: %w", err)
 	}
+
+	go db.autoSyncLoop()
 
 	return db, nil
 }
@@ -973,10 +1144,10 @@ func (db *AnchorDB) loadEntities() error {
 		if offset+2 > len(data) {
 			return fmt.Errorf("corrupt file: truncated attribute count at entity %d", i)
 		}
+		attrStart := offset
 		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 
-		attrs := make([]AttrEntry, 0, attrCount)
 		for a := 0; a < attrCount; a++ {
 			if offset+2 > len(data) {
 				return fmt.Errorf("corrupt file: truncated attribute key length at entity %d", i)
@@ -986,13 +1157,10 @@ func (db *AnchorDB) loadEntities() error {
 			if offset+keyLen+4 > len(data) {
 				return fmt.Errorf("corrupt file: truncated attribute value at entity %d", i)
 			}
-			key := db.internAttr(string(data[offset : offset+keyLen]))
-			offset += keyLen
-			valBits := binary.LittleEndian.Uint32(data[offset : offset+4])
-			offset += 4
-			attrs = append(attrs, AttrEntry{Key: key, Value: math.Float32frombits(valBits)})
+			offset += keyLen + 4
 		}
-		db.EntityStore[name] = CompactRecord{Operation: opStatus, Attrs: attrs}
+		raw := data[attrStart:offset]
+		db.EntityStore[name] = CompactRecord{Operation: opStatus, Raw: raw}
 		db.EntityOrder = append(db.EntityOrder, name)
 		loaded++
 	}
@@ -1006,6 +1174,82 @@ func (db *AnchorDB) loadEntities() error {
 		return fmt.Errorf("corrupt file: %d trailing bytes after entity section", len(data)-offset)
 	}
 	return nil
+}
+
+// remapEntitiesLocked iterates the entity section in mmapData and points
+// all non-dirtied records in EntityStore directly to mmap bytes, dropping
+// heap AttrEntry slices. Caller must hold db.mu.Lock.
+func (db *AnchorDB) remapEntitiesLocked() {
+	if db.Header.EntityCount == 0 || db.Header.EntityOffset == 0 || len(db.mmapData) == 0 {
+		db.dirtyDuringSync = nil
+		db.isSyncing = false
+		return
+	}
+	if int(db.Header.EntityOffset) >= len(db.mmapData) {
+		db.dirtyDuringSync = nil
+		db.isSyncing = false
+		return
+	}
+	data := db.mmapData[db.Header.EntityOffset:]
+	offset := 0
+	for i := uint64(0); i < db.Header.EntityCount; i++ {
+		if offset+2 > len(data) {
+			break
+		}
+		nameLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if offset+nameLen > len(data) {
+			break
+		}
+		name := string(data[offset : offset+nameLen])
+		offset += nameLen
+
+		opStatus := OpStatusActive
+		if db.Header.Version >= 2 {
+			if offset+1 > len(data) {
+				break
+			}
+			opStatus = data[offset]
+			offset += 1
+		}
+
+		if offset+2 > len(data) {
+			break
+		}
+		attrStart := offset
+		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+
+		for a := 0; a < attrCount; a++ {
+			if offset+2 > len(data) {
+				break
+			}
+			keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+			if offset+keyLen+4 > len(data) {
+				break
+			}
+			offset += keyLen + 4
+		}
+		raw := data[attrStart:offset]
+
+		// If entity was modified while db.mu was released during Sync Step 2, keep its newer in-memory state
+		if db.dirtyDuringSync != nil {
+			if _, dirty := db.dirtyDuringSync[name]; dirty {
+				continue
+			}
+		}
+
+		if _, exists := db.EntityStore[name]; exists {
+			db.EntityStore[name] = CompactRecord{
+				Operation: opStatus,
+				Raw:       raw,
+			}
+		}
+	}
+	db.dirtyDuringSync = nil
+	db.isSyncing = false
+	db.compactAttrPoolLocked()
 }
 
 // AppendNode adds a new node record into AnchorDB.
@@ -1132,6 +1376,11 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 		db.EntityOrder = append(db.EntityOrder, name)
 	}
 	db.EntityStore[name] = cr
+	db.markEntityDirtyLocked(name)
+	db.pendingEntitiesCount++
+	if db.pendingEntitiesCount >= AutoSyncPendingThreshold {
+		db.TriggerAutoSync()
+	}
 
 	// Ensure entity also exists in the geometric graph
 	if _, exists := db.Lexicon[name]; !exists {
@@ -1189,6 +1438,11 @@ func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[st
 		db.EntityOrder = append(db.EntityOrder, name)
 	}
 	db.EntityStore[name] = cr
+	db.markEntityDirtyLocked(name)
+	db.pendingEntitiesCount++
+	if db.pendingEntitiesCount >= AutoSyncPendingThreshold {
+		db.TriggerAutoSync()
+	}
 	return name, nil
 }
 
@@ -1288,6 +1542,7 @@ func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) 
 			db.EntityOrder = append(db.EntityOrder, name)
 		}
 		db.EntityStore[name] = cr
+		db.markEntityDirtyLocked(name)
 
 		if item.Coord != nil || item.Roles != nil {
 			coord := spatial.Point2D{}
@@ -1309,6 +1564,11 @@ func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) 
 				db.appendNodeLocked(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
 			}
 		}
+	}
+
+	db.pendingEntitiesCount += int64(len(items))
+	if db.pendingEntitiesCount >= AutoSyncPendingThreshold {
+		db.TriggerAutoSync()
 	}
 
 	return names, nil
@@ -1608,6 +1868,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				}
 			}
 			db.EntityStore[name] = cr
+			db.markEntityDirtyLocked(name)
 			updatedCount++
 		}
 		return updatedCount, nil
@@ -1678,6 +1939,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			}
 		}
 		db.EntityStore[name] = cr
+		db.markEntityDirtyLocked(name)
 		updatedCount++
 	}
 
@@ -1714,6 +1976,7 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error
 		}
 		cr.Operation = status
 		db.EntityStore[name] = cr
+		db.markEntityDirtyLocked(name)
 		updated++
 	}
 	return updated, nil
@@ -1743,6 +2006,7 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 			}
 		}
 		db.EntityStore[name] = cr
+		db.markEntityDirtyLocked(name)
 		delete(db.partitionLocks, name)
 		updated++
 	}
@@ -1811,12 +2075,14 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 						}
 					}
 					db.EntityStore[written.Name] = current
+					db.markEntityDirtyLocked(written.Name)
 					delete(db.partitionLocks, written.Name)
 				}
 				return nil, errors.Join(fmt.Errorf("failed to persist partition lock for %q: %w", record.Name, err), errors.Join(rollbackErrs...))
 			}
 		}
 		db.EntityStore[record.Name] = updated
+		db.markEntityDirtyLocked(record.Name)
 		db.partitionLocks[record.Name] = true
 		locked = append(locked, record)
 	}
@@ -1910,6 +2176,7 @@ func (db *AnchorDB) DeleteRecords(names []string) (int, error) {
 func (db *AnchorDB) deleteEntityLocked(names map[string]bool) {
 	for name := range names {
 		delete(db.EntityStore, name)
+		db.markEntityDirtyLocked(name)
 		if nodeIdx, exists := db.Lexicon[name]; exists {
 			delete(db.Lexicon, name)
 			db.markNodeDeleted(nodeIdx)
@@ -1963,11 +2230,15 @@ func (db *AnchorDB) Sync() error {
 	entityStoreSnapshot := make(map[string]CompactRecord, len(db.EntityStore))
 	for _, name := range entityOrderSnapshot {
 		cr := db.EntityStore[name]
-		attrsCopy := make([]AttrEntry, len(cr.Attrs))
-		copy(attrsCopy, cr.Attrs)
+		var attrsCopy []AttrEntry
+		if len(cr.Attrs) > 0 {
+			attrsCopy = make([]AttrEntry, len(cr.Attrs))
+			copy(attrsCopy, cr.Attrs)
+		}
 		entityStoreSnapshot[name] = CompactRecord{
 			Operation: cr.Operation,
 			Attrs:     attrsCopy,
+			Raw:       cr.Raw,
 		}
 	}
 
@@ -1988,16 +2259,32 @@ func (db *AnchorDB) Sync() error {
 	hdrSnapshot.EntityCount = uint64(len(entityOrderSnapshot))
 	hdrSnapshot.EntityOffset = entityOffset
 
+	snappedPending := db.pendingEntitiesCount
+	db.dirtyDuringSync = make(map[string]struct{})
+	db.isSyncing = true
+
 	var walCheckpointOffset int64
 	if db.wal != nil {
 		var err error
 		walCheckpointOffset, err = db.wal.CurrentOffset()
 		if err != nil {
+			db.isSyncing = false
+			db.dirtyDuringSync = nil
 			db.mu.Unlock()
 			return fmt.Errorf("failed to capture wal checkpoint offset: %w", err)
 		}
 	}
 	db.mu.Unlock() // UNLOCK: Read/Write queries are free to proceed while disk I/O runs!
+
+	syncSuccess := false
+	defer func() {
+		if !syncSuccess {
+			db.mu.Lock()
+			db.isSyncing = false
+			db.dirtyDuringSync = nil
+			db.mu.Unlock()
+		}
+	}()
 
 	// 2. Stream snapshot to temp file and fsync - TOTALLY UNLOCKED!
 	tempFile, err := os.CreateTemp(filepath.Dir(db.filePath), ".anchordb_sync_*.tmp")
@@ -2057,8 +2344,8 @@ func (db *AnchorDB) Sync() error {
 		if len(nameBytes) > math.MaxUint16 {
 			return fmt.Errorf("entity name %q too long (%d bytes) for binary format", name, len(nameBytes))
 		}
-		if len(cr.Attrs) > math.MaxUint16 {
-			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", name, len(cr.Attrs))
+		if cr.AttrCount() > math.MaxUint16 {
+			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", name, cr.AttrCount())
 		}
 
 		// 2 bytes name length + name bytes
@@ -2076,28 +2363,34 @@ func (db *AnchorDB) Sync() error {
 			return err
 		}
 
-		// 2 bytes attr count
-		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(cr.Attrs)))
-		if _, err := writer.Write(lBuf[:]); err != nil {
-			return err
-		}
-
-		for _, attr := range cr.Attrs {
-			kBytes := []byte(attr.Key)
-			if len(kBytes) > math.MaxUint16 {
-				return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), name)
+		if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
+			if _, err := writer.Write(cr.Raw); err != nil {
+				return err
 			}
-			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
+		} else {
+			// 2 bytes attr count
+			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(cr.Attrs)))
 			if _, err := writer.Write(lBuf[:]); err != nil {
 				return err
 			}
-			if _, err := writer.Write(kBytes); err != nil {
-				return err
-			}
 
-			binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(attr.Value))
-			if _, err := writer.Write(vBuf[:]); err != nil {
-				return err
+			for _, attr := range cr.Attrs {
+				kBytes := []byte(attr.Key)
+				if len(kBytes) > math.MaxUint16 {
+					return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), name)
+				}
+				binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
+				if _, err := writer.Write(lBuf[:]); err != nil {
+					return err
+				}
+				if _, err := writer.Write(kBytes); err != nil {
+					return err
+				}
+
+				binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(attr.Value))
+				if _, err := writer.Write(vBuf[:]); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -2155,6 +2448,17 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 	oldFile, oldMmap, oldMapped := db.file, db.mmapData, db.isMmapped
+	db.file = newF
+	db.mmapData = mmapData
+	db.isMmapped = true
+	db.Header = hdrSnapshot
+
+	db.pendingEntitiesCount -= snappedPending
+	if db.pendingEntitiesCount < 0 {
+		db.pendingEntitiesCount = 0
+	}
+	db.remapEntitiesLocked()
+
 	if oldMapped && oldMmap != nil {
 		if err := syscall.Munmap(oldMmap); err != nil {
 			_ = syscall.Munmap(mmapData)
@@ -2162,10 +2466,6 @@ func (db *AnchorDB) Sync() error {
 			return fmt.Errorf("release previous database mapping: %w", err)
 		}
 	}
-	db.file = newF
-	db.mmapData = mmapData
-	db.isMmapped = true
-	db.Header = hdrSnapshot
 	if oldFile != nil {
 		if err := oldFile.Close(); err != nil {
 			return fmt.Errorf("close previous database file: %w", err)
@@ -2198,6 +2498,7 @@ func (db *AnchorDB) Sync() error {
 		}
 	}
 
+	syncSuccess = true
 	return nil
 }
 
@@ -2612,6 +2913,13 @@ func (db *AnchorDB) ExecuteGraphChainWithContext(ctx context.Context, initialInp
 // Sync can never resurrect a closed database. After Close, mutations and Sync fail
 // with ErrDatabaseClosed instead of silently succeeding without WAL durability.
 func (db *AnchorDB) Close() error {
+	if db.autoSyncDone != nil {
+		select {
+		case <-db.autoSyncDone:
+		default:
+			close(db.autoSyncDone)
+		}
+	}
 	db.syncMu.Lock()
 	defer db.syncMu.Unlock()
 	db.mu.Lock()
