@@ -21,7 +21,7 @@ func TestLocalDiskSinkStreamsFromFile(t *testing.T) {
 		t.Fatalf("write source: %v", err)
 	}
 
-	sink := NewLocalDiskSink(filepath.Join(dir, "out"))
+	sink := NewLocalDiskSink(filepath.Join(dir, "nested", "out"))
 	target, err := sink.SavePartitionFromFile("2026-10-16_part.anchordb", src)
 	if err != nil {
 		t.Fatalf("SavePartitionFromFile: %v", err)

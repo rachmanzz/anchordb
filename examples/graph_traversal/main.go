@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"os"
 	"runtime"
 	"sync"
@@ -57,8 +56,8 @@ func main() {
 		"severity":    "int",     // Required integer: 1 (info) to 5 (critical)
 		"impact_usd":  "float",   // Required float: economic impact
 		"latency_ms":  "float",   // Required float: latency impact
-		"is_critical": "bool",    // Required bool: 1.0 (true) or 0.0 (false)
-		"tier":        "string?", // Optional string tag
+		"is_critical": "bool", // Required bool: 1.0 (true) or 0.0 (false)
+		"tier":        "int?", // Optional int tag
 	}
 
 	if err := client.Attach(schema); err != nil {
@@ -218,9 +217,6 @@ func main() {
 		{"triggers", "propagates", "degrades", "disrupts", "escalates"}, // 5-Hops
 	}
 
-	var allTargets []string
-	targetSet := make(map[string]bool)
-
 	for i, rels := range hopRels {
 		hopNum := i + 1
 		t0 := time.Now()
@@ -236,10 +232,6 @@ func main() {
 
 		for rank, r := range res {
 			fmt.Printf("       [%d] Node: %-28s | Final Score: %.4f\n", rank+1, r.Word, r.Score)
-			if !targetSet[r.Word] {
-				targetSet[r.Word] = true
-				allTargets = append(allTargets, r.Word)
-			}
 		}
 		fmt.Println()
 	}
@@ -344,8 +336,4 @@ func main() {
 	fmt.Println("\n==================================================================================")
 	fmt.Println("               Graph Traversal & Schema Stress Test Completed!                    ")
 	fmt.Println("==================================================================================")
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }

@@ -26,7 +26,7 @@ go run ./examples/spatial_graph
 
 ```
 ==========================================================
-    AnchorDB Example: 2D Spatial Grid & Raycasting DDA    
+    AnchorDB Example: 2D Spatial Grid & Raycasting DDA
 ==========================================================
 [OK] Connected to AnchorDB Embedded Engine in 4.2ms (mmap zero-copy)
 ----------------------------------------------------------

@@ -171,3 +171,22 @@ func TestIPFilter_InvalidRulesReturnErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestIPFilter_LiteralQuotesHandledGracefully(t *testing.T) {
+	// Literal quotes from Docker compose env or shell strings should not cause failure
+	f1, err := NewIPFilter(`""`, false)
+	if err != nil {
+		t.Fatalf("expected literal quotes to be treated as empty, got error: %v", err)
+	}
+	if !f1.IsEmpty() {
+		t.Errorf("expected f1 to be empty/open")
+	}
+
+	f2, err := NewIPFilter(`"127.0.0.1", "10.0.0.1"`, false)
+	if err != nil {
+		t.Fatalf("expected quoted IPs to parse cleanly, got error: %v", err)
+	}
+	if !f2.IsAllowed(net.ParseIP("127.0.0.1")) {
+		t.Errorf("expected 127.0.0.1 allowed in f2")
+	}
+}

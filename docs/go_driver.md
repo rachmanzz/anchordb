@@ -100,18 +100,16 @@ Schemas are defined using `driver.Schema` (a mapping of field names to type stri
 
 ```go
 schema := driver.Schema{
-    "voltage":          "float",       // Required float32
-    "current":          "float",       // Required float32
-    "status":           "int",         // Required integer
-    "brand":            "string?",     // Optional string (trailing ?)
-    "tags":             "string[]?",   // Optional 1D string array
-    "vector_embedding": "float[]",     // Required 1D float vector
+    "voltage":     "float", // Required float32
+    "current":     "float", // Required float32
+    "status":      "int",   // Required integer
+    "is_active":   "bool?", // Optional boolean (trailing ?)
+    "calibrated":  "date?", // Optional calendar date (epoch day)
 }
 ```
 
 #### Supported Field Types & Modifiers:
-- **Primitives**: `string`, `int`, `float`, `bool`, `date` (YYYY-MM-DD epoch day)
-- **1D Arrays**: `string[]`, `int[]`, `float[]`, `bool[]`, `date[]`
+- **Primitives**: `int`, `float`, `bool`, `date` (YYYY-MM-DD epoch day)
 - **Required (Default)**: Omission of `?` makes the field strictly mandatory during writes.
 - **Optional (`?`)**: Suffix `?` marks the field as optional.
 

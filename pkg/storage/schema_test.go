@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -14,16 +15,19 @@ func TestSchema_ParseFieldSpec(t *testing.T) {
 		optional bool
 		wantErr  bool
 	}{
-		{"string", "string", false, false, false},
 		{"int", "int", false, false, false},
 		{"float", "float", false, false, false},
 		{"bool", "bool", false, false, false},
 		{"date", "date", false, false, false},
-		{"string?", "string", false, true, false},
 		{"int?", "int", false, true, false},
-		{"string[]", "string", true, false, false},
-		{"float[]?", "float", true, true, false},
-		{"int[]?", "int", true, true, false},
+		{"float?", "float", false, true, false},
+		{"bool?", "bool", false, true, false},
+		{"date?", "date", false, true, false},
+		{"string", "", false, false, true},
+		{"string?", "", false, false, true},
+		{"string[]", "", false, false, true},
+		{"float[]?", "", false, false, true},
+		{"int[]?", "", false, false, true},
 		{"unknown", "", false, false, true},
 		{"", "", false, false, true},
 	}
@@ -57,13 +61,20 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Unsupported string / array types must be rejected at AttachSchema
+	if err := db.AttachSchema(ModelSchema{"color": "string"}); !errors.Is(err, ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType for string schema field, got %v", err)
+	}
+	if err := db.AttachSchema(ModelSchema{"embedding": "float[]"}); !errors.Is(err, ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType for array schema field, got %v", err)
+	}
+
 	schema1 := ModelSchema{
-		"color":            "string",
-		"age":              "int",
-		"speed":            "float",
-		"brand":            "string?",
-		"tags":             "string[]?",
-		"vector_embedding": "float[]?",
+		"color_code": "int",
+		"age":        "int",
+		"speed":      "float",
+		"is_active":  "bool?",
+		"registered": "date?",
 	}
 
 	// 1. Initial Attach must succeed
@@ -78,8 +89,8 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 
 	// 3. Attach with mismatched schema must be REJECTED
 	mismatchedSchema := ModelSchema{
-		"color": "string",
-		"age":   "string", // Type mismatch: string instead of int
+		"color_code": "int",
+		"age":        "float", // Type mismatch: float instead of int
 	}
 	err = db.AttachSchema(mismatchedSchema)
 	if !errors.Is(err, ErrSchemaMismatch) {
@@ -88,7 +99,7 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 
 	// 4. Missing required field on Save must fail
 	err = db.SaveRecord("car_01", map[string]float32{
-		"color": 1.0,
+		"color_code": 1.0,
 		// "age" missing!
 		"speed": 80.0,
 	})
@@ -98,7 +109,7 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 
 	// 5. Unknown field on Save must fail
 	err = db.SaveRecord("car_01", map[string]float32{
-		"color":       1.0,
+		"color_code":  1.0,
 		"age":         3.0,
 		"speed":       80.0,
 		"rogue_field": 99.0, // not in schema
@@ -107,17 +118,63 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 		t.Fatalf("expected ErrUnknownField, got %v", err)
 	}
 
-	// 6. Valid record (including optional brand omitted) must succeed
+	// 6. Fractional value for int field on Save must fail
 	err = db.SaveRecord("car_01", map[string]float32{
-		"color": 1.0,
-		"age":   3.0,
-		"speed": 80.0,
+		"color_code": 1.0,
+		"age":        3.5, // fractional value for int!
+		"speed":      80.0,
+	})
+	if !errors.Is(err, ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType for fractional int on save, got %v", err)
+	}
+
+	// 7. Valid record (including optional fields omitted) must succeed
+	err = db.SaveRecord("car_01", map[string]float32{
+		"color_code": 1.0,
+		"age":        3.0,
+		"speed":      80.0,
 	})
 	if err != nil {
 		t.Fatalf("valid SaveRecord failed: %v", err)
 	}
 
-	// 7. Verify persistence across DB re-open
+	// 8. UpdateRecords must also enforce schema field types (reject age=0.5)
+	_, err = db.UpdateRecords(UpdateOptions{
+		TargetEntities: []string{"car_01"},
+		Mutations: map[string]ComputeOp{
+			"age": OpAdd{FieldA: "0", FieldB: "0.5"},
+		},
+	})
+	if !errors.Is(err, ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType when updating int field to 0.5 (targeted), got %v", err)
+	}
+	// Scan path must also reject non-integer update on int field
+	_, err = db.UpdateRecords(UpdateOptions{
+		Mutations: map[string]ComputeOp{
+			"age": OpAdd{FieldA: "age", FieldB: "0.5"},
+		},
+	})
+	if !errors.Is(err, ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType when updating int field to 3.5 (scan), got %v", err)
+	}
+	// Verify age remained 3.0 after rejected updates
+	gotProps, err := db.GetRecord("car_01")
+	if err != nil || gotProps["age"] != 3.0 {
+		t.Fatalf("expected car_01 age to remain 3.0 after rejected update, got %v (err=%v)", gotProps["age"], err)
+	}
+
+	// Valid integer update must succeed
+	updated, err := db.UpdateRecords(UpdateOptions{
+		TargetEntities: []string{"car_01"},
+		Mutations: map[string]ComputeOp{
+			"age": OpAdd{FieldA: "age", FieldB: "1"},
+		},
+	})
+	if err != nil || updated != 1 {
+		t.Fatalf("expected valid integer update to succeed (updated=1), got updated=%d err=%v", updated, err)
+	}
+
+	// 9. Verify persistence across DB re-open
 	if err := db.Close(); err != nil {
 		t.Fatalf("db close failed: %v", err)
 	}
@@ -138,7 +195,7 @@ func TestSchema_AttachCompareAndValidation(t *testing.T) {
 
 	// Verify that saving invalid record still fails on reopened DB
 	err = reopenedDB.SaveRecord("car_02", map[string]float32{
-		"color": 1.0, // missing age!
+		"color_code": 1.0, // missing age!
 	})
 	if !errors.Is(err, ErrMissingRequiredField) {
 		t.Fatalf("expected ErrMissingRequiredField on reopened DB, got %v", err)
@@ -179,5 +236,33 @@ func TestSchema_ResetAllowsNewSchema(t *testing.T) {
 	loaded, ok := db.GetSchema()
 	if !ok || loaded["y"] != "int" {
 		t.Fatalf("expected schemaB attached after reset, got %+v", loaded)
+	}
+}
+
+func TestSchema_ResetKeepsLockWhenSidecarRemovalFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "model.anchordb")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AttachSchema(ModelSchema{"x": "float"}); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := dbPath + ".schema"
+	if err := os.Remove(sidecar); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sidecar, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sidecar, "keep"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetSchema(); err == nil {
+		t.Fatal("ResetSchema should report sidecar removal failure")
+	}
+	if schema, locked := db.GetSchema(); !locked || schema["x"] != "float" {
+		t.Fatalf("schema lock changed after failed reset: locked=%v schema=%v", locked, schema)
 	}
 }

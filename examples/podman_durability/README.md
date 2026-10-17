@@ -100,7 +100,7 @@ go run ./examples/podman_durability -phase=populate
 **Expected Output:**
 ```
 ==========================================================================
-   PODMAN STEP 1: Populating Schema, Multi-Branch Graph, and Initial Run   
+   PODMAN STEP 1: Populating Schema, Multi-Branch Graph, and Initial Run
 ==========================================================================
     [✓] Schema attached and locked to model 'infra_causal' via REST API
     [✓] Ingested 28 nodes into Podman container with schema validation
@@ -166,7 +166,7 @@ go run ./examples/podman_durability -phase=verify
 **Expected Output:**
 ```
 ==========================================================================
-   PODMAN STEP 3: Verifying Schema, Traversal, Get & List After Restart   
+   PODMAN STEP 3: Verifying Schema, Traversal, Get & List After Restart
 ==========================================================================
     [✓] Schema Contract Restored from disk: map[impact_usd:float is_critical:bool latency_ms:float severity:int tier:string?]
 
@@ -228,7 +228,7 @@ go run ./examples/podman_durability -phase=verify
     db_primary_crash             | 5        | $180000.00   | $900000.00     | 1
 
 ==========================================================================
-   PODMAN CONTAINER DURABILITY VERIFICATION: 100% PASSED!                  
+   PODMAN CONTAINER DURABILITY VERIFICATION: 100% PASSED!
 ==========================================================================
 ```
 

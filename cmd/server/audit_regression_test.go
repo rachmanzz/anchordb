@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
 // When a token is configured, every /v1 endpoint must reject unauthenticated
@@ -94,5 +100,91 @@ func TestPartitionRunRejectsPrivateS3Endpoint(t *testing.T) {
 	s.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for private s3 endpoint, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSaveSchemaRejectionDoesNotLeaveNode(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+	db, err := s.getModel("m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AttachSchema(storage.ModelSchema{"required": "float"}); err != nil {
+		t.Fatal(err)
+	}
+	request := []byte(`{"model":"m","name":"orphan","props":{"wrong":1},"coord":{"X":0.2,"Y":0.3}}`)
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/save", bytes.NewReader(request)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("save status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, exists := db.Lexicon["orphan"]; exists {
+		t.Fatal("schema rejection left an orphan node")
+	}
+}
+
+func TestDynamicAPIErrorIsJSON(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+	db, err := s.getModel("m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveRecord("existing", map[string]float32{"x": 1}); err != nil {
+		t.Fatal(err)
+	}
+	expr := "bad\"line\n"
+	request, err := json.Marshal(GetRequest{Model: "m", Name: "existing", Computations: map[string]string{"out": expr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/get", bytes.NewReader(request)))
+	if rec.Code != http.StatusBadRequest || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("error status=%d content-type=%q body=%s", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON error: %v body=%s", err, rec.Body.String())
+	}
+	if !strings.Contains(payload["error"], strconv.Quote(expr)) {
+		t.Fatalf("error omitted expression: %q", payload["error"])
+	}
+}
+
+func TestCollectorReportsSyncFailure(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+	db, err := s.getModel("m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveRecordWithIDAndOp("expired", storage.OpStatusTombstone, map[string]float32{"x": 1}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "m.anchordb")
+	held := path + ".held"
+	if err := os.Rename(path, held); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.RemoveAll(path)
+		_ = os.Rename(held, path)
+	}()
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "keep"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/collector/run", strings.NewReader(`{"model":"m"}`)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("collector falsely succeeded: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil || !strings.Contains(payload["error"], "sync model m") {
+		t.Fatalf("collector error: payload=%v err=%v", payload, err)
 	}
 }

@@ -27,14 +27,74 @@ func main() {
 	}
 }
 
-func run(args []string) error {
-	var (
-		urlFlag     string
-		tokenFlag   string
-		modelFlag   string
-		timeoutFlag time.Duration
-	)
+// extractGlobalFlags parses global flags (-url, -token, -model, -timeout) from args
+// regardless of whether they appear before or after subcommand arguments, returning
+// the configuration and remaining non-global command tokens.
+func extractGlobalFlags(args []string, defaultURL, defaultToken, defaultModel string, defaultTimeout time.Duration) (url, token, model string, timeout time.Duration, remaining []string, err error) {
+	url = defaultURL
+	token = defaultToken
+	model = defaultModel
+	timeout = defaultTimeout
 
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-url" || arg == "--url":
+			if i+1 >= len(args) {
+				return "", "", "", 0, nil, errors.New("flag needs an argument: " + arg)
+			}
+			url = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "-url=") || strings.HasPrefix(arg, "--url="):
+			parts := strings.SplitN(arg, "=", 2)
+			url = parts[1]
+
+		case arg == "-token" || arg == "--token":
+			if i+1 >= len(args) {
+				return "", "", "", 0, nil, errors.New("flag needs an argument: " + arg)
+			}
+			token = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "-token=") || strings.HasPrefix(arg, "--token="):
+			parts := strings.SplitN(arg, "=", 2)
+			token = parts[1]
+
+		case arg == "-model" || arg == "--model":
+			if i+1 >= len(args) {
+				return "", "", "", 0, nil, errors.New("flag needs an argument: " + arg)
+			}
+			model = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "-model=") || strings.HasPrefix(arg, "--model="):
+			parts := strings.SplitN(arg, "=", 2)
+			model = parts[1]
+
+		case arg == "-timeout" || arg == "--timeout":
+			if i+1 >= len(args) {
+				return "", "", "", 0, nil, errors.New("flag needs an argument: " + arg)
+			}
+			d, parseErr := time.ParseDuration(args[i+1])
+			if parseErr != nil {
+				return "", "", "", 0, nil, fmt.Errorf("invalid timeout value: %w", parseErr)
+			}
+			timeout = d
+			i++
+		case strings.HasPrefix(arg, "-timeout=") || strings.HasPrefix(arg, "--timeout="):
+			parts := strings.SplitN(arg, "=", 2)
+			d, parseErr := time.ParseDuration(parts[1])
+			if parseErr != nil {
+				return "", "", "", 0, nil, fmt.Errorf("invalid timeout value: %w", parseErr)
+			}
+			timeout = d
+
+		default:
+			remaining = append(remaining, arg)
+		}
+	}
+	return url, token, model, timeout, remaining, nil
+}
+
+func run(args []string) error {
 	defaultURL := os.Getenv("ANCHORDB_URL")
 	if defaultURL == "" {
 		defaultURL = "http://localhost:7447"
@@ -45,21 +105,20 @@ func run(args []string) error {
 		defaultModel = "default"
 	}
 
-	rootFlags := flag.NewFlagSet("anchordb", flag.ContinueOnError)
-	rootFlags.StringVar(&urlFlag, "url", defaultURL, "AnchorDB server URL (or env ANCHORDB_URL)")
-	rootFlags.StringVar(&tokenFlag, "token", defaultToken, "Bearer authentication token (or env ANCHORDB_TOKEN)")
-	rootFlags.StringVar(&modelFlag, "model", defaultModel, "Target model database name (or env ANCHORDB_MODEL)")
-	rootFlags.DurationVar(&timeoutFlag, "timeout", 10*time.Second, "Request timeout duration")
-	rootFlags.Usage = printUsage
+	urlFlag, tokenFlag, modelFlag, timeoutFlag, remaining, err := extractGlobalFlags(args, defaultURL, defaultToken, defaultModel, 10*time.Second)
+	if err != nil {
+		return err
+	}
 
-	if len(args) < 1 {
+	if len(remaining) < 1 {
 		printUsage()
 		return nil
 	}
 
-	cmd := args[0]
+	cmd := remaining[0]
+	subArgs := remaining[1:]
 
-	// Handle global help / version before flag parsing
+	// Handle global help / version before dispatching
 	switch cmd {
 	case "help", "-h", "--help":
 		printUsage()
@@ -67,11 +126,6 @@ func run(args []string) error {
 	case "version", "-v", "--version":
 		fmt.Printf("AnchorDB CLI %s (%s/%s, runtime: %s)\n", cliVersion, runtime.GOOS, runtime.GOARCH, runtime.Version())
 		return nil
-	}
-
-	// Parse remainder args
-	if err := rootFlags.Parse(args[1:]); err != nil {
-		return err
 	}
 
 	client, err := driver.ConnectRemote(urlFlag,
@@ -86,8 +140,6 @@ func run(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFlag)
 	defer cancel()
-
-	subArgs := rootFlags.Args()
 
 	switch cmd {
 	case "ping":
@@ -134,7 +186,7 @@ Core Commands:
   version                       Display CLI version and build information
   help                          Display this help text
 
-Global Flags:
+Global Flags (usable before or after subcommands):
   -url string       AnchorDB server URL (default: http://localhost:7447, env: ANCHORDB_URL)
   -token string     Bearer authentication token (env: ANCHORDB_TOKEN)
   -model string     Target model database name (default: default, env: ANCHORDB_MODEL)
@@ -144,6 +196,7 @@ Examples:
   anchordb ping
   anchordb save sensor_1 distance=120 duration=2.0 -model plant_iot
   anchordb get sensor_1 -model plant_iot
+  anchordb list -page 2 -limit 10 -model plant_iot
   anchordb schema attach voltage:float current:float status:int -model plant_iot
   anchordb schema get -model plant_iot
   anchordb causal fuel_shortage causes -model events`)
@@ -325,19 +378,43 @@ func cmdSchema(ctx context.Context, client *driver.Client, args []string) error 
 	}
 }
 
-func cmdCausal(ctx context.Context, client *driver.Client, args []string) error {
-	if len(args) < 2 {
-		return errors.New("usage: anchordb causal <seed> <relation> [-k 5]")
-	}
-	seed := args[0]
-	rel := args[1]
-	k := 5
-
-	if len(args) > 2 {
-		if val, err := strconv.Atoi(args[2]); err == nil && val > 0 {
-			k = val
+func parseTraversalArgs(args []string) (positional []string, k int, err error) {
+	k = 5
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-k" || arg == "--k" {
+			if i+1 >= len(args) {
+				return nil, 0, fmt.Errorf("flag needs an argument: %s", arg)
+			}
+			i++
+			arg = args[i]
+		} else if strings.HasPrefix(arg, "-k=") || strings.HasPrefix(arg, "--k=") {
+			_, arg, _ = strings.Cut(arg, "=")
+		} else if strings.HasPrefix(arg, "-") {
+			return nil, 0, fmt.Errorf("unknown traversal flag: %s", arg)
+		} else {
+			positional = append(positional, arg)
+			continue
 		}
+		value, parseErr := strconv.Atoi(arg)
+		if parseErr != nil || value <= 0 {
+			return nil, 0, fmt.Errorf("invalid -k value %q: expected a positive integer", arg)
+		}
+		k = value
 	}
+	if len(positional) != 2 {
+		return nil, 0, errors.New("expected a seed and a relation")
+	}
+	return positional, k, nil
+}
+
+func cmdCausal(ctx context.Context, client *driver.Client, args []string) error {
+	positional, k, err := parseTraversalArgs(args)
+	if err != nil {
+		return fmt.Errorf("usage: anchordb causal <seed> <relation> [-k 5]: %w", err)
+	}
+	seed := positional[0]
+	rel := positional[1]
 
 	results, err := client.Causal(seed, rel, k)
 	if err != nil {
@@ -352,18 +429,12 @@ func cmdCausal(ctx context.Context, client *driver.Client, args []string) error 
 }
 
 func cmdChain(ctx context.Context, client *driver.Client, args []string) error {
-	if len(args) < 2 {
-		return errors.New("usage: anchordb chain <seed> <rel1,rel2,...> [-k 5]")
+	positional, k, err := parseTraversalArgs(args)
+	if err != nil {
+		return fmt.Errorf("usage: anchordb chain <seed> <rel1,rel2,...> [-k 5]: %w", err)
 	}
-	seed := args[0]
-	relations := strings.Split(args[1], ",")
-	k := 5
-
-	if len(args) > 2 {
-		if val, err := strconv.Atoi(args[2]); err == nil && val > 0 {
-			k = val
-		}
-	}
+	seed := positional[0]
+	relations := strings.Split(positional[1], ",")
 
 	results, err := client.CausalChain([]string{seed}, relations, k)
 	if err != nil {

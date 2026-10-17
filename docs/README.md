@@ -30,7 +30,7 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
 
 5. **[Model Schema Registration & Immutability Specification](model_schema_specification.md)**
    * One-time model schema registration and permanent file locking.
-   * Primitive types and 1D arrays (`string[]`, `float[]`, `int[]`, `bool[]`, `date[]`).
+   * Scalar numeric and temporal primitives (`int`, `float`, `bool`, `date`).
    * Required vs. optional (`?`) syntax.
    * Attach/connect schema verification, comparison, and fail-fast rejection (`ErrSchemaMismatch`).
    * Permanent lock lifecycle and administrative hard reset contract (`POST /v1/model/reset`).

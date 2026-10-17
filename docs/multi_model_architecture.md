@@ -57,7 +57,7 @@ When running the standalone engine server (e.g. Docker/Podman container on port 
 
 ```go
 // Connect to remote engine
-client, err := driver.ConnectRemote("http://localhost:7447", 
+client, err := driver.ConnectRemote("http://localhost:7447",
     driver.WithToken("secure-token"),
     driver.WithModel("sensors"),
 )
@@ -80,7 +80,7 @@ When embedded directly within a Go binary, the engine manages model files inside
 
 ```go
 // Open in-process engine runtime targeting local directory
-client, err := driver.OpenEmbedded("./data", 
+client, err := driver.OpenEmbedded("./data",
     driver.WithModel("sensors"),
     driver.WithWorkerConcurrency(4),
     driver.WithSyncInterval(5 * time.Second),

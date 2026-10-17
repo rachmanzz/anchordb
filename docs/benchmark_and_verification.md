@@ -132,7 +132,7 @@ Tests that data, WAL recovery, and file locks survive abrupt daemon restarts:
 
 ### Phase (F): Schema Attachment & Strict Immutability Stress
 Stresses the engine's contract enforcement and validation layers under heavy parallel load:
-1. **Schema Attachment**: Locks a model schema with primitives (`float`, `int`), optional modifiers (`?`), and 1D arrays (`string[]?`).
+1. **Schema Attachment**: Locks a model schema with scalar primitives (`float`, `int`, `bool`) and optional modifiers (`?`).
 2. **High-Concurrency Valid Ingestion**: 5,000 valid records ingested across 50 parallel goroutines (~13,900 writes/sec with 0 failures).
 3. **Fail-Fast Rejection Stress**: 1,000 invalid payloads (omitted required fields and undeclared unknown fields) sent across 20 goroutines; verifies 100% rejection with 0 leaks into storage.
 4. **Immutability Enforcement**: Re-attaching a conflicting schema under load fails with `ErrSchemaMismatch` (HTTP 409).

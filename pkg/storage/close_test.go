@@ -72,6 +72,25 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCloseReportsBackgroundWALError(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sync-error.anchordb"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	want := errors.New("background fsync failed")
+	db.wal.mu.Lock()
+	db.wal.syncErr = want
+	db.wal.mu.Unlock()
+
+	if err := db.Close(); !errors.Is(err, want) {
+		t.Fatalf("close error = %v, want background sync error", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+}
+
 // Close must wait for an in-flight Sync (they are mutually exclusive) so Sync
 // can never write into a DB that is being torn down. Run under -race.
 func TestConcurrentSyncAndClose(t *testing.T) {

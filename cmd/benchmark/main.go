@@ -227,7 +227,7 @@ func benchSchemaValidation() {
 		"temperature": "float",
 		"status":      "int",
 		"is_active":   "bool",
-		"zone":        "string?",
+		"zone":        "int?",
 	}
 	props := map[string]float32{
 		"voltage":     220.5,

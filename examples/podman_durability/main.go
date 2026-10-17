@@ -40,7 +40,8 @@ func main() {
 		{"triggers", "propagates", "degrades", "disrupts", "escalates"},
 	}
 
-	if *phase == "populate" {
+	switch *phase {
+	case "populate":
 		fmt.Println("==========================================================================")
 		fmt.Println("   PODMAN STEP 1: Populating Schema, Multi-Branch Graph, and Initial Run   ")
 		fmt.Println("==========================================================================")
@@ -51,7 +52,7 @@ func main() {
 			"impact_usd":  "float",
 			"latency_ms":  "float",
 			"is_critical": "bool",
-			"tier":        "string?",
+			"tier":        "int?",
 		}
 		if err := client.Attach(schema); err != nil {
 			fmt.Printf("client.Attach error: %v\n", err)
@@ -169,12 +170,16 @@ func main() {
 				fmt.Printf("CausalChain hop %d error: %v\n", hopNum, err)
 				os.Exit(1)
 			}
+			if len(res) == 0 {
+				fmt.Printf("    [X] CausalChain hop %d (%s) returned 0 nodes before restart\n", hopNum, rels[len(rels)-1])
+				os.Exit(1)
+			}
 			fmt.Printf("    Hop %d (%s) -> Reached %d nodes | Top: %-26s (Score: %.4f)\n",
 				hopNum, rels[len(rels)-1], len(res), res[0].Word, res[0].Score)
 		}
 		fmt.Println()
 
-	} else if *phase == "verify" {
+	case "verify":
 		fmt.Println("==========================================================================")
 		fmt.Println("   PODMAN STEP 3: Verifying Schema, Traversal, Get & List After Restart   ")
 		fmt.Println("==========================================================================")
@@ -196,6 +201,10 @@ func main() {
 				fmt.Printf("    [X] CausalChain hop %d error after restart: %v\n", hopNum, err)
 				os.Exit(1)
 			}
+			if len(res) == 0 {
+				fmt.Printf("    [X] CausalChain hop %d returned 0 nodes after restart\n", hopNum)
+				os.Exit(1)
+			}
 			fmt.Printf("    ▶ Hop %d (%-10s) -> %d nodes reached. Top Target: %-26s | Score: %.4f\n",
 				hopNum, rels[len(rels)-1], len(res), res[0].Word, res[0].Score)
 			for rIdx, r := range res {
@@ -212,8 +221,8 @@ func main() {
 		for _, name := range topNodes {
 			rec, err := client.Get(name).Execute(ctx)
 			if err != nil {
-				fmt.Printf("    Get(%s) error: %v\n", name, err)
-				continue
+				fmt.Printf("    [X] Get(%s) failed after restart: %v\n", name, err)
+				os.Exit(1)
 			}
 			fmt.Printf("    %-28s | %-8.0f | $%-11.2f | %-12.1f | %-11.0f\n",
 				rec.Name,
@@ -236,6 +245,10 @@ func main() {
 			fmt.Printf("    List query error: %v\n", err)
 			os.Exit(1)
 		}
+		if len(listRes.Items) == 0 {
+			fmt.Printf("    [X] List query returned 0 items after restart\n")
+			os.Exit(1)
+		}
 
 		fmt.Printf("    Total matching items returned: %d (HasMore: %v)\n", len(listRes.Items), listRes.HasMore)
 		fmt.Printf("    %-28s | %-8s | %-12s | %-14s | %-11s\n", "Entity Name", "Severity", "Impact (USD)", "Risk Index (Math)", "Is Critical")
@@ -252,5 +265,8 @@ func main() {
 		fmt.Println("\n==========================================================================")
 		fmt.Println("   PODMAN CONTAINER DURABILITY VERIFICATION: 100% PASSED!                  ")
 		fmt.Println("==========================================================================")
+	default:
+		fmt.Printf("Unknown phase %q; expected populate or verify\n", *phase)
+		os.Exit(1)
 	}
 }

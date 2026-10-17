@@ -325,10 +325,10 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 
 	// 2. Attach schema
 	schema := driver.Schema{
-		"quantity": "int",
-		"price":    "float",
-		"sku":      "string",
-		"tags":     "string[]?",
+		"quantity":  "int",
+		"price":     "float",
+		"sku":       "int",
+		"is_active": "bool?",
 	}
 	if err := client.Attach(schema); err != nil {
 		t.Fatalf("client.Attach failed: %v", err)
@@ -345,10 +345,10 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 
 	// 4. Attach identical schema -> success
 	identical := driver.Schema{
-		"quantity": "int",
-		"price":    "float",
-		"sku":      "string",
-		"tags":     "string[]?",
+		"quantity":  "int",
+		"price":     "float",
+		"sku":       "int",
+		"is_active": "bool?",
 	}
 	if err := client.Attach(identical); err != nil {
 		t.Fatalf("re-attaching identical schema failed: %v", err)
@@ -358,7 +358,7 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 	mismatched := driver.Schema{
 		"quantity": "float", // mismatched type
 		"price":    "float",
-		"sku":      "string",
+		"sku":      "int",
 	}
 	err = client.Attach(mismatched)
 	if err == nil {
@@ -376,6 +376,15 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("client.Save valid record failed: %v", err)
+	}
+
+	// 6b. Update record violating schema type (fractional value on int field) -> fails
+	_, err = client.Update().
+		In("item_1").
+		Set("quantity", driver.Add("0", "0.5")).
+		Execute(ctx)
+	if err == nil {
+		t.Fatalf("expected update error when setting int field quantity to 0.5, got nil")
 	}
 
 	// 7. Save record missing required field -> fails
@@ -402,7 +411,7 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 	_, err = driver.ConnectRemote(ts.URL,
 		driver.WithToken("secret-token-schema"),
 		driver.WithModel("inventory"),
-		driver.WithAttachSchema(driver.Schema{"category": "string"}),
+		driver.WithAttachSchema(driver.Schema{"category": "int"}),
 	)
 	if err == nil {
 		t.Fatalf("expected ConnectRemote rejection on mismatched schema, got nil")

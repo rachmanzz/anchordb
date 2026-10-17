@@ -17,16 +17,16 @@ services:
       - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:?set ANCHORDB_AUTH_TOKEN to a strong secret before starting}
       # Memory allocation (e.g. 500MB, 1GB, 5GB)
       - ANCHORDB_MEMORY_LIMIT=800MB
-      - ANCHORDB_IP_WHITELIST="" # Optional: e.g. "127.0.0.1,::1,192.168.1.0/24"
+      - ANCHORDB_IP_WHITELIST= # Optional: e.g. 127.0.0.1,::1,192.168.1.0/24
       - ANCHORDB_TRUST_PROXY=false
 
-      # Cron Scheduler (gosuite/v3/cron)
+      # Cron Scheduler (pkg/scheduler)
       - ANCHORDB_CRON_ENABLED=true
       - ANCHORDB_PARTITION_SCHEDULE=23:00
       - ANCHORDB_PARTITION_RETENTION_DAYS=180
       - ANCHORDB_SYNC_INTERVAL=5m
 
-      # Worker Engine (gosuite/v3/worker)
+      # Worker Engine (pkg/worker)
       - ANCHORDB_WORKER_ENABLED=true
       - ANCHORDB_WORKER_CONCURRENCY=8
       - ANCHORDB_WORKER_QUEUE_SIZE=1000

@@ -213,11 +213,11 @@ func limitRequestBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
 		if err != nil {
-			http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "failed to read request body")
 			return
 		}
 		if len(body) > maxRequestBodyBytes {
-			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -244,6 +244,12 @@ func requireMethod(w http.ResponseWriter, r *http.Request, allowed ...string) bo
 	w.WriteHeader(http.StatusMethodNotAllowed)
 	_, _ = io.WriteString(w, fmt.Sprintf(`{"error":"method not allowed; use %s"}`, strings.Join(allowed, " or ")))
 	return false
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 // validateS3Endpoint rejects endpoints that would let an authenticated caller
@@ -378,12 +384,18 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 			errs = append(errs, fmt.Errorf("sync model %s: %w", name, err))
 		}
 		if safeToClose {
-			_ = db.Close()
+			if err := db.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close model %s: %w", name, err))
+			}
 			delete(s.models, name)
 		}
 	}
 	if !safeToClose {
-		log.Printf("[WARN] Databases not closed because background work may still be running; durability guaranteed by WAL (replayed on restart).")
+		if s.dbOptions.WAL.SyncMode == storage.SyncAlways {
+			log.Printf("[WARN] Databases not closed because background work may still be running; durability of subsequent writes relies on WAL (sync=always, replayed on restart).")
+		} else {
+			log.Printf("[WARN] Databases not closed because background work may still be running; subsequent writes after this point are not guaranteed durable under non-sync WAL mode.")
+		}
 	}
 
 	return errors.Join(errs...)
@@ -633,7 +645,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	limited := limitRequestBody(next)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.isAuthorized(r) {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -922,13 +934,13 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	}
 	var req SaveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -947,22 +959,25 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		if req.Roles != nil {
 			roles = *req.Roles
 		}
-		if effectiveName == "" {
-			effectiveName = uuid.New().String()
-		}
-		if _, err := db.AppendNode(effectiveName, coord, roles, uint16(opStatus)); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
-			return
-		}
 		if len(req.Props) > 0 {
-			if _, err := db.SaveRecordWithIDAndOp(effectiveName, opStatus, req.Props); err != nil {
+			name, err := db.SaveRecordWithNode(effectiveName, opStatus, req.Props, coord, roles)
+			if err != nil {
 				if errors.Is(err, storage.ErrMissingRequiredField) ||
 					errors.Is(err, storage.ErrUnknownField) ||
 					errors.Is(err, storage.ErrInvalidFieldType) {
-					http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			effectiveName = name
+		} else {
+			if effectiveName == "" {
+				effectiveName = uuid.NewString()
+			}
+			if _, err := db.AppendNode(effectiveName, coord, roles, uint16(opStatus)); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
@@ -972,10 +987,10 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(err, storage.ErrMissingRequiredField) ||
 				errors.Is(err, storage.ErrUnknownField) ||
 				errors.Is(err, storage.ErrInvalidFieldType) {
-				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		effectiveName = name
@@ -995,19 +1010,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	var req GetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	_, op, err := db.GetRecordWithOperation(req.Name)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -1015,7 +1030,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	for outField, expr := range req.Computations {
 		opCompute, err := parseComputeOp(expr)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"invalid computation %q for field %q: %s"}`, expr, outField, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid computation %q for field %q: %s", expr, outField, err.Error()))
 			return
 		}
 		computations[outField] = opCompute
@@ -1023,7 +1038,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	props, err := db.GetRecordWithCompute(req.Name, computations, req.Select...)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -1041,13 +1056,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	var req ListRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1055,7 +1070,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	for outField, expr := range req.Computations {
 		op, err := parseComputeOp(expr)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"invalid computation %q for field %q: %s"}`, expr, outField, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid computation %q for field %q: %s", expr, outField, err.Error()))
 			return
 		}
 		computations[outField] = op
@@ -1063,7 +1078,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 	filters, err := buildFilters(req.Filters)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1093,7 +1108,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		AllowedOperations:    req.AllowedOperations,
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1111,13 +1126,13 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req UpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1125,7 +1140,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	for field, expr := range req.Mutations {
 		op, err := parseComputeOp(expr)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"invalid mutation %q for field %q: %s"}`, expr, field, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid mutation %q for field %q: %s", expr, field, err.Error()))
 			return
 		}
 		mutations[field] = op
@@ -1133,7 +1148,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	filters, err := buildFilters(req.Filters)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1160,7 +1175,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			// Note: No retry on arithmetic mutations (+ - * /) to prevent duplicate compounding of non-idempotent updates.
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch update to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("failed to dispatch update to worker: %s", err.Error()))
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -1181,11 +1196,13 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		Limit:          req.Limit,
 	})
 	if err != nil {
-		if errors.Is(err, storage.ErrUnknownField) {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		if errors.Is(err, storage.ErrUnknownField) ||
+			errors.Is(err, storage.ErrInvalidFieldType) ||
+			errors.Is(err, storage.ErrMissingRequiredField) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1201,13 +1218,13 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	var req GraphRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1223,7 +1240,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if len(req.Relations) > 0 {
 		steps, err := db.ExecuteGraphChainWithContext(r.Context(), req.Inputs, req.Relations, limit, beamWidth)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		seq := make([]string, len(steps))
@@ -1244,7 +1261,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	results, anchor, err := db.ExecuteGraphStepWithContext(r.Context(), req.Inputs, req.Relation, limit, orderMode, beamWidth)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1262,38 +1279,38 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 	}
 	var req EdgeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	switch strings.ToLower(strings.TrimSpace(req.Action)) {
 	case "", "add", "link":
 		if err := db.AddEdge(req.Source, req.Relation, req.Target, req.Weight); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	case "remove", "delete", "unlink":
 		if err := db.RemoveEdge(req.Source, req.Relation, req.Target); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	case "set_relation", "relation":
 		if req.Direction == nil {
-			http.Error(w, `{"error":"direction is required for set_relation"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "direction is required for set_relation")
 			return
 		}
 		if err := db.SetRelation(req.Relation, *req.Direction); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	default:
-		http.Error(w, `{"error":"action must be add, remove, or set_relation"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "action must be add, remove, or set_relation")
 		return
 	}
 
@@ -1310,13 +1327,13 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 	}
 	var req CausalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1332,7 +1349,7 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 		results, err = db.ExecuteCausalStep(r.Context(), req.Seeds, req.Relation, limit)
 	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1349,25 +1366,25 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 	}
 	var req MathRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	switch strings.ToLower(strings.TrimSpace(req.Op)) {
 	case "distance":
 		if len(req.Words) < 2 {
-			http.Error(w, `{"error":"distance requires at least 2 words"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "distance requires at least 2 words")
 			return
 		}
 		dist, err := db.CalculateDistance(req.Words[0], req.Words[1])
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1376,12 +1393,12 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		})
 	case "centroid":
 		if len(req.Words) < 1 {
-			http.Error(w, `{"error":"centroid requires at least 1 word"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "centroid requires at least 1 word")
 			return
 		}
 		coord, roles, err := db.CalculateCentroid(req.Words)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1391,12 +1408,12 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		})
 	case "cosine_similarity", "similarity":
 		if len(req.Words) < 2 {
-			http.Error(w, `{"error":"cosine_similarity requires at least 2 words"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "cosine_similarity requires at least 2 words")
 			return
 		}
 		sim, err := db.CalculateCosineSimilarity(req.Words[0], req.Words[1])
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1405,7 +1422,7 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		})
 	case "nearest":
 		if len(req.Words) < 1 {
-			http.Error(w, `{"error":"nearest requires at least 1 word"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "nearest requires at least 1 word")
 			return
 		}
 		limit := req.LimitK
@@ -1414,7 +1431,7 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		}
 		neighbors, err := db.FindNearestNeighbors(req.Words[0], limit)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1422,7 +1439,7 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			"neighbors": neighbors,
 		})
 	default:
-		http.Error(w, fmt.Sprintf(`{"error":"unsupported math op %q"}`, req.Op), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported math op %q", req.Op))
 	}
 }
 
@@ -1437,7 +1454,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1455,7 +1472,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			worker.WithRetry(1, 200*time.Millisecond),
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"failed to dispatch sync task to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("failed to dispatch sync task to worker: %s", err.Error()))
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -1470,7 +1487,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := db.Sync(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1497,13 +1514,13 @@ type PartitionRunRequest struct {
 
 func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed, use POST")
 		return
 	}
 
 	var req PartitionRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		http.Error(w, fmt.Sprintf(`{"error":"Invalid request body: %s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
 		return
 	}
 
@@ -1525,7 +1542,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	var sink partition.PartitionSink
 	if strings.ToLower(req.SinkType) == "s3" {
 		if err := validateS3Endpoint(req.S3Endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		endpoint := req.S3Endpoint
@@ -1547,27 +1564,27 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		} else {
 			absDataDir, err := filepath.Abs(s.dataDir)
 			if err != nil {
-				http.Error(w, `{"error":"invalid data directory"}`, http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, "invalid data directory")
 				return
 			}
 			absTarget, err := filepath.Abs(targetDir)
 			if err != nil {
-				http.Error(w, `{"error":"invalid target_path"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "invalid target_path")
 				return
 			}
 			resolvedRoot, err := filepath.EvalSymlinks(absDataDir)
 			if err != nil {
-				http.Error(w, `{"error":"cannot resolve data directory"}`, http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, "cannot resolve data directory")
 				return
 			}
 			resolvedTarget, err := resolvePathWithExistingSymlinks(absTarget)
 			if err != nil {
-				http.Error(w, `{"error":"cannot resolve target_path"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "cannot resolve target_path")
 				return
 			}
 			relTarget, relErr := filepath.Rel(resolvedRoot, resolvedTarget)
 			if relErr != nil || relTarget == ".." || strings.HasPrefix(relTarget, ".."+string(filepath.Separator)) || filepath.IsAbs(relTarget) {
-				http.Error(w, fmt.Sprintf(`{"error":"Invalid target_path: must reside inside data directory %s"}`, s.dataDir), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid target_path: must reside inside data directory %s", s.dataDir))
 				return
 			}
 			targetDir = resolvedTarget
@@ -1630,7 +1647,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		)
 
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch partition to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("Failed to dispatch partition to worker: %s", err.Error()))
 			return
 		}
 
@@ -1661,7 +1678,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			PruneHotDB:    prune,
 		})
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"Partition failed for model %s: %s"}`, m, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Partition failed for model %s: %s", m, err.Error()))
 			return
 		}
 
@@ -1690,7 +1707,7 @@ func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		http.Error(w, fmt.Sprintf(`{"error":"failed to read partitions directory: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read partitions directory: %s", err.Error()))
 		return
 	}
 
@@ -1736,24 +1753,24 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	}
 	var req PartitionInspectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 	if req.PartitionFile == "" {
-		http.Error(w, `{"error":"partition_file is required"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "partition_file is required")
 		return
 	}
 
 	cleanFilename := filepath.Base(req.PartitionFile)
 	fullPath := filepath.Join(s.dataDir, "partitions", cleanFilename)
 	if _, err := os.Stat(fullPath); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"partition file not found: %s"}`, cleanFilename), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("partition file not found: %s", cleanFilename))
 		return
 	}
 
 	pdb, err := storage.Open(fullPath)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to open partition: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open partition: %s", err.Error()))
 		return
 	}
 	defer pdb.Close()
@@ -1761,7 +1778,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	if req.Name != "" {
 		props, err := pdb.GetRecord(req.Name)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"record %q not found in partition"}`, req.Name), http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in partition", req.Name))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1779,7 +1796,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	}
 	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to list records in partition: %s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list records in partition: %s", err.Error()))
 		return
 	}
 
@@ -1822,7 +1839,7 @@ type SchedulerRunRequest struct {
 
 func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed, use POST")
 		return
 	}
 
@@ -1835,20 +1852,20 @@ func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 	}
 	taskName = strings.TrimSpace(taskName)
 	if taskName == "" {
-		http.Error(w, `{"error":"Task name is required (pass 'task' query param or JSON {'task': '...'})"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "Task name is required (pass 'task' query param or JSON {'task': '...'})")
 		return
 	}
 
 	if err := s.scheduler.RunNow(taskName); err != nil {
 		if strings.Contains(err.Error(), "already running") {
-			http.Error(w, fmt.Sprintf(`{"error":"Task %q is currently running"}`, taskName), http.StatusConflict)
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("Task %q is currently running", taskName))
 			return
 		}
 		if strings.Contains(err.Error(), "not found") {
-			http.Error(w, fmt.Sprintf(`{"error":"Task %q not found in scheduler"}`, taskName), http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("Task %q not found in scheduler", taskName))
 			return
 		}
-		http.Error(w, fmt.Sprintf(`{"error":"Failed to execute task %q: %s"}`, taskName, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to execute task %q: %s", taskName, err.Error()))
 		return
 	}
 
@@ -1879,13 +1896,13 @@ type CollectorRunRequest struct {
 
 func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed, use POST")
 		return
 	}
 
 	var req CollectorRunRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		http.Error(w, fmt.Sprintf(`{"error":"Invalid request body: %s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
 		return
 	}
 
@@ -1946,7 +1963,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 			worker.WithRetry(1, 200*time.Millisecond),
 		)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"Failed to dispatch collector to worker: %s"}`, err.Error()), dispatchErrorStatus(err))
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("Failed to dispatch collector to worker: %s", err.Error()))
 			return
 		}
 
@@ -1969,11 +1986,14 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		}
 		purged, err := db.CollectTombstones(maxBatch)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"collector failed for model %s: %s"}`, m, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("collector failed for model %s: %s", m, err.Error()))
 			return
 		}
 		if purged > 0 {
-			_ = db.Sync()
+			if err := db.Sync(); err != nil {
+				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("collector failed to sync model %s: %v", m, err))
+				return
+			}
 		}
 		totalPurged += purged
 	}
@@ -1994,13 +2014,13 @@ type WorkerCancelRequest struct {
 
 func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed, use POST")
 		return
 	}
 
 	var req WorkerCancelRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		http.Error(w, fmt.Sprintf(`{"error":"Invalid request body: %s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
 		return
 	}
 
@@ -2008,7 +2028,7 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 	if req.JobID != "" {
 		ok := s.worker.CancelByID(req.JobID)
 		if !ok {
-			http.Error(w, fmt.Sprintf(`{"error":"Task with job_id %q not found in queue"}`, req.JobID), http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("Task with job_id %q not found in queue", req.JobID))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2042,7 +2062,7 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Error(w, `{"error":"Scoped cancellation required. Provide 'job_id', 'model', or 'all: true' for global cancellation"}`, http.StatusBadRequest)
+	writeJSONError(w, http.StatusBadRequest, "Scoped cancellation required. Provide 'job_id', 'model', or 'all: true' for global cancellation")
 }
 
 type ModelAttachRequest struct {
@@ -2056,7 +2076,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	var req ModelAttachRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 	modelName := strings.TrimSpace(req.Model)
@@ -2064,13 +2084,13 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 		modelName = "default"
 	}
 	if len(req.Schema) == 0 {
-		http.Error(w, `{"error":"schema is required and cannot be empty"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "schema is required and cannot be empty")
 		return
 	}
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -2086,7 +2106,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2109,7 +2129,7 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 	}
 	db, err := s.getModel(modelName)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -2145,11 +2165,11 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 	}
 	var req ModelResetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 	if !req.Confirm {
-		http.Error(w, `{"error":"confirm must be true to reset model schema"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "confirm must be true to reset model schema")
 		return
 	}
 	modelName := strings.TrimSpace(req.Model)
@@ -2159,12 +2179,12 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if err := db.ResetSchema(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 

@@ -12,7 +12,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
-// Schema defines the contract for an AnchorDB model (e.g. {"color": "string", "age": "int", "brand": "string?"}).
+// Schema defines the contract for an AnchorDB model (e.g. {"voltage": "float", "age": "int", "active": "bool?"}).
 type Schema = storage.ModelSchema
 
 // Export schema error constants from storage for client convenience

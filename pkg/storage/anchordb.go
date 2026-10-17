@@ -737,6 +737,9 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 			db.applyWALDeleteLocked(ev.Name)
 		case WalOpNode:
 			db.appendNodeLocked(ev.Word, ev.Coord, ev.Roles, ev.DomainID)
+		case WalOpSaveNode:
+			db.appendNodeLocked(ev.Word, ev.Coord, ev.Roles, ev.DomainID)
+			db.applyWALSaveLocked(ev.Name, ev.Record)
 		case WalOpEdge:
 			db.upsertEdge(ev.Edge.Source, ev.Edge.Relation, ev.Edge.Target, ev.Edge.Weight)
 		case WalOpEdgeDelete:
@@ -1143,6 +1146,52 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 	return name, nil
 }
 
+// SaveRecordWithNode commits an entity and its geometric node as one WAL event.
+// Validation and both in-memory mutations run under the same database lock.
+func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[string]float32, coord spatial.Point2D, roles [4]float32) (string, error) {
+	if err := validateNodeGeometry(coord, roles); err != nil {
+		return "", err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = uuid.NewString()
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return "", ErrDatabaseClosed
+	}
+	if opStatus == OpStatusSafeDelete {
+		return "", fmt.Errorf("cannot save record with internal partition-lock status")
+	}
+	if db.partitionLocks[name] {
+		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
+	}
+	if db.schemaLocked && db.schema != nil {
+		if err := db.schema.ValidateProps(props); err != nil {
+			return "", err
+		}
+	}
+
+	attrs := make([]AttrEntry, 0, len(props))
+	for k, v := range props {
+		attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
+	}
+	cr := CompactRecord{Operation: opStatus, Attrs: attrs}
+	if db.wal != nil {
+		if err := db.wal.WriteSaveNode(name, cr, coord, roles, uint16(opStatus)); err != nil {
+			return "", fmt.Errorf("failed to write entity and node to wal: %w", err)
+		}
+	}
+	db.appendNodeLocked(name, coord, roles, uint16(opStatus))
+	if _, exists := db.EntityStore[name]; !exists {
+		db.EntityOrder = append(db.EntityOrder, name)
+	}
+	db.EntityStore[name] = cr
+	return name, nil
+}
+
 // SaveRecordWithID stores an entity with default OpStatusActive (1).
 func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (string, error) {
 	return db.SaveRecordWithIDAndOp(name, OpStatusActive, props)
@@ -1352,9 +1401,15 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		return 0, nil
 	}
 
+	var schemaSpecs map[string]FieldSpec
 	if db.schemaLocked && db.schema != nil {
+		var err error
+		schemaSpecs, err = db.schema.Parse()
+		if err != nil {
+			return 0, err
+		}
 		for outField := range opts.Mutations {
-			if _, exists := db.schema[outField]; !exists {
+			if _, exists := schemaSpecs[outField]; !exists {
 				return 0, fmt.Errorf("%w: field %q is not defined in model schema", ErrUnknownField, outField)
 			}
 		}
@@ -1414,6 +1469,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				newVal, err := op.Apply(props)
 				if err != nil {
 					return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
+				}
+				if schemaSpecs != nil {
+					if err := validateFieldValue(field, newVal, schemaSpecs[field]); err != nil {
+						return updatedCount, fmt.Errorf("update %q: %w", name, err)
+					}
 				}
 				pending[field] = newVal
 			}
@@ -1479,6 +1539,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			newVal, err := op.Apply(props)
 			if err != nil {
 				return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
+			}
+			if schemaSpecs != nil {
+				if err := validateFieldValue(field, newVal, schemaSpecs[field]); err != nil {
+					return updatedCount, fmt.Errorf("update %q: %w", name, err)
+				}
 			}
 			pending[field] = newVal
 		}
@@ -2434,26 +2499,37 @@ func (db *AnchorDB) Close() error {
 		return nil
 	}
 	db.closed = true
+	var closeErr error
 
 	if db.wal != nil {
-		_ = db.wal.Close()
+		if err := db.wal.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close wal: %w", err))
+		}
 		db.wal = nil
 	}
 
 	if db.isMmapped && db.mmapData != nil {
-		_ = syscall.Munmap(db.mmapData)
+		if err := syscall.Munmap(db.mmapData); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("unmap database: %w", err))
+		}
 		db.mmapData = nil
 		db.isMmapped = false
 	}
 
 	if db.file != nil {
-		_ = db.file.Close()
+		if err := db.file.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close database file: %w", err))
+		}
 		db.file = nil
 	}
 	if db.lockFile != nil {
-		_ = syscall.Flock(int(db.lockFile.Fd()), syscall.LOCK_UN)
-		_ = db.lockFile.Close()
+		if err := syscall.Flock(int(db.lockFile.Fd()), syscall.LOCK_UN); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("unlock database file: %w", err))
+		}
+		if err := db.lockFile.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close database lock file: %w", err))
+		}
 		db.lockFile = nil
 	}
-	return nil
+	return closeErr
 }

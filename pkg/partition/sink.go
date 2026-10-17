@@ -49,15 +49,18 @@ func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string,
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
 	}
-	if err := os.MkdirAll(s.BaseDir, 0755); err != nil {
-		return "", fmt.Errorf("failed creating partition directory: %w", err)
-	}
-
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return "", fmt.Errorf("failed opening source partition %s: %w", srcPath, err)
 	}
 	defer src.Close()
+	return s.savePartition(filename, src)
+}
+
+func (s *LocalDiskSink) savePartition(filename string, src io.Reader) (string, error) {
+	if err := mkdirPartitionDirDurably(s.BaseDir); err != nil {
+		return "", fmt.Errorf("failed creating partition directory: %w", err)
+	}
 
 	targetPath := filepath.Join(s.BaseDir, filename)
 	// Write to a temp file in the destination directory, fsync, then rename so a
@@ -87,27 +90,72 @@ func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string,
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("failed setting partition file permissions: %w", err)
 	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, err)
+	// Publish via os.Link instead of os.Rename so an existing archive (e.g. when a
+	// custom format like "{date}.anchordb" runs twice on the same day) is never
+	// overwritten. If targetPath already exists, disambiguate with a UUID suffix.
+	if err := os.Link(tmpPath, targetPath); err != nil {
+		if os.IsExist(err) {
+			ext := filepath.Ext(filename)
+			stem := strings.TrimSuffix(filename, ext)
+			uniqueName := fmt.Sprintf("%s_%s%s", stem, GenerateUUID(), ext)
+			targetPath = filepath.Join(s.BaseDir, uniqueName)
+			if linkErr := os.Link(tmpPath, targetPath); linkErr != nil {
+				_ = os.Remove(tmpPath)
+				return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, linkErr)
+			}
+		} else {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, err)
+		}
+	}
+	_ = os.Remove(tmpPath)
+	// The archive must survive a crash before its source can be pruned.
+	if err := syncPartitionDir(s.BaseDir); err != nil {
+		return "", fmt.Errorf("failed syncing partition directory for %s: %w", targetPath, err)
 	}
 	return targetPath, nil
+}
+
+// mkdirPartitionDirDurably also commits each newly created directory entry.
+// A durable archive filename is insufficient if its parent directory vanishes.
+func mkdirPartitionDirDurably(dir string) error {
+	var missing []string
+	for current := filepath.Clean(dir); ; current = filepath.Dir(current) {
+		if _, err := os.Stat(current); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, current)
+		if filepath.Dir(current) == current {
+			return fmt.Errorf("no existing ancestor for %s", dir)
+		}
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := syncPartitionDir(filepath.Dir(missing[i])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncPartitionDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (s *LocalDiskSink) SavePartition(filename string, data []byte) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
 	}
-	if err := os.MkdirAll(s.BaseDir, 0755); err != nil {
-		return "", fmt.Errorf("failed creating partition directory: %w", err)
-	}
-
-	targetPath := filepath.Join(s.BaseDir, filename)
-	if err := os.WriteFile(targetPath, data, 0600); err != nil {
-		return "", fmt.Errorf("failed writing partition file %s: %w", targetPath, err)
-	}
-
-	return targetPath, nil
+	return s.savePartition(filename, bytes.NewReader(data))
 }
 
 // S3Sink defines S3-compatible cloud storage destination (AWS S3, MinIO, Cloudflare R2, GCS)

@@ -298,3 +298,75 @@ func TestFormatPartitionFilename_Variations(t *testing.T) {
 		t.Errorf("unexpected custom filename: %q", name2)
 	}
 }
+
+func TestPartition_SameDayCustomFormatPreservesPriorArchive(t *testing.T) {
+	tmpDir := t.TempDir()
+	hotDBPath := filepath.Join(tmpDir, "events.anchordb")
+	partDir := filepath.Join(tmpDir, "partitions")
+
+	db, err := storage.Open(hotDBPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	nowDays := float32(time.Now().Unix() / 86400)
+	if err := db.SaveRecord("batch1_rec", map[string]float32{"date": nowDays - 250, "val": 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Sync()
+
+	policy := PartitionPolicy{
+		ModelName:     "events",
+		DateField:     "date",
+		RetentionDays: 180,
+		Sink:          NewLocalDiskSink(partDir),
+		FileFormat:    "{date}.anchordb",
+		PruneHotDB:    true,
+	}
+
+	res1, err := ExecutePartition(db, policy)
+	if err != nil {
+		t.Fatalf("first ExecutePartition failed: %v", err)
+	}
+	if res1.ArchivedCount != 1 {
+		t.Fatalf("expected 1 record in first partition, got %d", res1.ArchivedCount)
+	}
+
+	// Second old record arrives and is partitioned on the same day with the same "{date}.anchordb" format.
+	if err := db.SaveRecord("batch2_rec", map[string]float32{"date": nowDays - 220, "val": 2}); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Sync()
+
+	res2, err := ExecutePartition(db, policy)
+	if err != nil {
+		t.Fatalf("second ExecutePartition failed: %v", err)
+	}
+	if res2.ArchivedCount != 1 {
+		t.Fatalf("expected 1 record in second partition, got %d", res2.ArchivedCount)
+	}
+	if res1.TargetLocation == res2.TargetLocation {
+		t.Fatalf("second partition overwrote first archive path %s", res1.TargetLocation)
+	}
+
+	// Verify first archive still has batch1_rec
+	arch1, err := storage.Open(res1.TargetLocation)
+	if err != nil {
+		t.Fatalf("open first archive: %v", err)
+	}
+	defer arch1.Close()
+	if _, err := arch1.GetRecord("batch1_rec"); err != nil {
+		t.Fatalf("batch1_rec lost from first archive: %v", err)
+	}
+
+	// Verify second archive has batch2_rec
+	arch2, err := storage.Open(res2.TargetLocation)
+	if err != nil {
+		t.Fatalf("open second archive: %v", err)
+	}
+	defer arch2.Close()
+	if _, err := arch2.GetRecord("batch2_rec"); err != nil {
+		t.Fatalf("batch2_rec missing from second archive: %v", err)
+	}
+}

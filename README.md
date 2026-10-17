@@ -25,7 +25,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
   - Wall-clock aware cron scheduler (`pkg/scheduler`) for scheduled syncs and archival.
   - Asynchronous worker pool (`pkg/worker`) for background jobs and non-blocking maintenance tasks.
 - **Strict Schema Registration & Immutability**:
-  - One-time permanent schema locking with scalar primitives and 1D arrays (`string[]`, `float[]`, `int[]`, `bool[]`, `date[]`).
+  - One-time permanent schema locking with scalar numeric and temporal primitives (`int`, `float`, `bool`, `date`).
   - Required vs. optional (`?`) syntax, fail-fast rejection (`ErrSchemaMismatch`), and administrative reset.
 - **API & Client SDK**: RESTful HTTP API (default port `7447`) and a fluent Go driver library (`pkg/driver`).
 
@@ -34,7 +34,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 ## Feature Documentation
 
 - **[Multi-Model Architecture: One Model = One File](docs/multi_model_architecture.md)**: Independent storage files, failure isolation, and memory-mapped model routing.
-- **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**: Strict contract enforcement, primitives, 1D arrays, and fail-fast validation.
+- **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**: Strict contract enforcement, scalar primitives, and fail-fast validation.
 - **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, attribute projections, and batch updates.
 - **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, and weighted causal chains.
 - **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
@@ -202,10 +202,10 @@ func main() {
 	// 1. Declare Model Schema Contract
 	// AnchorDB enforces strict data contracts per model to prevent drift and corruption.
 	schema := driver.Schema{
-		"distance":  "float",     // Required float32 metric
-		"duration":  "float",     // Required float32 metric
-		"sensor_id": "string?",   // Optional string attribute (trailing ?)
-		"tags":      "string[]?", // Optional 1D string array
+		"distance":  "float", // Required float32 metric
+		"duration":  "float", // Required float32 metric
+		"sensor_id": "int?",  // Optional integer attribute (trailing ?)
+		"is_active": "bool?", // Optional boolean flag
 	}
 
 	// Mode A: Remote Engine (Connect over HTTP with schema attachment & verification)
@@ -257,12 +257,11 @@ AnchorDB enforces strict schema immutability per model database to guarantee typ
 ```go
 // Define schema contract: required types and optional (?) fields
 sensorSchema := driver.Schema{
-	"voltage":          "float",       // Required float32
-	"current":          "float",       // Required float32
-	"status":           "int",         // Required integer
-	"brand":            "string?",     // Optional string
-	"tags":             "string[]?",   // Optional 1D string array
-	"vector_embedding": "float[]",     // Required 1D float vector embedding
+	"voltage":    "float", // Required float32
+	"current":    "float", // Required float32
+	"status":     "int",   // Required integer
+	"is_active":  "bool?", // Optional boolean
+	"calibrated": "date?", // Optional calendar date (epoch day)
 }
 
 // 1. Attach to active model (fails fast if an incompatible schema was already locked)
@@ -278,11 +277,10 @@ registeredSchema, err := client.GetSchema(ctx)
 ```
 
 #### Supported Types & Validation Rules
-- **Primitives**: `string`, `int`, `float`, `bool`, `date` (`YYYY-MM-DD` epoch day).
-- **1D Arrays**: `string[]`, `int[]`, `float[]`, `bool[]`, `date[]`.
+- **Primitives**: `int`, `float`, `bool`, `date` (`YYYY-MM-DD` epoch day).
 - **Required (Default)**: Omission of `?` makes the field strictly mandatory. Missing fields return `driver.ErrMissingRequiredField`.
 - **Optional (`?` Modifier)**: Suffix `?` allows the field to be omitted on write without reserving empty space.
-- **Fail-Fast Safety**: Supplying undeclared attributes returns `driver.ErrUnknownField`. Mismatched connection contracts return `driver.ErrSchemaMismatch` (`HTTP 409 Conflict`).
+- **Fail-Fast Safety**: Supplying undeclared attributes returns `driver.ErrUnknownField`. Supplying incompatible values on `Save` or `Update` returns `driver.ErrInvalidFieldType`. Mismatched connection contracts return `driver.ErrSchemaMismatch` (`HTTP 409 Conflict`).
 
 For comprehensive specifications, see the **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**.
 
@@ -429,7 +427,7 @@ Settings can be specified through command-line flags or environment variables:
 AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D spatial indexing, and directed causal reasoning. It is designed with clear architectural trade-offs:
 
 1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. Each model maintains its own immutable schema contract, and there are no relational SQL tables, cross-model relational `JOIN` operations, or dynamic migrations.
-2. **Computational Property Storage & 1D Arrays**: Attribute values are stored as scalar primitives (`float`, `int`, `bool`, `date`, `string`) and 1D arrays (`float[]`, `string[]`, `int[]`, `bool[]`, `date[]`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
+2. **Computational Property Storage**: Attribute values are stored as contiguous `float32` scalar primitives (`float`, `int`, `bool`, `date`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
 3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (Remote HTTP Server or Embedded In-Process Engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
 

@@ -258,7 +258,7 @@ Cancels queued jobs before execution:
 AnchorDB provides strict contract immutability endpoints for model schema registration, validation, and administrative resetting.
 
 ### `POST /v1/model/attach`
-Attaches and permanently locks a schema contract into a model. If the model already has a locked schema, compares incoming fields, types, and modifiers (`?` optional, `[]` 1D array).
+Attaches and permanently locks a schema contract into a model. If the model already has a locked schema, compares incoming fields, types, and optional (`?`) modifiers.
 
 **Request Payload**:
 ```json
@@ -267,8 +267,8 @@ Attaches and permanently locks a schema contract into a model. If the model alre
   "schema": {
     "voltage": "float",
     "status": "int",
-    "brand": "string?",
-    "tags": "string[]?"
+    "is_active": "bool?",
+    "calibrated": "date?"
   }
 }
 ```
@@ -308,8 +308,8 @@ Retrieves the locked schema contract for a specified model.
   "schema": {
     "voltage": "float",
     "status": "int",
-    "brand": "string?",
-    "tags": "string[]?"
+    "is_active": "bool?",
+    "calibrated": "date?"
   }
 }
 ```

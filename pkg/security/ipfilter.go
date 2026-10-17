@@ -33,10 +33,11 @@ type IPFilter struct {
 // - CIDR Range: "192.168.1.0/24", "10.0.0.0/8"
 // - Explicit Range: "192.168.1.10-192.168.1.50"
 func NewIPFilter(rules string, trustProxy bool) (*IPFilter, error) {
+	cleanedRule := strings.Trim(strings.TrimSpace(rules), `"'`)
 	filter := &IPFilter{
 		allowedIPs: make(map[string]bool),
 		trustProxy: trustProxy,
-		rawRule:    strings.TrimSpace(rules),
+		rawRule:    cleanedRule,
 	}
 
 	if filter.rawRule == "" {
@@ -45,7 +46,7 @@ func NewIPFilter(rules string, trustProxy bool) (*IPFilter, error) {
 
 	tokens := strings.Split(filter.rawRule, ",")
 	for _, rawToken := range tokens {
-		token := strings.TrimSpace(rawToken)
+		token := strings.Trim(strings.TrimSpace(rawToken), `"'`)
 		if token == "" {
 			continue
 		}

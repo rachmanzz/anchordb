@@ -670,7 +670,7 @@ func runSchemaStressTest(ctx context.Context) {
 		"current":     "float",
 		"status":      "int",
 		"temperature": "float?",
-		"tags":        "string[]?",
+		"is_active":   "bool?",
 	}
 	if err := client.Attach(schema); err != nil {
 		log.Fatalf("client.Attach failed: %v", err)
@@ -817,7 +817,7 @@ func runSchemaStressTest(ctx context.Context) {
 	_, err = driver.ConnectRemote(baseURL,
 		driver.WithToken(authToken),
 		driver.WithModel(schemaModel),
-		driver.WithAttachSchema(driver.Schema{"random_field": "string"}),
+		driver.WithAttachSchema(driver.Schema{"random_field": "int"}),
 	)
 	if err == nil {
 		log.Fatalf("Expected connection rejection on mismatched schema, but succeeded!")

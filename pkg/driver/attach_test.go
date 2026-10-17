@@ -34,10 +34,10 @@ func TestDriver_AttachSchema_Embedded(t *testing.T) {
 
 	// 2. Attach valid schema
 	schema := driver.Schema{
-		"voltage": "float",
-		"status":  "int",
-		"model":   "string?",
-		"tags":    "string[]?",
+		"voltage":   "float",
+		"status":    "int",
+		"is_active": "bool?",
+		"installed": "date?",
 	}
 	if err := client.Attach(schema); err != nil {
 		t.Fatalf("client.Attach failed: %v", err)
@@ -54,10 +54,10 @@ func TestDriver_AttachSchema_Embedded(t *testing.T) {
 
 	// 3. Attach identical schema -> should succeed (idempotent contract check)
 	identicalSchema := driver.Schema{
-		"voltage": "float",
-		"status":  "int",
-		"model":   "string?",
-		"tags":    "string[]?",
+		"voltage":   "float",
+		"status":    "int",
+		"is_active": "bool?",
+		"installed": "date?",
 	}
 	if err := client.Attach(identicalSchema); err != nil {
 		t.Fatalf("re-attaching identical schema failed: %v", err)
@@ -111,9 +111,9 @@ func TestDriver_AttachSchema_Embedded(t *testing.T) {
 
 	// 8. AttachModel on a clean model
 	userClient, err := client.AttachModel("users", driver.Schema{
-		"age":   "int",
-		"name":  "string?",
-		"roles": "string[]?",
+		"age":       "int",
+		"is_active": "bool?",
+		"joined_at": "date?",
 	})
 	if err != nil {
 		t.Fatalf("client.AttachModel failed: %v", err)
@@ -124,6 +124,13 @@ func TestDriver_AttachSchema_Embedded(t *testing.T) {
 	err = userClient.Save("user_1", map[string]float32{"age": 30})
 	if err != nil {
 		t.Fatalf("saving to newly attached model failed: %v", err)
+	}
+	_, err = userClient.Update().
+		In("user_1").
+		Set("age", driver.Add("0", "0.5")).
+		Execute(ctx)
+	if !errors.Is(err, storage.ErrInvalidFieldType) {
+		t.Fatalf("expected ErrInvalidFieldType when updating int field to 0.5, got %v", err)
 	}
 
 	// Close initial client so we can test re-opening with flock
@@ -158,7 +165,7 @@ func TestDriver_AttachSchema_Embedded(t *testing.T) {
 
 	// Now a completely different schema can be attached
 	newSchema := driver.Schema{
-		"new_field": "string",
+		"new_field": "float",
 	}
 	if err := client2.Attach(newSchema); err != nil {
 		t.Fatalf("attaching new schema after reset failed: %v", err)

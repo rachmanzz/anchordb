@@ -1,0 +1,28 @@
+services:
+  anchordb-supply-chain:
+    image: anchordb:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: anchordb-supply-chain
+    restart: unless-stopped
+    ports:
+      - "7447:7447"
+    environment:
+      - ANCHORDB_PORT=7447
+      - ANCHORDB_DATA_DIR=/data
+      - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:-supply_chain_secret_token}
+      - ANCHORDB_MEMORY_LIMIT=2GB
+      - ANCHORDB_WAL_SYNC=always
+      - ANCHORDB_CRON_ENABLED=true
+      - ANCHORDB_SYNC_INTERVAL=30s
+      - ANCHORDB_WORKER_ENABLED=true
+      - ANCHORDB_WORKER_CONCURRENCY=8
+      - ANCHORDB_WORKER_QUEUE_SIZE=2000
+    volumes:
+      - ./data:/data:Z
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G

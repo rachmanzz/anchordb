@@ -1,6 +1,6 @@
 # Model Schema Registration & Strict Immutability Specification
 
-AnchorDB provides an immutable schema contract system called **Register Model** (or **Schema Attachment** in client SDKs). It enforces strict attribute names, data types, 1D array dimensions, and optionality constraints per model database to prevent schema drift, accidental property typos, and data corruption across distributed services.
+AnchorDB provides an immutable schema contract system called **Register Model** (or **Schema Attachment** in client SDKs). It enforces strict attribute names, scalar numeric/temporal data types, and optionality constraints per model database to prevent schema drift, accidental property typos, and data corruption across distributed services.
 
 ---
 
@@ -19,30 +19,24 @@ AnchorDB provides an immutable schema contract system called **Register Model** 
 
 ## 2. Supported Data Types & Modifiers
 
-A schema in AnchorDB is a dictionary mapping attribute names to normalized type identifiers.
+A schema in AnchorDB is a dictionary mapping attribute names to normalized scalar type identifiers backed by `float32` property storage.
 
 ### A. Required vs. Optional Syntax (`?` Suffix)
 
 * **Required (Default)**: Any type specification without a trailing `?` is strictly required. All write payloads must supply this attribute.
 * **Optional (`?` Modifier)**: Any type ending with `?` is optional. If omitted in a write payload, the attribute is omitted without reserving unused space.
 
-### B. Primitives & 1D Array Type Table
+### B. Scalar Type Table
 
 | Type Identifier | Description | Required Example | Optional Example | Internal Representation |
 | :--- | :--- | :--- | :--- | :--- |
-| **`string`** | Text label / interned identifier | `"color": "string"` | `"brand": "string?"` | Interned String Pool ID |
-| **`int`** | Integer number | `"age": "int"` | `"doors": "int?"` | Exact integer (IEEE 754 float32) |
+| **`int`** | Exact integer number | `"age": "int"` | `"doors": "int?"` | Exact integer (IEEE 754 float32) |
 | **`float`** | Floating-point metric | `"speed": "float"` | `"weight": "float?"` | IEEE 754 float32 |
 | **`bool`** | Boolean flag (`0.0` or `1.0`) | `"active": "bool"` | `"verified": "bool?"` | Float scalar `1.0` (true) / `0.0` (false) |
-| **`date`** | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Days since Unix epoch (uint16/float32) |
-| **`string[]`** | Array of string tags / labels | `"roles": "string[]"` | `"tags": "string[]?"` | Length prefix + interned string pool array |
-| **`float[]`** | Vector embedding / float array | `"embedding": "float[]"` | `"history": "float[]?"` | Length prefix + contiguous IEEE 754 float32 array |
-| **`int[]`** | Array of integers | `"codes": "int[]"` | `"ports": "int[]?"` | Length prefix + contiguous integer array |
-| **`bool[]`** | Array of boolean flags | `"flags": "bool[]"` | `"mask": "bool[]?"` | Bitmask / byte slice |
-| **`date[]`** | Array of calendar dates | `"holidays": "date[]"` | `"events": "date[]?"` | Length prefix + contiguous epoch days array |
+| **`date`** | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Non-negative integer days since Unix epoch (float32) |
 
 > [!NOTE]
-> **Design Boundary: 1D Arrays Only**: Complex nested document trees (e.g. `array -> object -> array`) are intentionally out-of-scope. AnchorDB is an ultra-fast computational engine. 1D arrays provide native support for high-dimensional vector embeddings, categorical tags, and discrete coordinates while preserving $O(1)$ zero-copy memory-mapped operations.
+> **Design Boundary: Contiguous Scalar Float32 Properties**: Record attributes in AnchorDB are stored in contiguous `map[string]float32` structures (`CompactRecord`) to support zero-copy memory-mapped operations and sub-microsecond in-storage arithmetic. Non-numeric types (`string`) and array modifiers (`[]`) are rejected at schema parse time.
 
 ---
 
@@ -53,12 +47,9 @@ A schema in AnchorDB is a dictionary mapping attribute names to normalized type 
 {
   "model": "vehicles",
   "schema": {
-    "color": "string",
     "age": "int",
     "speed": "float",
-    "brand": "string?",
-    "tags": "string[]?",
-    "vector_embedding": "float[]",
+    "active": "bool?",
     "manufactured_date": "date"
   }
 }
@@ -67,13 +58,10 @@ A schema in AnchorDB is a dictionary mapping attribute names to normalized type 
 ### Go Driver Format (`pkg/driver`)
 ```go
 schema := driver.Schema{
-    "color":             "string",       // Required string
-    "age":               "int",          // Required int
-    "speed":             "float",        // Required float
-    "brand":             "string?",      // Optional string
-    "tags":              "string[]?",    // Optional 1D string array
-    "vector_embedding":  "float[]",      // Required 1D vector embedding
-    "manufactured_date": "date",         // Required date (YYYY-MM-DD)
+    "age":               "int",   // Required int
+    "speed":             "float", // Required float
+    "active":            "bool?", // Optional bool
+    "manufactured_date": "date",  // Required date (epoch days)
 }
 ```
 
@@ -110,7 +98,7 @@ schema := driver.Schema{
 ### 1. First-Time Registration
 If the model file does not yet have a schema contract:
 - The incoming schema definition is validated for syntax and type correctness.
-- The schema is written to disk alongside the model database file as `{model}.anchordb.schema`.
+- The schema is written atomically (`fsync` + rename + directory sync) to disk alongside the model database file as `{model}.anchordb.schema`.
 - The model state is locked (`LOCKED`). Subsequent modifications are blocked.
 
 ### 2. Verification on Connect / Attach
@@ -118,20 +106,19 @@ If the model already possesses a locked schema contract:
 - AnchorDB executes a canonical equality comparison across:
   - Total field count
   - Field names
-  - Base data types
-  - Array dimensionality (`[]`)
+  - Base data types (`int`, `float`, `bool`, `date`)
   - Optionality modifiers (`?`)
 - **Matching Schemas**: The attach call returns successfully.
 - **Mismatched Schemas**: The engine rejects the request immediately with `ErrSchemaMismatch` (`HTTP 409 Conflict`), halting client startup before any corrupted writes can occur.
 
 ### 3. Fail-Fast Mutation Errors
-When writing to a model with a locked schema:
+When writing (`Save`, `SaveAutoID`, `Update`) to a model with a locked schema:
 
 | Error | Condition | HTTP Status |
 | :--- | :--- | :---: |
 | `ErrMissingRequiredField` | A field declared without `?` was omitted in payload | `400 Bad Request` |
 | `ErrUnknownField` | A property was passed that does not exist in the schema | `400 Bad Request` |
-| `ErrInvalidFieldType` | An integer received a fractional float, or bool received non-binary values | `400 Bad Request` |
+| `ErrInvalidFieldType` | An integer/date received a fractional float, or bool received non-binary values | `400 Bad Request` |
 | `ErrSchemaMismatch` | Client attempted to attach or connect with conflicting contract | `409 Conflict` |
 
 ---
@@ -208,10 +195,10 @@ Locks a schema into a model or verifies an existing contract.
 {
   "model": "vehicles",
   "schema": {
-    "color": "string",
+    "speed": "float",
     "age": "int",
-    "brand": "string?",
-    "tags": "string[]?"
+    "active": "bool?",
+    "manufactured_date": "date?"
   }
 }
 ```
@@ -251,10 +238,10 @@ Fetches the registered schema contract for a given model.
   "model": "vehicles",
   "locked": true,
   "schema": {
-    "color": "string",
+    "speed": "float",
     "age": "int",
-    "brand": "string?",
-    "tags": "string[]?"
+    "active": "bool?",
+    "manufactured_date": "date?"
   }
 }
 ```

@@ -109,7 +109,7 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 		}
 		if !s.limiter.allow(s.clientKey(r)) {
 			w.Header().Set("Retry-After", strconv.Itoa(s.limiter.retryAfterSeconds()))
-			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+			writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 		next.ServeHTTP(w, r)
