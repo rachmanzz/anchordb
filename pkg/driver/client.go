@@ -65,6 +65,11 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("empty DSN or target address")
 	}
 
+	// 0. AnchorWire Binary TCP remote URL (Maximum Performance)
+	if strings.HasPrefix(dsn, "wire://") || strings.HasPrefix(dsn, "tcp://") || strings.HasPrefix(dsn, "anchordb+wire://") {
+		return ConnectWire(dsn, opts...)
+	}
+
 	// 1. Direct HTTP/HTTPS remote URL
 	if strings.HasPrefix(dsn, "http://") || strings.HasPrefix(dsn, "https://") {
 		u, err := url.Parse(dsn)
@@ -233,6 +238,61 @@ func ConnectRemote(baseURL string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{backend: backend, model: cfg.model, dsn: baseURL}
+	if len(cfg.schema) > 0 {
+		if err := c.Attach(cfg.schema); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// ConnectWire connects to an AnchorDB engine server over the AnchorWire binary TCP protocol.
+func ConnectWire(addr string, opts ...Option) (*Client, error) {
+	cfg := defaultClientConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	raw := addr
+	if strings.HasPrefix(raw, "wire://") {
+		raw = strings.TrimPrefix(raw, "wire://")
+	} else if strings.HasPrefix(raw, "tcp://") {
+		raw = strings.TrimPrefix(raw, "tcp://")
+	} else if strings.HasPrefix(raw, "anchordb+wire://") {
+		raw = strings.TrimPrefix(raw, "anchordb+wire://")
+	}
+
+	if strings.Contains(raw, "?") || strings.Contains(raw, "@") || strings.Contains(raw, "/") {
+		u, err := url.Parse("tcp://" + raw)
+		if err == nil {
+			if u.User != nil {
+				if pass, ok := u.User.Password(); ok && pass != "" {
+					cfg.token = pass
+				} else if u.User.Username() != "" {
+					cfg.token = u.User.Username()
+				}
+			}
+			q := u.Query()
+			if tok := q.Get("token"); tok != "" {
+				cfg.token = tok
+			}
+			if mdl := q.Get("model"); mdl != "" {
+				cfg.model = mdl
+			}
+			pathModel := strings.Trim(u.Path, "/")
+			if pathModel != "" && cfg.model == "default" {
+				cfg.model = pathModel
+			}
+			raw = u.Host
+		}
+	}
+
+	backend, err := newWireBackend(raw, cfg)
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{backend: backend, model: cfg.model, dsn: "wire://" + raw}
 	if len(cfg.schema) > 0 {
 		if err := c.Attach(cfg.schema); err != nil {
 			_ = c.Close()

@@ -18,6 +18,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
+	"github.com/rachmanzz/anchordb/pkg/wire"
 	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
@@ -1407,4 +1408,181 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 		out[i] = m
 	}
 	return out
+}
+
+// -----------------------------------------------------------------------------
+// Wire Backend (AnchorWire Binary TCP Client)
+// -----------------------------------------------------------------------------
+
+type wireBackend struct {
+	addr       string
+	cfg        clientConfig
+	wireClient *wire.Client
+}
+
+func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
+	opts := []wire.ClientOption{
+		wire.WithClientModel(cfg.model),
+		wire.WithClientTimeout(cfg.timeout),
+	}
+	if cfg.token != "" {
+		opts = append(opts, wire.WithClientToken(cfg.token))
+	}
+	wc, err := wire.Connect(addr, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &wireBackend{
+		addr:       addr,
+		cfg:        cfg,
+		wireClient: wc,
+	}, nil
+}
+
+func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	opStatus := storage.OpStatusActive
+	if op != nil {
+		opStatus = *op
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.Save(storage.BatchRecordItem{
+		Name:      name,
+		Operation: opStatus,
+		Props:     props,
+	})
+}
+
+func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.SaveBatch(records)
+}
+
+func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	props, _, err := b.wireClient.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	return &EntityResult{
+		Name:  name,
+		props: props,
+	}, nil
+}
+
+func (b *wireBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
+	return nil, fmt.Errorf("list query is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+}
+
+func (b *wireBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
+	return 0, fmt.Errorf("bulk update is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+}
+
+func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
+	return nil, fmt.Errorf("graph step query is not supported over AnchorWire binary transport; use Causal query or HTTP engine")
+}
+
+func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
+	return nil, fmt.Errorf("graph chain query is not supported over AnchorWire binary transport; use HTTP engine or embedded mode")
+}
+
+func (b *wireBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.Edge(action, source, relation, target, weight)
+}
+
+func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.Causal(seeds, relation, limitK)
+}
+
+func (b *wireBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
+	return 0, fmt.Errorf("distance computation is not supported over AnchorWire binary transport; use embedded mode")
+}
+
+func (b *wireBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
+	return CentroidResult{}, fmt.Errorf("centroid computation is not supported over AnchorWire binary transport; use embedded mode")
+}
+
+func (b *wireBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
+	return 0, fmt.Errorf("cosine similarity is not supported over AnchorWire binary transport; use embedded mode")
+}
+
+func (b *wireBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
+	return nil, fmt.Errorf("nearest search is not supported over AnchorWire binary transport; use embedded mode")
+}
+
+func (b *wireBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
+	_, err := b.Save(ctx, model, word, nil, nil)
+	return err
+}
+
+func (b *wireBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
+	return fmt.Errorf("set relation is not supported over AnchorWire binary transport; use embedded mode")
+}
+
+func (b *wireBackend) Sync(ctx context.Context, model string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if model != "" && model != b.wireClient.ModelName() {
+		_ = b.wireClient.SelectModel(model)
+	}
+	return b.wireClient.Sync()
+}
+
+func (b *wireBackend) Close() error {
+	return b.wireClient.Close()
+}
+
+func (b *wireBackend) DB() *storage.AnchorDB {
+	return nil
+}
+
+func (b *wireBackend) IsRemote() bool {
+	return true
+}
+
+func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	return nil, fmt.Errorf("partition management is not supported over AnchorWire binary transport; use HTTP engine")
+}
+
+func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return nil, fmt.Errorf("partition inspection is not supported over AnchorWire binary transport; use HTTP engine")
+}
+
+func (b *wireBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
+	return nil
+}
+
+func (b *wireBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
+	return nil, fmt.Errorf("schema inspection is not supported over AnchorWire binary transport; use HTTP engine")
+}
+
+func (b *wireBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
+	return fmt.Errorf("reset model is not supported over AnchorWire binary transport; use HTTP engine")
 }

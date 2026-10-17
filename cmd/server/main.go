@@ -32,6 +32,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 	"github.com/rachmanzz/anchordb/pkg/system"
+	"github.com/rachmanzz/anchordb/pkg/wire"
 	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
@@ -68,6 +69,7 @@ type ServerConfig struct {
 	// Per-client abuse controls. RateLimitPerSec <= 0 disables rate limiting.
 	RateLimitPerSec float64
 	RateLimitBurst  int
+	WirePort        string
 }
 
 // Server holds active AnchorDB database instances and background subsystems
@@ -76,6 +78,8 @@ type Server struct {
 	dataDir     string
 	authToken   string
 	port        string
+	wirePort    string
+	wireServer  *wire.Server
 	models      map[string]*storage.AnchorDB
 	scheduler   *scheduler.InternalScheduler
 	cronEnabled bool
@@ -124,6 +128,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		dataDir:     cfg.DataDir,
 		authToken:   cfg.AuthToken,
 		port:        cfg.Port,
+		wirePort:    cfg.WirePort,
 		models:      make(map[string]*storage.AnchorDB),
 		scheduler:   sched,
 		cronEnabled: cfg.CronEnabled,
@@ -135,6 +140,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 		shutdownTimeout: cfg.ShutdownTimeout,
 	}
+	s.wireServer = wire.NewServer(s)
 
 	if cfg.RateLimitPerSec > 0 {
 		s.limiter = newRateLimiter(cfg.RateLimitPerSec, cfg.RateLimitBurst)
@@ -349,6 +355,11 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		cancel()
 	}
 
+	// 1.5 Stop AnchorWire binary TCP daemon.
+	if s.wireServer != nil {
+		_ = s.wireServer.Close()
+	}
+
 	// 2. Stop the cron scheduler (cancels task contexts, waits for loops).
 	if s.scheduler != nil {
 		sctx, cancel := context.WithTimeout(ctx, budget/6)
@@ -400,6 +411,29 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// WireServer returns the internal AnchorWire binary protocol server.
+func (s *Server) WireServer() *wire.Server {
+	return s.wireServer
+}
+
+// GetModel implements wire.Backend.
+func (s *Server) GetModel(name string) (*storage.AnchorDB, error) {
+	return s.getModel(name)
+}
+
+// Authenticate implements wire.Backend.
+func (s *Server) Authenticate(token string) bool {
+	if s.authToken == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) == 1
+}
+
+// RequiresAuth implements wire.Backend.
+func (s *Server) RequiresAuth() bool {
+	return s.authToken != ""
 }
 
 // --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
@@ -2321,6 +2355,7 @@ func resolveDBOptions(flagSyncMode, flagSyncInterval string) (storage.Options, e
 func main() {
 	// 1. Core Server Flags
 	flagPort := flag.String("port", "", "Port to listen on (overrides ANCHORDB_PORT, default 7447)")
+	flagWirePort := flag.String("wire-port", "", "AnchorWire binary TCP port to listen on (overrides ANCHORDB_WIRE_PORT, default 7448; 'none' or 'off' disables)")
 	flagDataDir := flag.String("data-dir", "", "Data directory path (overrides ANCHORDB_DATA_DIR)")
 	flagToken := flag.String("auth-token", "", "Bearer auth token (overrides ANCHORDB_AUTH_TOKEN)")
 	flagMemLimit := flag.String("memory-limit", "", "RAM allocation limit e.g. 500MB, 1GB, 5GB (overrides ANCHORDB_MEMORY_LIMIT)")
@@ -2358,6 +2393,11 @@ func main() {
 	portStr := *flagPort
 	if portStr == "" {
 		portStr = getEnv("ANCHORDB_PORT", "7447")
+	}
+
+	wirePortStr := *flagWirePort
+	if wirePortStr == "" {
+		wirePortStr = getEnv("ANCHORDB_WIRE_PORT", "7448")
 	}
 
 	dataDir := *flagDataDir
@@ -2498,6 +2538,7 @@ func main() {
 
 	serverConfig := ServerConfig{
 		Port:              portStr,
+		WirePort:          wirePortStr,
 		DataDir:           dataDir,
 		AuthToken:         authToken,
 		MemoryLimit:       memLimitStr,
@@ -2538,7 +2579,12 @@ func main() {
 	fmt.Println("          ANCHORDB HIGH-PERFORMANCE SERVER DAEMON         ")
 	fmt.Println("      Copyright (c) 2026 MUHAMMD ABDURRAHMAN              ")
 	fmt.Println("             Licensed under Apache-2.0                    ")
-	fmt.Printf("   Port Dedicated : %s\n", portStr)
+	fmt.Printf("   Port Dedicated : %s (HTTP REST API)\n", portStr)
+	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
+		fmt.Printf("   Wire Port (TCP): %s (AnchorWire Binary Protocol)\n", wirePortStr)
+	} else {
+		fmt.Println("   Wire Port (TCP): DISABLED")
+	}
 	fmt.Printf("   Memory Limit   : %s\n", memSummary)
 	if authToken == "" {
 		fmt.Println("   Auth           : DISABLED (ANCHORDB_ALLOW_INSECURE=true)")
@@ -2564,6 +2610,20 @@ func main() {
 	fmt.Println("   Architecture   : Minimal Dependencies (Pure Go, Zero External Broker)")
 	fmt.Println("   Container Ready: Docker / Podman / Cloud Host / K8s    ")
 	fmt.Println("==========================================================")
+
+	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
+		wireAddr := ":" + wirePortStr
+		wireListener, wErr := net.Listen("tcp", wireAddr)
+		if wErr != nil {
+			log.Fatalf("[FATAL] Failed to bind AnchorWire TCP port %s: %v", wirePortStr, wErr)
+		}
+		go func() {
+			log.Printf("[READY] AnchorWire TCP Binary Protocol listening on %s ...", wireAddr)
+			if err := server.WireServer().Serve(wireListener); err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("[WARN] AnchorWire server terminated with error: %v", err)
+			}
+		}()
+	}
 
 	addr := ":" + portStr
 	srv := &http.Server{
