@@ -3,7 +3,7 @@
 AnchorDB includes three independent tiers of verification and performance measurement:
 1. **Standalone Bare-Metal CLI Benchmark (`cmd/benchmark`)**: Instant zero-dependency evaluation of arithmetic compute, spatial grid DDA, causal graphs, and embedded engine throughput without requiring Docker.
 2. **Native Go Microbenchmark Suite (`pkg/storage/bench_test.go`)**: Standard Go testing benchmarks measuring allocations and ns/op.
-3. **End-to-End Container Verification Suite (`cmd/container_verifier`)**: Full 6-phase integration test verifying container lifecycles, concurrency ramp-up with Little's Law, crash durability, background cron scheduling, partition archival, and strict schema immutability.
+3. **End-to-End Container Verification Suite (`test/container_verifier`)**: Full 6-phase integration test verifying container lifecycles, concurrency ramp-up with Little's Law, crash durability, background cron scheduling, partition archival, and strict schema immutability.
 
 ---
 
@@ -69,7 +69,7 @@ podman run -d \
 ### Step 3: Run the Verification Suite
 
 ```bash
-go run ./cmd/container_verifier
+go run ./test/container_verifier
 ```
 
 ---

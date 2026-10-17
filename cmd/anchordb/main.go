@@ -2,202 +2,385 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
-	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
-	"github.com/rachmanzz/anchordb/pkg/spatial"
+)
+
+const (
+	cliVersion = "v0.1.1"
 )
 
 func main() {
-	fmt.Println("==========================================================")
-	fmt.Println("    ANCHORDB: COMPUTATIONAL GRAPH STORAGE ENGINE (CPU)    ")
-	fmt.Println("==========================================================")
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
 
-	_ = os.MkdirAll("data", 0755)
-	dbFile := filepath.Join("data", "world.anchordb")
-	_ = os.Remove(dbFile) // Start fresh for demo
+func run(args []string) error {
+	var (
+		urlFlag     string
+		tokenFlag   string
+		modelFlag   string
+		timeoutFlag time.Duration
+	)
 
-	// 1. Open local connection via Dedicated Driver SDK (embedded demo mode)
-	t0 := time.Now()
-	client, err := driver.OpenLocal(dbFile)
+	defaultURL := os.Getenv("ANCHORDB_URL")
+	if defaultURL == "" {
+		defaultURL = "http://localhost:7447"
+	}
+	defaultToken := os.Getenv("ANCHORDB_TOKEN")
+	defaultModel := os.Getenv("ANCHORDB_MODEL")
+	if defaultModel == "" {
+		defaultModel = "default"
+	}
+
+	rootFlags := flag.NewFlagSet("anchordb", flag.ContinueOnError)
+	rootFlags.StringVar(&urlFlag, "url", defaultURL, "AnchorDB server URL (or env ANCHORDB_URL)")
+	rootFlags.StringVar(&tokenFlag, "token", defaultToken, "Bearer authentication token (or env ANCHORDB_TOKEN)")
+	rootFlags.StringVar(&modelFlag, "model", defaultModel, "Target model database name (or env ANCHORDB_MODEL)")
+	rootFlags.DurationVar(&timeoutFlag, "timeout", 10*time.Second, "Request timeout duration")
+	rootFlags.Usage = printUsage
+
+	if len(args) < 1 {
+		printUsage()
+		return nil
+	}
+
+	cmd := args[0]
+
+	// Handle global help / version before flag parsing
+	switch cmd {
+	case "help", "-h", "--help":
+		printUsage()
+		return nil
+	case "version", "-v", "--version":
+		fmt.Printf("AnchorDB CLI %s (%s/%s, runtime: %s)\n", cliVersion, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return nil
+	}
+
+	// Parse remainder args
+	if err := rootFlags.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	client, err := driver.ConnectRemote(urlFlag,
+		driver.WithToken(tokenFlag),
+		driver.WithModel(modelFlag),
+		driver.WithTimeout(timeoutFlag),
+	)
 	if err != nil {
-		log.Fatalf("Failed to open local AnchorDB: %v", err)
+		return fmt.Errorf("failed to initialize client: %w", err)
 	}
 	defer client.Close()
-	fmt.Printf("[OK] Connected to AnchorDB via Driver in %v (mmap zero-copy)\n", time.Since(t0))
 
-	// 2. Populate initial nodes into binary storage (Fixed-size 40 bytes / node)
-	db := client.DB()
-	nodes := []struct {
-		word  string
-		coord spatial.Point2D
-		roles [4]float32
-	}{
-		{"primary_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
-		{"backup_cluster", spatial.Point2D{X: 0.2, Y: 0.9}, [4]float32{0.9, 0.1, 0.2, 0.2}},
-		{"load_balancer", spatial.Point2D{X: 0.2, Y: 0.1}, [4]float32{0.2, 0.1, 0.95, 0.2}},
-		{"service_mesh", spatial.Point2D{X: 0.2, Y: -0.5}, [4]float32{0.1, 0.1, 0.9, 0.5}},
-		{"database_cluster", spatial.Point2D{X: 0.2, Y: -0.7}, [4]float32{0.2, 0.9, 0.5, 0.1}},
-		{"cache_layer", spatial.Point2D{X: 0.6, Y: -0.7}, [4]float32{0.1, 0.1, 0.9, 0.2}},
-		{"analytics_engine", spatial.Point2D{X: 0.8, Y: -0.9}, [4]float32{0.2, 0.1, 0.95, 0.4}},
-		{"edge_gateway", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.8, 0.1, 0.2, 0.1}},
-		{"waf_service", spatial.Point2D{X: -0.5, Y: 0.5}, [4]float32{0.1, 0.1, 0.2, 0.9}},
-		{"dns_resolver", spatial.Point2D{X: -0.5, Y: -0.2}, [4]float32{0.2, 0.1, 0.95, 0.3}},
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutFlag)
+	defer cancel()
+
+	subArgs := rootFlags.Args()
+
+	switch cmd {
+	case "ping":
+		return cmdPing(ctx, urlFlag, tokenFlag)
+	case "status":
+		return cmdStatus(ctx, urlFlag, tokenFlag)
+	case "get":
+		return cmdGet(ctx, client, subArgs)
+	case "save":
+		return cmdSave(ctx, client, subArgs)
+	case "list":
+		return cmdList(ctx, client, subArgs)
+	case "schema":
+		return cmdSchema(ctx, client, subArgs)
+	case "causal":
+		return cmdCausal(ctx, client, subArgs)
+	case "chain":
+		return cmdChain(ctx, client, subArgs)
+	case "sync":
+		return cmdSync(ctx, client)
+	default:
+		printUsage()
+		return fmt.Errorf("unknown command: %q", cmd)
+	}
+}
+
+func printUsage() {
+	fmt.Println(`AnchorDB Official Command-Line Interface (CLI)
+
+Usage:
+  anchordb <command> [arguments] [flags]
+
+Core Commands:
+  ping                          Test connection to the AnchorDB server
+  status                        Display server metrics, memory, and scheduler status
+  get <name>                    Retrieve an entity by name
+  save <name> <k=v ...>         Store an entity with key-value numerical properties
+  list                          List entities with optional filters and pagination
+  schema get                    Display the locked schema contract for the active model
+  schema attach <field:type...> Attach and permanently lock a schema contract
+  causal <seed> <rel>           Follow 1-hop causal edges from a seed node
+  chain <seed> <rel1,rel2...>   Follow multi-hop causal reasoning chain
+  sync                          Flush storage engine buffers and WAL to disk
+  version                       Display CLI version and build information
+  help                          Display this help text
+
+Global Flags:
+  -url string       AnchorDB server URL (default: http://localhost:7447, env: ANCHORDB_URL)
+  -token string     Bearer authentication token (env: ANCHORDB_TOKEN)
+  -model string     Target model database name (default: default, env: ANCHORDB_MODEL)
+  -timeout duration Request timeout (default: 10s)
+
+Examples:
+  anchordb ping
+  anchordb save sensor_1 distance=120 duration=2.0 -model plant_iot
+  anchordb get sensor_1 -model plant_iot
+  anchordb schema attach voltage:float current:float status:int -model plant_iot
+  anchordb schema get -model plant_iot
+  anchordb causal fuel_shortage causes -model events`)
+}
+
+func cmdPing(ctx context.Context, baseURL, token string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	for _, n := range nodes {
-		if _, err := db.AppendNode(n.word, n.coord, n.roles, 1); err != nil {
-			log.Fatalf("failed to append node %q: %v", n.word, err)
+	t0 := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ping failed: %w", err)
+	}
+	defer resp.Body.Close()
+	lat := time.Since(t0)
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Printf("PONG: %s is healthy (latency: %v)\n", baseURL, lat)
+		return nil
+	}
+	return fmt.Errorf("%s returned HTTP status %d (latency: %v)", baseURL, resp.StatusCode, lat)
+}
+
+func cmdStatus(ctx context.Context, baseURL, token string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("querying server status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return fmt.Errorf("parsing server status response: %w", err)
+	}
+
+	out, _ := json.MarshalIndent(data, "", "  ")
+	fmt.Println(string(out))
+	return nil
+}
+
+func cmdGet(ctx context.Context, client *driver.Client, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: anchordb get <entity_name>")
+	}
+	name := args[0]
+	rec, err := client.Get(name).Execute(ctx)
+	if err != nil {
+		return fmt.Errorf("get failed: %w", err)
+	}
+
+	output := map[string]any{
+		"name":       rec.Name,
+		"model":      client.ModelName(),
+		"properties": rec.Props(),
+	}
+	out, _ := json.MarshalIndent(output, "", "  ")
+	fmt.Println(string(out))
+	return nil
+}
+
+func cmdSave(ctx context.Context, client *driver.Client, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: anchordb save <entity_name> <field1=value1> [field2=value2 ...]")
+	}
+	name := args[0]
+	props := make(map[string]float32)
+
+	for _, pair := range args[1:] {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid property argument: %q (expected key=value)", pair)
+		}
+		val, err := strconv.ParseFloat(parts[1], 32)
+		if err != nil {
+			return fmt.Errorf("invalid float32 value for %q: %w", parts[0], err)
+		}
+		props[parts[0]] = float32(val)
+	}
+
+	if err := client.Save(name, props); err != nil {
+		return fmt.Errorf("save failed: %w", err)
+	}
+
+	fmt.Printf("OK: saved entity %q to model %q with %d properties\n", name, client.ModelName(), len(props))
+	return nil
+}
+
+func cmdList(ctx context.Context, client *driver.Client, args []string) error {
+	listFlags := flag.NewFlagSet("list", flag.ContinueOnError)
+	page := listFlags.Int("page", 1, "Page number")
+	limit := listFlags.Int("limit", 20, "Page size limit")
+	where := listFlags.String("where", "", "Filter condition: 'field op value' (e.g. 'voltage >= 10')")
+
+	if err := listFlags.Parse(args); err != nil {
+		return err
+	}
+
+	builder := client.List().Page(*page, *limit)
+	if *where != "" {
+		parts := strings.Fields(*where)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid where filter: %q (expected 'field op value')", *where)
+		}
+		val, err := strconv.ParseFloat(parts[2], 32)
+		if err != nil {
+			return fmt.Errorf("invalid filter numeric value %q: %w", parts[2], err)
+		}
+		builder.Where(parts[0], parts[1], float32(val))
+	}
+
+	res, err := builder.Execute(ctx)
+	if err != nil {
+		return fmt.Errorf("list failed: %w", err)
+	}
+
+	fmt.Printf("Model: %s | Page %d | Items: %d | HasMore: %v\n\n", client.ModelName(), *page, len(res.Items), res.HasMore)
+	if len(res.Items) == 0 {
+		fmt.Println("No records found.")
+		return nil
+	}
+
+	for _, item := range res.Items {
+		propsJSON, _ := json.Marshal(item.Props())
+		fmt.Printf("• %-24s -> %s\n", item.Name, string(propsJSON))
+	}
+	return nil
+}
+
+func cmdSchema(ctx context.Context, client *driver.Client, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: anchordb schema [get|attach <field:type ...>]")
+	}
+	action := args[0]
+
+	switch action {
+	case "get":
+		schema, err := client.GetSchema(ctx)
+		if err != nil {
+			return fmt.Errorf("get schema failed: %w", err)
+		}
+		out, _ := json.MarshalIndent(schema, "", "  ")
+		fmt.Printf("Model: %s\nLocked Schema Contract:\n%s\n", client.ModelName(), string(out))
+		return nil
+
+	case "attach":
+		if len(args) < 2 {
+			return errors.New("usage: anchordb schema attach <field1:type1> [field2:type2 ...]")
+		}
+		schema := make(driver.Schema)
+		for _, pair := range args[1:] {
+			parts := strings.SplitN(pair, ":", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid schema argument: %q (expected field:type)", pair)
+			}
+			schema[parts[0]] = parts[1]
+		}
+		if err := client.Attach(schema); err != nil {
+			return fmt.Errorf("attach schema failed: %w", err)
+		}
+		fmt.Printf("OK: schema contract locked successfully to model %q with %d fields\n", client.ModelName(), len(schema))
+		return nil
+
+	default:
+		return fmt.Errorf("unknown schema action: %q (expected 'get' or 'attach')", action)
+	}
+}
+
+func cmdCausal(ctx context.Context, client *driver.Client, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: anchordb causal <seed> <relation> [-k 5]")
+	}
+	seed := args[0]
+	rel := args[1]
+	k := 5
+
+	if len(args) > 2 {
+		if val, err := strconv.Atoi(args[2]); err == nil && val > 0 {
+			k = val
 		}
 	}
-	if err := db.SetRelation("route-down", spatial.Point2D{Y: -1}); err != nil {
-		log.Fatalf("failed to configure demo relation: %v", err)
-	}
-	_ = db.Sync()
 
-	fi, _ := os.Stat(dbFile)
-	fmt.Printf("[OK] Binary .anchordb file saved: %d bytes (Ultra-dense format!)\n\n", fi.Size())
-
-	ctx := context.Background()
-
-	// 3. Execute Graph Query using Fluent Builder Driver
-	fmt.Println("----------------------------------------------------------")
-	fmt.Println(">>> QUERY 1: In-Storage Pushdown Graph Step")
-	fmt.Println("Query: client.Graph().From('primary_cluster', 'backup_cluster').Relate('route-down').TopK(5).Execute()")
-
-	qStart := time.Now()
-	resp, err := client.Graph().
-		From("primary_cluster", "backup_cluster").
-		Relate("route-down").
-		BeamWidth(0.05).
-		TopK(5).
-		Execute(ctx)
-	qDuration := time.Since(qStart)
-
+	results, err := client.Causal(seed, rel, k)
 	if err != nil {
-		log.Fatalf("Query failed: %v", err)
+		return fmt.Errorf("causal query failed: %w", err)
 	}
 
-	fmt.Printf("Barycenter Anchor Point: (%.2f, %.2f)\n", resp.Anchor.X, resp.Anchor.Y)
-	fmt.Printf("Internal DB Computation Time: %v (Sub-Microsecond!)\n", qDuration)
-	fmt.Printf("Top Candidates Passing DDA Ray & Pythagoras:\n")
-	for i, r := range resp.Results {
-		fmt.Printf("   [%d] '%s' | Axis Distance t: %.2f | Perp Deviation d_perp: %.4f | Score: %.4f\n",
-			i+1, r.Word, r.T, r.DistSqPerp, r.Score)
+	fmt.Printf("Causal 1-Hop Query: seed=%q relation=%q (Top %d):\n", seed, rel, len(results))
+	for i, r := range results {
+		fmt.Printf("   [%d] Target: %-24s | Score: %.4f\n", i+1, r.Word, r.Score)
+	}
+	return nil
+}
+
+func cmdChain(ctx context.Context, client *driver.Client, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: anchordb chain <seed> <rel1,rel2,...> [-k 5]")
+	}
+	seed := args[0]
+	relations := strings.Split(args[1], ",")
+	k := 5
+
+	if len(args) > 2 {
+		if val, err := strconv.Atoi(args[2]); err == nil && val > 0 {
+			k = val
+		}
 	}
 
-	// 4. Query 2: In-Storage Multi-Hop Chaining
-	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> QUERY 2: In-Storage Multi-Hop Chain Execution")
-	fmt.Println("Query: client.Graph().From('primary_cluster', 'backup_cluster').Chain('route-down').ExecuteChain()")
-
-	chainStart := time.Now()
-	chainResp, err := client.Graph().
-		From("primary_cluster", "backup_cluster").
-		Chain("route-down").
-		ExecuteChain(ctx)
-	chainDuration := time.Since(chainStart)
-
+	results, err := client.CausalChain([]string{seed}, relations, k)
 	if err != nil {
-		log.Fatalf("Chain query failed: %v", err)
+		return fmt.Errorf("causal chain query failed: %w", err)
 	}
 
-	fmt.Printf("Chained Traversal Result: %v (Duration: %v)\n", chainResp.Sequence, chainDuration)
-
-	// 5. Query 3: Direct In-Storage Mathematical Calculations (Math Engine)
-	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> QUERY 3: In-Storage Direct Mathematical Calculation (Math Engine)")
-
-	mathEng := client.Math()
-
-	// A. Direct Euclidean Distance
-	dist, _ := mathEng.Distance("primary_cluster", "load_balancer")
-	fmt.Printf("1. Direct Spatial Distance 'primary_cluster' <-> 'load_balancer': %.4f\n", dist)
-
-	// B. Direct Centroid Calculation
-	centroid, _ := mathEng.Centroid("primary_cluster", "backup_cluster", "load_balancer")
-	fmt.Printf("2. Center of Gravity (Centroid) ['primary_cluster', 'backup_cluster', 'load_balancer']: (%.2f, %.2f)\n",
-		centroid.Coord.X, centroid.Coord.Y)
-
-	// C. Semantic Role Cosine Similarity
-	sim, _ := mathEng.CosineSimilarity("primary_cluster", "backup_cluster")
-	fmt.Printf("3. Role Cosine Similarity 'primary_cluster' & 'backup_cluster': %.4f (Identical)\n", sim)
-
-	// D. Nearest Spatial Neighbors
-	nearest, _ := mathEng.Nearest("primary_cluster", 3)
-	fmt.Println("4. Nearest Spatial Neighbors of 'primary_cluster':")
-	for i, n := range nearest {
-		fmt.Printf("   [%d] '%s' (Distance: %.4f)\n", i+1, n.Word, n.T)
+	fmt.Printf("Causal Multi-Hop Chain: seed=%q relations=%v (Top %d):\n", seed, relations, len(results))
+	for i, r := range results {
+		fmt.Printf("   [%d] Target: %-24s | Score: %.4f\n", i+1, r.Word, r.Score)
 	}
+	return nil
+}
 
-	// 6. Query 4: SAVING, GETTING, and CALCULATING (Example: Distance, Duration -> Speed)
-	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> QUERY 4: CORE DATABASE ENGINE (SAVING & GETTING + CALCULATING)")
-	fmt.Println("Example: Save distance & duration, retrieve and calculate speed = distance / duration")
-
-	// 1. SAVING: Save Raw Data
-	_ = client.Save("vehicle_trip", map[string]float32{
-		"distance": 100.0, // km
-		"duration": 2.0,   // hours
-	})
-	fmt.Println("1. SAVING: Data saved -> 'vehicle_trip' {distance: 100.0, duration: 2.0}")
-
-	// 2. GETTING: Retrieve Pure Data
-	rawEntity, _ := client.Get("vehicle_trip").Execute(ctx)
-	fmt.Printf("2. GETTING: Pure retrieved data -> %v\n", rawEntity.All())
-
-	// 3. CALCULATING: Retrieve + Compute Speed internally during retrieval
-	calcEntity, _ := client.Get("vehicle_trip").
-		Compute("speed", driver.Divide("distance", "duration")).
-		Execute(ctx)
-
-	fmt.Printf("3. CALCULATING (In-DB Compute): Distance = %.1f km, Duration = %.1f hours ==> Speed = %.1f km/h\n",
-		calcEntity.Get("distance"), calcEntity.Get("duration"), calcEntity.Get("speed"))
-	fmt.Printf("   Full Return from DB: %v\n", calcEntity.All())
-
-	// 7. Query 5: LIST, WHERE, COMPUTE, and PAGING (CONSTANT TIME)
-	fmt.Println("\n----------------------------------------------------------")
-	fmt.Println(">>> QUERY 5: LIST + WHERE + COMPUTE + PAGING (CONSTANT O(Limit))")
-	fmt.Println("Filter distance >= 50, compute speed, filter speed > 50, Limit 2 per page")
-
-	_ = client.Save("route_express_1", map[string]float32{"distance": 150, "duration": 2})    // v = 75
-	_ = client.Save("route_regional_2", map[string]float32{"distance": 90, "duration": 1.5})  // v = 60
-	_ = client.Save("route_local_loop", map[string]float32{"distance": 10, "duration": 1})    // v = 10 (filtered out)
-	_ = client.Save("route_interstate_4", map[string]float32{"distance": 400, "duration": 4}) // v = 100
-
-	// Page 1
-	p1, _ := client.List().
-		Where("distance", ">=", 50).
-		Compute("speed", driver.Divide("distance", "duration")).
-		Where("speed", ">", 50).
-		Page(1, 2).
-		Execute(ctx)
-
-	fmt.Println("--- PAGE 1 (Limit: 2) ---")
-	for i, item := range p1.Items {
-		fmt.Printf("   [%d] %-22s | Distance: %5.0f km | Duration: %3.1f h | Speed: %5.0f km/h\n",
-			i+1, item.Name, item.Get("distance"), item.Get("duration"), item.Get("speed"))
+func cmdSync(ctx context.Context, client *driver.Client) error {
+	if err := client.Sync(); err != nil {
+		return fmt.Errorf("sync failed: %w", err)
 	}
-	fmt.Printf("   HasMore: %v\n", p1.HasMore)
-
-	// Page 2
-	p2, _ := client.List().
-		Where("distance", ">=", 50).
-		Compute("speed", driver.Divide("distance", "duration")).
-		Where("speed", ">", 50).
-		Page(2, 2).
-		Execute(ctx)
-
-	fmt.Println("--- PAGE 2 (Next Page) ---")
-	for i, item := range p2.Items {
-		fmt.Printf("   [%d] %-22s | Distance: %5.0f km | Duration: %3.1f h | Speed: %5.0f km/h\n",
-			i+1, item.Name, item.Get("distance"), item.Get("duration"), item.Get("speed"))
-	}
-	fmt.Printf("   HasMore: %v (Paging Complete!)\n", p2.HasMore)
-
-	fmt.Println("==========================================================")
+	fmt.Printf("OK: storage engine buffers flushed to disk for model %q\n", client.ModelName())
+	return nil
 }

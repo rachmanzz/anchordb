@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -18,7 +19,7 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
 
-const (
+var (
 	baseURL       = "http://localhost:7447"
 	authToken     = "test_secret_token_live"
 	containerName = "anchordb-live-test"
@@ -26,6 +27,12 @@ const (
 )
 
 func main() {
+	flag.StringVar(&baseURL, "url", baseURL, "AnchorDB server base URL")
+	flag.StringVar(&authToken, "token", authToken, "AnchorDB bearer auth token")
+	flag.StringVar(&containerName, "container", containerName, "Container name in podman/docker")
+	flag.StringVar(&testModel, "model", testModel, "Test model database name")
+	flag.Parse()
+
 	fmt.Println("================================================================================")
 	fmt.Println("       ANCHORDB CONTAINER INTEGRATION & STRESS VERIFICATION SUITE              ")
 	fmt.Println("================================================================================")
@@ -36,7 +43,7 @@ func main() {
 	if err := waitForHealth(15 * time.Second); err != nil {
 		log.Fatalf("[FATAL] Container is not ready: %v", err)
 	}
-	fmt.Println("[READY] AnchorDB Container is healthy and responding on :7447")
+	fmt.Printf("[READY] AnchorDB Container (%s) is healthy on %s\n", containerName, baseURL)
 
 	// -------------------------------------------------------------------------
 	// (a) Stress Testing All Operations
@@ -218,21 +225,24 @@ func runStressTests(ctx context.Context) {
 	fmt.Printf("      -> Ray Cast from root_controller along south_feed: Top Result = %s (Score: %.4f) [OK]\n",
 		graphResp.Results[0].Word, graphResp.Results[0].Score)
 
-	// 6. Causal Reasoning & Chain
-	fmt.Println("[6/7] Testing Causal Link Insertion and Multi-Hop Chain Traversal...")
-	_ = client.Link("soil_dry", "triggers", "irrigation_on", 0.95)
-	_ = client.Link("irrigation_on", "causes", "soil_moist", 0.90)
+	// 6. Causal Reasoning & Multi-Branching Chain (Mesh DAG)
+	fmt.Println("[6/7] Testing Causal Link Insertion & Multi-Branching DAG Traversal...")
+	_ = client.Link("soil_dry", "triggers", "irrigation_pump_1", 0.95)
+	_ = client.Link("soil_dry", "triggers", "irrigation_pump_2", 0.90)
+	_ = client.Link("irrigation_pump_1", "causes", "sprinkler_zone_a", 0.95)
+	_ = client.Link("irrigation_pump_2", "causes", "sprinkler_zone_a", 0.88) // convergence
+	_ = client.Link("sprinkler_zone_a", "propagates", "soil_moist", 0.95)
 
 	causalHop, err := client.Causal("soil_dry", "triggers", 5)
-	if err != nil || len(causalHop) == 0 {
+	if err != nil || len(causalHop) < 2 {
 		log.Fatalf("Causal step failed: %v", err)
 	}
-	causalChain, err := client.CausalChain([]string{"soil_dry"}, []string{"triggers", "causes"}, 5)
+	causalChain, err := client.CausalChain([]string{"soil_dry"}, []string{"triggers", "causes", "propagates"}, 5)
 	if err != nil || len(causalChain) == 0 {
 		log.Fatalf("Causal chain failed: %v", err)
 	}
-	fmt.Printf("      -> Causal Chain: soil_dry -> triggers -> %s -> causes -> %s (Cumulative Score: %.3f) [OK]\n",
-		causalHop[0].Word, causalChain[0].Word, causalChain[0].Score)
+	fmt.Printf("      -> Multi-Branching Mesh Traversal: soil_dry -> triggers (%d branches) -> causes -> sprinkler_zone_a -> propagates -> %s (Score: %.3f) [OK]\n",
+		len(causalHop), causalChain[0].Word, causalChain[0].Score)
 
 	// 7. Direct Math Engine
 	fmt.Println("[7/7] Testing Direct Math Engine (Distance, Centroid, CosineSimilarity, Nearest)...")
@@ -390,7 +400,10 @@ func runPersistenceRestartTest(ctx context.Context) {
 		log.Fatalf("Canary write failed: %v", err)
 	}
 	_ = client.AppendNode("canary_node_primary", spatial.Point2D{X: 0.5, Y: 0.5}, [4]float32{0.8, 0.2, 0.5, 0.1})
-	_ = client.Link("canary_node_primary", "triggers", "canary_node_target", 0.99)
+	_ = client.Link("canary_node_primary", "triggers", "canary_branch_a", 0.95)
+	_ = client.Link("canary_node_primary", "triggers", "canary_branch_b", 0.90)
+	_ = client.Link("canary_branch_a", "propagates", "canary_node_target", 0.95)
+	_ = client.Link("canary_branch_b", "propagates", "canary_node_target", 0.85) // convergence
 
 	// Explicit sync
 	if err := client.Sync(); err != nil {
@@ -457,11 +470,15 @@ func runPersistenceRestartTest(ctx context.Context) {
 
 	// Verify spatial & causal data
 	causal, err := reopenedClient.Causal("canary_node_primary", "triggers", 5)
-	if err != nil || len(causal) == 0 {
-		log.Fatalf("Canary causal edge missing after restart: %v", err)
+	if err != nil || len(causal) < 2 {
+		log.Fatalf("Canary causal branches missing after restart: %v", err)
 	}
-	fmt.Printf("      -> Canary Causal Edge verified: %s -> triggers -> %s (Score: %.2f) [OK]\n",
-		"canary_node_primary", causal[0].Word, causal[0].Score)
+	chain, err := reopenedClient.CausalChain([]string{"canary_node_primary"}, []string{"triggers", "propagates"}, 5)
+	if err != nil || len(chain) == 0 {
+		log.Fatalf("Canary causal chain missing after restart: %v", err)
+	}
+	fmt.Printf("      -> Canary Multi-Branch Causal Chain verified: %s -> triggers (%d branches) -> propagates -> %s (Score: %.4f) [OK]\n",
+		"canary_node_primary", len(causal), chain[0].Word, chain[0].Score)
 
 	// Verify bulk records count
 	listRes, err := reopenedClient.List().Page(1, 10).Execute(ctx)

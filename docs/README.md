@@ -58,7 +58,7 @@ Welcome to the technical documentation for **AnchorDB**. Below is a directory of
    * Cold partition inspection and context cancellation handling.
 
 10. **[Benchmark & Integration Verification Guide](benchmark_and_verification.md)**
-   * Reproducible 6-phase test suite execution (`cmd/container_verifier`).
+   * Reproducible 6-phase test suite execution (`test/container_verifier`).
    * Little's Law validation ($L = \lambda \cdot W$) across concurrent worker pools.
    * Container crash durability, background sync, and cold partition archival.
    * High-load schema attachment, validation, and fail-fast rejection stress testing.

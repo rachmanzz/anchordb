@@ -3,6 +3,7 @@ package security
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -252,7 +253,9 @@ func (f *IPFilter) Middleware(next http.Handler) http.Handler {
 		if !f.IsAllowed(clientIP) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = fmt.Fprintf(w, `{"error":"Forbidden: client IP %s is not allowed by AnchorDB whitelist"}`, clientIP)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("Forbidden: client IP %s is not allowed by AnchorDB whitelist", clientIP),
+			})
 			return
 		}
 		next.ServeHTTP(w, r)

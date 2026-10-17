@@ -124,9 +124,6 @@ func (t *registeredTask) execute(ctx context.Context) (err error) {
 	t.lastRun = time.Now()
 	t.mu.Unlock()
 
-	log.Printf("[SCHEDULER] Running task %q ...", t.name)
-	t0 := time.Now()
-
 	if t.task != nil {
 		err = t.task.Execute(ctx)
 	} else if t.jobFunc != nil {
@@ -139,7 +136,6 @@ func (t *registeredTask) execute(ctx context.Context) (err error) {
 		log.Printf("[SCHEDULER] Task %q FAILED: %v", t.name, err)
 	} else {
 		t.lastStatus = "Success"
-		log.Printf("[SCHEDULER] Task %q SUCCEEDED in %v", t.name, time.Since(t0))
 	}
 	t.mu.Unlock()
 	return err
@@ -348,7 +344,6 @@ func (s *InternalScheduler) register(name, schedule string, t *registeredTask) e
 		s.run.wg.Add(1) // safe: s.run is read/set under s.mu and Wait happens after run=nil
 		go s.runTaskLoop(s.run, t)
 	}
-	log.Printf("[SCHEDULER] Task %q registered with schedule %q (spec: %q)", name, schedule, spec.cronSpec)
 	return nil
 }
 
@@ -365,7 +360,6 @@ func (s *InternalScheduler) Unregister(name string) error {
 	s.mu.Unlock()
 
 	close(t.stop)
-	log.Printf("[SCHEDULER] Task %q removed.", name)
 	return nil
 }
 
@@ -413,8 +407,6 @@ func (s *InternalScheduler) Start() {
 		go s.runTaskLoop(rs, t)
 	}
 	s.mu.Unlock()
-
-	log.Println("[SCHEDULER] Pure Go background scheduler active.")
 }
 
 func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
@@ -533,7 +525,6 @@ func (s *InternalScheduler) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		log.Println("[SCHEDULER] Background scheduler stopped (all tasks finished).")
 		return nil
 	case <-ctx.Done():
 		log.Printf("[SCHEDULER] Background scheduler forcibly stopped (timeout: %v).", ctx.Err())

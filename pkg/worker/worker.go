@@ -349,7 +349,6 @@ func (p *Pool) checkMemory() error {
 // that ignored cancellation) is refused to avoid overlapping workers.
 func (p *Pool) Start() {
 	if !p.cfg.Enabled {
-		log.Println("[WORKER] Worker pool disabled by configuration.")
 		return
 	}
 	p.lifecycleMu.Lock()
@@ -382,8 +381,6 @@ func (p *Pool) Start() {
 		p.wg.Add(1)
 		go p.workerLoop(taskCh, quitCh)
 	}
-	log.Printf("[WORKER] Worker pool active with %d worker goroutines (queue: %d)",
-		p.cfg.Concurrency, p.cfg.QueueSize)
 }
 
 func (p *Pool) workerLoop(taskCh <-chan jobItem, quitCh <-chan struct{}) {
@@ -436,7 +433,6 @@ func (p *Pool) executeJob(t Task, quitCh <-chan struct{}) {
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUCCEEDED (attempt %d/%d, duration: %v)", t.Name, i+1, attempts, time.Since(start))
 			return
 		}
 
@@ -496,7 +492,6 @@ FINAL:
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUCCEEDED via FALLBACK (duration: %v)", t.Name, time.Since(start))
 			return
 		}
 		finalErr = fbErr
@@ -644,7 +639,6 @@ func (p *Pool) executeJobSync(t Task) {
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUCCEEDED (sync, attempt %d/%d, duration: %v)", t.Name, i+1, attempts, time.Since(start))
 			return
 		}
 		lastErr = err
@@ -698,7 +692,6 @@ FINALSYNC:
 					t.OnSuccess(ctx)
 				}()
 			}
-			log.Printf("[WORKER] Task %q SUCCEEDED via FALLBACK (sync, duration: %v)", t.Name, time.Since(start))
 			return
 		}
 		finalErr = fbErr
@@ -900,7 +893,6 @@ func (p *Pool) reportCanceled(t Task) {
 			t.OnError(ctx, ErrCanceled)
 		}()
 	}
-	log.Printf("[WORKER] Task %q CANCELED before execution (queue cleared).", t.Name)
 }
 
 // Shutdown gracefully drains the queue and stops the pool. It first stops
@@ -917,7 +909,6 @@ func (p *Pool) Shutdown() error {
 	if !p.running.CompareAndSwap(true, false) {
 		return nil
 	}
-	log.Println("[WORKER] Stopping worker pool...")
 	p.draining.Store(true)
 
 	// Close the task channel: workers finish buffered jobs, then exit on !ok.
@@ -938,7 +929,6 @@ func (p *Pool) Shutdown() error {
 	case <-done:
 		p.stopped.Store(true)
 		p.forced.Store(false)
-		log.Println("[WORKER] Worker pool stopped cleanly (queue drained).")
 		return nil
 	case <-time.After(p.cfg.ShutdownTimeout):
 		// Force workers out (abort retry backoff / unblock workerLoop selects).
