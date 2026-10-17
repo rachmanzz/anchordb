@@ -85,7 +85,7 @@ func main() {
 
 // ------------------------------------------------------------------------------------------------
 // SCENARIO 1: Real-World 6-Hop Supply Chain Disruption Analysis
-// "Kalau pabrik di Vietnam banjir, produk mana yang stoknya habis dalam 30 hari?"
+// "If the factory in Vietnam floods, which products run out of stock within 30 days?"
 // ------------------------------------------------------------------------------------------------
 
 func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir string) {
@@ -116,7 +116,7 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 	// 2. Multi-Tier Supply Network Entities (Hop 0 to Hop 6)
 	fmt.Println(">>> [PHASE 2] Ingesting Multi-Tier Supply Chain Entities (Hop 0 to Hop 6)")
 	entities := []SupplyChainEntity{
-		// Hop 0: Epicenter (Pabrik Bac Ninh, Vietnam)
+		// Hop 0: Epicenter (Bac Ninh Factory, Vietnam)
 		{"factory_vietnam_bac_ninh", 0, 0.0, 0.0, 90.0, 1.0},
 
 		// Hop 1: Tier-1 Specialized Component Suppliers
@@ -280,9 +280,9 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 	}
 
 	// 5. Combining Graph Scoring with In-Storage Math:
-	// "Produk mana yang stoknya habis dalam 30 hari?"
+	// "Which products run out of stock within 30 days?"
 	fmt.Println(">>> [PHASE 5] Answering Business Question via Graph Scoring + In-Storage Math")
-	fmt.Println("    Question: \"Kalau pabrik di Vietnam banjir, produk mana yang stoknya habis dalam 30 hari?\"")
+	fmt.Println("    Question: \"If the factory in Vietnam floods, which products run out of stock within 30 days?\"")
 	fmt.Println("    Method: In-Storage Division (inventory_units / daily_burn_rate) on all Hop-6 reached SKUs.")
 	fmt.Println()
 
@@ -378,16 +378,16 @@ func runSupplyChainAnalysis(mode, serverURL, authToken, modelName, dataDir strin
 	}
 
 	fmt.Println("==========================================================================================")
-	fmt.Printf(">>> HASIL ANALISIS: Ditemukan %d SKU yang stoknya HABIS DALAM 30 HARI akibat banjir Vietnam!\n", criticalCount)
+	fmt.Printf(">>> ANALYSIS FINDINGS: Detected %d SKUs RUNNING OUT OF STOCK WITHIN 30 DAYS due to Vietnam flood!\n", criticalCount)
 	fmt.Println("==========================================================================================")
 	for idx, it := range analysisTable {
 		if it.StockoutIn30 {
 			fmt.Printf(" [%d] %s:\n", idx+1, it.SKU)
-			fmt.Printf("     - Sisa Hari Operasional: %.1f HARI (Stok: %.0f unit, Konsumsi: %.1f unit/hari)\n",
+			fmt.Printf("     - Days of Stock Remaining: %.1f DAYS (Stock: %.0f units, Burn Rate: %.1f units/day)\n",
 				it.DaysRemaining, it.CurrentStock, it.DailyBurn)
-			fmt.Printf("     - Probabilitas Terpapar Gangguan Rantai Pasok: %.2f%%\n", it.DisruptionProb*100)
-			fmt.Printf("     - Tingkat Kritis Komponen: %v (Skor Resiko Gabungan: %.2f)\n",
-				map[bool]string{true: "KOMPONEN TUNGGAL (SINGLE SOURCE)", false: "DUAL SOURCE"}[it.IsBottleneck], it.RiskScore)
+			fmt.Printf("     - Supply Chain Disruption Probability: %.2f%%\n", it.DisruptionProb*100)
+			fmt.Printf("     - Component Criticality: %v (Composite Risk Score: %.2f)\n",
+				map[bool]string{true: "SINGLE SOURCE BOTTLENECK", false: "DUAL SOURCE"}[it.IsBottleneck], it.RiskScore)
 			fmt.Println()
 		}
 	}

@@ -1,108 +1,108 @@
-# Analisis Rantai Pasok (Supply Chain Disruption Analysis) dengan AnchorDB
+# Multi-Tier Supply Chain Disruption Analysis with AnchorDB
 
-Studi kasus implementasi nyata AnchorDB untuk analisis dampak gangguan rantai pasok multi-tingkat (*multi-tier supply chain disruption*) menggunakan **Directed Causal Graph (Multi-Hop Traversal)** dan **In-Storage Arithmetic Computation**.
-
----
-
-## 1. Domain Problem & Siapa yang Menggunakan
-
-### Siapa yang Memakai Solusi Ini?
-1. **Manufaktur Multinasional (OEM & Electronics Brands)**: Mengelola ribuan komponen dari ratusan supplier di berbagai negara (semikonduktor, modul kamera, baterai, sasis).
-2. **Retail Besar & E-Commerce Global**: Memonitor ketersediaan stok produk akhir di jaringan pusat pemenuhan (*fulfillment centers*) dan toko flagship.
-3. **Penyedia Layanan Logistik 3PL/4PL**: Mengoptimalkan rute kargo dan mengantisipasi efek domino keterlambatan pengiriman bahan baku terhadap pabrik perakitan.
+Real-world implementation case study of AnchorDB for **multi-tier supply chain disruption analysis** using **Directed Causal Graphs (Multi-Hop Traversal)** and **In-Storage Arithmetic Computation**.
 
 ---
 
-## 2. Pertanyaan Bisnis Nyata
+## 1. Domain Problem & Target Audience
 
-> ### *"Kalau pabrik semikonduktor di Bac Ninh, Vietnam terendam banjir akibat badai, produk (SKU) mana saja di toko ritel kita yang stoknya akan habis dalam 30 hari ke depan?"*
-
-Pertanyaan ini terdengar sederhana, namun pada sistem database tradisional (Relational SQL atau Key-Value biasa) memerlukan kueri rekursif berulang (`JOIN` bertingkat 6 tabel) yang sangat lambat dan rawan *lock contention*, atau pemrosesan batch malam hari yang memakan waktu berjam-jam. 
-
-AnchorDB menyelesaikan analisis ini dalam **beberapa mikrodetik** secara *in-memory* dan *zero-copy*.
+### Who Uses This Solution?
+1. **Multinational OEMs & Electronics Brands**: Managing thousands of component dependencies across worldwide suppliers (semiconductors, camera modules, batteries, display panels, chassis).
+2. **Global Retail & E-Commerce Enterprises**: Monitoring real-time buffer inventory and replenishment velocity across regional distribution fulfillment centers and flagship retail stores.
+3. **Logistics & Freight Operators (3PL/4PL)**: Anticipating domino effects of raw material and component delays on manufacturing plants and consumer product availability.
 
 ---
 
-## 3. Mengapa Butuh Multi-Hop (> 2 Hops)?
+## 2. Real-World Business Question
 
-Gangguan di dunia nyata tidak berhenti di supplier tingkat pertama (Tier 1). Rantai pasok modern terdiri dari jaringan ketergantungan yang dalam:
+> ### *"If our semiconductor and sensor fab in Bac Ninh, Vietnam is shut down due to severe monsoon flooding, which consumer product SKUs will run out of stock within 30 days across our retail stores?"*
+
+In conventional database architectures (Relational SQL or Document/Key-Value stores), answering this question requires recursive multi-table queries (6-level nested joins) that suffer from high latency and lock contention, or slow overnight ETL jobs.
+
+AnchorDB solves this query in **microseconds** directly in-memory and zero-copy.
+
+---
+
+## 3. Why Multi-Hop (> 2 Hops) Is Essential
+
+Real-world industrial disruptions do not stop at Tier 1 suppliers. Global manufacturing relies on a deep multi-tier propagation mesh:
 
 ```
-[Hop 0: Bencana Alam]
-   Pabrik Bac Ninh, Vietnam Terendam Banjir
+[Hop 0: Natural Disaster Event]
+   Bac Ninh Fab, Vietnam (Flooded & Offline)
                │
                ▼ (Hop 1: supplies_t1)
-   Supplier Tier 1 (Fabrikasi Wafer SoC 3nm, Lensa Periskop, Display OLED)
+   Tier 1 Specialized Suppliers (3nm SoC Wafer, Periscope Prism, Flexible OLED, 5G RF)
                │
                ▼ (Hop 2: subassembles)
-   Sub-Assembly Unit (Mainboard PCB, Modul Kamera OIS, Display Chassis)
+   Sub-Assembly Units (Main Logic Board PCB, OIS Camera Module, Display Chassis)
                │
                ▼ (Hop 3: fabricates)
-   Final Assembly Mega-Plant (Pabrik Perakitan Shenzhen, Penang, Chennai)
+   Final Assembly Mega-Plants (Shenzhen, Penang, Chennai)
                │
                ▼ (Hop 4: transports)
-   Regional Logistics Hub (Hub Kargo Singapura, Los Angeles, Rotterdam)
+   Regional Logistics & Cargo Hubs (Singapore APAC, Los Angeles NA, Rotterdam EU)
                │
                ▼ (Hop 5: distributes)
-   Retail Megastores (Toko Flagship Tokyo, Seattle, Jakarta, Frankfurt, Sydney)
+   Retail Megastores (Tokyo Ginza, Seattle Flagship, Jakarta, Frankfurt, Sydney)
                │
                ▼ (Hop 6: stocks_sku)
-   Final Product SKUs di Rak Toko (Smartphone Pro 1TB, Ultrabook Pro 16", Tablet Air 11", Smartwatch)
+   Final Consumer Product SKUs on Retail Shelves (Smartphone Pro, Ultrabook, Tablet, Watch)
 ```
 
-Jika query terhenti di **Hop 2**, pengambil keputusan hanya tahu bahwa *"Sub-assembly mainboard terganggu"*, tetapi **tidak tahu produk mana di toko ritel mana yang stoknya akan habis**. Analisis operasional membutuhkan visibilitas menyeluruh hingga **Hop 6**.
+If query traversal halts at **Hop 2**, decision makers only know that *"Mainboard sub-assembly is delayed"*, but **cannot identify which final products and stores will suffer stockouts**. Actionable operational decisions require complete visibility down to **Hop 6**.
 
 ---
 
-## 4. Mengapa Butuh Skor Probabilitas?
+## 4. Why Historical Probability Scoring Matters
 
-Ketergantungan rantai pasok bukan relasi biner (`true` atau `false`). 
-- Komponen dengan **pemasok tunggal (*single source*)** memiliki koefisien transmisi kegagalan sangat tinggi ($0.95 - 0.98$). Jika pabrik hulu tutup, perakitan hilir pasti terhenti.
-- Komponen dengan **pemasok ganda (*dual source*)** memiliki koefisien transmisi lebih rendah ($0.70 - 0.85$) karena pabrik perakitan dapat mengalihkan sebagian pesanan ke pabrik cadangan.
-- Jalur logistik dengan cadangan buffer memiliki probabilitas redaman risiko.
+Supply chain dependencies are not binary (`true`/`false`):
+- **Single-Source Bottlenecks**: Components with no alternative supplier have very high failure transmission coefficients ($0.95 - 0.98$). If the upstream plant halts, downstream assembly stops immediately.
+- **Dual-Source Components**: Components with qualified secondary suppliers have lower transmission coefficients ($0.70 - 0.85$), as production orders can be partially re-routed.
+- **Logistics Routes**: Shipping lanes with buffer buffers dampen shock waves.
 
-AnchorDB menghitung probabilitas kumulatif di sepanjang jalur multi-hop secara otomatis melalui `CausalChain`:
-$$\text{Probabilitas Transmisi Dampak} = \prod_{i=1}^{n} w_i$$
+AnchorDB multiplies edge transmission weights along the multi-hop path automatically via `CausalChain`:
+$$P(\text{Disruption}) = \prod_{i=1}^{n} w_i$$
 
 ---
 
-## 5. Mengapa Butuh In-Storage Math?
+## 5. Why In-Storage Math Is Critical
 
-Mengetahui bahwa suatu produk terkena dampak gangguan probabilitas 79% baru setengah jawaban. Pertanyaan bisnisnya adalah: **"Apakah stoknya habis dalam 30 hari?"**
+Knowing a product has a 79% disruption probability is only half the answer. The executive question is: **"Will current stock run out within 30 days?"**
 
-AnchorDB menyimpan atribut entitas:
-- `inventory_units`: Jumlah unit buffer stok yang ada di gudang/toko saat ini.
-- `daily_burn_rate`: Kecepatan konsumsi/penjualan rata-rata per hari.
+AnchorDB stores entity attributes:
+- `inventory_units`: Current buffer inventory units available in the warehouse/store.
+- `daily_burn_rate`: Daily sales or consumption rate (units/day).
 
-AnchorDB mengevaluasi formula matematis langsung di dalam mesin penyimpanan (*in-storage computation*) tanpa mengekstrak data ke aplikasi:
+AnchorDB calculates the time-to-stockout on-the-fly directly inside the storage engine without round-trip data transfer:
 $$\text{Days to Stockout} = \frac{\text{inventory\_units}}{\text{daily\_burn\_rate}}$$
 
-Jika $\text{Days to Stockout} \le 30.0$, sistem secara otomatis membunyikan alarm **ALERT (<30 Hari)** dan memberikan rekomendasi tindakan mitigasi darurat (misal: pengalihan kargo udara ekspres atau pengalokasian stok cadangan regional).
+If $\text{Days to Stockout} \le 30.0$, the engine triggers an **ALERT (<30 Days)** and outputs priority mitigation recommendations (e.g., expediting air freight or reallocating regional buffer stock).
 
 ---
 
-## 6. Struktur File Proyek
+## 6. Directory Structure
 
 ```
 examples/supply_chain/
-├── main.go               # Program lengkap (Mode Embedded & Remote, Analisis 6-Hop, Crash-Test, Benchmark 5jt)
-├── docker-compose.yml    # Konfigurasi container AnchorDB daemon dengan persistent volume & WAL
-└── README.md             # Panduan operasional & dokumentasi arsitektur (file ini)
+├── main.go               # Complete Go program (Embedded & Remote modes, 6-Hop Causal Graph, 30-Day Math, Crash-Test, 5M Benchmark)
+├── docker-compose.yml    # Container service definition with persistent volume & WAL sync
+└── README.md             # Complete technical guide & operational instructions (this file)
 ```
 
 ---
 
-## 7. Cara Menjalankan
+## 7. How to Run
 
-### Mode A: Embedded Mode (In-Process Runtime, Zero Dependency)
-Mode ini menjalankan AnchorDB secara langsung di dalam proses Go tanpa memerlukan instalasi Docker, daemon eksternal, atau port jaringan TCP.
+### Mode A: Embedded Engine (In-Process Runtime, Zero Dependency)
+Runs AnchorDB directly in the Go process memory with zero network overhead and no Docker/server required:
 
 ```bash
-# Jalankan analisis skenario banjir Vietnam (6-Hop Causal + In-Storage Math)
+# Run realistic Vietnam flood disruption analysis (6-Hop Causal + In-Storage Math)
 go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
 ```
 
-#### Output Eksekutif yang Dihasilkan:
+#### Real Execution Output:
 ```text
 >>> [PHASE 4] Executing Multi-Hop Causal Disruption Traversal (Hop 1 to Hop 6)
     ▶ Hop 1 (supplies_t1) -> Reached 4 downstream targets [Latency: 4.39µs]
@@ -112,32 +112,43 @@ go run ./examples/supply_chain/main.go -mode=embedded -scenario=analysis
     ▶ Hop 5 (supplies_t1 → ... → distributes) -> Reached 5 downstream targets [Latency: 4.46µs]
     ▶ Hop 6 (supplies_t1 → ... → stocks_sku) -> Reached 6 downstream targets [Latency: 13.59µs]
 
-┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────┬────────────────────────┐
-│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status   │ Action Recommendation  │
-├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────┼────────────────────────┤
-│ sku_ultrabook_pro_16in    │       150 u │     12.0/d │       12.5 d │       76.6% │ ALERT    │ EMERGENCY: Reroute air │
-│ sku_smartphone_pro_1tb    │       240 u │     14.0/d │       17.1 d │       79.0% │ ALERT    │ EMERGENCY: Reroute air │
-│ sku_smartwatch_fit_band   │       190 u │      9.0/d │       21.1 d │       71.1% │ ALERT    │ Allocate backup stock  │
-│ sku_smartphone_base_128gb │       520 u │     20.0/d │       26.0 d │       75.0% │ ALERT    │ Allocate backup stock  │
-│ sku_tablet_air_11in       │       480 u │     10.0/d │       48.0 d │       72.6% │ SAFE     │ Monitor replenishment  │
-│ sku_smartwatch_ultra_49mm │       650 u │     11.0/d │       59.1 d │       70.3% │ SAFE     │ Monitor replenishment  │
-└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────┴────────────────────────┘
+┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────┬────────────────────────────────┐
+│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status   │ Action Recommendation          │
+├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────┼────────────────────────────────┤
+│ sku_ultrabook_pro_16in    │       150 u │     12.0/d │       12.5 d │       76.6% │ ALERT    │ EMERGENCY: Reroute air freight │
+│ sku_smartphone_pro_1tb    │       240 u │     14.0/d │       17.1 d │       79.0% │ ALERT    │ EMERGENCY: Reroute air freight │
+│ sku_smartwatch_fit_band   │       190 u │      9.0/d │       21.1 d │       71.1% │ ALERT    │ Allocate backup stock          │
+│ sku_smartphone_base_128gb │       520 u │     20.0/d │       26.0 d │       75.0% │ ALERT    │ Allocate backup stock          │
+│ sku_tablet_air_11in       │       480 u │     10.0/d │       48.0 d │       72.6% │ SAFE     │ Monitor normal replenishment   │
+│ sku_smartwatch_ultra_49mm │       650 u │     11.0/d │       59.1 d │       70.3% │ SAFE     │ Monitor normal replenishment   │
+└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────┴────────────────────────────────┘
+
+>>> ANALYSIS FINDINGS: Detected 4 SKUs RUNNING OUT OF STOCK WITHIN 30 DAYS due to Vietnam flood!
+ [1] sku_ultrabook_pro_16in:
+     - Days of Stock Remaining: 12.5 DAYS (Stock: 150 units, Burn Rate: 12.0 units/day)
+     - Supply Chain Disruption Probability: 76.63%
+     - Component Criticality: SINGLE SOURCE BOTTLENECK (Composite Risk Score: 8.51)
+
+ [2] sku_smartphone_pro_1tb:
+     - Days of Stock Remaining: 17.1 DAYS (Stock: 240 units, Burn Rate: 14.0 units/day)
+     - Supply Chain Disruption Probability: 79.05%
+     - Component Criticality: SINGLE SOURCE BOTTLENECK (Composite Risk Score: 6.54)
 ```
 
 ---
 
 ### Mode B: Container Mode (Docker & Podman)
 
-Pada mode ini, AnchorDB berjalan sebagai daemon container server di port `7447`, dan aplikasi bertindak sebagai remote client (`driver.ConnectRemote`).
+Runs AnchorDB as an isolated daemon container on port `7447`, communicating via HTTP REST client driver (`driver.ConnectRemote`).
 
-#### Langkah 1: Jalankan Container AnchorDB
-Menggunakan **Docker Compose**:
+#### Step 1: Start AnchorDB Container
+Using **Docker Compose**:
 ```bash
 cd examples/supply_chain
 docker compose up -d
 ```
 
-Atau menggunakan **Podman** secara langsung:
+Or using **Podman**:
 ```bash
 podman run -d \
   --name anchordb-supply-chain \
@@ -150,12 +161,12 @@ podman run -d \
   anchordb:latest
 ```
 
-Verifikasi container berjalan normal:
+Verify container health:
 ```bash
 curl -H "Authorization: Bearer supply_chain_secret_token" http://localhost:7447/health
 ```
 
-#### Langkah 2: Jalankan Analisis Rantai Pasok via Remote Client
+#### Step 2: Execute Supply Chain Analysis via Remote Driver
 ```bash
 go run ./examples/supply_chain/main.go \
   -mode=remote \
@@ -166,18 +177,18 @@ go run ./examples/supply_chain/main.go \
 
 ---
 
-## 8. Skenario Crash Recovery & Uji Durabilitas
+## 8. Crash Recovery & WAL Durability Scenario
 
-AnchorDB mengimplementasikan **Write-Ahead Logging (WAL)** berbasis frame binary dengan checksum CRC32 dan mode sinkronisasi disk fisik (`fsync`).
+AnchorDB utilizes a **Write-Ahead Log (WAL)** with CRC32 frame checksums and strict fsync commit semantics.
 
-### Uji Otomatis (In-Process Simulated Crash):
+### Automated In-Process Crash Test:
 ```bash
 go run ./examples/supply_chain/main.go -scenario=crash-test -phase=all
 ```
 
-### Uji Nyata pada Container (Abrupt Container Kill & Reboot):
+### Live Container Crash Test (Abrupt SIGKILL & Reboot):
 
-1. **Populasikan data awal & link 6-hop ke container**:
+1. **Populate initial graph & data in container**:
    ```bash
    go run ./examples/supply_chain/main.go \
      -mode=remote \
@@ -187,20 +198,19 @@ go run ./examples/supply_chain/main.go -scenario=crash-test -phase=all
      -phase=populate
    ```
 
-2. **Simulasikan crash server tiba-tiba (Hard Kill)**:
+2. **Simulate server power loss / hard kill**:
    ```bash
-   # Matikan container seketika tanpa graceful shutdown
    docker kill anchordb-supply-chain
-   # (atau: podman kill anchordb-supply-chain)
+   # (or with Podman: podman kill anchordb-supply-chain)
    ```
 
-3. **Hidupkan kembali container**:
+3. **Reboot the container**:
    ```bash
    docker start anchordb-supply-chain
-   # (atau: podman start anchordb-supply-chain)
+   # (or with Podman: podman start anchordb-supply-chain)
    ```
 
-4. **Verifikasi rekonsiliasi data dan graf**:
+4. **Verify post-crash data & graph integrity**:
    ```bash
    go run ./examples/supply_chain/main.go \
      -mode=remote \
@@ -210,7 +220,7 @@ go run ./examples/supply_chain/main.go -scenario=crash-test -phase=all
      -phase=verify
    ```
 
-Hasil verifikasi:
+Output confirms zero data loss:
 ```text
 [STEP 2/3] Verifying Data & Graph Integrity Post-Crash...
     [✓] Schema survived crash: 5 fields locked
@@ -224,22 +234,22 @@ Hasil verifikasi:
 
 ---
 
-## 9. Uji Skala Besar (Dataset hingga 5 Juta Entitas & Relasi)
+## 9. Large-Scale Stress Testing (Up to 5 Million Entities & Edges)
 
-Untuk menguji performa AnchorDB pada skala enterprise besar (misal: 100.000 hingga 5.000.000 SKU / komponen rantai pasok global):
+To validate AnchorDB under massive enterprise supply chain topologies (e.g., 100,000 to 5,000,000 global parts and SKUs):
 
-### Menjalankan Uji 100.000 Record:
+### Run 100,000 Record Benchmark:
 ```bash
 go run ./examples/supply_chain/main.go -scenario=benchmark -scale=100000
 ```
-- **Throughput Ingesti**: ~181.000 writes/detik
-- **Throughput Pembuatan Relasi Graf**: ~141.000 edges/detik
-- **Latensi Query Multi-Hop**: ~244 mikrodetik (**Sub-Milidetik!**)
+- **Ingestion Throughput**: ~181,000 writes/sec
+- **Graph Link Throughput**: ~141,000 edges/sec
+- **Multi-Hop Query Latency**: ~244 microseconds (**Sub-Millisecond!**)
 
-### Menjalankan Uji Skala Penuh 5.000.000 Record (5jt):
+### Run Full 5,000,000 Record Stress Test:
 ```bash
 go run ./examples/supply_chain/main.go -scenario=benchmark -scale=5000000
 ```
 
-> **Catatan Penggunaan Memori**:
-> Karena AnchorDB menggunakan arsitektur *memory-mapped file* (`mmap`), sistem tidak memuat seluruh 5 juta objek ke dalam Go Garbage Collector heap. Ingesti di-stream dalam batch multi-thread, sehingga footprint RAM tetap stabil dan bebas dari *GC pause*.
+> **Memory Architecture Note**:
+> AnchorDB uses zero-copy memory mapping (`mmap`). The streaming ingestion pipeline operates in concurrent batches without allocating millions of heap objects into the Go runtime garbage collector, preserving stable RAM usage and eliminating GC pause spikes.
