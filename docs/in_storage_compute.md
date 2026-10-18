@@ -115,37 +115,31 @@ fmt.Printf("Updated %d records\n", updatedCount)
 
 ---
 
-## 5. REST API Usage
+## 5. AnchorWire Usage
 
-In-storage calculations can be triggered over the HTTP REST API.
+In-storage calculations work through the Go driver over AnchorWire:
 
-### `POST /v1/get` with Computations
-```json
-{
-  "name": "vehicle_route_1",
-  "select": ["distance", "duration", "speed"],
-  "computations": {
-    "speed": {
-      "op": "divide",
-      "field_a": "distance",
-      "field_b": "duration"
-    }
-  }
+```go
+client, err := driver.ConnectWire("wire://localhost:7448",
+    driver.WithToken("your_auth_token"),
+    driver.WithModel("vehicles"),
+)
+if err != nil {
+    log.Fatal(err)
 }
+defer client.Close()
+
+result, err := client.Get("vehicle_route_1").
+    Select("distance", "duration", "speed").
+    Compute("speed", driver.Divide("distance", "duration")).
+    Execute(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(result.Get("speed"))
 ```
 
-**Response**:
-```json
-{
-  "name": "vehicle_route_1",
-  "operation": 1,
-  "props": {
-    "distance": 100,
-    "duration": 2,
-    "speed": 50
-  }
-}
-```
+See the [AnchorWire guide](anchorwire.md) for a complete runnable program.
 
 ---
 

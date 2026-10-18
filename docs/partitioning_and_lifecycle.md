@@ -42,7 +42,7 @@ A partition job isolates records older than a configured retention threshold bas
 1. **Candidate Lock**: Candidates where `date <= today - RetentionDays` are identified and atomically transitioned from `ACTIVE (1)` to `SAFE_DELETE (0)`.
 2. **Streaming Serialization**: Partition records are written to a temporary `.anchordb` file on disk.
 3. **Sink Transfer**: The file is transferred to the configured sink.
-4. **State Transition**: Upon sink confirmation, records in hot storage are updated from `0` to `TOMBSTONE (2)`. If transfer fails, records transition to `RETRY (3)`.
+4. **State Transition**: If transfer fails, records transition to `RETRY (3)`. On success with `PruneHotDB=true`, records pass through `TOMBSTONE (2)`, are collected immediately, and the hot database is synced. With `PruneHotDB=false`, they return to `ACTIVE (1)`.
 
 ---
 
@@ -54,33 +54,33 @@ Stores partitions in a local directory (e.g., `./data/partitions/`):
 sink := partition.NewLocalDiskSink("./data/partitions")
 ```
 * Writes to a temporary staging file first.
-* Uses atomic `os.Rename` to finalize storage.
+* Publishes the synced staging file with `os.Link`, so an existing archive is not overwritten. If the requested filename already exists, the sink adds a UUID suffix.
 
 ### 2. S3 Object Storage Sink (`S3Sink`)
 Streams partition files to AWS S3, MinIO, or compatible storage:
 ```go
-sink, err := partition.NewS3Sink(partition.S3Config{
-    Endpoint:  "s3.us-east-1.amazonaws.com",
-    Bucket:    "my-archive-bucket",
-    Prefix:    "anchordb/partitions/",
-    AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
-    SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-    Region:    "us-east-1",
-})
+sink := partition.NewS3Sink(
+    "https://s3.us-east-1.amazonaws.com",
+    "my-archive-bucket",
+    "anchordb/partitions/",
+    os.Getenv("AWS_ACCESS_KEY_ID"),
+    os.Getenv("AWS_SECRET_ACCESS_KEY"),
+)
+sink.Region = "us-east-1"
 ```
 * **Streaming SigV4**: Computes payload hashes in a single pass without buffering multi-gigabyte partitions in RAM.
-* **SSRF Guard**: Rejects endpoints resolving to private or link-local IP addresses unless `ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT=true` is set.
+* **Server-side SSRF Guard**: The REST partition endpoint rejects S3 endpoints resolving to private or link-local IP addresses unless `ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT=true` is set. Direct use of `NewS3Sink` does not perform that server-side check.
 
 ---
 
 ## 4. Tombstone Garbage Collection
 
-Records in the `TOMBSTONE (2)` state remain in hot storage until swept by the collector. This separation ensures query performance remains consistent during peak hours by deferring cleanup passes.
+Records marked `TOMBSTONE (2)` remain in hot storage until collected. A successful partition run with `PruneHotDB=true` invokes the collector immediately; other tombstones can be removed by scheduled or manual collection.
 
 ### Triggering Collection
 Collection can be initiated:
 1. **Automatically**: Periodic background cleanup runs during scheduled sync windows.
-2. **Via REST API**:
+2. **Via the HTTP administration API** (the Wire backend does not start collector jobs):
 ```bash
 curl -X POST http://localhost:7447/v1/collector/run \
   -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
@@ -104,7 +104,7 @@ partitions, err := client.ListPartitions(ctx)
 coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
 ```
 
-Or via REST:
+Partition listing and inspection are not implemented by the AnchorWire driver backend. Use the authenticated HTTP administration endpoints when those operations are needed:
 ```bash
 # List partitions
 curl -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" http://localhost:7447/v1/partition/list
@@ -120,7 +120,7 @@ curl -X POST http://localhost:7447/v1/partition/inspect \
 
 ## 6. Design Boundaries & Limitations
 
-1. **Immutable Partition Archives**: Once written and finalized, partition files are read-only historical archives. Mutations, inserts, and in-place updates are not supported on archived partition files.
+1. **Archive Writes**: The local sink does not overwrite an existing filename. Archived files are inspected read-only through the engine; inserts and in-place updates are not exposed there. The S3 sink currently uses an ordinary PUT, so an object with the same key can be replaced; use unique filenames or bucket versioning when that matters.
 2. **Date Field Requirement**: Automated partition archival requires an integer or float32 epoch-day attribute (e.g. `MustDate("YYYY-MM-DD")`). Records without a recognizable date attribute are not eligible for automated date-cutoff archival.
 3. **Engine-Mediated Inspection**: Direct host volume mounts of `/data/partitions` must not be read with raw file open calls; queries should always be routed through `client.InspectPartition` or `/v1/partition/inspect`.
 

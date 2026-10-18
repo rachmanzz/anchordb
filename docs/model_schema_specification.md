@@ -7,8 +7,8 @@ AnchorDB provides an immutable schema contract system called **Register Model** 
 ## 1. Core Principles
 
 1. **One-Time Registration**: A schema contract is declared and permanently locked into the model file upon first registration. Once locked, the schema contract is permanent.
-2. **Attach & Connect Verification**: Whenever a service connects (`ConnectRemote`) or attaches (`Attach`) to a model, the engine validates the incoming schema against the model's locked contract.
-3. **Fail-Fast Rejection**: If the schema is mismatched or incompatible, the engine **immediately rejects** the attach or connection attempt with `ErrSchemaMismatch` (HTTP 409 Conflict).
+2. **Attach & Connect Verification**: Whenever a service connects through AnchorWire with `WithAttachSchema` or calls `Attach`, the engine validates the incoming schema against the model's locked contract.
+3. **Fail-Fast Rejection**: If the schema is mismatched or incompatible, the engine **immediately rejects** the attach or connection attempt with `ErrSchemaMismatch`.
 4. **Execution-Level Enforcement**: Write operations (`Save`, `SaveAutoID`, `Update`) are validated in-memory before reaching the WAL:
    - Omitting a required attribute fails immediately with `ErrMissingRequiredField`.
    - Supplying an undeclared attribute fails with `ErrUnknownField`.
@@ -33,7 +33,7 @@ A schema in AnchorDB is a dictionary mapping attribute names to normalized scala
 | **`int`** | Exact integer number | `"age": "int"` | `"doors": "int?"` | Exact integer (IEEE 754 float32) |
 | **`float`** | Floating-point metric | `"speed": "float"` | `"weight": "float?"` | IEEE 754 float32 |
 | **`bool`** | Boolean flag (`0.0` or `1.0`) | `"active": "bool"` | `"verified": "bool?"` | Float scalar `1.0` (true) / `0.0` (false) |
-| **`date`** | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Non-negative integer days since Unix epoch (float32) |
+| **`date`** | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Integer days since Unix epoch (float32); dates before 1970 are negative |
 
 > [!NOTE]
 > **Design Boundary: Contiguous Scalar Float32 Properties**: Record attributes in AnchorDB are stored in contiguous `map[string]float32` structures (`CompactRecord`) to support zero-copy memory-mapped operations and sub-microsecond in-storage arithmetic. Non-numeric types (`string`) and array modifiers (`[]`) are rejected at schema parse time.
@@ -42,20 +42,7 @@ A schema in AnchorDB is a dictionary mapping attribute names to normalized scala
 
 ## 3. Schema Declaration Example
 
-### JSON Format (REST API)
-```json
-{
-  "model": "vehicles",
-  "schema": {
-    "age": "int",
-    "speed": "float",
-    "active": "bool?",
-    "manufactured_date": "date"
-  }
-}
-```
-
-### Go Driver Format (`pkg/driver`)
+### Go Driver Format (`pkg/driver`, AnchorWire)
 ```go
 schema := driver.Schema{
     "age":               "int",   // Required int
@@ -90,7 +77,6 @@ schema := driver.Schema{
                    ALLOW ATTACH             ALLOW ATTACH     REJECT (Error)
                                                                  │
                                                                  ▼
-                                                        HTTP 409 Conflict
                                                         ErrSchemaMismatch
                                                       All Mutations Blocked
 ```
@@ -109,17 +95,17 @@ If the model already possesses a locked schema contract:
   - Base data types (`int`, `float`, `bool`, `date`)
   - Optionality modifiers (`?`)
 - **Matching Schemas**: The attach call returns successfully.
-- **Mismatched Schemas**: The engine rejects the request immediately with `ErrSchemaMismatch` (`HTTP 409 Conflict`), halting client startup before any corrupted writes can occur.
+- **Mismatched Schemas**: The engine rejects the request immediately with `ErrSchemaMismatch`, halting client startup before any corrupted writes can occur.
 
 ### 3. Fail-Fast Mutation Errors
 When writing (`Save`, `SaveAutoID`, `Update`) to a model with a locked schema:
 
-| Error | Condition | HTTP Status |
-| :--- | :--- | :---: |
-| `ErrMissingRequiredField` | A field declared without `?` was omitted in payload | `400 Bad Request` |
-| `ErrUnknownField` | A property was passed that does not exist in the schema | `400 Bad Request` |
-| `ErrInvalidFieldType` | An integer/date received a fractional float, or bool received non-binary values | `400 Bad Request` |
-| `ErrSchemaMismatch` | Client attempted to attach or connect with conflicting contract | `409 Conflict` |
+| Error | Condition |
+| :--- | :--- |
+| `ErrMissingRequiredField` | A field declared without `?` was omitted in payload |
+| `ErrUnknownField` | A property was passed that does not exist in the schema |
+| `ErrInvalidFieldType` | An integer/date received a fractional float, or bool received non-binary values |
+| `ErrSchemaMismatch` | Client attempted to attach or connect with conflicting contract |
 
 ---
 
@@ -127,7 +113,7 @@ When writing (`Save`, `SaveAutoID`, `Update`) to a model with a locked schema:
 
 ### A. Attaching Schema to an Active Model
 ```go
-client, err := driver.ConnectRemote("http://localhost:7447", driver.WithToken("token"))
+client, err := driver.ConnectWire("wire://localhost:7448", driver.WithToken("token"))
 if err != nil {
     log.Fatal(err)
 }
@@ -145,8 +131,8 @@ if err != nil {
 
 ### B. Enforcing Schema during Connection
 ```go
-// ConnectRemote will fail at connection time if the remote model contract does not match
-client, err := driver.ConnectRemote("http://localhost:7447",
+// ConnectWire will fail during schema attachment if the model contract does not match
+client, err := driver.ConnectWire("wire://localhost:7448",
     driver.WithToken("token"),
     driver.WithModel("vehicles"),
     driver.WithAttachSchema(schema),
@@ -185,85 +171,6 @@ if err != nil {
 
 ---
 
-## 6. REST API Endpoints
+## 6. AnchorWire Usage
 
-### 1. `POST /v1/model/attach`
-Locks a schema into a model or verifies an existing contract.
-
-**Request Payload**:
-```json
-{
-  "model": "vehicles",
-  "schema": {
-    "speed": "float",
-    "age": "int",
-    "active": "bool?",
-    "manufactured_date": "date?"
-  }
-}
-```
-
-**Success Response (`200 OK`)**:
-```json
-{
-  "success": true,
-  "model": "vehicles",
-  "status": "LOCKED",
-  "message": "model schema attached and locked successfully"
-}
-```
-
-**Rejection Response (`409 Conflict`)**:
-```json
-{
-  "success": false,
-  "error": "schema_mismatch",
-  "model": "vehicles",
-  "message": "schema mismatch: incoming schema does not match registered model contract: field \"age\" mismatch (expected int, got float)"
-}
-```
-
----
-
-### 2. `GET /v1/model/schema`
-Fetches the registered schema contract for a given model.
-
-**Query Parameters**:
-* `model`: Target model name (e.g. `?model=vehicles`).
-
-**Response (`200 OK`)**:
-```json
-{
-  "success": true,
-  "model": "vehicles",
-  "locked": true,
-  "schema": {
-    "speed": "float",
-    "age": "int",
-    "active": "bool?",
-    "manufactured_date": "date?"
-  }
-}
-```
-
----
-
-### 3. `POST /v1/model/reset`
-Administrative hard reset to unmount the schema.
-
-**Request Payload**:
-```json
-{
-  "model": "vehicles",
-  "confirm": true
-}
-```
-
-**Response (`200 OK`)**:
-```json
-{
-  "success": true,
-  "model": "vehicles",
-  "message": "model schema reset successfully"
-}
-```
+The Go driver methods above (`Attach`, `GetSchema`, and `ResetModel`) work through `driver.ConnectWire`. For a complete connection and schema example, see the [AnchorWire guide](anchorwire.md). HTTP equivalents are documented separately in the [REST reference](rest_api.md#6-model-schema-management-endpoints).

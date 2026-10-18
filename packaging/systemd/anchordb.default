@@ -6,10 +6,13 @@
 # Port for HTTP server to listen on (default: 7447)
 PORT=7447
 
+# AnchorWire binary TCP port for Go driver clients (default: 7448)
+ANCHORDB_WIRE_PORT=7448
+
 # Base data directory where database models and WAL files are stored
 DATA_DIR=/var/lib/anchordb
 
-# Optional secret bearer token for API authentication (leave empty to disable)
+# Required bearer token. Set a strong value before starting the service.
 AUTH_TOKEN=
 
 # Write-Ahead Log durability mode: always | interval | none (default: always)

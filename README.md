@@ -27,7 +27,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 - **Strict Schema Registration & Immutability**:
   - One-time permanent schema locking with scalar numeric and temporal primitives (`int`, `float`, `bool`, `date`).
   - Required vs. optional (`?`) syntax, fail-fast rejection (`ErrSchemaMismatch`), and administrative reset.
-- **API & Client SDK**: RESTful HTTP API (default port `7447`) and a fluent Go driver library (`pkg/driver`).
+- **API & Client SDK**: AnchorWire binary TCP (default port `7448`) for remote Go driver clients. HTTP on port `7447` serves health, metrics, and server operations.
 
 ---
 
@@ -40,8 +40,9 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 - **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
 - **[Data Partitioning & Record Lifecycle](docs/partitioning_and_lifecycle.md)**: 4-state lifecycle machine, archival sinks, and tombstone collection.
 - **[Background Subsystems: Scheduler & Worker Pool](docs/background_subsystems.md)**: Wall-clock cron scheduler and bounded async worker pool.
-- **[REST API Reference](docs/rest_api.md)**: HTTP daemon configuration, authentication, telemetry, and endpoints.
+- **[AnchorWire Guide](docs/anchorwire.md)**: Start the server and connect, attach a schema, save, and query over binary TCP.
 - **[Go Driver SDK Guide](docs/go_driver.md)**: Connection setup, query builders, and integration examples.
+- **[REST API Reference](docs/rest_api.md)**: HTTP server administration and transport-specific endpoints.
 - **[Benchmark & Verification Guide](docs/benchmark_and_verification.md)**: Reproducible test suite, Little's Law validation, and container durability.
 - **[Installation & Deployment Guide](docs/installation_and_deployment.md)**: Native packages (.deb, .rpm), systemd service management, Docker/Podman container images, and universal archives.
 
@@ -54,16 +55,16 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 ```
                        +---------------------------------------------+
                        |            AnchorDB Server Daemon           |
-                       |                  (Port 7447)                |
+                       |          (AnchorWire TCP Port 7448)        |
                        +----------------------+----------------------+
                                               |
                    +--------------------------+--------------------------+
                    |                          |                          |
                    v                          v                          v
     +------------------------------+   +--------------------+   +---------------------+
-    |       REST HTTP Engine       |   |   Cron Scheduler   |   | Async Worker Pool   |
-    |  /v1/save, /v1/get, /v1/list |   |     (pkg/scheduler)|   |    (pkg/worker)     |
-    |  /v1/update, /v1/edge, etc.  |   | Periodic Sync/Jobs |   | Background Tasks    |
+    |     AnchorWire Engine        |   |   Cron Scheduler   |   | Async Worker Pool   |
+    |  Save, Get, List, Update     |   |     (pkg/scheduler)|   |    (pkg/worker)     |
+    |  Graph, Causal, Schema       |   | Periodic Sync/Jobs |   | Background Tasks    |
     +--------------+---------------+   +----------+---------+   +----------+----------+
                    |                              |                        |
                    +------------------------------+------------------------+
@@ -83,6 +84,8 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
       +-----------------------------+   +--------------------+   +--------------------------+
 ```
 
+HTTP on port `7447` remains available for health, metrics, and administration, including partition inspection, which is not implemented by the AnchorWire driver backend.
+
 ---
 
 ## Installation & Quick Start
@@ -93,7 +96,7 @@ For complete operational and deployment options, see the **[Installation & Deplo
 
 ### 1. Native Linux Packages (`.deb` / `.rpm`) with Automated Background Systemd
 
-Pre-built native packages are published on [GitHub Releases](https://github.com/rachmanzz/anchordb/releases). Installing a package automatically provisions the `anchordb:anchordb` service user, configures `/var/lib/anchordb` with `0750` permissions, and registers a background `systemd` service that starts automatically.
+Pre-built native packages are published on [GitHub Releases](https://github.com/rachmanzz/anchordb/releases). Installing a package provisions the `anchordb:anchordb` service user, configures `/var/lib/anchordb` with `0750` permissions, and enables a background `systemd` service. Set a strong `AUTH_TOKEN` in `/etc/default/anchordb` or `/etc/sysconfig/anchordb`, then restart the service; the server refuses to start with an empty token.
 
 ```bash
 # Ubuntu / Debian (.deb)
@@ -108,7 +111,7 @@ Verify service status:
 ```bash
 sudo systemctl status anchordb
 ```
-*(Configuration is managed at `/etc/default/anchordb` or `/etc/sysconfig/anchordb`. If port `7447` is occupied by another service, the installer logs a safe warning without failing; modify `PORT` in that file and run `sudo systemctl restart anchordb`)*
+*(If port `7447` is occupied, check `sudo journalctl -u anchordb`, change `PORT` in the same configuration file, and run `sudo systemctl restart anchordb`.)*
 
 ### 2. Multi-Architecture Container Images (Docker & Podman)
 
@@ -117,7 +120,7 @@ Official multi-architecture images (`linux/amd64` and `linux/arm64`) are publish
 ```bash
 docker run -d \
   --name anchordb \
-  -p 7447:7447 \
+  -p 7448:7448 \
   -v ./data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="your-secure-token" \
   -e ANCHORDB_DATA_DIR="/data" \
@@ -134,7 +137,7 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
-      - "7447:7447"
+      - "7448:7448"
     environment:
       - ANCHORDB_AUTH_TOKEN=your-secure-token
       - ANCHORDB_DATA_DIR=/data
@@ -157,7 +160,8 @@ Download universal pre-compiled archives (`.tar.gz`) for Linux or macOS from [Gi
 ```bash
 wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_linux_amd64.tar.gz
 tar -xzf anchordb_0.1.0_linux_amd64.tar.gz
-./anchordb-server -port 7447 -data-dir ./data
+export ANCHORDB_AUTH_TOKEN="your-secure-token"
+./anchordb-server -wire-port 7448 -data-dir ./data
 ```
 
 ### 5. Building from Source
@@ -179,7 +183,7 @@ go build -o bin/anchordb-benchmark ./cmd/benchmark
 ## Using the Go Driver SDK
 
 AnchorDB includes an official client driver in `pkg/driver`. It operates in two modes:
-1. **Remote Engine Mode (`driver.ConnectRemote`)**: Connects to a running AnchorDB engine server over HTTP/REST, leveraging background schedulers, worker pools, central file locking, token authentication, and multi-model routing.
+1. **AnchorWire Remote Mode (`driver.ConnectWire`)**: Connects to a running AnchorDB engine server over binary TCP, using its background schedulers, worker pools, file locking, token authentication, and multi-model routing.
 2. **Embedded Engine Mode (`driver.OpenEmbedded`)**: Runs the full in-process AnchorDB engine runtime (WAL, file locking, multi-model routing, worker pool, and optional background sync) directly in RAM with zero network overhead.
 
 > **Raw File Exposure Notice**: The `.anchordb` binary file is strictly an internal storage engine artifact. Never open or manipulate `.anchordb` files directly outside the engine.
@@ -208,8 +212,8 @@ func main() {
 		"is_active": "bool?", // Optional boolean flag
 	}
 
-	// Mode A: Remote Engine (Connect over HTTP with schema attachment & verification)
-	client, err := driver.ConnectRemote("http://localhost:7447",
+	// Mode A: AnchorWire (binary TCP with schema attachment & verification)
+	client, err := driver.ConnectWire("wire://localhost:7448",
 		driver.WithToken("your_auth_token"),
 		driver.WithModel("plant_iot"),
 		driver.WithAttachSchema(schema), // Locks and validates schema contract
@@ -280,7 +284,7 @@ registeredSchema, err := client.GetSchema(ctx)
 - **Primitives**: `int`, `float`, `bool`, `date` (`YYYY-MM-DD` epoch day).
 - **Required (Default)**: Omission of `?` makes the field strictly mandatory. Missing fields return `driver.ErrMissingRequiredField`.
 - **Optional (`?` Modifier)**: Suffix `?` allows the field to be omitted on write without reserving empty space.
-- **Fail-Fast Safety**: Supplying undeclared attributes returns `driver.ErrUnknownField`. Supplying incompatible values on `Save` or `Update` returns `driver.ErrInvalidFieldType`. Mismatched connection contracts return `driver.ErrSchemaMismatch` (`HTTP 409 Conflict`).
+- **Fail-Fast Safety**: Supplying undeclared attributes returns `driver.ErrUnknownField`. Supplying incompatible values on `Save` or `Update` returns `driver.ErrInvalidFieldType`. Mismatched connection contracts return `driver.ErrSchemaMismatch`.
 
 For comprehensive specifications, see the **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**.
 
@@ -339,47 +343,11 @@ chain, _ := client.CausalChain([]string{"fuel_shortage"}, []string{"causes", "ca
 
 ---
 
-## REST API Reference
+## AnchorWire Operations
 
-All requests and responses use JSON. When an auth token is configured, endpoints under `/v1/*` require `Authorization: Bearer <token>`.
+Use `driver.ConnectWire("wire://localhost:7448", ...)` for record saves and batches, `Get`/`List`/`Update` queries, spatial and causal graphs, schema management, and `Sync`. The [AnchorWire guide](docs/anchorwire.md) includes a complete runnable client and links to larger examples.
 
-### Health & Metrics
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/health` | Server health check (detailed stats require auth) |
-| `GET` | `/metrics` | Prometheus-compatible metrics endpoint |
-
-### Model Schema Management
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/v1/model/attach` | Attach and permanently lock a schema contract to a model (fails with HTTP 409 if mismatched) |
-| `GET` | `/v1/model/schema` | Retrieve the active schema contract for a model |
-| `POST` | `/v1/model/reset` | Administrative hard reset of a model's registered schema (`confirm: true` required) |
-
-### CRUD & Computations
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/v1/save` | Store an entity with key-value properties |
-| `POST` | `/v1/get` | Retrieve an entity by name, optionally projecting or computing fields |
-| `POST` | `/v1/list` | Paginated query with range, date, and compute filters |
-| `POST` | `/v1/update` | Batch update records matching filter conditions |
-
-### Graph & Causal Links
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/v1/graph` | Spatial ray-projection and nearest neighbor search |
-| `POST` | `/v1/edge` | Add or remove directed causal edges |
-| `POST` | `/v1/causal` | Query 1-hop or multi-hop causal paths from seed nodes |
-
-### Administration & Maintenance
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/v1/sync` | Flush memory-mapped changes to disk |
-| `POST` | `/v1/partition/run` | Execute partition archival (supports `async: true`) |
-| `POST` | `/v1/collector/run` | Run garbage collection on tombstoned records |
-| `GET` | `/v1/scheduler/status`| View scheduled background jobs |
-| `GET` | `/v1/worker/status` | View background worker pool status |
-| `POST` | `/v1/worker/cancel` | Cancel queued background tasks |
+HTTP remains available for health, metrics, and server administration. The AnchorWire driver does not implement partition listing or inspection; those endpoints are documented in the [REST reference](docs/rest_api.md).
 
 ---
 
@@ -402,6 +370,7 @@ Settings can be specified through command-line flags or environment variables:
 
 | Setting | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
+| **AnchorWire Port** | `-wire-port` | `ANCHORDB_WIRE_PORT` | `7448` | Binary TCP port for Go driver clients |
 | **Port** | `-port` | `ANCHORDB_PORT` | `7447` | HTTP listening port |
 | **Data Directory** | `-data-dir` | `ANCHORDB_DATA_DIR` | `./data` | Directory for `.anchordb` files |
 | **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer token for API authentication |
@@ -428,7 +397,7 @@ AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D 
 
 1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. Each model maintains its own immutable schema contract, and there are no relational SQL tables, cross-model relational `JOIN` operations, or dynamic migrations.
 2. **Computational Property Storage**: Attribute values are stored as contiguous `float32` scalar primitives (`float`, `int`, `bool`, `date`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
-3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (Remote HTTP Server or Embedded In-Process Engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
+3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (AnchorWire server or embedded in-process engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
 
 ---

@@ -1,10 +1,10 @@
 # Go Driver SDK Guide
 
-The official AnchorDB Go driver is located in `pkg/driver`. It provides an idiomatic, fluent client API for interacting with AnchorDB instances either over the network against the daemon server engine, or locally via embedded storage.
+The official AnchorDB Go driver is located in `pkg/driver`. For remote applications, use the AnchorWire binary TCP transport with `driver.ConnectWire`; embedded applications can run the engine in-process. Start with the [AnchorWire guide](anchorwire.md) for a complete runnable example.
 
 ---
 
-## 1. Architecture: Remote Engine vs Embedded Local Mode
+## 1. Architecture: AnchorWire Remote vs Embedded Local Mode
 
 AnchorDB driver supports two modes of operation:
 
@@ -14,7 +14,7 @@ Connecting directly to local `.anchordb` files in an application process acquire
 - Multiple web services or worker processes cannot access the file simultaneously.
 - Worker pools, rate limiting, and token authentication are bypassed.
 
-**Production Best Practice**: Run `anchordb-server` as a persistent background daemon, and connect client applications to it over the network.
+**Production Best Practice**: Run `anchordb-server` as a persistent background daemon, and connect client applications over AnchorWire (default TCP port `7448`).
 
 ---
 
@@ -32,14 +32,13 @@ Then import it in your Go code:
 import "github.com/rachmanzz/anchordb/pkg/driver"
 ```
 
-### Option A: Remote Engine Client (Production / Recommended)
+### Option A: AnchorWire Client (Production / Recommended)
 
 ```go
-// Connect to a running AnchorDB engine server
-client, err := driver.ConnectRemote("http://localhost:7447",
+// Connect to a running AnchorDB engine server over binary TCP
+client, err := driver.ConnectWire("wire://localhost:7448",
     driver.WithToken("your_auth_token"),
     driver.WithModel("plant_iot"),
-    driver.WithTimeout(5*time.Second),
 )
 if err != nil {
     log.Fatalf("failed to connect to engine: %v", err)
@@ -49,8 +48,8 @@ defer client.Close()
 
 You can also connect using standard URI DSN strings:
 ```go
-// Connect with URI string
-client, err := driver.Connect("anchordb://user:secret@localhost:7447/plant_iot")
+// Connect selects AnchorWire from the wire:// scheme
+client, err := driver.Connect("wire://localhost:7448", driver.WithToken("your_auth_token"), driver.WithModel("plant_iot"))
 ```
 
 ### Option B: Embedded Engine Mode (In-Process Runtime, Zero Network Overhead)
@@ -72,7 +71,7 @@ if err != nil {
 defer client.Close()
 ```
 
-> **Important — Raw File Exposure Notice**: The `.anchordb` binary file is strictly an internal storage engine format. Direct raw file opening (`OpenLocal`) is deprecated in favor of `OpenEmbedded(dataDir)`. Accessing raw `.anchordb` files bypasses WAL durability, file locking, background scheduler tasks, and lifecycle transitions.
+> **Direct File Access**: `OpenLocal(filePath)` is deprecated in favor of `OpenEmbedded(dataDir)`. It still opens storage through `storage.Open`, including WAL recovery and an exclusive file lock, but does not provide the embedded engine's multi-model routing, worker pool, or background scheduling. Do not open the same model concurrently from another process.
 >
 > **Note on `?mode=mmap`**: AnchorDB core storage is always memory-mapped via zero-copy `mmap(MAP_SHARED)`. Redundant query flags like `?mode=mmap` are unnecessary and stripped automatically for backward compatibility.
 
@@ -114,7 +113,7 @@ schema := driver.Schema{
 - **Optional (`?`)**: Suffix `?` marks the field as optional.
 
 ### Attaching and Locking a Schema
-Once attached, the schema is **permanently locked** into the model file header and sidecar:
+Once attached, the schema is locked in a `{model}.anchordb.schema` sidecar alongside the model file:
 
 ```go
 // 1. Attach to active model
@@ -128,7 +127,7 @@ if err != nil {
 deviceClient, err := client.AttachModel("devices_zone_1", schema)
 
 // 3. Or enforce schema attachment during initial connection:
-client, err := driver.ConnectRemote("http://localhost:7447",
+client, err := driver.ConnectWire("wire://localhost:7448",
     driver.WithToken("token"),
     driver.WithModel("devices_zone_1"),
     driver.WithAttachSchema(schema),
@@ -147,7 +146,7 @@ err = client.ResetModel(ctx, true)
 ```
 
 ### Fail-Fast Error Guarantees
-- `driver.ErrSchemaMismatch`: Returned on `Attach` or `Connect` if incoming schema conflicts with the model's locked contract.
+- `driver.ErrSchemaMismatch`: Returned on `Attach` or `ConnectWire` if incoming schema conflicts with the model's locked contract.
 - `driver.ErrMissingRequiredField`: Returned on `Save` or `Update` if a required field is omitted.
 - `driver.ErrUnknownField`: Returned on `Save` or `Update` if an undeclared property is passed.
 - `driver.ErrInvalidFieldType`: Returned if a field value does not conform to its type specification.
@@ -221,10 +220,10 @@ if results.HasMore {
 
 ## 7. Batch Updates (`UpdateBuilder`)
 
-Apply atomic in-place arithmetic updates matching filter criteria:
+Apply in-place arithmetic updates matching filter criteria. A batch is not transactional: if a later record fails, earlier updates remain committed.
 
 ```go
-// Atomic in-place increment matching filtered records
+// In-place increment matching filtered records
 count, err := client.Update().
     Where("status", "=", 1.0).
     Set("reconnect_attempts", driver.AddConst("reconnect_attempts", 1.0)).
@@ -318,27 +317,7 @@ All builder execution methods (`.Execute(ctx)`) strictly honor `context.Context`
 
 ## 12. Cold Partition Inspection
 
-Archived partition files are inspected through the engine API without exposing raw filesystem descriptors:
-
-```go
-// 1. List available cold partition archives
-partitions, err := client.ListPartitions(ctx)
-for _, p := range partitions {
-    fmt.Printf("Archive: %s (%d bytes, modified %s)\n", p.Name, p.SizeBytes, p.ModTime)
-}
-
-// 2. Inspect a specific record from a cold archive
-coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
-if err == nil {
-    fmt.Printf("Archived sensor moisture: %.1f\n", coldRec.Get("moisture"))
-}
-
-// 3. Paginate through archived records
-res, err := client.InspectPartition(ctx, "2026-10-16_part1.anchordb", "", 25)
-for _, item := range res.Records {
-    fmt.Println("Archived Record:", item.Name, item.Props)
-}
-```
+AnchorWire does not implement `ListPartitions`, `InspectPartition`, or `InspectPartitionRecord`; calling them on a Wire client returns an unsupported-transport error. These are server-management operations. Use the authenticated partition endpoints in the [REST reference](rest_api.md) when cold archive inspection is required.
 
 ---
 
@@ -346,5 +325,5 @@ for _, item := range res.Records {
 
 1. **One Model = One File**: Each named model (`sensors`, `telemetry`) is an isolated binary file with its own lock and WAL. AnchorDB does not support cross-model relational JOINs.
 2. **Numeric Property Vectors**: Record attributes are optimized for computational floating-point metrics (`float32`) and Epoch Days dates (`MustDate("YYYY-MM-DD")`).
-3. **Engine-Only Invariant Access**: Never attempt to open, copy, or mutate an active `.anchordb` file outside the engine. Always access data via `driver.ConnectRemote(...)` or `driver.OpenEmbedded(...)`.
+3. **Engine-Only Invariant Access**: Never attempt to open, copy, or mutate an active `.anchordb` file outside the engine. Access data via `driver.ConnectWire(...)` or `driver.OpenEmbedded(...)`.
 

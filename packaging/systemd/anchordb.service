@@ -9,7 +9,7 @@ User=anchordb
 Group=anchordb
 EnvironmentFile=-/etc/default/anchordb
 EnvironmentFile=-/etc/sysconfig/anchordb
-ExecStart=/usr/bin/anchordb-server -port=${PORT} -data-dir=${DATA_DIR} -token=${AUTH_TOKEN} -wal-sync=${WAL_SYNC} -wal-sync-interval=${WAL_SYNC_INTERVAL} -rate-limit=${RATE_LIMIT}
+ExecStart=/usr/bin/anchordb-server -port=${PORT} -data-dir=${DATA_DIR} -auth-token=${AUTH_TOKEN} -wal-sync=${WAL_SYNC} -wal-sync-interval=${WAL_SYNC_INTERVAL} -rate-limit=${RATE_LIMIT}
 Restart=always
 RestartSec=3s
 LimitNOFILE=65536

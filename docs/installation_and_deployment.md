@@ -46,7 +46,7 @@ When the package is installed, the package manager automatically:
 1. Creates a dedicated, unprivileged system service user and group: `anchordb:anchordb` with `/usr/sbin/nologin`.
 2. Creates the secure persistent data directory: `/var/lib/anchordb` (permission `0750`, owned by `anchordb`).
 3. Registers and enables `anchordb.service` to start automatically on system boot.
-4. Starts the service in the background immediately.
+4. Attempts to start the service. The server requires a bearer token, so a new installation with an empty `AUTH_TOKEN` will not start until you configure one.
 
 #### Managing the Service
 
@@ -75,10 +75,13 @@ Default configuration file (`/etc/default/anchordb`):
 # Port for HTTP server to listen on (default: 7447)
 PORT=7447
 
+# AnchorWire binary TCP port for Go driver clients (default: 7448)
+ANCHORDB_WIRE_PORT=7448
+
 # Base data directory where database models and WAL files are stored
 DATA_DIR=/var/lib/anchordb
 
-# Optional secret bearer token for API authentication (leave empty to disable)
+# Required bearer token; set a strong value before starting the service
 AUTH_TOKEN=
 
 # Write-Ahead Log durability mode: always | interval | none (default: always)
@@ -91,9 +94,11 @@ WAL_SYNC_INTERVAL=200ms
 RATE_LIMIT=0
 ```
 
+Set `AUTH_TOKEN` to a strong secret in the configuration file, then run `sudo systemctl restart anchordb`. Keep the file readable only by administrators because the token is passed to the server as a CLI argument by this unit.
+
 > [!NOTE]
-> **Port Conflict Handling**: If port `7447` is already bound to another application when installing the package, the post-install script detects the bind failure and logs an informative warning rather than aborting package installation. To resolve:
-> 1. Edit `/etc/default/anchordb` (or `/etc/sysconfig/anchordb`) and change `PORT=7448` (or any available port).
+> **Port Conflict Handling**: If port `7447` is already bound to another application, the service cannot bind. Check `sudo systemctl status anchordb` and `sudo journalctl -u anchordb` to confirm the cause. To resolve a port conflict:
+> 1. Edit `/etc/default/anchordb` (or `/etc/sysconfig/anchordb`) and choose an available HTTP port, for example `PORT=7450`. Port `7448` is the default AnchorWire TCP port.
 > 2. Restart the service: `sudo systemctl restart anchordb`.
 
 ### Sandboxing & Security Hardening
@@ -126,7 +131,7 @@ docker pull ghcr.io/rachmanzz/anchordb:v0.1.0
 ```bash
 docker run -d \
   --name anchordb \
-  -p 7447:7447 \
+  -p 7448:7448 \
   -v ./anchordb_data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="your-strong-secret-token" \
   -e ANCHORDB_DATA_DIR="/data" \
@@ -147,9 +152,10 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
-      - "7447:7447"
+      - "7448:7448"
     environment:
       - ANCHORDB_PORT=7447
+      - ANCHORDB_WIRE_PORT=7448
       - ANCHORDB_DATA_DIR=/data
       - ANCHORDB_AUTH_TOKEN=your-strong-secret-token
       - ANCHORDB_ALLOW_INSECURE=false
@@ -177,7 +183,8 @@ docker compose up -d
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `ANCHORDB_PORT` | `7447` | TCP port the HTTP REST daemon listens on |
+| `ANCHORDB_WIRE_PORT` | `7448` | AnchorWire binary TCP port for application clients |
+| `ANCHORDB_PORT` | `7447` | HTTP port for health, metrics, and server administration |
 | `ANCHORDB_DATA_DIR` | `/data` | Path inside container where `.anchordb` files and `.wal` logs are stored |
 | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer token required for all authenticated endpoints |
 | `ANCHORDB_ALLOW_INSECURE` | `false` | Set to `true` only for development without an auth token |
@@ -223,7 +230,7 @@ sudo install -m 0755 anchordb-benchmark /usr/local/bin/
 ```
 
 Binaries included in the archive:
-- `anchordb-server`: Full database server daemon with HTTP REST API, scheduler, and worker pool.
+- `anchordb-server`: Database daemon with AnchorWire, HTTP administration endpoints, scheduler, and worker pool.
 - `anchordb`: Interactive and scripting CLI for inspecting models and queries.
 - `anchordb-benchmark`: Standalone bare-metal benchmark CLI.
 
@@ -253,7 +260,7 @@ import (
 
 func main() {
 	// Connect to background engine server
-	client, err := driver.ConnectRemote("http://localhost:7447",
+	client, err := driver.ConnectWire("wire://localhost:7448",
 		driver.WithToken("your-token"),
 		driver.WithModel("plant_iot"),
 	)

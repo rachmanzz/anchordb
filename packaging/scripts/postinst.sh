@@ -34,10 +34,10 @@ if [ -d /run/systemd/system ]; then
     else
         echo "[AnchorDB] Starting systemd service on port 7447..."
         if ! systemctl start anchordb.service 2>/dev/null; then
-            echo "[WARNING] Service failed to bind to default port 7447."
-            echo "          If port 7447 is already occupied by another service,"
-            echo "          edit /etc/default/anchordb (or /etc/sysconfig/anchordb)"
-            echo "          to specify a different PORT, then run: sudo systemctl restart anchordb"
+            echo "[WARNING] AnchorDB service did not start."
+            echo "          Set a strong AUTH_TOKEN in /etc/default/anchordb"
+            echo "          (or /etc/sysconfig/anchordb), then restart the service."
+            echo "          Check journalctl -u anchordb for other errors, such as a port conflict."
         fi
     fi
 fi

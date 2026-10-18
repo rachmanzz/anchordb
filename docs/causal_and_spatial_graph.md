@@ -122,39 +122,33 @@ AnchorDB enforces a strict architectural boundary between graph inputs and query
 
 ---
 
-## 4. REST API Endpoints
+## 4. AnchorWire Usage
 
-### Add Edge (`POST /v1/edge`)
-```json
-{
-  "source": "fuel_shortage",
-  "relation": "causes",
-  "target": "inflation",
-  "weight": 0.9,
-  "action": "add"
+Use the Go driver over AnchorWire for graph writes and causal traversal:
+
+```go
+client, err := driver.ConnectWire("wire://localhost:7448",
+    driver.WithToken("your_auth_token"),
+    driver.WithModel("events"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+
+if err := client.Link("fuel_shortage", "causes", "inflation", 0.9); err != nil {
+    log.Fatal(err)
+}
+results, err := client.CausalChain([]string{"fuel_shortage"}, []string{"causes"}, 5)
+if err != nil {
+    log.Fatal(err)
+}
+for _, result := range results {
+    fmt.Println(result.Word, result.Score)
 }
 ```
 
-### Traverse Causal Chain (`POST /v1/causal`)
-```json
-{
-  "seeds": ["fuel_shortage"],
-  "relations": ["causes", "causes"],
-  "limit": 5
-}
-```
-
-**Response**:
-```json
-{
-  "results": [
-    {
-      "word": "economic_crisis",
-      "score": 0.63
-    }
-  ]
-}
-```
+See the [AnchorWire guide](anchorwire.md) and the [graph traversal example](../examples/graph_traversal/README.md) for complete setups.
 
 ---
 

@@ -12,12 +12,12 @@ In AnchorDB:
 - Each model file possesses its own:
   - **Memory-Mapped Region (`mmap`)**: Dedicated virtual address mapping isolated from other models.
   - **File Lock (`flock`)**: Concurrency control at the file descriptor level. Writes to Model A never block reads or writes to Model B.
-  - **Write-Ahead Log (`WAL`)**: Crash recovery state managed independently per model (`{model}.wal`).
+  - **Write-Ahead Log (`WAL`)**: Crash recovery state managed independently per model (`{model}.anchordb.wal`).
   - **Spatial Coordinate Grid & Causal Graph**: Spatial coordinates and causal relation weights are localized per model domain.
   - **Lifecycle Policy & Archival Cutoffs**: Models can enforce distinct data retention windows (e.g., 30 days for telemetry, 365 days for financial metrics).
 
 ```
-   [ Application / Go SDK ]           [ Remote HTTP Clients ]
+   [ Embedded Go Client ]             [ AnchorWire Go Clients ]
               │                                  │
               ▼                                  ▼
    ┌─────────────────────────────────────────────────────────────┐
@@ -42,7 +42,7 @@ Traditional relational database engines (RDBMS) multiplex hundreds of tables int
 
 In AnchorDB:
 - **File-Level Failure Isolation**: If a process crashes or hardware corruption impacts `telemetry.anchordb`, `sensors.anchordb` remains completely intact and operational.
-- **Trivial Backup & Sharding**: Backing up a model is as simple as syncing and copying `{model}.anchordb`. Sharding across machines requires zero schema rewriting.
+- **Model-Scoped Backup & Sharding**: After a successful sync, copy `{model}.anchordb` and, if the model has a locked schema, `{model}.anchordb.schema`. Coordinate the copy with writers so it captures one consistent state. Sharding across machines requires no schema rewriting.
 - **Zero Schema Overhead**: Each record stores dynamic property vectors (`map[string]float32`) without table migration migrations or DDL locks.
 
 ---
@@ -53,11 +53,11 @@ Raw `.anchordb` binary files are **strictly internal engine storage artifacts**.
 
 ### Mode A: Remote Engine (Client-Server / Container)
 
-When running the standalone engine server (e.g. Docker/Podman container on port 7447), models are selected dynamically:
+When running the standalone engine server (e.g. Docker/Podman container with AnchorWire on port `7448`), models are selected dynamically:
 
 ```go
 // Connect to remote engine
-client, err := driver.ConnectRemote("http://localhost:7447",
+client, err := driver.ConnectWire("wire://localhost:7448",
     driver.WithToken("secure-token"),
     driver.WithModel("sensors"),
 )
@@ -113,15 +113,7 @@ data/
     └── 2026-10-16_vehicles_part1.anchordb
 ```
 
-Partition archives preserve the identical binary format. To inspect cold records, clients use authenticated Engine APIs rather than reading raw files:
-
-```go
-// List available partition archives
-partitions, err := client.ListPartitions(ctx)
-
-// Inspect a cold record through the engine
-coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_sensors_part1.anchordb", "sensor_archive_old_1")
-```
+Partition archives preserve the identical binary format. AnchorWire clients cannot list or inspect cold partitions; these server-management operations use the authenticated endpoints in the [REST reference](rest_api.md). Do not open archive files directly in an application process.
 
 ---
 
@@ -136,9 +128,9 @@ coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_sensors_part1.anc
 ## 6. Strict Schema Registration Contract
 
 For applications requiring strict schema immutability and contract enforcement, AnchorDB defines the **Register Model** specification:
-- **One-Time Registration**: Schema is declared once and locked into the file header.
+- **One-Time Registration**: Schema is declared once and stored in a durable `{model}.anchordb.schema` sidecar.
 - **Attach Verification**: When clients attach to a model, the engine compares declared schemas; mismatches are rejected immediately, blocking all subsequent insert/update operations.
 - **Lock Permanence**: The schema cannot be detached or altered dynamically until an explicit administrative reset.
 
-For complete specifications, see the **[Model Schema Registration & Immutability Specification](model_schema_specification.md)**, as well as the **[Go Driver SDK Guide](go_driver.md#4-schema-attachment--contract-enforcement-clientattach)** and **[REST API Reference](rest_api.md#6-model-schema-management-endpoints)**.
+For complete specifications, see the **[Model Schema Registration & Immutability Specification](model_schema_specification.md)**, the **[AnchorWire guide](anchorwire.md)**, and the **[Go Driver SDK Guide](go_driver.md#4-schema-attachment--contract-enforcement-clientattach)**.
 

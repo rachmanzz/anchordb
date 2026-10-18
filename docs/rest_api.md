@@ -1,6 +1,8 @@
 # REST API Reference
 
-The AnchorDB HTTP server daemon operates on port `7447` by default. All API endpoints accept and return JSON payloads.
+For application reads, writes, schema, and graph operations, start with the [AnchorWire guide](anchorwire.md). This page documents the HTTP transport and server administration endpoints.
+
+The AnchorDB HTTP server daemon operates on port `7447` by default. `/v1/*` endpoints use JSON; `/metrics` returns Prometheus text.
 
 ---
 
@@ -23,19 +25,20 @@ Returns server operational health. Unauthenticated requests receive basic status
 ```json
 {
   "status": "ok",
-  "engine": "AnchorDB",
-  "version": "3",
-  "uptime_sec": 3600,
-  "loaded_models": ["transactions", "analytics"]
+  "engine": "AnchorDB"
 }
 ```
+
+With a valid bearer token, the response also includes `uptime_seconds`, `port`, `loaded_models`, `memory`, and `background`.
 
 ### `GET /metrics`
 Exports metrics formatted for Prometheus scrapers:
 * `anchordb_uptime_seconds`
-* `anchordb_goroutines`
+* `anchordb_go_goroutines`
 * `anchordb_heap_alloc_bytes`
-* `anchordb_worker_tasks_total`
+* `anchordb_worker_jobs_dispatched_total`
+* `anchordb_worker_jobs_completed_total`
+* `anchordb_worker_jobs_failed_total`
 
 ---
 
@@ -60,8 +63,10 @@ Stores an entity with key-value properties.
 **Response**:
 ```json
 {
-  "status": "saved",
-  "id": "vehicle_101"
+  "success": true,
+  "name": "vehicle_101",
+  "operation": 1,
+  "message": "record saved"
 }
 ```
 
@@ -76,11 +81,7 @@ Retrieves an entity by name with optional in-storage computations and selective 
   "name": "vehicle_101",
   "select": ["distance", "duration", "speed"],
   "computations": {
-    "speed": {
-      "op": "divide",
-      "field_a": "distance",
-      "field_b": "duration"
-    }
+    "speed": "distance / duration"
   }
 }
 ```
@@ -94,8 +95,8 @@ Queries records matching attribute ranges or date criteria with pagination.
 ```json
 {
   "model": "vehicles",
-  "where": [
-    {"field": "distance", "op": ">=", "val": 100}
+  "filters": [
+    {"field": "distance", "operator": ">=", "value": "100"}
   ],
   "page": 1,
   "limit": 20
@@ -103,21 +104,17 @@ Queries records matching attribute ranges or date criteria with pagination.
 ```
 
 ### `POST /v1/update`
-Executes in-place batch arithmetic mutations.
+Executes in-place batch arithmetic mutations. The batch is not transactional: if a later record fails, earlier updates remain committed.
 
 **Request Payload**:
 ```json
 {
   "model": "vehicles",
-  "where": [
-    {"field": "distance", "op": "<", "val": 1000}
+  "filters": [
+    {"field": "distance", "operator": "<", "value": "1000"}
   ],
-  "set": {
-    "distance": {
-      "op": "add",
-      "field_a": "distance",
-      "field_b": "10"
-    }
+  "mutations": {
+    "distance": "distance + 10"
   },
   "limit": 500
 }
@@ -151,7 +148,7 @@ Queries causal connections from seed nodes.
   "model": "events",
   "seeds": ["fuel_shortage"],
   "relations": ["causes", "causes"],
-  "limit": 5
+  "limit_k": 5
 }
 ```
 
@@ -162,10 +159,10 @@ Executes 2D spatial ray-projection queries.
 ```json
 {
   "model": "topology",
-  "from": ["primary_cluster", "backup_cluster"],
-  "relate": "route-down",
+  "inputs": ["primary_cluster", "backup_cluster"],
+  "relation": "route-down",
   "beam_width": 0.05,
-  "top_k": 5
+  "limit_k": 5
 }
 ```
 
@@ -186,10 +183,12 @@ Archives historical records older than the retention threshold.
   "retention_days": 180,
   "date_field": "date",
   "sink_type": "local",
-  "sink_path": "./data/partitions",
+  "target_path": "./data/partitions",
   "async": true
 }
 ```
+
+For a local sink, `target_path` must resolve inside the configured data directory; omit it to use the default `partitions` subdirectory.
 
 ### `GET /v1/partition/list`
 Lists available archived partition files in the partition storage directory.
@@ -338,8 +337,8 @@ Administrative hard reset that unmounts and deletes the model's locked schema co
 
 ## 7. Design Boundaries & Limitations
 
-1. **Protocol Transport**: All engine communication utilizes HTTP/1.1 REST JSON. Persistent connections are maintained via standard HTTP Keep-Alive.
-2. **Model Parameter**: Endpoints accept `"model"` in the request payload or `?model=` query string. If omitted, the engine routes requests to the `"default"` model file.
+1. **Protocol Transport**: The REST API uses HTTP and JSON. AnchorWire is a separate binary TCP protocol.
+2. **Model Parameter**: JSON endpoints read `"model"` from the request body; endpoints documented with `?model=` read it from the query string. If omitted, the engine routes requests to the `"default"` model file.
 3. **Internal Partition Storage**: Partition archive files stored under `/data/partitions` are inaccessible directly over the network; they must be queried via `/v1/partition/inspect`.
 4. **Schema Enforcement Fail-Fast**: When a model is locked, `POST /v1/save` and `POST /v1/update` return HTTP `400 Bad Request` if mandatory fields are omitted, if unknown fields are provided, or if data types conflict with the schema contract.
 

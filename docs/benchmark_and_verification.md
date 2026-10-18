@@ -1,5 +1,7 @@
 # Reproducible Benchmark & Integration Verification Guide
 
+The container verifier in this guide exercises the HTTP API, including server administration endpoints. For application examples over the primary remote transport, see the [AnchorWire guide](anchorwire.md).
+
 AnchorDB includes three independent tiers of verification and performance measurement:
 1. **Standalone Bare-Metal CLI Benchmark (`cmd/benchmark`)**: Instant zero-dependency evaluation of arithmetic compute, spatial grid DDA, causal graphs, and embedded engine throughput without requiring Docker.
 2. **Native Go Microbenchmark Suite (`pkg/storage/bench_test.go`)**: Standard Go testing benchmarks measuring allocations and ns/op.
