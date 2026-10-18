@@ -154,18 +154,18 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 			c.negotiation = &MemoryNegotiationResponse{
 				Status:             MemoryStatusHold,
 				HostUsedPct:        85,
-				AllocatedBatchSize: 100,
-				ReleaseIntervalMs:  100,
+				AllocatedBatchSize: 500,
+				ReleaseIntervalMs:  10,
 			}
 		} else {
 			c.negotiation.Status = MemoryStatusHold
-			if c.negotiation.AllocatedBatchSize > 200 {
-				c.negotiation.AllocatedBatchSize = 200
-			}
-			if c.negotiation.ReleaseIntervalMs < 50 {
-				c.negotiation.ReleaseIntervalMs = 50
-			}
 		}
+		c.negoMu.Unlock()
+	} else if c.negotiation != nil && c.negotiation.Status == MemoryStatusHold {
+		c.negoMu.Lock()
+		c.negotiation.Status = MemoryStatusGranted
+		c.negotiation.AllocatedBatchSize = 1000
+		c.negotiation.ReleaseIntervalMs = 0
 		c.negoMu.Unlock()
 	}
 
@@ -266,9 +266,6 @@ func (c *Client) Save(item storage.BatchRecordItem) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if resp.Flags&FlagMemoryPressure != 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
 	return DecodeOKPayload(resp.Payload)
 }
 
@@ -287,17 +284,8 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	}
 	c.negoMu.RUnlock()
 
-	// If pacing is enabled and negotiation indicates throttled or hold status
-	if pacing && nego != nil {
-		// If server is in Hold status, hold/pause execution
-		if nego.Status == MemoryStatusHold {
-			delay := time.Duration(nego.ReleaseIntervalMs) * time.Millisecond
-			if delay < 20*time.Millisecond {
-				delay = 20 * time.Millisecond
-			}
-			time.Sleep(delay)
-		}
-
+	// If pacing is enabled and negotiation indicates hold status
+	if pacing && nego != nil && nego.Status == MemoryStatusHold {
 		// Slicing into negotiated batch size
 		batchSize := int(nego.AllocatedBatchSize)
 		if batchSize <= 0 {
@@ -312,15 +300,14 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 					end = len(records)
 				}
 				chunk := records[i:end]
-				var resp Frame
 				var err error
 				for attempt := 0; attempt < 4; attempt++ {
-					resp, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
+					_, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
 					if err == nil {
 						break
 					}
 					if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
-						time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 						continue
 					}
 					return allNames, err
@@ -330,9 +317,6 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 				}
 				for _, r := range chunk {
 					allNames = append(allNames, r.Name)
-				}
-				if resp.Flags&FlagMemoryPressure != 0 {
-					time.Sleep(15 * time.Millisecond)
 				}
 
 				// Progressive release delay between slices
@@ -345,15 +329,14 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	}
 
 	// Direct send (single chunk or unpaced)
-	var resp Frame
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
-		resp, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
+		_, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
 		if err == nil {
 			break
 		}
 		if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
-			time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+			time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 			continue
 		}
 		return nil, err
@@ -364,9 +347,6 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	names := make([]string, len(records))
 	for i, r := range records {
 		names[i] = r.Name
-	}
-	if resp.Flags&FlagMemoryPressure != 0 {
-		time.Sleep(15 * time.Millisecond)
 	}
 	return names, nil
 }

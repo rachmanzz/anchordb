@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
 	"sync"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -203,26 +202,26 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 
 			usedPct := headroom.UsedPercent
-			if usedPct < 60 {
+			if usedPct < 75 {
 				status = MemoryStatusGranted
 				if allocatedBatch > 2000 {
 					allocatedBatch = 2000
 				}
 				releaseIntervalMs = 0
-			} else if usedPct < 80 {
-				// Moderate pressure (e.g. Neo4j consumes 60% host RAM)
+			} else if usedPct < 88 {
+				// Moderate pressure
 				status = MemoryStatusThrottled
+				if allocatedBatch > 1000 {
+					allocatedBatch = 1000
+				}
+				releaseIntervalMs = 5 // gentle pacing
+			} else {
+				// High pressure (>88% non-reclaimable RAM consumed)
+				status = MemoryStatusHold
 				if allocatedBatch > 500 {
 					allocatedBatch = 500
 				}
-				releaseIntervalMs = 15 // pace releases with 15ms delay per batch
-			} else {
-				// High pressure (>80% RAM consumed)
-				status = MemoryStatusHold
-				if allocatedBatch > 100 {
-					allocatedBatch = 100
-				}
-				releaseIntervalMs = 100 // hold releases
+				releaseIntervalMs = 20
 			}
 
 			resp.OpCode = OpResponseOK
@@ -257,12 +256,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		switch req.OpCode {
 		case OpSave:
 			headroom := system.GetMemoryHeadroom()
-			if headroom.UsedPercent >= 90 {
+			if headroom.UsedPercent >= 93 {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(507, fmt.Sprintf("storage admission control: container memory pressure %d%%", headroom.UsedPercent))
 				break
 			}
-			if headroom.UsedPercent >= 82 {
+			if headroom.UsedPercent >= 88 {
 				db.TriggerAutoSync()
 			}
 
@@ -295,7 +294,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				savedName, err = db.SaveRecordWithIDAndOp(item.Name, opStatus, item.Props)
 			}
-			if headroom.UsedPercent >= 80 {
+			if headroom.UsedPercent >= 85 {
 				resp.Flags |= FlagMemoryPressure
 			}
 			if err != nil {
@@ -314,22 +313,17 @@ func (s *Server) handleConn(conn net.Conn) {
 				break
 			}
 			headroom := system.GetMemoryHeadroom()
-			if headroom.UsedPercent >= 80 {
+			if headroom.UsedPercent >= 85 {
 				resp.Flags |= FlagMemoryPressure
 			}
-			if headroom.UsedPercent >= 82 {
+			if headroom.UsedPercent >= 88 {
 				db.TriggerAutoSync()
 			}
-			if headroom.UsedPercent >= 88 {
-				_ = db.Sync()
-				runtime.GC()
-				headroom = system.GetMemoryHeadroom()
-				if headroom.UsedPercent >= 88 {
-					resp.OpCode = OpResponseError
-					resp.Flags |= FlagMemoryPressure
-					resp.Payload = EncodeErrorPayload(507, "memory limit exceeded; backpressure active")
-					break
-				}
+			if headroom.UsedPercent >= 93 {
+				resp.OpCode = OpResponseError
+				resp.Flags |= FlagMemoryPressure
+				resp.Payload = EncodeErrorPayload(507, fmt.Sprintf("storage admission control: container memory pressure %d%%", headroom.UsedPercent))
+				break
 			}
 			names, err := db.SaveRecordsBatch(items)
 			if err != nil {

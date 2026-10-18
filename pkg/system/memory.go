@@ -8,6 +8,8 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // MemoryStats provides live runtime memory statistics
@@ -200,9 +202,38 @@ type MemoryHeadroom struct {
 	Source         string `json:"source"`
 }
 
-// GetMemoryHeadroom detects the host and container memory availability.
-// It inspects /proc/meminfo for host availability and /sys/fs/cgroup for container caps.
+var (
+	headroomCacheMu sync.RWMutex
+	cachedHeadroom  MemoryHeadroom
+	lastHeadroomAt  time.Time
+)
+
+const headroomCacheTTL = 100 * time.Millisecond
+
+// GetMemoryHeadroom detects the host and container memory availability with a 100ms cache TTL
+// to eliminate filesystem syscall storms during high-throughput ingestion.
 func GetMemoryHeadroom() MemoryHeadroom {
+	headroomCacheMu.RLock()
+	if time.Since(lastHeadroomAt) < headroomCacheTTL {
+		cached := cachedHeadroom
+		headroomCacheMu.RUnlock()
+		return cached
+	}
+	headroomCacheMu.RUnlock()
+
+	headroomCacheMu.Lock()
+	defer headroomCacheMu.Unlock()
+	if time.Since(lastHeadroomAt) < headroomCacheTTL {
+		return cachedHeadroom
+	}
+
+	fresh := computeMemoryHeadroom()
+	cachedHeadroom = fresh
+	lastHeadroomAt = time.Now()
+	return fresh
+}
+
+func computeMemoryHeadroom() MemoryHeadroom {
 	var hostTotal, hostAvailable uint64
 	var hasHostInfo bool
 
@@ -231,18 +262,18 @@ func GetMemoryHeadroom() MemoryHeadroom {
 		}
 	}
 
-	// 2. Check container cgroup limits
+	// 2. Check container cgroup limits and non-reclaimable memory usage
 	cgroupLimit, _ := DetectCgroupMemoryLimit()
-	cgroupCurrent, hasCgroupCurrent := readCgroupMemoryCurrent()
+	cgroupUsed, hasCgroupUsed := readCgroupMemoryUsage()
 
 	// 3. Synthesize effective memory headroom
 	if hasHostInfo {
 		hostUsed := hostTotal - hostAvailable
 		hostUsedPct := uint8((hostUsed * 100) / hostTotal)
 
-		if cgroupLimit > 0 && hasCgroupCurrent && uint64(cgroupLimit) > cgroupCurrent {
-			cgroupAvailable := uint64(cgroupLimit) - cgroupCurrent
-			cgroupUsedPct := uint8((cgroupCurrent * 100) / uint64(cgroupLimit))
+		if cgroupLimit > 0 && hasCgroupUsed && uint64(cgroupLimit) > cgroupUsed {
+			cgroupAvailable := uint64(cgroupLimit) - cgroupUsed
+			cgroupUsedPct := uint8((cgroupUsed * 100) / uint64(cgroupLimit))
 
 			// Pick the more constrained metric
 			effectiveUsedPct := hostUsedPct
@@ -302,6 +333,79 @@ func GetMemoryHeadroom() MemoryHeadroom {
 		CgroupLimited:  false,
 		Source:         "runtime.SysFallback",
 	}
+}
+
+// readCgroupMemoryUsage reads non-reclaimable memory usage in containers.
+// It excludes clean page cache (inactive_file and clean active_file) which Linux
+// automatically evicts under memory pressure without triggering OOM.
+func readCgroupMemoryUsage() (uint64, bool) {
+	// 1. Try cgroup v2 memory.stat for real non-reclaimable memory (anon + file_dirty + slab_unreclaimable)
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.stat"); err == nil {
+		var anon, fileDirty, slabUnrec uint64
+		var hasAnon bool
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				switch fields[0] {
+				case "anon":
+					if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						anon = v
+						hasAnon = true
+					}
+				case "file_dirty":
+					if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						fileDirty = v
+					}
+				case "slab_unreclaimable":
+					if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						slabUnrec = v
+					}
+				}
+			}
+		}
+		if hasAnon {
+			return anon + fileDirty + slabUnrec, true
+		}
+	}
+
+	// 2. Try cgroup v1 memory.stat
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.stat"); err == nil {
+		var rss, dirty uint64
+		var hasRSS bool
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				switch fields[0] {
+				case "total_rss", "rss":
+					if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						rss = v
+						hasRSS = true
+					}
+				case "total_dirty", "dirty":
+					if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						dirty = v
+					}
+				}
+			}
+		}
+		if hasRSS {
+			return rss + dirty, true
+		}
+	}
+
+	// 3. Fallback to Go runtime MemStats (actual virtual/heap memory held from OS)
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	if m.Sys > m.HeapReleased {
+		return m.Sys - m.HeapReleased, true
+	} else if m.Sys > 0 {
+		return m.Sys, true
+	}
+
+	// 4. Last resort: raw cgroup memory.current
+	return readCgroupMemoryCurrent()
 }
 
 func readCgroupMemoryCurrent() (uint64, bool) {
