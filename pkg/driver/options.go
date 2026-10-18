@@ -19,6 +19,7 @@ type clientConfig struct {
 	schema            Schema
 	adaptivePacing    bool
 	targetRecords     uint32
+	poolSize          int
 }
 
 func defaultClientConfig() clientConfig {
@@ -123,6 +124,17 @@ func WithAdaptivePacing(targetRecords int) Option {
 			c.targetRecords = uint32(targetRecords)
 		} else {
 			c.targetRecords = 100000
+		}
+	}
+}
+
+// WithPoolSize sets the number of concurrent AnchorWire connections in the client connection pool.
+// When poolSize > 1, concurrent worker goroutines use parallel TCP connections rather than serializing
+// over a single socket, scaling ingestion throughput linearly with worker concurrency.
+func WithPoolSize(n int) Option {
+	return func(c *clientConfig) {
+		if n > 0 {
+			c.poolSize = n
 		}
 	}
 }

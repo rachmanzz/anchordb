@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -202,35 +203,145 @@ type MemoryHeadroom struct {
 	Source         string `json:"source"`
 }
 
+// DefaultMemoryCheckStride is the default number of record mutations between background headroom samplings.
+const DefaultMemoryCheckStride uint64 = 5000
+
+// MemoryMonitor tracks memory headroom asynchronously using a configurable stride counter
+// and background sampling, eliminating lock and syscall overhead on high-throughput hot paths.
+type MemoryMonitor struct {
+	current atomic.Pointer[MemoryHeadroom]
+	counter atomic.Uint64
+	stride  uint64
+	trigger chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+}
+
+// NewMemoryMonitor creates and starts a MemoryMonitor.
+// If stride is 0, it reads the ANCHORDB_MEMORY_CHECK_STRIDE environment variable,
+// falling back to DefaultMemoryCheckStride (5000).
+func NewMemoryMonitor(stride uint64) *MemoryMonitor {
+	if stride == 0 {
+		if envStr := os.Getenv("ANCHORDB_MEMORY_CHECK_STRIDE"); envStr != "" {
+			if parsed, err := strconv.ParseUint(strings.TrimSpace(envStr), 10, 64); err == nil && parsed > 0 {
+				stride = parsed
+			}
+		}
+	}
+	if stride == 0 {
+		stride = DefaultMemoryCheckStride
+	}
+
+	m := &MemoryMonitor{
+		stride:  stride,
+		trigger: make(chan struct{}, 1),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+
+	// Immediate synchronous baseline sample
+	initial := computeMemoryHeadroom()
+	m.current.Store(&initial)
+
+	go m.run()
+	return m
+}
+
+func (m *MemoryMonitor) run() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer func() {
+		ticker.Stop()
+		close(m.done)
+	}()
+
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			fresh := computeMemoryHeadroom()
+			m.current.Store(&fresh)
+		case <-m.trigger:
+			fresh := computeMemoryHeadroom()
+			m.current.Store(&fresh)
+		}
+	}
+}
+
+// RecordMutation increments the mutation counter by delta and triggers an asynchronous
+// memory check if a stride boundary is crossed. It never blocks.
+func (m *MemoryMonitor) RecordMutation(delta uint64) {
+	if m == nil || m.stride == 0 || delta == 0 {
+		return
+	}
+	newCount := m.counter.Add(delta)
+	oldCount := newCount - delta
+	if (newCount / m.stride) > (oldCount / m.stride) {
+		select {
+		case m.trigger <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// GetHeadroom returns the latest sampled memory headroom without locks or syscalls.
+func (m *MemoryMonitor) GetHeadroom() MemoryHeadroom {
+	if m == nil {
+		return computeMemoryHeadroom()
+	}
+	p := m.current.Load()
+	if p == nil {
+		fresh := computeMemoryHeadroom()
+		m.current.Store(&fresh)
+		return fresh
+	}
+	return *p
+}
+
+// Stop cleanly terminates the monitor's background sampling goroutine.
+func (m *MemoryMonitor) Stop() {
+	if m == nil {
+		return
+	}
+	select {
+	case <-m.stop:
+		// already stopped
+	default:
+		close(m.stop)
+		<-m.done
+	}
+}
+
+// Stride returns the configured stride for this monitor.
+func (m *MemoryMonitor) Stride() uint64 {
+	if m == nil {
+		return DefaultMemoryCheckStride
+	}
+	return m.stride
+}
+
 var (
-	headroomCacheMu sync.RWMutex
-	cachedHeadroom  MemoryHeadroom
-	lastHeadroomAt  time.Time
+	defaultMonitor     *MemoryMonitor
+	defaultMonitorOnce sync.Once
 )
 
-const headroomCacheTTL = 100 * time.Millisecond
+// GetDefaultMemoryMonitor returns the global default MemoryMonitor singleton.
+func GetDefaultMemoryMonitor() *MemoryMonitor {
+	defaultMonitorOnce.Do(func() {
+		defaultMonitor = NewMemoryMonitor(0)
+	})
+	return defaultMonitor
+}
 
-// GetMemoryHeadroom detects the host and container memory availability with a 100ms cache TTL
-// to eliminate filesystem syscall storms during high-throughput ingestion.
+// GetMemoryHeadroom returns the current host and container memory headroom using the default monitor.
+// This is lock-free and avoids syscall storms on hot paths.
 func GetMemoryHeadroom() MemoryHeadroom {
-	headroomCacheMu.RLock()
-	if time.Since(lastHeadroomAt) < headroomCacheTTL {
-		cached := cachedHeadroom
-		headroomCacheMu.RUnlock()
-		return cached
-	}
-	headroomCacheMu.RUnlock()
+	return GetDefaultMemoryMonitor().GetHeadroom()
+}
 
-	headroomCacheMu.Lock()
-	defer headroomCacheMu.Unlock()
-	if time.Since(lastHeadroomAt) < headroomCacheTTL {
-		return cachedHeadroom
-	}
-
-	fresh := computeMemoryHeadroom()
-	cachedHeadroom = fresh
-	lastHeadroomAt = time.Now()
-	return fresh
+// RecordMutation records delta mutations against the default monitor's stride counter.
+func RecordMutation(delta uint64) {
+	GetDefaultMemoryMonitor().RecordMutation(delta)
 }
 
 func computeMemoryHeadroom() MemoryHeadroom {

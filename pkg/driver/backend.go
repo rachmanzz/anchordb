@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1411,17 +1413,32 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 }
 
 // -----------------------------------------------------------------------------
-// Wire Backend (AnchorWire Binary TCP Client)
+// Wire Backend (AnchorWire Binary TCP Client Pool)
 // -----------------------------------------------------------------------------
 
 type wireBackend struct {
-	addr       string
-	cfg        clientConfig
-	mu         sync.Mutex
-	wireClient *wire.Client
+	addr      string
+	cfg       clientConfig
+	poolSize  int
+	pool      chan *wire.Client
+	clients   []*wire.Client
+	mu        sync.Mutex
+	closed    bool
+	closeChan chan struct{}
 }
 
 func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
+	poolSize := cfg.poolSize
+	if poolSize <= 0 {
+		poolSize = runtime.NumCPU() * 2
+		if poolSize < 4 {
+			poolSize = 4
+		}
+		if poolSize > 32 {
+			poolSize = 32
+		}
+	}
+
 	opts := []wire.ClientOption{
 		wire.WithClientModel(cfg.model),
 		wire.WithClientTimeout(cfg.timeout),
@@ -1432,29 +1449,81 @@ func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
 	if cfg.adaptivePacing {
 		opts = append(opts, wire.WithClientAdaptivePacing(cfg.targetRecords))
 	}
-	wc, err := wire.Connect(addr, opts...)
-	if err != nil {
-		return nil, err
+
+	clients := make([]*wire.Client, 0, poolSize)
+	pool := make(chan *wire.Client, poolSize)
+
+	for i := 0; i < poolSize; i++ {
+		wc, err := wire.Connect(addr, opts...)
+		if err != nil {
+			for _, c := range clients {
+				_ = c.Close()
+			}
+			return nil, fmt.Errorf("failed to initialize wire connection %d/%d: %w", i+1, poolSize, err)
+		}
+		clients = append(clients, wc)
+		pool <- wc
 	}
+
 	return &wireBackend{
-		addr:       addr,
-		cfg:        cfg,
-		wireClient: wc,
+		addr:      addr,
+		cfg:       cfg,
+		poolSize:  poolSize,
+		pool:      pool,
+		clients:   clients,
+		closeChan: make(chan struct{}),
 	}, nil
 }
 
-func (b *wireBackend) withModel(ctx context.Context, model string, fn func() error) error {
+func (b *wireBackend) acquire(ctx context.Context) (*wire.Client, error) {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil, errors.New("wire client closed")
+	}
+	b.mu.Unlock()
+
+	select {
+	case wc := <-b.pool:
+		return wc, nil
+	case <-b.closeChan:
+		return nil, errors.New("wire client closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (b *wireBackend) release(wc *wire.Client) {
+	if wc == nil {
+		return
+	}
+	b.mu.Lock()
+	closed := b.closed
+	b.mu.Unlock()
+
+	if closed {
+		_ = wc.Close()
+		return
+	}
+	b.pool <- wc
+}
+
+func (b *wireBackend) withClient(ctx context.Context, model string, fn func(wc *wire.Client) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if model != "" && model != b.wireClient.ModelName() {
-		if err := b.wireClient.SelectModel(model); err != nil {
+	wc, err := b.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer b.release(wc)
+
+	if model != "" && model != wc.ModelName() {
+		if err := wc.SelectModel(model); err != nil {
 			return err
 		}
 	}
-	return fn()
+	return fn(wc)
 }
 
 func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
@@ -1463,9 +1532,9 @@ func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, p
 		opStatus = *op
 	}
 	var res string
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		res, err = b.wireClient.Save(storage.BatchRecordItem{
+		res, err = wc.Save(storage.BatchRecordItem{
 			Name:      name,
 			Operation: opStatus,
 			Props:     props,
@@ -1477,9 +1546,9 @@ func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, p
 
 func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
 	var names []string
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		names, err = b.wireClient.SaveBatch(records)
+		names, err = wc.SaveBatch(records)
 		return err
 	})
 	return names, err
@@ -1487,9 +1556,9 @@ func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []sto
 
 func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
 	var props map[string]float32
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		props, _, err = b.wireClient.GetWithOptions(wire.GetRequest{
+		props, _, err = wc.GetWithOptions(wire.GetRequest{
 			Name:         name,
 			Select:       selectFields,
 			Computations: computations,
@@ -1517,9 +1586,9 @@ func (b *wireBackend) List(ctx context.Context, model string, opts storage.Query
 		Computations:         opts.Computations,
 	}
 	var resp wire.ListResponse
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		resp, err = b.wireClient.List(req)
+		resp, err = wc.List(req)
 		return err
 	})
 	if err != nil {
@@ -1547,9 +1616,9 @@ func (b *wireBackend) Update(ctx context.Context, model string, opts storage.Upd
 		Mutations:      opts.Mutations,
 	}
 	var count int
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		count, err = b.wireClient.Update(req)
+		count, err = wc.Update(req)
 		return err
 	})
 	return count, err
@@ -1564,9 +1633,9 @@ func (b *wireBackend) Graph(ctx context.Context, model string, inputs []string, 
 		BeamWidth: beamWidth,
 	}
 	var resp wire.GraphResponsePayload
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		resp, err = b.wireClient.Graph(req)
+		resp, err = wc.Graph(req)
 		return err
 	})
 	if err != nil {
@@ -1583,9 +1652,9 @@ func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []str
 		BeamWidth:     beamWidth,
 	}
 	var results []storage.GraphQueryResult
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		results, err = b.wireClient.GraphChain(req)
+		results, err = wc.GraphChain(req)
 		return err
 	})
 	if err != nil {
@@ -1602,18 +1671,18 @@ func (b *wireBackend) GraphChain(ctx context.Context, model string, inputs []str
 }
 
 func (b *wireBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
-	return b.withModel(ctx, model, func() error {
-		return b.wireClient.Edge(action, source, relation, target, weight)
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		return wc.Edge(action, source, relation, target, weight)
 	})
 }
 
 func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
 	var finalResults []storage.CausalResult
-	err := b.withModel(ctx, model, func() error {
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		if len(relations) > 0 {
 			currentSeeds := seeds
 			for _, rel := range relations {
-				stepRes, err := b.wireClient.Causal(currentSeeds, rel, limitK)
+				stepRes, err := wc.Causal(currentSeeds, rel, limitK)
 				if err != nil {
 					return err
 				}
@@ -1629,7 +1698,7 @@ func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, 
 			return nil
 		}
 		var err error
-		finalResults, err = b.wireClient.Causal(seeds, relation, limitK)
+		finalResults, err = wc.Causal(seeds, relation, limitK)
 		return err
 	})
 	return finalResults, err
@@ -1637,8 +1706,8 @@ func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, 
 
 func (b *wireBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
 	var val float32
-	err := b.withModel(ctx, model, func() error {
-		resp, err := b.wireClient.Math(wire.MathRequest{
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		resp, err := wc.Math(wire.MathRequest{
 			Op:    "distance",
 			Words: []string{wordA, wordB},
 		})
@@ -1653,8 +1722,8 @@ func (b *wireBackend) Distance(ctx context.Context, model, wordA, wordB string) 
 
 func (b *wireBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
 	var res CentroidResult
-	err := b.withModel(ctx, model, func() error {
-		resp, err := b.wireClient.Math(wire.MathRequest{
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		resp, err := wc.Math(wire.MathRequest{
 			Op:    "centroid",
 			Words: words,
 		})
@@ -1669,8 +1738,8 @@ func (b *wireBackend) Centroid(ctx context.Context, model string, words []string
 
 func (b *wireBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
 	var val float32
-	err := b.withModel(ctx, model, func() error {
-		resp, err := b.wireClient.Math(wire.MathRequest{
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		resp, err := wc.Math(wire.MathRequest{
 			Op:    "cosine_similarity",
 			Words: []string{wordA, wordB},
 		})
@@ -1685,8 +1754,8 @@ func (b *wireBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB 
 
 func (b *wireBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
 	var res []storage.GraphQueryResult
-	err := b.withModel(ctx, model, func() error {
-		resp, err := b.wireClient.Math(wire.MathRequest{
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		resp, err := wc.Math(wire.MathRequest{
 			Op:     "nearest",
 			Words:  []string{word},
 			LimitK: limitK,
@@ -1701,8 +1770,8 @@ func (b *wireBackend) Nearest(ctx context.Context, model, word string, limitK in
 }
 
 func (b *wireBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
-	return b.withModel(ctx, model, func() error {
-		_, err := b.wireClient.Save(storage.BatchRecordItem{
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		_, err := wc.Save(storage.BatchRecordItem{
 			Name:      word,
 			Operation: storage.OpStatusActive,
 			Coord:     &coord,
@@ -1713,21 +1782,34 @@ func (b *wireBackend) AppendNode(ctx context.Context, model, word string, coord 
 }
 
 func (b *wireBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
-	return b.withModel(ctx, model, func() error {
-		return b.wireClient.SetRelation(name, direction)
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		return wc.SetRelation(name, direction)
 	})
 }
 
 func (b *wireBackend) Sync(ctx context.Context, model string) error {
-	return b.withModel(ctx, model, func() error {
-		return b.wireClient.Sync()
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		return wc.Sync()
 	})
 }
 
 func (b *wireBackend) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.wireClient.Close()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	close(b.closeChan)
+	b.mu.Unlock()
+
+	var lastErr error
+	for _, wc := range b.clients {
+		if err := wc.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func (b *wireBackend) DB() *storage.AnchorDB {
@@ -1751,15 +1833,15 @@ func (b *wireBackend) Attach(ctx context.Context, model string, schema storage.M
 	if err != nil {
 		return err
 	}
-	return b.withModel(ctx, model, func() error {
-		return b.wireClient.AttachSchema(string(data))
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		return wc.AttachSchema(string(data))
 	})
 }
 
 func (b *wireBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
 	var ms storage.ModelSchema
-	err := b.withModel(ctx, model, func() error {
-		raw, err := b.wireClient.GetSchema()
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		raw, err := wc.GetSchema()
 		if err != nil {
 			return err
 		}
@@ -1769,7 +1851,7 @@ func (b *wireBackend) GetSchema(ctx context.Context, model string) (storage.Mode
 }
 
 func (b *wireBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
-	return b.withModel(ctx, model, func() error {
-		return b.wireClient.ResetModel(confirm)
+	return b.withClient(ctx, model, func(wc *wire.Client) error {
+		return wc.ResetModel(confirm)
 	})
 }

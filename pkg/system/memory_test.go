@@ -2,7 +2,9 @@ package system
 
 import (
 	"math"
+	"os"
 	"runtime/debug"
+	"sync"
 	"testing"
 )
 
@@ -129,4 +131,62 @@ func TestGetMemoryHeadroom(t *testing.T) {
 	if h.UsedPercent > 100 {
 		t.Errorf("expected UsedPercent <= 100, got %d", h.UsedPercent)
 	}
+}
+
+func TestMemoryMonitor_StrideConfig(t *testing.T) {
+	// Test default stride = 5000
+	mDefault := NewMemoryMonitor(0)
+	defer mDefault.Stop()
+	if mDefault.Stride() != DefaultMemoryCheckStride {
+		t.Errorf("expected default stride %d, got %d", DefaultMemoryCheckStride, mDefault.Stride())
+	}
+
+	// Test explicit stride
+	mExplicit := NewMemoryMonitor(1000)
+	defer mExplicit.Stop()
+	if mExplicit.Stride() != 1000 {
+		t.Errorf("expected stride 1000, got %d", mExplicit.Stride())
+	}
+
+	// Test environment variable stride
+	origEnv := os.Getenv("ANCHORDB_MEMORY_CHECK_STRIDE")
+	defer func() {
+		if origEnv != "" {
+			_ = os.Setenv("ANCHORDB_MEMORY_CHECK_STRIDE", origEnv)
+		} else {
+			_ = os.Unsetenv("ANCHORDB_MEMORY_CHECK_STRIDE")
+		}
+	}()
+
+	_ = os.Setenv("ANCHORDB_MEMORY_CHECK_STRIDE", "12345")
+	mEnv := NewMemoryMonitor(0)
+	defer mEnv.Stop()
+	if mEnv.Stride() != 12345 {
+		t.Errorf("expected env stride 12345, got %d", mEnv.Stride())
+	}
+}
+
+func TestMemoryMonitor_ConcurrentLockFree(t *testing.T) {
+	m := NewMemoryMonitor(100)
+	defer m.Stop()
+
+	var wg sync.WaitGroup
+	const numGoroutines = 20
+	const opsPerGoroutine = 500
+
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsPerGoroutine; i++ {
+				m.RecordMutation(1)
+				h := m.GetHeadroom()
+				if h.TotalBytes == 0 {
+					t.Errorf("unexpected zero TotalBytes during concurrent reads")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

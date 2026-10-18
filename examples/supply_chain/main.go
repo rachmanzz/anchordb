@@ -617,10 +617,36 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	const numEdges = 50000
 	fmt.Printf("[2/3] Constructing %s multi-hop causal mesh edges...\n", formatNumber(numEdges))
 	tEdge := time.Now()
+
+	// Pre-register the 100 regional logistics hub nodes so that graph edges connect valid entity records
+	fmt.Println("    -> Pre-registering 100 regional logistics hub nodes...")
+	for h := 0; h < 100; h++ {
+		hubName := fmt.Sprintf("hub_logistics_%04d", h)
+		hubProps := map[string]float32{
+			"tier":            4.0, // Logistics tier
+			"inventory_units": 50000.0,
+			"daily_burn_rate": 3500.0,
+			"lead_time_days":  7.0,
+			"is_critical":     float32(h % 2),
+		}
+		if err := client.Save(hubName, hubProps); err != nil {
+			fmt.Printf("Warning: Failed to create hub %s: %v\n", hubName, err)
+		}
+	}
+
+	var edgeErrors atomic.Int64
 	for i := 0; i < numEdges; i++ {
 		src := fmt.Sprintf("hub_logistics_%04d", i%100)
 		target := fmt.Sprintf("sku_auto_%08d", i)
-		_ = client.Link(src, "stocks_sku", target, 0.85+float32(i%15)*0.01)
+		if err := client.Link(src, "stocks_sku", target, 0.85+float32(i%15)*0.01); err != nil {
+			errCount := edgeErrors.Add(1)
+			if errCount <= 5 {
+				fmt.Printf("Error linking %s -> %s: %v\n", src, target, err)
+			}
+		}
+	}
+	if errs := edgeErrors.Load(); errs > 0 {
+		fmt.Printf("    [!] Warning: Edge linking encountered %d errors\n", errs)
 	}
 	fmt.Printf("    [✓] Linked %s edges in %v (%.0f edges/sec)\n\n",
 		formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())

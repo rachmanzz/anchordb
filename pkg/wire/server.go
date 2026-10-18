@@ -301,6 +301,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(500, err.Error())
 			} else {
+				system.RecordMutation(1)
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload(savedName)
 			}
@@ -330,6 +331,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(500, err.Error())
 			} else {
+				system.RecordMutation(uint64(len(items)))
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", len(names)))
 			}
@@ -382,6 +384,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, err.Error())
 			} else {
+				system.RecordMutation(1)
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", db.EdgeCount()))
 			}
@@ -462,6 +465,9 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(500, err.Error())
 			} else {
+				if updatedCount > 0 {
+					system.RecordMutation(uint64(updatedCount))
+				}
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeUpdateResponse(updatedCount)
 			}

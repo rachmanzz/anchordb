@@ -288,6 +288,11 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 					cfg.targetRecords = uint32(n)
 				}
 			}
+			if poolStr := q.Get("pool"); poolStr != "" {
+				if n, err := strconv.Atoi(poolStr); err == nil && n > 0 {
+					cfg.poolSize = n
+				}
+			}
 			pathModel := strings.Trim(u.Path, "/")
 			if pathModel != "" && cfg.model == "default" {
 				cfg.model = pathModel
