@@ -13,8 +13,8 @@ Real-world production implementation of AnchorDB for **in-line payment fraud pre
 ### The In-Line Latency Bottleneck:
 Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FAST) mandate strict authorization Service Level Agreements (**SLA < 50 ms**, with internal database evaluation budgets often **< 5 ms**).
 
-* **Traditional Graph Databases (e.g. Neo4j)**: Declarative Cypher pattern matching across deep multi-hop graphs under high concurrent transaction load frequently incurs **50 ms to 300 ms** latencies. Consequently, banks are forced to run fraud detection **asynchronously / post-facto** (funds are already gone, and recovery rates are below 5%).
-* **AnchorDB Solution**: Evaluates directed multi-hop causal chains and 2D spatial physical distances in **microseconds (0.005 ms - 0.025 ms)**. This allows AnchorDB to be embedded directly inside the **pre-authorization transaction gatekeeper**, blocking fraudulent transfers **in-line before funds leave the bank**.
+* **Complex Query Overhead**: General-purpose graph pattern matching across deep multi-hop graphs under high concurrent transaction load frequently incurs latency overhead, making it difficult to complete within tight payment authorization windows. Consequently, fraud analysis is often deferred asynchronously after funds have already departed.
+* **AnchorDB In-Line Engine**: Evaluates directed multi-hop causal chains and 2D spatial physical distances in in-memory execution paths. This allows AnchorDB to be positioned directly inside the **pre-authorization transaction gatekeeper**, performing fraud checks **in-line before funds leave the bank**.
 
 ---
 
@@ -33,7 +33,7 @@ Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FA
                                    ▼
                     ┌──────────────────────────────┐
                     │  AnchorDB In-Line Gatekeeper │
-                    │  - Latency: 5 to 25 µs       │
+                    │  - In-Memory Traversal       │
                     │  - 5-Hop Mule Chain Scoring  │
                     │  - 2D Spatial Velocity Math  │
                     │  - In-Storage Math Filtering │
@@ -48,14 +48,13 @@ Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FA
                     │                             │
                     └──────────────┬──────────────┘
                                    │
-                     Async Event Stream (Kafka / CDC)
+                     Async Event Stream (Event Broker / CDC)
                                    ▼
                     ┌──────────────────────────────┐
-                    │   Offline Deep Graph DB      │
-                    │   (Neo4j / Graph Data Science│
-                    │   - Monthly Louvain Clusters │
-                    │   - Ad-hoc Cypher Discovery  │
-                    │   - Analyst GUI (Bloom)      │
+                    │   Offline Forensic Storage   │
+                    │   - Monthly Batch Clusters   │
+                    │   - Ad-hoc Pattern Analysis  │
+                    │   - Historical Reporting     │
                     └──────────────────────────────┘
 ```
 
@@ -77,7 +76,7 @@ Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FA
 ### Scenario 3: Massive 1,000,000+ Scale Stress Test
 - **Scale**: Ingests **1,000,000 bank accounts** with strict schema validation (`risk_score`, `last_tx_timestamp`, `daily_tx_volume`, `is_blacklisted`, `kyc_tier`).
 - **Graph Density**: Connects **100,000 fund transfer edges**.
-- **Throughput & Latency**: Executes **50,000 live fraud inspection queries**, measuring p50, p95, and p99 latency to prove sub-millisecond execution at scale.
+- **Throughput & Latency**: Executes **50,000 live fraud inspection queries**, measuring p50, p95, and p99 latency distributions at scale.
 
 ---
 
@@ -153,7 +152,7 @@ go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=bankin
     [✓] Linked 12 directed fund transfer edges across 5 relational hops.
 
 >>> Executing Real-Time Pre-Authorization Multi-Hop Causal Inspection:
-    [✓] 5-Hop Causal Chain Completed in 8.041µs (SUB-MILLISECOND IN-MEMORY LATENCY!)
+    [✓] 5-Hop Causal Chain Completed in 8.041µs (in-memory traversal)
 
 ┌──────────────────────────────┬──────────────┬────────────┬────────────┬──────────────────────────────┬──────────────┐
 │ Downstream Account (Hop 5)   │ Path Prob.   │ Risk Score │ Watchlist? │ Pre-Authorization Decision   │ Decision Time│
@@ -195,25 +194,25 @@ go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=bankin
 ------------------------------------------------------------------------------------------
     [✓] Total Inspections Executed: 50,000 queries
     [✓] Inspection Throughput:      1435617 fraud checks / sec
-    [✓] Average Latency:            696ns (SUB-MILLISECOND!)
+    [✓] Average Latency:            696ns
     [✓] p50 Latency:                329ns
     [✓] p95 Latency:                937ns
     [✓] p99 Latency:                1.474µs
 ------------------------------------------------------------------------------------------
->>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA with 99.8% margin!
+>>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA budget.
 ```
 
 ---
 
-## 7. Comparative Summary: AnchorDB vs Neo4j in Banking
+## 7. Architectural Characteristics in Banking
 
-| Feature | AnchorDB | Neo4j |
-|---|---|---|
-| **Primary Placement** | **In-Line Payment Gateway (< 1 ms SLA)** | **Offline Crime Analytics & Forensic Intelligence** |
-| **Traversal Latency** | **Sub-millisecond (0.001 - 0.025 ms)** | Single to triple-digit milliseconds (50 - 300 ms) |
-| **Throughput** | **140,000+ writes/sec**, 1,400,000+ checks/sec | 10,000 - 40,000 writes/sec |
-| **Runtime Footprint** | Native Go binary (~30 MB RAM), zero JVM GC | JVM Heap (requires multi-GB RAM tuning, GC pause spikes) |
-| **Spatial Anomaly** | Native 2D Spatial Index & Euclidean velocity | Spatial plugin required (APOC / Neo4j Spatial) |
-| **Data Science Algorithms**| None (Focused exclusively on real-time causality & math)| Full Graph Data Science (GDS) library (PageRank, Louvain) |
-| **Query Mechanism** | Programmatic Fluent Go Driver / REST API | Declarative Cypher pattern matching language |
-| **Storage Architecture**| "One Model = One File" (`banking_fraud.anchordb`) | Monolithic cluster store |
+| Characteristic | AnchorDB In-Line Architecture |
+|---|---|
+| **Primary Placement** | In-Line Payment Gateway (< 1 ms budget) |
+| **Traversal Latency** | Low-latency in-memory causal chain evaluation |
+| **Throughput** | High-throughput concurrent writes and checks |
+| **Runtime Footprint** | Native Go binary, compact memory footprint |
+| **Spatial Anomaly** | Native 2D Spatial Index & Euclidean velocity |
+| **Data Science Algorithms**| Focused on real-time causality and in-storage arithmetic |
+| **Query Mechanism** | Programmatic Fluent Go Driver / Binary Wire TCP |
+| **Storage Architecture**| "One Model = One File" (`banking_fraud.anchordb`) |

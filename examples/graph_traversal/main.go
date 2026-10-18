@@ -109,7 +109,7 @@ func main() {
 		{"db_primary_crash", 5, 180000.0, 2500.0, 1.0},
 		{"db_replica_desync", 4, 60000.0, 800.0, 1.0},
 		{"kafka_broker_loss", 5, 110000.0, 1400.0, 1.0},
-		{"redis_cluster_eviction", 3, 25000.0, 350.0, 0.0},
+		{"cache_cluster_eviction", 3, 25000.0, 350.0, 0.0},
 		{"san_io_lockup", 5, 140000.0, 3000.0, 1.0},
 		{"ingress_api_timeout", 4, 55000.0, 900.0, 1.0},
 
@@ -182,7 +182,7 @@ func main() {
 		{"rack_alpha_blackout", "degrades", "db_primary_crash", 0.95},
 		{"rack_alpha_blackout", "degrades", "kafka_broker_loss", 0.90},
 		{"rack_beta_blackout", "degrades", "db_replica_desync", 0.90},
-		{"rack_beta_blackout", "degrades", "redis_cluster_eviction", 0.85},
+		{"rack_beta_blackout", "degrades", "cache_cluster_eviction", 0.85},
 		{"spine_switch_restart", "degrades", "ingress_api_timeout", 0.92},
 		{"san_storage_bus_fault", "degrades", "san_io_lockup", 0.95},
 		// Convergence: storage fault also causes db_primary_crash
@@ -196,7 +196,7 @@ func main() {
 		{"kafka_broker_loss", "disrupts", "inventory_sync_hang", 0.90},
 		{"kafka_broker_loss", "disrupts", "streaming_telemetry_loss", 0.85},
 		{"ingress_api_timeout", "disrupts", "checkout_api_down", 0.88},
-		{"redis_cluster_eviction", "disrupts", "auth_session_invalidation", 0.90},
+		{"cache_cluster_eviction", "disrupts", "auth_session_invalidation", 0.90},
 		{"db_replica_desync", "disrupts", "inventory_sync_hang", 0.80},
 
 		// Hop 5: escalates (Final enterprise impact outcomes)

@@ -1,6 +1,6 @@
 # Background Subsystems: Scheduler & Worker Pool
 
-AnchorDB contains built-in background management subsystems implemented entirely in pure Go, eliminating the need for external brokers (such as Redis, Kafka, or RabbitMQ) for task scheduling and asynchronous processing.
+AnchorDB contains built-in background management subsystems implemented entirely in pure Go, eliminating the need for external broker or queue services for task scheduling and asynchronous processing.
 
 ---
 

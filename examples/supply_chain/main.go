@@ -645,7 +645,7 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 
 	fmt.Printf("    [✓] Executed %s causal traversals in %v\n", formatNumber(benchmarkQueries), durQuery)
 	fmt.Printf("    [✓] Traversal Throughput: %.0f queries/sec\n", qps)
-	fmt.Printf("    [✓] Average Latency:      %.2f µs / query (SUB-MILLISECOND IN-MEMORY)\n", avgLat)
+	fmt.Printf("    [✓] Average Latency:      %.2f µs / query\n", avgLat)
 
 	// 5. In-Storage Math at Scale
 	tMath := time.Now()

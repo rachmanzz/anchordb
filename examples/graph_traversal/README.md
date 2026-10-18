@@ -78,7 +78,7 @@ flowchart TD
     H2_1 -->|"degrades (0.95)"| H3_1["db_primary_crash"]
     H2_1 -->|"degrades (0.90)"| H3_2["kafka_broker_loss"]
     H2_2 -->|"degrades (0.90)"| H3_3["db_replica_desync"]
-    H2_2 -->|"degrades (0.85)"| H3_4["redis_cluster_eviction"]
+    H2_2 -->|"degrades (0.85)"| H3_4["cache_cluster_eviction"]
     H2_3 -->|"degrades (0.92)"| H3_5["ingress_api_timeout"]
     H2_6 -->|"degrades (0.95)"| H3_6["san_io_lockup"]
     H2_6 -.->|"cross: degrades (0.88)"| H3_1

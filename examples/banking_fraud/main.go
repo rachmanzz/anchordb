@@ -210,7 +210,7 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 		return
 	}
 
-	fmt.Printf("    [✓] 5-Hop Causal Chain Completed in %v (SUB-MILLISECOND IN-MEMORY LATENCY!)\n\n", traversalLat)
+	fmt.Printf("    [✓] 5-Hop Causal Chain Completed in %v\n\n", traversalLat)
 
 	// Decision Evaluation Table
 	var decisions []FraudDecision
@@ -449,12 +449,12 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	fmt.Println("------------------------------------------------------------------------------------------")
 	fmt.Printf("    [✓] Total Inspections Executed: %s queries\n", formatNumber(fraudInspectionQueries))
 	fmt.Printf("    [✓] Inspection Throughput:      %.0f fraud checks / sec\n", qps)
-	fmt.Printf("    [✓] Average Latency:            %v (SUB-MILLISECOND!)\n", avgLat)
+	fmt.Printf("    [✓] Average Latency:            %v\n", avgLat)
 	fmt.Printf("    [✓] p50 Latency:                %v\n", p50)
 	fmt.Printf("    [✓] p95 Latency:                %v\n", p95)
 	fmt.Printf("    [✓] p99 Latency:                %v\n", p99)
 	fmt.Println("------------------------------------------------------------------------------------------")
-	fmt.Println(">>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA with 99.8% margin!")
+	fmt.Println(">>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA budget.")
 	fmt.Println("==========================================================================================")
 }
 

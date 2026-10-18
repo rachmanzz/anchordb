@@ -252,7 +252,7 @@ go run ./examples/supply_chain/main.go -scenario=benchmark -scale=100000
 ```
 - **Entities Ingested**: 100,000 in ~0.57s (**~174,000 writes/sec**)
 - **Causal Edges**: 50,000 (fixed) in ~0.36s (**~137,000 edges/sec**)
-- **Multi-Hop Query Latency**: ~237 microseconds (**Sub-Millisecond!**)
+- **Multi-Hop Query Latency**: ~237 microseconds
 
 ### Run Full 5,000,000 Entity Stress Test:
 ```bash
