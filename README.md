@@ -100,11 +100,11 @@ Pre-built native packages are published on [GitHub Releases](https://github.com/
 
 ```bash
 # Ubuntu / Debian (.deb)
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_amd64.deb
-sudo dpkg -i anchordb_0.1.0_amd64.deb
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_amd64.deb
+sudo dpkg -i anchordb_0.1.2_amd64.deb
 
 # RHEL / CentOS / Fedora (.rpm)
-sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_amd64.rpm
+sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_amd64.rpm
 ```
 
 Verify service status:
@@ -120,6 +120,7 @@ Official multi-architecture images (`linux/amd64` and `linux/arm64`) are publish
 ```bash
 docker run -d \
   --name anchordb \
+  -p 7447:7447 \
   -p 7448:7448 \
   -v ./data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="your-secure-token" \
@@ -137,6 +138,7 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
+      - "7447:7447"
       - "7448:7448"
     environment:
       - ANCHORDB_AUTH_TOKEN=your-secure-token
@@ -150,7 +152,7 @@ services:
 To connect your Go application to AnchorDB or embed the engine:
 
 ```bash
-go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.1
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.2
 ```
 
 ### 4. Standalone Binaries (Linux & macOS)
@@ -158,8 +160,8 @@ go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.1
 Download universal pre-compiled archives (`.tar.gz`) for Linux or macOS from [GitHub Releases](https://github.com/rachmanzz/anchordb/releases):
 
 ```bash
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.0_linux_amd64.tar.gz
-tar -xzf anchordb_0.1.0_linux_amd64.tar.gz
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_linux_amd64.tar.gz
+tar -xzf anchordb_0.1.2_linux_amd64.tar.gz
 export ANCHORDB_AUTH_TOKEN="your-secure-token"
 ./anchordb-server -wire-port 7448 -data-dir ./data
 ```
