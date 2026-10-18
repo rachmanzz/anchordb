@@ -13,9 +13,11 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 - **Memory-Mapped Storage (`mmap`)**: Uses shared memory mapping for reading and writing records directly, with atomic snapshot synchronization to disk.
 - **In-Storage Computations**: Evaluates arithmetic expressions (`+`, `-`, `*`, `/`) and date math (epoch day arithmetic) directly during read queries or batch updates, avoiding the round-trip overhead of external compute layers.
+- **In-Storage Basic Statistics** *(Next Release)*: Evaluates single-pass statistical summaries (`Count`, `Sum`, `Min`, `Max`, `Mean`, `Variance`, `StdDev`) powered by B.P. Welford's algorithm, avoiding numerical cancellation without multi-pass memory overhead.
 - **Compact Record Storage**: Key-value entity attributes are stored using contiguous binary structures and interned attribute names to reduce heap allocations and memory usage.
 - **Spatial & Causal Graph Capabilities**:
   - **2D Spatial Index**: Grid-based indexing supporting directional ray-casting, barycenter computation, and nearest-neighbor search.
+  - **Computational Geometry & Geofencing** *(Next Release)*: `Box2D` AABB bounding box, `Polygon2D` ray-casting geofencing, zero-sqrt radius filtering (`WithinRadius`), spherical Earth geodesics (`HaversineDistanceKM`), and compass forward azimuth (`InitialBearing`).
   - **Causal Graph**: Directed, weighted edges (`source --relation--> target`) with support for single-step lookups and multi-hop causal chain traversal.
 - **Crash Durability & WAL**: Write-Ahead Logging with CRC32 frame checksums, automatic recovery on startup, and configurable sync modes (`always`, `interval`, `none`).
 - **Data Lifecycle & Archival**:
@@ -35,8 +37,8 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 - **[Multi-Model Architecture: One Model = One File](docs/multi_model_architecture.md)**: Independent storage files, failure isolation, and memory-mapped model routing.
 - **[Model Schema Registration & Immutability Specification](docs/model_schema_specification.md)**: Strict contract enforcement, scalar primitives, and fail-fast validation.
-- **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, attribute projections, and batch updates.
-- **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, and weighted causal chains.
+- **[In-Storage Computations & Date Math](docs/in_storage_compute.md)**: Operators, date arithmetic, attribute projections, batch updates, and single-pass Welford statistics.
+- **[Causal & Spatial Graph Engine](docs/causal_and_spatial_graph.md)**: 2D spatial indexing, ray casting, computational geometry (geofencing, AABB, Haversine), and weighted causal chains.
 - **[Storage Engine, WAL & Durability](docs/storage_and_durability.md)**: Binary format, write-ahead log modes, and crash recovery.
 - **[Data Partitioning & Record Lifecycle](docs/partitioning_and_lifecycle.md)**: 4-state lifecycle machine, archival sinks, and tombstone collection.
 - **[Background Subsystems: Scheduler & Worker Pool](docs/background_subsystems.md)**: Wall-clock cron scheduler and bounded async worker pool.
@@ -343,6 +345,63 @@ chain, _ := client.CausalChain([]string{"fuel_shortage"}, []string{"causes", "ca
 // Returns: [{"Word": "economic_crisis", "Score": ...}]
 ```
 
+### 6. Computational Geometry & Geofencing (Next Release)
+
+> [!NOTE]
+> The computational geometry package (`pkg/spatial`) and in-storage geometry query methods are scheduled for the **next release**.
+
+```go
+import "github.com/rachmanzz/anchordb/pkg/spatial"
+
+// 1. Ray-Casting Polygon Geofencing
+polygon, _ := spatial.NewPolygon2D([]spatial.Point2D{
+	{X: 106.820, Y: -6.180},
+	{X: 106.835, Y: -6.180},
+	{X: 106.835, Y: -6.170},
+	{X: 106.820, Y: -6.170},
+})
+isInside := polygon.Contains(spatial.Point2D{X: 106.827, Y: -6.175}) // true
+
+// 2. Great-Circle Haversine Distance (WGS84 Earth Mean Radius R = 6,371 km)
+p1 := spatial.Point2D{X: 106.8271, Y: -6.1754} // Monas, Jakarta
+p2 := spatial.Point2D{X: 106.8227, Y: -6.1950} // Bundaran HI, Jakarta
+distKM := spatial.HaversineDistanceKM(p1, p2)   // ~2.23 km
+
+// 3. Initial Forward Compass Azimuth (Bearing)
+azimuth := spatial.InitialBearing(p1, p2)       // ~192.5°
+
+// 4. In-Storage Direct Spatial Queries (Embedded / Server)
+nodesInGeofence, _ := db.FindNodesInPolygon(polygon, 50)
+nodesInProximity, _ := db.FindNodesInRadius(p1, 5.0, 10)
+```
+
+### 7. In-Storage Basic Statistics (Next Release)
+
+> [!NOTE]
+> Single-pass statistical computations (`db.ComputeStats`, `db.ComputeStatsWithOptions`) are scheduled for the **next release**.
+
+```go
+import "github.com/rachmanzz/anchordb/pkg/storage"
+
+// Compute Count, Sum, Min, Max, Mean, Variance, StdDev in a single O(N) streaming pass
+// using B.P. Welford's algorithm (zero heap allocation per entity).
+stats, err := db.ComputeStats("temperature")
+if err != nil {
+	log.Fatal(err)
+}
+
+fmt.Printf("Count: %d, Mean: %.2f, StdDev: %.2f (Min: %.1f, Max: %.1f)\n",
+	stats.Count, stats.Mean, stats.StdDev, stats.Min, stats.Max)
+
+// Filtered statistical aggregation
+filteredStats, _ := db.ComputeStatsWithOptions(storage.StatsOptions{
+	Field: "temperature",
+	Filters: []storage.FilterCondition{
+		{Field: "pressure", Operator: ">=", Value: 101.3},
+	},
+})
+```
+
 ---
 
 ## AnchorWire Operations
@@ -401,6 +460,8 @@ AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D 
 2. **Computational Property Storage**: Attribute values are stored as contiguous `float32` scalar primitives (`float`, `int`, `bool`, `date`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
 3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (AnchorWire server or embedded in-process engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
+5. **Geometry & Spherical Navigation**: 2D geofencing operates on planar coordinates. Great-circle distance calculation (`HaversineDistanceKM`) uses the mean spherical Earth radius ($R = 6371.0\text{ km}$), which is computationally efficient for high-frequency geofencing and proximity filtering without the latency overhead of ellipsoidal geodesic algorithms.
+6. **Single-Pass Streaming Statistics**: In-storage statistics calculate 1st and 2nd central moments (mean, variance, standard deviation) in a single streaming pass ($O(N)$ time, $O(1)$ space). Order statistics (such as percentiles and medians) are intentionally excluded to maintain zero heap allocations and sub-millisecond execution.
 
 ---
 

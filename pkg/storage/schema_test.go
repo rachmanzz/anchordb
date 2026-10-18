@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
 
 func TestSchema_ParseFieldSpec(t *testing.T) {
@@ -264,5 +266,83 @@ func TestSchema_ResetKeepsLockWhenSidecarRemovalFails(t *testing.T) {
 	}
 	if schema, locked := db.GetSchema(); !locked || schema["x"] != "float" {
 		t.Fatalf("schema lock changed after failed reset: locked=%v schema=%v", locked, schema)
+	}
+}
+
+func TestSchema_WithComputeStatsAndGeometry(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "schema_stats.anchordb")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Attach and lock schema
+	schema := ModelSchema{
+		"voltage":   "float",
+		"is_active": "bool",
+	}
+	if err := db.AttachSchema(schema); err != nil {
+		t.Fatalf("AttachSchema failed: %v", err)
+	}
+
+	// 2. Reject un-declared fields (schema enforcement intact)
+	err = db.SaveRecord("sensor_bad", map[string]float32{"voltage": 220.0, "unknown_field": 99.0})
+	if !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("expected ErrUnknownField, got %v", err)
+	}
+
+	// 3. Save valid schema-conforming records with spatial coordinates
+	_, err = db.SaveRecordWithNode("sensor_jkt", OpStatusActive, map[string]float32{
+		"voltage":   220.0,
+		"is_active": 1.0,
+	}, spatial.Point2D{X: 106.8272, Y: -6.1754}, [4]float32{1, 0, 0, 0})
+	if err != nil {
+		t.Fatalf("SaveRecordWithNode 1 failed: %v", err)
+	}
+
+	_, err = db.SaveRecordWithNode("sensor_bdg", OpStatusActive, map[string]float32{
+		"voltage":   240.0,
+		"is_active": 1.0,
+	}, spatial.Point2D{X: 107.6186, Y: -6.9025}, [4]float32{0, 1, 0, 0})
+	if err != nil {
+		t.Fatalf("SaveRecordWithNode 2 failed: %v", err)
+	}
+
+	// 4. ComputeStats on schema field "voltage"
+	stats, err := db.ComputeStats("voltage")
+	if err != nil {
+		t.Fatalf("ComputeStats failed under locked schema: %v", err)
+	}
+	if stats.Count != 2 || stats.Mean != 230.0 || stats.Min != 220.0 || stats.Max != 240.0 {
+		t.Fatalf("unexpected stats under locked schema: %+v", stats)
+	}
+
+	// 5. Query nodes in polygon under locked schema
+	poly, err := spatial.NewPolygon2D([]spatial.Point2D{
+		{X: 106.0, Y: -6.0},
+		{X: 108.0, Y: -6.0},
+		{X: 108.0, Y: -8.0},
+		{X: 106.0, Y: -8.0},
+	})
+	if err != nil {
+		t.Fatalf("NewPolygon2D failed: %v", err)
+	}
+
+	nodes, err := db.FindNodesInPolygon(poly, 10)
+	if err != nil {
+		t.Fatalf("FindNodesInPolygon failed under locked schema: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes in polygon, got %d", len(nodes))
+	}
+
+	// 6. Haversine distance under locked schema
+	dist, err := db.CalculateHaversineDistance("sensor_jkt", "sensor_bdg")
+	if err != nil {
+		t.Fatalf("CalculateHaversineDistance failed under locked schema: %v", err)
+	}
+	if dist < 115 || dist > 125 {
+		t.Fatalf("unexpected distance under locked schema: %f", dist)
 	}
 }

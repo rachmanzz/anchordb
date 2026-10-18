@@ -166,6 +166,63 @@ Executes 2D spatial ray-projection queries.
 }
 ```
 
+### `POST /v1/math`
+Executes spatial graph math operations and in-storage statistical computations.
+
+Supported `op` values:
+- `distance`: Euclidean distance between two spatial nodes (`words: ["nodeA", "nodeB"]`).
+- `centroid`: Centroid coordinate and semantic role vector of one or more spatial nodes (`words: ["nodeA", "nodeB", ...]`).
+- `cosine_similarity`: Cosine similarity between 4D semantic role vectors of two nodes (`words: ["nodeA", "nodeB"]`).
+- `nearest`: Nearest neighbor search for a given spatial node (`words: ["nodeA"]`, `limit_k: 5`).
+- `haversine` *(Next release)*: Great-circle distance in kilometers using the WGS84 spherical Earth model ($R = 6371.0\text{ km}$, where $X = \text{Longitude}, Y = \text{Latitude}$) between two spatial nodes (`words: ["nodeA", "nodeB"]`).
+- `stats` *(Next release)*: Single-pass statistical aggregates (`count`, `sum`, `min`, `max`, `mean`, `variance`, `std_dev`) for a specified numeric field using Welford's algorithm (`field: "fieldname"`).
+
+> [!NOTE]
+> The `haversine` and `stats` operations on `POST /v1/math` are scheduled for the **next release**.
+
+**Request Payload (Haversine Distance - Next Release)**:
+```json
+{
+  "model": "airports",
+  "op": "haversine",
+  "words": ["airport_jfk", "airport_lhr"]
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "distance_km": 5554.82
+}
+```
+
+**Request Payload (In-Storage Statistics - Next Release)**:
+```json
+{
+  "model": "telemetry",
+  "op": "stats",
+  "field": "speed"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "stats": {
+    "field": "speed",
+    "count": 10000,
+    "sum": 650000.0,
+    "min": 15.2,
+    "max": 145.8,
+    "mean": 65.0,
+    "variance": 125.4,
+    "std_dev": 11.1982
+  }
+}
+```
+
 ---
 
 ## 5. Maintenance & Lifecycle Endpoints

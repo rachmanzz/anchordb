@@ -2848,6 +2848,29 @@ func (db *AnchorDB) CalculateDistance(wordA, wordB string) (float32, error) {
 	return pA.Distance(pB), nil
 }
 
+// CalculateHaversineDistance computes the great-circle GPS distance in kilometers between two words (X = Lon, Y = Lat).
+func (db *AnchorDB) CalculateHaversineDistance(wordA, wordB string) (float32, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	idxA, existsA := db.Lexicon[wordA]
+	if !existsA {
+		return 0, fmt.Errorf("word not found: %q", wordA)
+	}
+	idxB, existsB := db.Lexicon[wordB]
+	if !existsB {
+		return 0, fmt.Errorf("word not found: %q", wordB)
+	}
+
+	recA := db.getNode(idxA)
+	recB := db.getNode(idxB)
+
+	pA := spatial.Point2D{X: recA.X, Y: recA.Y}
+	pB := spatial.Point2D{X: recB.X, Y: recB.Y}
+
+	return spatial.HaversineDistanceKM(pA, pB), nil
+}
+
 // CalculateCentroid computes the central gravitational coordinate and average roles for a set of words.
 func (db *AnchorDB) CalculateCentroid(words []string) (spatial.Point2D, [4]float32, error) {
 	db.mu.RLock()
@@ -2976,6 +2999,209 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 		limitK = len(results)
 	}
 	return results[:limitK], nil
+}
+
+// FindNodesInPolygon finds nodes located inside a 2D polygon using in-memory Ray-Casting.
+func (db *AnchorDB) FindNodesInPolygon(poly spatial.Polygon2D, limitK int) ([]GraphQueryResult, error) {
+	if limitK < 0 {
+		return nil, fmt.Errorf("limitK must not be negative")
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	var results []GraphQueryResult
+	totNodes := db.totalNodes()
+	for idx := 0; idx < totNodes; idx++ {
+		rec := db.getNode(uint32(idx))
+		if rec.ID == 0 {
+			continue
+		}
+		p := spatial.Point2D{X: rec.X, Y: rec.Y}
+		if poly.Contains(p) {
+			w := db.getWord(rec.WordOffset, rec.WordLen)
+			results = append(results, GraphQueryResult{
+				Word:  w,
+				Coord: p,
+				Score: 1.0,
+			})
+			if limitK > 0 && len(results) >= limitK {
+				break
+			}
+		}
+	}
+	return results, nil
+}
+
+// FindNodesInRadius finds nodes located within radius from a center coordinate.
+func (db *AnchorDB) FindNodesInRadius(center spatial.Point2D, radius float32, limitK int) ([]GraphQueryResult, error) {
+	if limitK < 0 {
+		return nil, fmt.Errorf("limitK must not be negative")
+	}
+	if radius <= 0 {
+		return nil, fmt.Errorf("radius must be positive")
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	var results []GraphQueryResult
+	totNodes := db.totalNodes()
+	for idx := 0; idx < totNodes; idx++ {
+		rec := db.getNode(uint32(idx))
+		if rec.ID == 0 {
+			continue
+		}
+		p := spatial.Point2D{X: rec.X, Y: rec.Y}
+		if spatial.WithinRadius(p, center, radius) {
+			w := db.getWord(rec.WordOffset, rec.WordLen)
+			dist := p.Distance(center)
+			results = append(results, GraphQueryResult{
+				Word:       w,
+				Coord:      p,
+				T:          dist,
+				DistSqPerp: p.DistanceSq(center),
+				Score:      1.0 / (1.0 + dist),
+			})
+			if limitK > 0 && len(results) >= limitK {
+				break
+			}
+		}
+	}
+	return results, nil
+}
+
+// StatsResult represents single-pass statistical aggregate calculations for a numeric field.
+type StatsResult struct {
+	Field    string  `json:"field"`
+	Count    uint64  `json:"count"`
+	Sum      float64 `json:"sum"`
+	Min      float32 `json:"min"`
+	Max      float32 `json:"max"`
+	Mean     float64 `json:"mean"`
+	Variance float64 `json:"variance"`
+	StdDev   float64 `json:"std_dev"`
+}
+
+// StatsOptions defines configuration and filters for single-pass in-storage statistical computations.
+type StatsOptions struct {
+	Field                string
+	Filters              []FilterCondition
+	IncludeAllOperations bool
+	AllowedOperations    []uint8
+}
+
+// ComputeStats calculates single-pass statistical aggregates (Count, Sum, Min, Max, Mean, Variance, StdDev)
+// for a numeric field across all active records using Welford's algorithm.
+func (db *AnchorDB) ComputeStats(field string) (StatsResult, error) {
+	return db.ComputeStatsWithOptions(StatsOptions{Field: field})
+}
+
+// ComputeStatsWithOptions calculates single-pass statistical aggregates with custom filters using Welford's algorithm.
+func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, error) {
+	if opts.Field == "" {
+		return StatsResult{}, fmt.Errorf("field must not be empty")
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return StatsResult{}, ErrDatabaseClosed
+	}
+
+	totalEntities := len(db.EntityOrder)
+	if totalEntities == 0 {
+		return StatsResult{Field: opts.Field}, nil
+	}
+
+	var count uint64
+	var sum float64
+	var minVal float32 = math.MaxFloat32
+	var maxVal float32 = -math.MaxFloat32
+	var m float64 // Mean accumulator
+	var s float64 // M2 sum-of-squares accumulator in Welford's algorithm
+
+	for i := 0; i < totalEntities; i++ {
+		name := db.EntityOrder[i]
+		cr := db.EntityStore[name]
+
+		if len(opts.AllowedOperations) > 0 {
+			matched := false
+			for _, allowed := range opts.AllowedOperations {
+				if cr.Operation == allowed {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		} else if !opts.IncludeAllOperations {
+			if cr.Operation != OpStatusActive {
+				continue
+			}
+		}
+
+		if len(opts.Filters) > 0 {
+			matches := true
+			for _, f := range opts.Filters {
+				if !cr.MatchesFilter(f) {
+					matches = false
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
+		}
+
+		val, exists := cr.Get(opts.Field)
+		if !exists {
+			continue
+		}
+
+		count++
+		val64 := float64(val)
+		sum += val64
+
+		if val < minVal {
+			minVal = val
+		}
+		if val > maxVal {
+			maxVal = val
+		}
+
+		// Welford's single-pass update
+		delta := val64 - m
+		m += delta / float64(count)
+		delta2 := val64 - m
+		s += delta * delta2
+	}
+
+	if count == 0 {
+		return StatsResult{Field: opts.Field}, nil
+	}
+
+	var variance float64
+	if count > 1 {
+		variance = s / float64(count-1)
+	}
+	stdDev := math.Sqrt(variance)
+
+	return StatsResult{
+		Field:    opts.Field,
+		Count:    count,
+		Sum:      sum,
+		Min:      minVal,
+		Max:      maxVal,
+		Mean:     m,
+		Variance: variance,
+		StdDev:   stdDev,
+	}, nil
 }
 
 func (db *AnchorDB) getWord(offset uint32, length uint16) string {

@@ -872,8 +872,9 @@ type CausalRequest struct {
 // MathRequest triggers direct numerical and geometric operations on the graph.
 type MathRequest struct {
 	Model  string   `json:"model"`
-	Op     string   `json:"op"` // "distance", "centroid", "cosine_similarity", "nearest"
+	Op     string   `json:"op"` // "distance", "centroid", "cosine_similarity", "nearest", "haversine", "stats"
 	Words  []string `json:"words"`
+	Field  string   `json:"field,omitempty"`
 	LimitK int      `json:"limit_k,omitempty"`
 }
 
@@ -1519,6 +1520,38 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":   true,
 			"neighbors": neighbors,
+		})
+	case "haversine":
+		if len(req.Words) < 2 {
+			writeJSONError(w, http.StatusBadRequest, "haversine requires at least 2 words")
+			return
+		}
+		dist, err := db.CalculateHaversineDistance(req.Words[0], req.Words[1])
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":     true,
+			"distance_km": dist,
+		})
+	case "stats", "statistics":
+		field := strings.TrimSpace(req.Field)
+		if field == "" && len(req.Words) > 0 {
+			field = req.Words[0]
+		}
+		if field == "" {
+			writeJSONError(w, http.StatusBadRequest, "stats requires field parameter")
+			return
+		}
+		stats, err := db.ComputeStats(field)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"stats":   stats,
 		})
 	default:
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported math op %q", req.Op))

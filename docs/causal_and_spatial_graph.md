@@ -54,7 +54,113 @@ neighbors, err := math.Nearest("primary_cluster", 5)
 
 ---
 
-## 2. Explicit Causal Graph Engine
+## 2. Computational Geometry & Geofencing
+
+> [!NOTE]
+> The computational geometry primitives (`Box2D`, `Polygon2D`, `WithinRadius`, `HaversineDistanceKM`, `InitialBearing`) and storage engine methods (`FindNodesInPolygon`, `FindNodesInRadius`, `CalculateHaversineDistance`) described below are scheduled for the **next release**.
+
+AnchorDB provides high-performance 2D computational geometry primitives in `pkg/spatial` and exposes direct query operations within `pkg/storage`. These routines are implemented with zero heap allocations in inner loops to maximize throughput in high-frequency telemetry, geofencing, and proximity tracking workloads.
+
+### 2.1 Axis-Aligned Bounding Box (`Box2D`)
+
+`spatial.Box2D` defines a rectangular envelope bounded by minimum and maximum `Point2D` coordinates.
+
+```go
+// Construct normalized bounding box (guarantees Min <= Max)
+bbox := spatial.NewBox2D(
+    spatial.Point2D{X: -10.0, Y: -10.0},
+    spatial.Point2D{X: 10.0, Y: 10.0},
+)
+
+// O(1) containment check
+inside := bbox.Contains(spatial.Point2D{X: 5.0, Y: 5.0}) // true
+
+// O(1) intersection check between two bounding boxes
+intersects := bbox.Intersects(spatial.NewBox2D(
+    spatial.Point2D{X: 8.0, Y: 8.0},
+    spatial.Point2D{X: 20.0, Y: 20.0},
+)) // true
+```
+
+### 2.2 Polygons & Ray-Casting Geofencing (`Polygon2D`)
+
+`spatial.Polygon2D` represents a closed planar polygon with vertices ordered sequentially. Upon creation, `Polygon2D` precalculates and caches its tight bounding box (`BBox`) for two-stage filtering.
+
+```go
+vertices := []spatial.Point2D{
+    {X: 0.0, Y: 0.0},
+    {X: 10.0, Y: 0.0},
+    {X: 10.0, Y: 10.0},
+    {X: 0.0, Y: 10.0},
+}
+poly, err := spatial.NewPolygon2D(vertices)
+if err != nil {
+    log.Fatal(err) // Returns ErrPolygonTooFewVertices if len(vertices) < 3
+}
+
+// 1. Point-in-Polygon (Geofencing)
+contains := poly.Contains(spatial.Point2D{X: 5.0, Y: 5.0}) // true
+
+// 2. Planar Polygon Area (Shoelace Formula)
+area := poly.Area() // 100.0
+
+// 3. Perimeter Length
+perimeter := poly.Perimeter() // 40.0
+```
+
+#### Two-Stage Containment Algorithm
+1. **Stage 1: Broad-Phase Bounding Box Rejection ($O(1)$)**: Checks if `poly.BBox.Contains(p)` is satisfied. Points outside the envelope are rejected immediately without testing vertices.
+2. **Stage 2: Narrow-Phase Ray-Casting ($O(V)$)**: Evaluates horizontal ray intersections using Jordan's curve theorem (Even-Odd rule). A point is inside if a horizontal ray cast from $(X, Y)$ toward $+\infty$ intersects an odd number of polygon boundary segments.
+
+### 2.3 Zero-Square-Root Radius Filtering (`WithinRadius`)
+
+To avoid the computational cost of floating-point square roots (`math.Sqrt`) in inner spatial scanning loops, `spatial.WithinRadius` evaluates squared Euclidean distance:
+
+$$\text{DistanceSq}(p, c) = (p.X - c.X)^2 + (p.Y - c.Y)^2 \le r^2$$
+
+```go
+center := spatial.Point2D{X: 0.0, Y: 0.0}
+radius := float32(10.0)
+
+// Fast O(1) proximity test without square root
+isNear := spatial.WithinRadius(spatial.Point2D{X: 6.0, Y: 8.0}, center, radius) // true (36 + 64 <= 100)
+```
+
+### 2.4 Spherical Geodesics (`HaversineDistanceKM` & `InitialBearing`)
+
+For geographical coordinates (where $X = \text{Longitude}$ and $Y = \text{Latitude}$ in decimal degrees), AnchorDB provides spherical Earth geodesic routines:
+
+```go
+monas := spatial.Point2D{X: 106.8271, Y: -6.1754}  // Jakarta
+bundaranHI := spatial.Point2D{X: 106.8227, Y: -6.1950} // Jakarta
+
+// 1. Great-circle distance using WGS84 mean Earth radius (R = 6,371.0 km)
+distKM := spatial.HaversineDistanceKM(monas, bundaranHI)
+fmt.Printf("Distance: %.3f km\n", distKM) // ~2.231 km
+
+// 2. Initial forward compass azimuth in degrees [0°, 360°)
+azimuth := spatial.InitialBearing(monas, bundaranHI)
+fmt.Printf("Bearing: %.1f°\n", azimuth) // ~192.5°
+```
+
+### 2.5 In-Storage Geometric Queries
+
+The storage engine (`pkg/storage`) evaluates geometry filters directly over the memory-mapped node layout:
+
+```go
+// 1. Find up to K nodes within a Polygon boundary
+nodesInZone, err := db.FindNodesInPolygon(poly, 100)
+
+// 2. Find up to K nodes within a radius from center coordinate
+nodesNearby, err := db.FindNodesInRadius(center, 50.0, 20)
+
+// 3. Compute great-circle distance between two named spatial entities
+km, err := db.CalculateHaversineDistance("airport_cgk", "airport_dps")
+```
+
+---
+
+## 3. Explicit Causal Graph Engine
 
 For deterministic cause-and-effect modeling, AnchorDB supports explicit, weighted directed edges stored in a dedicated causal graph structure (`EDG3` binary section).
 
@@ -115,14 +221,14 @@ AnchorDB enforces a strict architectural boundary between graph inputs and query
 
 ---
 
-## 3. Storage & Compaction
+## 4. Storage & Compaction
 
 * **Memory-Mapped Persistence**: Causal edges are serialized alongside spatial nodes in the `.anchordb` binary file and recorded in the Write-Ahead Log (`WalOpEdge`, `WalOpEdgeDelete`).
 * **Tombstone Tagging & Compaction**: Deleted edges are tagged with tombstones in $O(1)$ constant time without shifting array elements. When the number of tombstoned records exceeds the configured ratio threshold, an amortized $O(N)$ compaction pass reclaims fragmented slots and flushes clean contiguous storage to disk.
 
 ---
 
-## 4. AnchorWire Usage
+## 5. AnchorWire Usage
 
 Use the Go driver over AnchorWire for graph writes and causal traversal:
 
@@ -152,9 +258,11 @@ See the [AnchorWire guide](anchorwire.md) and the [graph traversal example](../e
 
 ---
 
-## 5. Design Boundaries & Limitations
+## 6. Design Boundaries & Limitations
 
 1. **Cumulative Weights vs. Probabilities**: The aggregate score along a multi-hop causal chain is the product of transition edge weights ($\prod w_i$). It represents cumulative relational affinity, not a Bayesian conditional probability or formal causal DAG backdoor adjustment.
 2. **2D Spatial Coordinates**: Spatial indexing is specifically optimized for 2D Cartesian planes (e.g. facility layouts, IoT field grids, game maps). It is not designed to replace high-dimensional dense vector embeddings (e.g. 1536-dim OpenAI embeddings).
 3. **Bounded Beam Search**: Multi-hop traversals and ray casting evaluate candidates within bounded grid radius or beam width ($O(K)$ candidate evaluations), ensuring bounded latency rather than exhaustive graph exploration.
+4. **Planar Geometry Scope**: `Polygon2D` geofencing and `Box2D` operate on 2D Cartesian coordinates. Self-intersecting polygons or multi-polygon holes are not modeled natively in this primitive.
+5. **Spherical Earth Model**: `HaversineDistanceKM` approximates Earth using the standard mean spherical radius ($R = 6371.0\text{ km}$). This yields an accuracy within ~0.3%–0.5% for general navigation and geofencing without requiring the computation overhead of ellipsoidal geodesic integration (e.g. Vincenty or Karney). Coordinates must use decimal degrees with $X = \text{Longitude}$ and $Y = \text{Latitude}$.
 

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/rachmanzz/anchordb/pkg/driver"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
+	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
 func TestRemoteDriver_ConnectAndSaveGetCompute(t *testing.T) {
@@ -432,5 +437,95 @@ func TestRemoteDriver_AttachSchemaLifecycle(t *testing.T) {
 	_, err = client.GetSchema(ctx)
 	if err == nil {
 		t.Fatalf("expected error after reset when getting schema, got nil")
+	}
+}
+
+func TestServer_Math_StatsAndHaversine(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	s.authToken = "test-token"
+	ts := httptest.NewServer(s.Routes())
+	defer ts.Close()
+
+	client, err := driver.ConnectRemote(ts.URL,
+		driver.WithToken("test-token"),
+		driver.WithModel("analytics"),
+	)
+	if err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	defer client.Close()
+
+	// Seed nodes and records
+	_ = client.AppendNode("jakarta", spatial.Point2D{X: 106.8272, Y: -6.1754}, [4]float32{1, 0, 0, 0})
+	_ = client.AppendNode("bandung", spatial.Point2D{X: 107.6186, Y: -6.9025}, [4]float32{0, 1, 0, 0})
+
+	_ = client.Save("rec1", map[string]float32{"amount": 10.0})
+	_ = client.Save("rec2", map[string]float32{"amount": 20.0})
+	_ = client.Save("rec3", map[string]float32{"amount": 30.0})
+
+	// 1. Test POST /v1/math with op="stats"
+	statsReqBody, _ := json.Marshal(map[string]interface{}{
+		"model": "analytics",
+		"op":    "stats",
+		"field": "amount",
+	})
+	httpReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/math", bytes.NewReader(statsReqBody))
+	httpReq.Header.Set("Authorization", "Bearer test-token")
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("POST /v1/math stats failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	var statsResp struct {
+		Success bool                `json:"success"`
+		Stats   storage.StatsResult `json:"stats"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&statsResp); err != nil {
+		t.Fatalf("failed decoding stats response: %v", err)
+	}
+	if !statsResp.Success || statsResp.Stats.Count != 3 || statsResp.Stats.Mean != 20.0 {
+		t.Fatalf("unexpected stats response: %+v", statsResp)
+	}
+
+	// 2. Test POST /v1/math with op="haversine"
+	havReqBody, _ := json.Marshal(map[string]interface{}{
+		"model": "analytics",
+		"op":    "haversine",
+		"words": []string{"jakarta", "bandung"},
+	})
+	httpReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/math", bytes.NewReader(havReqBody))
+	httpReq2.Header.Set("Authorization", "Bearer test-token")
+	httpReq2.Header.Set("Content-Type", "application/json")
+
+	resp2, err := http.DefaultClient.Do(httpReq2)
+	if err != nil {
+		t.Fatalf("POST /v1/math haversine failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("expected 200 OK, got %d: %s", resp2.StatusCode, string(body))
+	}
+
+	var havResp struct {
+		Success    bool    `json:"success"`
+		DistanceKM float32 `json:"distance_km"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&havResp); err != nil {
+		t.Fatalf("failed decoding haversine response: %v", err)
+	}
+	if !havResp.Success || havResp.DistanceKM < 115 || havResp.DistanceKM > 125 {
+		t.Fatalf("unexpected haversine distance: %+v", havResp)
 	}
 }

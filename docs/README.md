@@ -12,10 +12,12 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
    * Arithmetic operators (`+`, `-`, `*`, `/`) evaluated directly inside the storage engine.
    * Date arithmetic using Epoch Days (`AddDays`, `SubtractDays`, `DaysBetween`).
    * Read-time selective attribute projection and compound filtered queries.
+   * Single-pass in-storage statistics via Welford's algorithm (`Count`, `Sum`, `Min`, `Max`, `Mean`, `Variance`, `StdDev`) *(Next Release)*.
 
 2. **[Causal & Spatial Graph Engine](causal_and_spatial_graph.md)**
    * 2D spatial indexing, grid mapping, and directional DDA ray casting.
    * Geometric calculations: barycenters, Euclidean distances, and role cosine similarity.
+   * Computational geometry primitives: `Box2D` AABB, `Polygon2D` geofencing, zero-sqrt `WithinRadius`, and `HaversineDistanceKM` geodesics *(Next Release)*.
    * Directed weighted causal graph modeling (`Link`, `Unlink`, `Causal`, `CausalChain`).
 
 3. **[Storage Engine, WAL & Durability](storage_and_durability.md)**
@@ -67,4 +69,5 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
 
 11. **[REST API Reference](rest_api.md)**
    * HTTP health, metrics, partition inspection, and server administration.
+   * Graph math operations and in-storage statistics endpoints (`POST /v1/math`).
    * Endpoint details for applications that explicitly use the HTTP transport.
