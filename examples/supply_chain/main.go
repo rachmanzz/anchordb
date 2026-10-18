@@ -669,11 +669,14 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 		}()
 	}
 	edgeWg.Wait()
-	if errs := edgeErrors.Load(); errs > 0 {
-		fmt.Printf("    [!] Warning: Edge linking encountered %d errors\n", errs)
+	errs := edgeErrors.Load()
+	if errs > 0 {
+		fmt.Printf("    [!] Warning: Edge linking encountered %d errors: %s / %s edges linked in %v (%.0f edges/sec)\n\n",
+			errs, formatNumber(numEdges-int(errs)), formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())
+	} else {
+		fmt.Printf("    [✓] Linked %s edges (0 errors) in %v (%.0f edges/sec)\n\n",
+			formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())
 	}
-	fmt.Printf("    [✓] Linked %s edges in %v (%.0f edges/sec)\n\n",
-		formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())
 
 	// 4. Measure Query Latency at 5M Scale
 	fmt.Println("[3/3] Measuring Multi-Hop Query Latency Under Scale...")
@@ -692,8 +695,10 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	durQuery := time.Since(tQuery)
 	qps := float64(benchmarkQueries) / durQuery.Seconds()
 	avgLat := (durQuery.Seconds() * 1e6) / float64(benchmarkQueries)
+	successCount := int(querySuccess.Load())
 
-	fmt.Printf("    [✓] Executed %s causal traversals in %v\n", formatNumber(benchmarkQueries), durQuery)
+	fmt.Printf("    [✓] Executed %s causal traversals (%s successful, %d errors) in %v\n",
+		formatNumber(benchmarkQueries), formatNumber(successCount), benchmarkQueries-successCount, durQuery)
 	fmt.Printf("    [✓] Traversal Throughput: %.0f queries/sec\n", qps)
 	fmt.Printf("    [✓] Average Latency:      %.2f µs / query\n", avgLat)
 
