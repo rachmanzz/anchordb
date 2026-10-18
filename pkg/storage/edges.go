@@ -81,6 +81,35 @@ func (db *AnchorDB) AddEdge(source, relation, target string, weight float32) err
 	return nil
 }
 
+// AddEdgesBatch registers or replaces a batch of directed edges under a single lock and WAL flush.
+func (db *AnchorDB) AddEdgesBatch(items []EdgeRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	for _, it := range items {
+		if err := validateEdge(it.Source, it.Relation, it.Target, it.Weight); err != nil {
+			return err
+		}
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+
+	if db.wal != nil {
+		if err := db.wal.WriteEdgeBatch(items); err != nil {
+			return fmt.Errorf("failed to write edge batch to wal: %w", err)
+		}
+	}
+
+	for _, it := range items {
+		db.upsertEdge(it.Source, it.Relation, it.Target, it.Weight)
+	}
+	return nil
+}
+
 // upsertEdge is the WAL-free mutation used both by AddEdge (after a successful
 // WAL write) and by WAL replay. Caller must hold db.mu.
 func (db *AnchorDB) upsertEdge(source, relation, target string, weight float32) {

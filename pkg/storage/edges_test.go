@@ -339,3 +339,46 @@ func TestOpenLegacyVersion2File(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAddEdgesBatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch_edges.anchordb")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items := []EdgeRecord{
+		{Source: "h1", Relation: "rel1", Target: "t1", Weight: 0.1},
+		{Source: "h1", Relation: "rel2", Target: "t2", Weight: 0.2},
+		{Source: "h2", Relation: "rel1", Target: "t3", Weight: 0.3},
+		{Source: "h1", Relation: "rel1", Target: "t1", Weight: 0.99}, // replacement
+	}
+	if err := db.AddEdgesBatch(items); err != nil {
+		t.Fatalf("AddEdgesBatch failed: %v", err)
+	}
+	if got := db.EdgeCount(); got != 3 {
+		t.Fatalf("EdgeCount = %d, want 3", got)
+	}
+	out := db.OutgoingEdges("h1", "rel1")
+	if len(out) != 1 || out[0].Weight != 0.99 {
+		t.Fatalf("unexpected out edge: %+v", out)
+	}
+
+	// Close without sync to verify WAL replay
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.EdgeCount(); got != 3 {
+		t.Fatalf("reopened EdgeCount = %d, want 3", got)
+	}
+	outReopened := reopened.OutgoingEdges("h1", "rel1")
+	if len(outReopened) != 1 || outReopened[0].Weight != 0.99 {
+		t.Fatalf("reopened out edge = %+v", outReopened)
+	}
+}

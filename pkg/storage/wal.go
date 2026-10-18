@@ -640,6 +640,82 @@ func (w *WALManager) WriteEdge(source, relation, target string, weight float32) 
 	return w.writeEntry(WalOpEdge, buf)
 }
 
+// WriteEdgeBatch writes multiple edge add/replace events to the WAL, syncing once at the end if SyncAlways.
+func (w *WALManager) WriteEdgeBatch(items []EdgeRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return fmt.Errorf("wal file is not open")
+	}
+	if w.corrupt {
+		return fmt.Errorf("cannot write to corrupt wal: %w", w.syncErr)
+	}
+	if w.syncErr != nil {
+		return fmt.Errorf("wal background sync failed: %w", w.syncErr)
+	}
+
+	start, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek wal end: %w", err)
+	}
+
+	rollback := func(cause error) error {
+		if err := w.file.Truncate(start); err != nil {
+			return errors.Join(cause, fmt.Errorf("rollback partial wal batch: %w", err))
+		}
+		if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+			return errors.Join(cause, fmt.Errorf("seek wal after rollback: %w", err))
+		}
+		if err := w.file.Sync(); err != nil {
+			return errors.Join(cause, fmt.Errorf("sync wal after rollback: %w", err))
+		}
+		return cause
+	}
+
+	for _, it := range items {
+		buf, err := appendWALString(nil, it.Source)
+		if err != nil {
+			return rollback(err)
+		}
+		if buf, err = appendWALString(buf, it.Relation); err != nil {
+			return rollback(err)
+		}
+		if buf, err = appendWALString(buf, it.Target); err != nil {
+			return rollback(err)
+		}
+		var wb [4]byte
+		binary.LittleEndian.PutUint32(wb[:], math.Float32bits(it.Weight))
+		buf = append(buf, wb[:]...)
+
+		checksum := crc32.ChecksumIEEE(buf)
+		var hdr [11]byte
+		hdr[0] = walMagic
+		hdr[1] = walVer
+		hdr[2] = WalOpEdge
+		binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(buf)))
+		binary.LittleEndian.PutUint32(hdr[7:11], checksum)
+
+		if _, err := w.file.Write(hdr[:]); err != nil {
+			return rollback(err)
+		}
+		if len(buf) > 0 {
+			if _, err := w.file.Write(buf); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+
+	if w.syncMode == SyncAlways {
+		if err := w.file.Sync(); err != nil {
+			return rollback(err)
+		}
+	}
+	return nil
+}
+
 // WriteEdgeDelete writes a causal edge removal event to WAL.
 // Payload: [2 byte SrcLen][Src][2 byte RelLen][Rel][2 byte TgtLen][Tgt]
 func (w *WALManager) WriteEdgeDelete(source, relation, target string) error {

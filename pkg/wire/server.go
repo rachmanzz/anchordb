@@ -29,6 +29,13 @@ type saveJob struct {
 	done      chan struct{}
 }
 
+type edgeJob struct {
+	model string
+	item  storage.EdgeRecord
+	err   error
+	done  chan struct{}
+}
+
 // Server is the AnchorWire binary TCP protocol daemon.
 type Server struct {
 	backend  Backend
@@ -38,6 +45,7 @@ type Server struct {
 	closed   bool
 	wg       sync.WaitGroup
 	saveJobs chan *saveJob
+	edgeJobs chan *edgeJob
 	stopChan chan struct{}
 }
 
@@ -47,10 +55,12 @@ func NewServer(backend Backend) *Server {
 		backend:  backend,
 		conns:    make(map[net.Conn]struct{}),
 		saveJobs: make(chan *saveJob, 2048),
+		edgeJobs: make(chan *edgeJob, 2048),
 		stopChan: make(chan struct{}),
 	}
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.runGroupCommitter()
+	go s.runEdgeGroupCommitter()
 	return s
 }
 
@@ -250,6 +260,94 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 		} else {
 			for i, j := range jobs {
 				j.savedName = names[i]
+				close(j.done)
+			}
+			system.RecordMutation(uint64(len(jobs)))
+		}
+	}
+}
+
+func (s *Server) runEdgeGroupCommitter() {
+	defer s.wg.Done()
+	const maxBatch = 128
+
+	for {
+		var firstJob *edgeJob
+		select {
+		case <-s.stopChan:
+			for {
+				select {
+				case j := <-s.edgeJobs:
+					j.err = errors.New("server closing")
+					close(j.done)
+				default:
+					return
+				}
+			}
+		case firstJob = <-s.edgeJobs:
+		}
+
+		batch := []*edgeJob{firstJob}
+	drain:
+		for len(batch) < maxBatch {
+			select {
+			case j := <-s.edgeJobs:
+				batch = append(batch, j)
+			default:
+				break drain
+			}
+		}
+
+		s.processEdgeBatch(batch)
+	}
+}
+
+func (s *Server) processEdgeBatch(batch []*edgeJob) {
+	if len(batch) == 0 {
+		return
+	}
+
+	byModel := make(map[string][]*edgeJob)
+	for _, j := range batch {
+		byModel[j.model] = append(byModel[j.model], j)
+	}
+
+	for model, jobs := range byModel {
+		db, err := s.backend.GetModel(model)
+		if err != nil {
+			for _, j := range jobs {
+				j.err = err
+				close(j.done)
+			}
+			continue
+		}
+
+		if len(jobs) == 1 {
+			j := jobs[0]
+			j.err = db.AddEdge(j.item.Source, j.item.Relation, j.item.Target, j.item.Weight)
+			close(j.done)
+			if j.err == nil {
+				system.RecordMutation(1)
+			}
+			continue
+		}
+
+		items := make([]storage.EdgeRecord, len(jobs))
+		for i, j := range jobs {
+			items[i] = j.item
+		}
+
+		bErr := db.AddEdgesBatch(items)
+		if bErr != nil {
+			for _, j := range jobs {
+				j.err = db.AddEdge(j.item.Source, j.item.Relation, j.item.Target, j.item.Weight)
+				close(j.done)
+				if j.err == nil {
+					system.RecordMutation(1)
+				}
+			}
+		} else {
+			for _, j := range jobs {
 				close(j.done)
 			}
 			system.RecordMutation(uint64(len(jobs)))
@@ -520,20 +618,41 @@ func (s *Server) handleConn(conn net.Conn) {
 			switch action {
 			case "remove":
 				err = db.RemoveEdge(src, rel, tgt)
+				if err == nil {
+					system.RecordMutation(1)
+				}
 			case "set_relation":
 				if direction == nil {
 					err = errors.New("direction is required for set_relation")
 				} else {
 					err = db.SetRelation(rel, *direction)
+					if err == nil {
+						system.RecordMutation(1)
+					}
 				}
 			default:
-				err = db.AddEdge(src, rel, tgt, weight)
+				job := &edgeJob{
+					model: currentModel,
+					item: storage.EdgeRecord{
+						Source:   src,
+						Relation: rel,
+						Target:   tgt,
+						Weight:   weight,
+					},
+					done: make(chan struct{}),
+				}
+				select {
+				case s.edgeJobs <- job:
+					<-job.done
+					err = job.err
+				case <-s.stopChan:
+					err = errors.New("server stopping")
+				}
 			}
 			if err != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, err.Error())
 			} else {
-				system.RecordMutation(1)
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", db.EdgeCount()))
 			}
