@@ -75,7 +75,7 @@ AnchorDB stores entity attributes:
 - `daily_burn_rate`: Daily sales or consumption rate (units/day).
 
 AnchorDB calculates the time-to-stockout on-the-fly directly inside the storage engine without round-trip data transfer:
-$$\text{Days to Stockout} = \frac{\text{inventory\_units}}{\text{daily\_burn\_rate}}$$
+$$\text{Days to Stockout} = \frac{\text{inventory units}}{\text{daily burn rate}}$$
 
 If $\text{Days to Stockout} \le 30.0$, the engine triggers an **ALERT (<30 Days)** and outputs priority mitigation recommendations (e.g., expediting air freight or reallocating regional buffer stock).
 
