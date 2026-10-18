@@ -76,10 +76,14 @@ func main() {
 
 	if err := client.Attach(schema); err != nil {
 		fmt.Printf("Schema attach failed: %v\n", err)
-		return
+		os.Exit(1)
 	}
 	fmt.Println("    ✓ Schema successfully locked to model 'infra_causal'")
-	gotSchema, _ := client.GetSchema(ctx)
+	gotSchema, err := client.GetSchema(ctx)
+	if err != nil {
+		fmt.Printf("GetSchema failed: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("    ✓ Active Schema Contract: %+v\n\n", gotSchema)
 
 	// -------------------------------------------------------------------------
@@ -137,7 +141,7 @@ func main() {
 		}
 		if err := client.Save(n.Name, props); err != nil {
 			fmt.Printf("Save failed for %s: %v\n", n.Name, err)
-			return
+			os.Exit(1)
 		}
 	}
 	fmt.Printf("    ✓ Ingested %d nodes with strict schema verification.\n", len(nodes))
@@ -149,6 +153,9 @@ func main() {
 	}
 	if err := client.Save("invalid_test_node", invalidProps); err != nil {
 		fmt.Printf("    ✓ Schema Guard Check Passed: Rejection of invalid int property: %v\n\n", err)
+	} else {
+		fmt.Println("    [X] Schema guard failed: invalid fractional integer was accepted")
+		os.Exit(1)
 	}
 
 	// -------------------------------------------------------------------------
@@ -212,7 +219,7 @@ func main() {
 	for _, e := range edges {
 		if err := client.Link(e.Src, e.Rel, e.Dst, e.W); err != nil {
 			fmt.Printf("Link error (%s->%s): %v\n", e.Src, e.Dst, err)
-			return
+			os.Exit(1)
 		}
 	}
 	fmt.Printf("    ✓ Successfully connected %d directed causal edges across 5 relational tiers.\n\n", len(edges))
@@ -238,7 +245,11 @@ func main() {
 		lat := time.Since(t0)
 		if err != nil {
 			fmt.Printf("Error at hop %d: %v\n", hopNum, err)
-			continue
+			os.Exit(1)
+		}
+		if len(res) == 0 {
+			fmt.Printf("Traversal at hop %d returned no nodes\n", hopNum)
+			os.Exit(1)
 		}
 
 		fmt.Printf("    ▶ Hop Depth %d (%s) -> Reached %d nodes [Latency: %v]:\n",
@@ -260,33 +271,53 @@ func main() {
 	for _, workers := range concurrencyLevels {
 		var wg sync.WaitGroup
 		var completed atomic.Int64
+		var queryErrors atomic.Int64
 		queriesPerWorker := totalQueriesPerLevel / workers
+		queryRemainder := totalQueriesPerLevel % workers
 
 		t0 := time.Now()
 		for w := 0; w < workers; w++ {
 			wg.Add(1)
-			go func() {
+			go func(workerID int) {
 				defer wg.Done()
+				workerQueries := queriesPerWorker
+				if workerID < queryRemainder {
+					workerQueries++
+				}
 				// Each worker executes traversals across random hop depths (1 to 5)
-				for q := 0; q < queriesPerWorker; q++ {
+				for q := 0; q < workerQueries; q++ {
 					depth := (q % 5) + 1
 					rels := hopRels[depth-1]
-					_, err := client.CausalChain(seed, rels, 5)
-					if err != nil {
-						fmt.Printf("Worker error: %v\n", err)
-						return
+					results, err := client.CausalChain(seed, rels, 5)
+					if err != nil || len(results) == 0 {
+						errors := queryErrors.Add(1)
+						if errors <= 5 {
+							if err != nil {
+								fmt.Printf("Worker error: %v\n", err)
+							} else {
+								fmt.Println("Worker query returned no nodes")
+							}
+						}
+						continue
 					}
 					completed.Add(1)
 				}
-			}()
+			}(w)
 		}
 		wg.Wait()
 		duration := time.Since(t0)
 		opsPerSec := float64(completed.Load()) / duration.Seconds()
-		nsPerOp := float64(duration.Nanoseconds()) / float64(completed.Load())
+		var nsPerOp float64
+		if completed.Load() > 0 {
+			nsPerOp = float64(duration.Nanoseconds()) / float64(completed.Load())
+		}
 
 		fmt.Printf("    * Workers: %2d | Completed: %d queries | Total Time: %8v | Latency: %6.2f µs/op | Throughput: %8.0f ops/sec\n",
 			workers, completed.Load(), duration, nsPerOp/1000.0, opsPerSec)
+		if queryErrors.Load() > 0 || completed.Load() != totalQueriesPerLevel {
+			fmt.Printf("Stress level with %d workers did not complete successfully (%d errors)\n", workers, queryErrors.Load())
+			os.Exit(1)
+		}
 	}
 	fmt.Println()
 
@@ -307,7 +338,7 @@ func main() {
 		rec, err := client.Get(name).Execute(ctx)
 		if err != nil {
 			fmt.Printf("    Error getting %s: %v\n", name, err)
-			continue
+			os.Exit(1)
 		}
 		fmt.Printf("    %-28s | %-8.0f | $%-11.2f | %-12.1f | %-11.0f\n",
 			rec.Name,
@@ -331,7 +362,7 @@ func main() {
 
 	if err != nil {
 		fmt.Printf("    List query error: %v\n", err)
-		return
+		os.Exit(1)
 	}
 
 	fmt.Printf("    Matching Entities Count: %d (HasMore: %v)\n\n", len(listRes.Items), listRes.HasMore)

@@ -54,6 +54,10 @@ func main() {
 	scale := flag.Int("scale", 100000, "Dataset scale for benchmark scenario (e.g. 100000, 1000000, 5000000)")
 	phase := flag.String("phase", "all", "For crash-test: 'populate', 'verify', or 'all' (auto wire durability verification)")
 	flag.Parse()
+	if *scenario == "benchmark" && (*scale < 50000 || *scale > 5000000) {
+		fmt.Fprintf(os.Stderr, "benchmark scale must be between 50,000 and 5,000,000 entities (got %d)\n", *scale)
+		os.Exit(2)
+	}
 
 	fmt.Println("==========================================================================================")
 	fmt.Println("       AnchorDB Real-World Case Study: Multi-Tier Supply Chain Disruption Analysis        ")
@@ -72,7 +76,10 @@ func main() {
 	case "crash-test":
 		runCrashDurabilityTest(*wireURL, *authToken, *modelName, *phase)
 	case "benchmark":
-		runLargeScaleBenchmark(*wireURL, *authToken, *modelName, *scale)
+		if err := runLargeScaleBenchmark(*wireURL, *authToken, *modelName, *scale); err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: benchmark failed: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Printf("Unknown scenario %q. Available: 'analysis', 'crash-test', 'benchmark'\n", *scenario)
 		os.Exit(1)
@@ -259,7 +266,11 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 		lat := time.Since(t0)
 		if err != nil {
 			fmt.Printf("Error at hop %d: %v\n", h, err)
-			continue
+			os.Exit(1)
+		}
+		if len(res) == 0 {
+			fmt.Printf("Traversal at hop %d returned no downstream targets\n", h)
+			os.Exit(1)
 		}
 
 		fmt.Printf("    ▶ Hop %d (%s) -> Reached %d downstream targets [Latency: %v]:\n",
@@ -288,6 +299,10 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 		fmt.Printf("FATAL: Failed to query Hop-6 causal chain: %v\n", err)
 		os.Exit(1)
 	}
+	if len(skuResults) == 0 {
+		fmt.Println("FATAL: Hop-6 causal chain returned no SKUs")
+		os.Exit(1)
+	}
 
 	var analysisTable []DisruptionAnalysisResult
 
@@ -303,7 +318,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 			Execute(ctx)
 		if err != nil {
 			fmt.Printf("Error evaluating SKU %s: %v\n", skuName, err)
-			continue
+			os.Exit(1)
 		}
 
 		curStock := entityRes.Get("inventory_units")
@@ -341,10 +356,10 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 	fmt.Println("├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────────┼──────────────────────────────────┤")
 
 	for _, item := range analysisTable {
-		statusStr := "SAFE (>30d)"
+		statusStr := "SAFE (>=30d)"
 		actionStr := "Monitor normal replenishment"
 		if item.StockoutIn30 {
-			statusStr = "ALERT (<30d)"
+			statusStr = "ALERT (<=30d)"
 			if item.IsBottleneck {
 				actionStr = "EMERGENCY: Reroute air freight"
 			} else {
@@ -395,7 +410,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 
 func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 	fmt.Println("==========================================================================================")
-	fmt.Println("   SCENARIO: Crash Recovery & WAL Frame Durability on Multi-Hop Supply Network            ")
+	fmt.Println("   SCENARIO: Selected Post-Restart Checks on Multi-Hop Supply Network                       ")
 	fmt.Println("==========================================================================================")
 
 	canaryKey := "canary_supply_chain_sentinel"
@@ -436,7 +451,7 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 			fmt.Printf("Sync error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("    [✓] Data written and synced via AnchorWire. Ready for container stop / abrupt SIGKILL.")
+		fmt.Println("    [✓] Data written and synced via AnchorWire. You may now stop/restart or kill the container manually.")
 
 	case "verify":
 		client, cleanup := setupClient(serverURL, authToken, modelName)
@@ -445,11 +460,21 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		fmt.Println("[STEP 2/3] Verifying Data & Graph Integrity Post-Crash via AnchorWire...")
 		// 1. Schema must remain locked
 		sch, err := client.GetSchema(context.Background())
-		if err != nil {
-			fmt.Printf("FATAL: Schema lost after crash: %v\n", err)
+		expectedSchema := driver.Schema{
+			"tier": "int", "inventory_units": "float", "daily_burn_rate": "float",
+			"lead_time_days": "float", "is_critical": "bool",
+		}
+		if err != nil || len(sch) != len(expectedSchema) {
+			fmt.Printf("FATAL: Schema missing or incomplete after restart: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("    [✓] Schema survived crash: %d fields locked\n", len(sch))
+		for field, want := range expectedSchema {
+			if sch[field] != want {
+				fmt.Printf("FATAL: Schema mismatch for %q: got %q, want %q\n", field, sch[field], want)
+				os.Exit(1)
+			}
+		}
+		fmt.Printf("    [✓] Expected schema fields present: %d\n", len(sch))
 
 		// 2. Canary entity must be intact
 		res, err := client.Get(canaryKey).Execute(context.Background())
@@ -469,7 +494,7 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 			"factory_vietnam_bac_ninh", causalRes[0].Word, causalRes[0].Score)
 
 		fmt.Println("\n==========================================================================================")
-		fmt.Println("    >>> DURABILITY VERIFICATION RESULT: 100% PASSED (0 DATA LOSS)")
+		fmt.Println("    >>> POST-RESTART SAMPLE CHECKS PASSED (no full-dataset comparison performed)")
 		fmt.Println("==========================================================================================")
 
 	case "all":
@@ -483,13 +508,29 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 			"lead_time_days":  "float",
 			"is_critical":     "bool",
 		}
-		_ = c1.Attach(schema)
-		_ = c1.Save(canaryKey, canaryProps)
-		_ = c1.Link("factory_vietnam_bac_ninh", "supplies_t1", "supplier_t1_soc_processor", 0.96)
-		_ = c1.Sync()
+		if err := c1.Attach(schema); err != nil {
+			cleanup1()
+			fmt.Printf("Attach error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := c1.Save(canaryKey, canaryProps); err != nil {
+			cleanup1()
+			fmt.Printf("Save canary error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := c1.Link("factory_vietnam_bac_ninh", "supplies_t1", "supplier_t1_soc_processor", 0.96); err != nil {
+			cleanup1()
+			fmt.Printf("Link error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := c1.Sync(); err != nil {
+			cleanup1()
+			fmt.Printf("Sync error: %v\n", err)
+			os.Exit(1)
+		}
 
 		// Disconnect client to test durability across sessions
-		fmt.Println("[STEP 2/3] Closing AnchorWire connection (verifying state persistence)...")
+		fmt.Println("[STEP 2/3] Closing AnchorWire connection (session reconnect check; no server restart)...")
 		cleanup1()
 
 		fmt.Println("[STEP 3/3] Reconnecting via AnchorWire & verifying data integrity...")
@@ -497,9 +538,19 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		defer cleanup2()
 
 		sch, err := c2.GetSchema(context.Background())
-		if err != nil || len(sch) == 0 {
+		expectedSchema := driver.Schema{
+			"tier": "int", "inventory_units": "float", "daily_burn_rate": "float",
+			"lead_time_days": "float", "is_critical": "bool",
+		}
+		if err != nil || len(sch) != len(expectedSchema) {
 			fmt.Printf("FATAL: Schema lost after session reconnect: %v\n", err)
 			os.Exit(1)
+		}
+		for field, want := range expectedSchema {
+			if sch[field] != want {
+				fmt.Printf("FATAL: Schema mismatch for %q after session reconnect: got %q, want %q\n", field, sch[field], want)
+				os.Exit(1)
+			}
 		}
 		cRes, err := c2.Get(canaryKey).Execute(context.Background())
 		if err != nil || cRes.Get("inventory_units") != 999999.0 {
@@ -512,12 +563,15 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 			os.Exit(1)
 		}
 
-		fmt.Println("    [✓] Schema Lock Intact:           100%")
-		fmt.Println("    [✓] Canary Record Recovered:      100%")
-		fmt.Println("    [✓] Causal Edge Traversed:        100%")
+		fmt.Println("    [✓] Schema matched expected fields after session reconnect")
+		fmt.Println("    [✓] Canary record matched expected value after session reconnect")
+		fmt.Println("    [✓] Causal edge was traversable after session reconnect")
 		fmt.Println("\n==========================================================================================")
-		fmt.Println("    >>> DURABILITY VERIFICATION RESULT: 100% PASSED (0 DATA LOSS)")
+		fmt.Println("    >>> SESSION RECONNECT CHECKS PASSED (no server restart performed)")
 		fmt.Println("==========================================================================================")
+	default:
+		fmt.Printf("Unknown crash-test phase %q; expected populate, verify, or all\n", phase)
+		os.Exit(2)
 	}
 }
 
@@ -525,9 +579,9 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 // SCENARIO 3: Large-Scale Benchmark Stress Test (Up to 5,000,000 Entities/Edges)
 // ------------------------------------------------------------------------------------------------
 
-func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords int) {
+func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords int) error {
 	fmt.Println("==========================================================================================")
-	fmt.Printf("   SCENARIO: Large-Scale Benchmark Stress Test (%s records/edges)\n", formatNumber(totalRecords))
+	fmt.Printf("   SCENARIO: Large-Scale Benchmark Stress Test (%s entities)\n", formatNumber(totalRecords))
 	fmt.Println("==========================================================================================")
 
 	client, cleanup := setupClient(serverURL, authToken, modelName)
@@ -541,7 +595,9 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 		"lead_time_days":  "float",
 		"is_critical":     "bool",
 	}
-	_ = client.Attach(schema)
+	if err := client.Attach(schema); err != nil {
+		return fmt.Errorf("attach benchmark schema: %w", err)
+	}
 
 	// 2. High-Throughput Streaming Ingestion
 	fmt.Printf("[1/3] Streaming %s entities in high-speed batches...\n", formatNumber(totalRecords))
@@ -608,7 +664,7 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	if totalErrors > 0 {
 		fmt.Printf("    [!] Ingestion Completed with %d ERRORS: %s / %s records saved in %v (%.0f writes/sec)\n\n",
 			totalErrors, formatNumber(int(savedCount)), formatNumber(totalRecords), durIngest, throughput)
-		os.Exit(1)
+		return fmt.Errorf("ingestion failed: %d of %d writes failed; %d saved", totalErrors, totalRecords, savedCount)
 	}
 	fmt.Printf("    [✓] Ingestion Completed: %s records in %v (%.0f writes/sec)\n\n",
 		formatNumber(int(savedCount)), durIngest, throughput)
@@ -631,6 +687,7 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 		}
 		if err := client.Save(hubName, hubProps); err != nil {
 			fmt.Printf("Warning: Failed to create hub %s: %v\n", hubName, err)
+			return fmt.Errorf("save logistics hub %s: %w", hubName, err)
 		}
 	}
 
@@ -670,25 +727,27 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	}
 	edgeWg.Wait()
 	errs := edgeErrors.Load()
+	linked := int64(numEdges) - errs
+	fmt.Printf("    Linked %s / %s edges (%d errors) in %v (%.0f successful edges/sec)\n\n",
+		formatNumber(int(linked)), formatNumber(numEdges), errs, time.Since(tEdge), float64(linked)/time.Since(tEdge).Seconds())
 	if errs > 0 {
-		fmt.Printf("    [!] Warning: Edge linking encountered %d errors: %s / %s edges linked in %v (%.0f edges/sec)\n\n",
-			errs, formatNumber(numEdges-int(errs)), formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())
-	} else {
-		fmt.Printf("    [✓] Linked %s edges (0 errors) in %v (%.0f edges/sec)\n\n",
-			formatNumber(numEdges), time.Since(tEdge), float64(numEdges)/time.Since(tEdge).Seconds())
+		return fmt.Errorf("%d of %d causal edge writes failed", errs, numEdges)
 	}
 
-	// 4. Measure Query Latency at 5M Scale
+	// 4. Measure Query Latency at the configured entity scale
 	fmt.Println("[3/3] Measuring Multi-Hop Query Latency Under Scale...")
 	const benchmarkQueries = 20000
 	tQuery := time.Now()
 	ctx := context.Background()
 
 	var querySuccess atomic.Int64
+	var queryErrors atomic.Int64
 	for i := 0; i < benchmarkQueries; i++ {
 		src := fmt.Sprintf("hub_logistics_%04d", i%100)
 		res, err := client.Causal(src, "stocks_sku", 5)
-		if err == nil && len(res) > 0 {
+		if err != nil {
+			queryErrors.Add(1)
+		} else if len(res) > 0 {
 			querySuccess.Add(1)
 		}
 	}
@@ -697,21 +756,30 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	avgLat := (durQuery.Seconds() * 1e6) / float64(benchmarkQueries)
 	successCount := int(querySuccess.Load())
 
-	fmt.Printf("    [✓] Executed %s causal traversals (%s successful, %d errors) in %v\n",
-		formatNumber(benchmarkQueries), formatNumber(successCount), benchmarkQueries-successCount, durQuery)
-	fmt.Printf("    [✓] Traversal Throughput: %.0f queries/sec\n", qps)
+	emptyResults := benchmarkQueries - successCount - int(queryErrors.Load())
+	fmt.Printf("    Executed %s causal traversals (%s non-empty, %d empty, %d errors) in %v\n",
+		formatNumber(benchmarkQueries), formatNumber(successCount), emptyResults, queryErrors.Load(), durQuery)
+	fmt.Printf("    Traversal Throughput: %.0f queries/sec\n", qps)
 	fmt.Printf("    [✓] Average Latency:      %.2f µs / query\n", avgLat)
 
 	// 5. In-Storage Math at Scale
 	tMath := time.Now()
-	_, _ = client.Get("sku_auto_00000001").
+	_, err := client.Get("sku_auto_00000001").
 		Compute("days_remaining", driver.Divide("inventory_units", "daily_burn_rate")).
 		Execute(ctx)
-	fmt.Printf("    [✓] Point Compute Latency: %v\n", time.Since(tMath))
+	if err != nil {
+		return fmt.Errorf("point compute query: %w", err)
+	}
+	fmt.Printf("    Point Compute Latency: %v\n", time.Since(tMath))
+	if queryErrors.Load() > 0 || successCount != benchmarkQueries {
+		return fmt.Errorf("causal traversal incomplete: %d non-empty, %d empty, %d errors out of %d", successCount, emptyResults, queryErrors.Load(), benchmarkQueries)
+	}
+	fmt.Printf("    Query check passed: %d / %d causal queries returned results with no errors\n", successCount, benchmarkQueries)
 
 	fmt.Println("\n==========================================================================================")
-	fmt.Println("    >>> LARGE-SCALE STRESS TEST COMPLETED SUCCESSFULLY!")
+	fmt.Println("    >>> LARGE-SCALE WORKLOAD COMPLETED; all configured writes/queries reported success")
 	fmt.Println("==========================================================================================")
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------

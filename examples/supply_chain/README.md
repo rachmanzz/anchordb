@@ -156,6 +156,7 @@ Runs AnchorDB as an isolated daemon container exposing AnchorWire TCP on port `7
 Using **Docker Compose**:
 ```bash
 cd examples/supply_chain
+export ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 24)"
 docker compose up -d
 ```
 
@@ -169,7 +170,7 @@ podman run -d \
   -e ANCHORDB_PORT=7447 \
   -e ANCHORDB_WIRE_PORT=7448 \
   -e ANCHORDB_DATA_DIR=/data \
-  -e ANCHORDB_AUTH_TOKEN="supply_chain_secret_token" \
+  -e ANCHORDB_AUTH_TOKEN="$ANCHORDB_AUTH_TOKEN" \
   -e ANCHORDB_WAL_SYNC=always \
   anchordb:latest
 ```
@@ -178,7 +179,7 @@ podman run -d \
 ```bash
 go run ./examples/supply_chain/main.go \
   -url=wire://localhost:7448 \
-  -token=supply_chain_secret_token \
+  -token="$ANCHORDB_AUTH_TOKEN" \
   -scenario=analysis
 ```
 
@@ -188,26 +189,30 @@ go run ./examples/supply_chain/main.go \
 
 AnchorDB utilizes a **Write-Ahead Log (WAL)** with CRC32 frame checksums and strict fsync commit semantics.
 
-### Automated AnchorWire Session Durability Test:
+### Automated AnchorWire Session Reconnect Check (no server restart):
 ```bash
-go run ./examples/supply_chain/main.go -token=supply_chain_secret_token -scenario=crash-test -phase=all
+go run ./examples/supply_chain/main.go -token="$ANCHORDB_AUTH_TOKEN" -scenario=crash-test -phase=all
 ```
 
-### Live Container Crash Test (Abrupt SIGKILL & Reboot):
+This mode closes and reopens the client connection to the same running server. It checks selected schema, canary, and graph data; it does **not** simulate a container restart or prove zero data loss.
+
+Note: `-phase=all` may replace the canary value and should be run against a dedicated example model.
+
+### Container Stop/Restart Check:
 
 1. **Populate initial graph & data in container via AnchorWire**:
    ```bash
    go run ./examples/supply_chain/main.go \
      -url=wire://localhost:7448 \
-     -token=supply_chain_secret_token \
+      -token="$ANCHORDB_AUTH_TOKEN" \
      -scenario=crash-test \
      -phase=populate
    ```
 
-2. **Simulate server power loss / hard kill**:
+2. **Stop the server container** (this is a normal container stop, not a hard kill):
    ```bash
-   docker kill anchordb-supply-chain
-   # (or with Podman: podman kill anchordb-supply-chain)
+   docker stop anchordb-supply-chain
+   # (or with Podman: podman stop anchordb-supply-chain)
    ```
 
 3. **Reboot the container**:
@@ -216,17 +221,16 @@ go run ./examples/supply_chain/main.go -token=supply_chain_secret_token -scenari
    # (or with Podman: podman start anchordb-supply-chain)
    ```
 
-4. **Verify post-crash data & graph integrity**:
+4. **Verify selected data and graph reachability after restart**:
    ```bash
    go run ./examples/supply_chain/main.go \
-     -mode=remote \
-     -url=http://localhost:7447 \
-     -token=supply_chain_secret_token \
+      -url=wire://localhost:7448 \
+      -token="$ANCHORDB_AUTH_TOKEN" \
      -scenario=crash-test \
      -phase=verify
    ```
 
-Output confirms zero data loss:
+This checks that the expected schema fields exist, the canary value matches, and the selected causal edge is traversable. It does not compare the full dataset or establish zero data loss.
 ```text
 [STEP 2/3] Verifying Data & Graph Integrity Post-Crash...
     [✓] Schema survived crash: 5 fields locked
@@ -234,7 +238,7 @@ Output confirms zero data loss:
     [✓] Causal graph verified: factory_vietnam_bac_ninh -> supplier_t1_soc_processor (Score: 0.9600)
 
 ==========================================================================================
-    >>> DURABILITY VERIFICATION RESULT: 100% PASSED (0 DATA LOSS)
+    >>> POST-RESTART SAMPLE CHECKS PASSED (no full-dataset comparison performed)
 ==========================================================================================
 ```
 
@@ -244,7 +248,7 @@ Output confirms zero data loss:
 
 To validate AnchorDB under massive enterprise supply chain topologies (e.g., 100,000 to 5,000,000 global parts and SKUs), the `benchmark` scenario ingests `-scale` entities into the model.
 
-> **Scale Boundary**: Only **entities** scale with `-scale`. The benchmark graph always links a fixed **50,000** causal edges (see `numEdges` in `main.go`), independent of `-scale`. The "5 million" figure refers to entities, not edges. (The CLI banner prints `records/edges` as a legacy label; only the entity count reflects `-scale`.)
+> **Scale Boundary**: Only **entities** scale with `-scale`. The benchmark graph always links a fixed **50,000** causal edges, independent of `-scale`. The scale must therefore be between **50,000 and 5,000,000**. The "5 million" figure refers to entities, not edges.
 
 ### Run 100,000 Entity Benchmark:
 ```bash

@@ -13,7 +13,7 @@ services:
       - ANCHORDB_PORT=7447
       - ANCHORDB_WIRE_PORT=7448
       - ANCHORDB_DATA_DIR=/data
-      - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:-banking_fraud_secret_token}
+      - ANCHORDB_AUTH_TOKEN=${ANCHORDB_AUTH_TOKEN:?Set ANCHORDB_AUTH_TOKEN before starting this example}
       - ANCHORDB_MEMORY_LIMIT=2GB
       - ANCHORDB_WAL_SYNC=always
       - ANCHORDB_CRON_ENABLED=true

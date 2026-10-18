@@ -1,6 +1,6 @@
 # Real-Time Banking Fraud Detection & Anti-Money Laundering (AML) with AnchorDB
 
-Real-world production implementation of AnchorDB for **in-line payment fraud prevention, multi-hop money mule tracking, and impossible travel detection** at a scale of **1,000,000+ bank accounts**.
+Illustrative example of AnchorDB for **in-line payment fraud prevention, multi-hop money mule tracking, and impossible travel detection**, including a configurable scale workload. It is not a production-ready fraud control or an SLA certification.
 
 ---
 
@@ -65,13 +65,13 @@ Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FA
 ### Scenario 1: Multi-Hop Mule Account & Smurfing Layering Detection
 - **Structure**: 5 relational hops connecting a compromised victim account through Tier-1 rapid relays, Tier-2 aggregators, Tier-3 smurfing nodes, Tier-4 P2P crypto escrow mules, down to a blacklisted offshore cash-out wallet.
 - **Scoring**: Edge weights represent transaction anomaly risk confidence. `CausalChain` multiplies weights along the path ($P = \prod w_i$).
-- **Decision Engine**: Combines path probability with entity attributes (`risk_score`, `is_blacklisted`). If an account links to a known watchlist or exhibits high risk, it is blocked automatically in **under 10 microseconds**.
+- **Illustrative decision logic**: Combines path probability with entity attributes (`risk_score`, `is_blacklisted`) and prints a sample recommendation. It does not integrate with a payment switch or freeze accounts.
 
 ### Scenario 2: Impossible Travel & Spatial Velocity Anomaly
 - **Structure**: ATM and POS physical coordinates mapped into AnchorDB's **2D Spatial Grid**.
 - **Velocity Formula**:
-  $$\text{Travel Velocity (km/h)} = \frac{\text{Distance}(\text{ATM}_A, \text{ATM}_B)}{\text{Time}(\text{Swipe}_B) - \text{Time}(\text{Swipe}_A)}$$
-- **Detection**: A card swiped in Jakarta and 15 minutes later in Surabaya (670 km away) requires a physical speed of **2,694 km/h**. AnchorDB triggers an instant `IMPOSSIBLE TRAVEL ANOMALY` and freezes the cloned card in **1.2 microseconds**.
+  $$\text{Travel Velocity (km/h)} = \frac{\text{Great-circle distance}(\text{ATM}_A, \text{ATM}_B)}{\text{Time}(\text{Swipe}_B) - \text{Time}(\text{Swipe}_A)}$$
+- **Detection**: A sample card swipe from Jakarta to Surabaya 15 minutes later uses a great-circle distance estimate and compares the implied speed with the example threshold. The output is an illustrative recommendation, not a real card freeze or production decision.
 
 ### Scenario 3: Massive 1,000,000+ Scale Stress Test
 - **Scale**: Ingests **1,000,000 bank accounts** with strict schema validation (`risk_score`, `last_tx_timestamp`, `daily_tx_volume`, `is_blacklisted`, `kyc_tier`).
@@ -105,6 +105,7 @@ AnchorDB communicates exclusively via the high-performance **AnchorWire Binary T
 Using **Docker Compose**:
 ```bash
 cd examples/banking_fraud
+export ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 24)"
 docker compose up -d
 ```
 
@@ -118,7 +119,7 @@ podman run -d \
   -e ANCHORDB_PORT=7447 \
   -e ANCHORDB_WIRE_PORT=7448 \
   -e ANCHORDB_DATA_DIR=/data \
-  -e ANCHORDB_AUTH_TOKEN="banking_fraud_secret_token" \
+  -e ANCHORDB_AUTH_TOKEN="$ANCHORDB_AUTH_TOKEN" \
   -e ANCHORDB_WAL_SYNC=always \
   anchordb:latest
 ```
@@ -126,21 +127,23 @@ podman run -d \
 #### Step 2: Execute Fraud Detection Scenarios via AnchorWire
 ```bash
 # 1. Run Multi-Hop Mule Account Tracking
-go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=banking_fraud_secret_token -scenario=mule-tracking
+go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=mule-tracking
 
 # 2. Run Impossible Travel Geolocation Anomaly Detection
-go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=banking_fraud_secret_token -scenario=impossible-travel
+go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=impossible-travel
 
 # 3. Run 1,000,000 Scale Benchmark
-go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=banking_fraud_secret_token -scenario=scale-benchmark -scale=1000000
+go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=scale-benchmark -scale=1000000
 
-# 4. Run All Scenarios Concurrently
-go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=banking_fraud_secret_token -scenario=all -scale=1000000
+# 4. Run All Scenarios Sequentially
+go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=all -scale=1000000
 ```
 
 ---
 
-## 6. Real-World Execution Results
+## 6. Illustrative Sample Output
+
+The figures below are historical examples, not guaranteed current output. Runtime timings, counts, and decisions are determined by each run; the example prints recommendations and does not make payment decisions or certify an SLA.
 
 ### Scenario 1: Multi-Hop Mule Account Traversal Output
 ```text
@@ -165,41 +168,38 @@ go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=bankin
 ### Scenario 2: Impossible Travel Output
 ```text
 >>> [SCENARIO 2] Impossible Travel & Geolocation Anomaly Detection (ATM / POS Fraud)
-    Method: 2D Spatial Index Euclidean Distance / In-Storage Physical Velocity Check.
+    Method: 2D spatial lookup and great-circle distance estimate.
 
     [✓] Registered 3 ATM/POS physical coordinate nodes in 2D Spatial Index.
     ▶ Distance Evaluated in-storage: 670.5 km [Query Latency: 1.255µs]
     ▶ Time Elapsed between swipes:   15 minutes (0.25 hours)
-    ▶ Required Travel Speed:         2694.0 km/h
+    ▶ Required Travel Speed:         computed at runtime
     🚨 [FRAUD ALERT TRIGGERED]: IMPOSSIBLE TRAVEL ANOMALY (CARD CLONING SUSPECTED)
-       Action: Transaction at Surabaya ATM REJECTED. Card automatically FROZEN.
+       Example recommendation: reject this transaction and freeze the card.
 ```
 
 ### Scenario 3: 1,000,000 Accounts Benchmark Output
 ```text
 >>> [SCENARIO 3] Enterprise High-Throughput Scale Benchmark (1,000,000 Accounts)
-    Testing zero-copy mmap ingestion throughput and pre-authorization query latency at scale.
+    Measuring AnchorWire ingestion throughput and causal-query latency at scale.
 
 [1/3] Streaming 1,000,000 bank account records across 16 parallel workers...
       -> Ingested 250,000 / 1,000,000 accounts (151846 writes/sec) [Elapsed: 1s]
       -> Ingested 500,000 / 1,000,000 accounts (146648 writes/sec) [Elapsed: 3s]
       -> Ingested 750,000 / 1,000,000 accounts (151719 writes/sec) [Elapsed: 4s]
       -> Ingested 1,000,000 / 1,000,000 accounts (144532 writes/sec) [Elapsed: 6s]
-    [✓] Ingestion Completed: 1,000,000 records in 6.918903675s (144532 writes/sec)
+    [✓] Ingestion Completed: 1,000,000 records (timings computed at runtime)
 
 [2/3] Linking 100,000 transactional transfer edges across accounts...
-    [✓] Linked 100,000 edges in 391.340939ms (255532 edges/sec)
+    Linked 100,000 / 100,000 edges (0 errors; timings computed at runtime)
 
 [3/3] Benchmarking 50,000 Pre-Authorization Real-Time Fraud Inspections...
 ------------------------------------------------------------------------------------------
-    [✓] Total Inspections Executed: 50,000 queries
-    [✓] Inspection Throughput:      1435617 fraud checks / sec
-    [✓] Average Latency:            696ns
-    [✓] p50 Latency:                329ns
-    [✓] p95 Latency:                937ns
+    Inspections: 50,000 queries (0 errors or empty results)
+    Inspection throughput and latency percentiles are computed at runtime.
     [✓] p99 Latency:                1.474µs
 ------------------------------------------------------------------------------------------
->>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA budget.
+>>> Sample result: p99 is below the 1ms example budget; this benchmark alone is not an SLA guarantee.
 ```
 
 ---
@@ -212,7 +212,7 @@ go run ./examples/banking_fraud/main.go -url=wire://localhost:7448 -token=bankin
 | **Traversal Latency** | Low-latency in-memory causal chain evaluation |
 | **Throughput** | High-throughput concurrent writes and checks |
 | **Runtime Footprint** | Native Go binary, compact memory footprint |
-| **Spatial Anomaly** | Native 2D Spatial Index & Euclidean velocity |
+| **Spatial Anomaly** | 2D Spatial index lookup and great-circle velocity estimate |
 | **Data Science Algorithms**| Focused on real-time causality and in-storage arithmetic |
 | **Query Mechanism** | Programmatic Fluent Go Driver / Binary Wire TCP |
 | **Storage Architecture**| "One Model = One File" (`banking_fraud.anchordb`) |

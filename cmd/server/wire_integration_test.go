@@ -362,4 +362,3 @@ func TestServer_AnchorWire_MultiModel_Isolation(t *testing.T) {
 		}
 	}
 }
-

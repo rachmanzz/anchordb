@@ -1,11 +1,11 @@
-# Example: Podman Container Durability & Crash Recovery
+# Example: Podman Container Restart Checks
 
-This example demonstrates how AnchorDB provides **Zero-Data-Loss Durability** across container lifecycle events, sudden container stops, and restarts using **Podman** and host-mounted storage volumes.
+This example demonstrates how to check selected AnchorDB data after a normal Podman container stop and restart, using a host-mounted storage volume. It does not by itself prove zero data loss for the complete database.
 
-It proves that:
-1. **Model Schema Immutability**: The locked schema contract is persisted to disk and automatically restored upon restart.
-2. **Causal Graph Topology Retention**: All directed causal edges across 5 relational tiers are preserved and traversed with identical scores after container recreation.
-3. **In-Storage Arithmetic Durability**: Entity properties and in-storage arithmetic queries (`List().Compute()`) yield 100% consistent results pre- and post-restart.
+It checks that:
+1. The expected schema fields are returned after restart.
+2. The example's configured causal paths remain traversable.
+3. Selected entities and a list-compute query return data after restart. The example does not snapshot and compare all pre-restart results.
 
 ---
 
@@ -37,7 +37,7 @@ It proves that:
 +-----------------------------------------------------------------------------------+
                                         |
                            podman stop anchordb-podman-test
-                         (Container Killed - Zero TCP Access)
+                            (Normal container shutdown; TCP stops)
                                         |
                            podman start anchordb-podman-test
                        (Engine Boots - Storage & WAL Replayed)
@@ -75,6 +75,7 @@ It proves that:
 # 1. Create host directory for persistent volume mount
 mkdir -p ./podman_test_data
 chmod -R 777 ./podman_test_data
+export ANCHORDB_AUTH_TOKEN="$(openssl rand -hex 24)"
 
 # 2. Run AnchorDB container in the background exposing AnchorWire on port 7448
 podman run -d \
@@ -82,7 +83,7 @@ podman run -d \
   -p 7447:7447 \
   -p 7448:7448 \
   -v $(pwd)/podman_test_data:/data:Z \
-  -e ANCHORDB_ALLOW_INSECURE=true \
+  -e ANCHORDB_AUTH_TOKEN="$ANCHORDB_AUTH_TOKEN" \
   -e ANCHORDB_DATA_DIR=/data \
   localhost/anchordb:latest
 
@@ -95,7 +96,7 @@ curl -s http://localhost:7447/health
 Run the population phase using the example runner via AnchorWire Binary TCP:
 
 ```bash
-go run ./examples/podman_durability -phase=populate -url=wire://localhost:7448
+go run ./examples/podman_durability -phase=populate -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN"
 ```
 
 **Expected Output:**
@@ -136,7 +137,7 @@ ls -la ./podman_test_data
 podman stop anchordb-podman-test
 ```
 
-Verify that the container is completely stopped and port 7447 is down:
+Verify that the container is completely stopped and the example server is unavailable:
 ```bash
 curl -s http://localhost:7447/health || echo "Server is DOWN"
 ```
@@ -156,12 +157,16 @@ curl -s http://localhost:7447/health
 
 ---
 
-### Step 5: Verify Durability & Data Retention
+### Step 5: Verify Selected Data & Graph Reachability
+
+This performs selected post-restart checks; it does not compare the entire pre-restart database and should not be interpreted as proof of zero data loss.
+
+The example uses the `infra_causal` model. Run it against a dedicated data directory because populate replaces entity values for its fixed sample names.
 
 Execute the verification phase:
 
 ```bash
-go run ./examples/podman_durability -phase=verify -url=wire://localhost:7448
+go run ./examples/podman_durability -phase=verify -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN"
 ```
 
 **Expected Output:**
@@ -229,7 +234,7 @@ go run ./examples/podman_durability -phase=verify -url=wire://localhost:7448
     db_primary_crash             | 5        | $180000.00   | $900000.00     | 1
 
 ==========================================================================
-   PODMAN CONTAINER DURABILITY VERIFICATION: 100% PASSED!
+    PODMAN RESTART CHECKS PASSED for sampled schema, graph, and entities.
 ==========================================================================
 ```
 

@@ -21,6 +21,7 @@ type GraphNode struct {
 func main() {
 	phase := flag.String("phase", "populate", "Execution phase: 'populate' or 'verify'")
 	url := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or tcp://host:7448")
+	authToken := flag.String("token", "", "Optional AnchorWire auth token")
 	flag.Parse()
 
 	target := *url
@@ -34,7 +35,11 @@ func main() {
 
 	ctx := context.Background()
 
-	client, err := driver.ConnectWire(target, driver.WithModel("infra_causal"))
+	opts := []driver.Option{driver.WithModel("infra_causal")}
+	if *authToken != "" {
+		opts = append(opts, driver.WithToken(*authToken))
+	}
+	client, err := driver.ConnectWire(target, opts...)
 	if err != nil {
 		fmt.Printf("AnchorWire connection error to %s: %v\n", target, err)
 		os.Exit(1)
@@ -68,7 +73,7 @@ func main() {
 			fmt.Printf("client.Attach error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("    [✓] Schema attached and locked to model 'infra_causal' via REST API")
+		fmt.Println("    [✓] Schema attached and locked to model 'infra_causal' via AnchorWire TCP")
 
 		// 2. Ingest 28 Nodes
 		nodes := []GraphNode{
@@ -196,9 +201,19 @@ func main() {
 
 		// 1. Verify Schema Persistence
 		gotSchema, err := client.GetSchema(ctx)
-		if err != nil {
+		expectedSchema := driver.Schema{
+			"severity": "int", "impact_usd": "float", "latency_ms": "float",
+			"is_critical": "bool", "tier": "int?",
+		}
+		if err != nil || len(gotSchema) != len(expectedSchema) {
 			fmt.Printf("    [X] GetSchema failed after restart: %v\n", err)
 			os.Exit(1)
+		}
+		for field, want := range expectedSchema {
+			if gotSchema[field] != want {
+				fmt.Printf("    [X] Schema mismatch after restart for %q: got %q, want %q\n", field, gotSchema[field], want)
+				os.Exit(1)
+			}
 		}
 		fmt.Printf("    [✓] Schema Contract Restored from disk: %+v\n\n", gotSchema)
 
@@ -234,6 +249,10 @@ func main() {
 				fmt.Printf("    [X] Get(%s) failed after restart: %v\n", name, err)
 				os.Exit(1)
 			}
+			if rec.Name != name || rec.Get("severity") == 0 || rec.Get("impact_usd") == 0 {
+				fmt.Printf("    [X] Get(%s) returned incomplete entity data\n", name)
+				os.Exit(1)
+			}
 			fmt.Printf("    %-28s | %-8.0f | $%-11.2f | %-12.1f | %-11.0f\n",
 				rec.Name,
 				rec.Get("severity"),
@@ -259,6 +278,12 @@ func main() {
 			fmt.Printf("    [X] List query returned 0 items after restart\n")
 			os.Exit(1)
 		}
+		for _, item := range listRes.Items {
+			if item.Get("severity") < 4 || item.Get("risk_index") != item.Get("impact_usd")*item.Get("severity") {
+				fmt.Printf("    [X] List compute returned invalid risk_index for %s\n", item.Name)
+				os.Exit(1)
+			}
+		}
 
 		fmt.Printf("    Total matching items returned: %d (HasMore: %v)\n", len(listRes.Items), listRes.HasMore)
 		fmt.Printf("    %-28s | %-8s | %-12s | %-14s | %-11s\n", "Entity Name", "Severity", "Impact (USD)", "Risk Index (Math)", "Is Critical")
@@ -273,7 +298,7 @@ func main() {
 			)
 		}
 		fmt.Println("\n==========================================================================")
-		fmt.Println("   PODMAN CONTAINER DURABILITY VERIFICATION: 100% PASSED!                  ")
+		fmt.Println("   PODMAN RESTART CHECKS PASSED for sampled schema, graph, and entities.   ")
 		fmt.Println("==========================================================================")
 	default:
 		fmt.Printf("Unknown phase %q; expected populate or verify\n", *phase)

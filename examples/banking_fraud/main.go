@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -52,9 +53,18 @@ func main() {
 	scale := flag.Int("scale", 1000000, "Dataset scale for benchmark (minimum 1,000,000 accounts)")
 	flag.Parse()
 
-	if *scale < 1000000 && (*scenario == "scale-benchmark" || *scenario == "all") {
-		fmt.Printf("Notice: Enforcing minimum dataset size of 1,000,000 records (specified: %d)\n", *scale)
-		*scale = 1000000
+	if (*scenario == "scale-benchmark" || *scenario == "all") && (*scale < 1000000 || *scale > 5000000) {
+		if *scale > 0 && *scale < 1000000 {
+			fmt.Printf("Notice: Enforcing minimum dataset size of 1,000,000 records (specified: %d)\n", *scale)
+			*scale = 1000000
+		} else {
+			fmt.Fprintf(os.Stderr, "scale must be between 1,000,000 and 5,000,000 accounts (got %d)\n", *scale)
+			os.Exit(2)
+		}
+	}
+	if *scenario != "all" && *scenario != "mule-tracking" && *scenario != "impossible-travel" && *scenario != "scale-benchmark" {
+		fmt.Fprintf(os.Stderr, "unknown scenario %q; expected all, mule-tracking, impossible-travel, or scale-benchmark\n", *scenario)
+		os.Exit(2)
 	}
 
 	fmt.Println("==========================================================================================")
@@ -76,7 +86,7 @@ func main() {
 	fmt.Println(">>> [PHASE 1] Registering & Locking Bank Account Risk Schema")
 	schema := driver.Schema{
 		"risk_score":        "float", // Continuous risk rating: 0.0 (safe) - 100.0 (critical)
-		"last_tx_timestamp": "float", // Epoch timestamp (seconds)
+		"last_tx_timestamp": "float", // Seconds since sample epoch (float32 precision-safe)
 		"daily_tx_volume":   "float", // Cumulative daily transfer total in USD
 		"is_blacklisted":    "bool",  // 1.0 (True) = in financial crimes watchlist
 		"kyc_tier":          "int",   // 1 (basic) to 3 (fully verified)
@@ -96,15 +106,24 @@ func main() {
 
 	// Execute Scenarios
 	if *scenario == "all" || *scenario == "mule-tracking" {
-		runMuleTrackingScenario(ctx, client)
+		if err := runMuleTrackingScenario(ctx, client); err != nil {
+			fmt.Printf("FATAL: mule-tracking scenario failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if *scenario == "all" || *scenario == "impossible-travel" {
-		runImpossibleTravelScenario(ctx, client)
+		if err := runImpossibleTravelScenario(ctx, client); err != nil {
+			fmt.Printf("FATAL: impossible-travel scenario failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if *scenario == "all" || *scenario == "scale-benchmark" {
-		runScaleBenchmarkScenario(ctx, client, *scale)
+		if err := runScaleBenchmarkScenario(ctx, client, *scale); err != nil {
+			fmt.Printf("FATAL: scale-benchmark scenario failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -112,7 +131,7 @@ func main() {
 // SCENARIO 1: Multi-Hop Money Mule & Layered Smurfing Detection
 // ------------------------------------------------------------------------------------------------
 
-func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
+func runMuleTrackingScenario(ctx context.Context, client *driver.Client) error {
 	fmt.Println("==========================================================================================")
 	fmt.Println(">>> [SCENARIO 1] Real-Time Multi-Hop Mule Account & Smurfing Layering Detection")
 	fmt.Println("    Goal: Trace stolen funds flowing across 5 hops from victim to offshore cashout.")
@@ -156,7 +175,7 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 		})
 		if err != nil {
 			fmt.Printf("Error saving account %s: %v\n", acc.AccountNumber, err)
-			return
+			return fmt.Errorf("save account %s: %w", acc.AccountNumber, err)
 		}
 	}
 	fmt.Printf("    [✓] Ingested %d bank accounts across 6 laundering layers.\n", len(accounts))
@@ -187,7 +206,9 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 	}
 
 	for _, tx := range transfers {
-		_ = client.Link(tx.SourceAccount, tx.Relation, tx.TargetAccount, tx.RiskWeight)
+		if err := client.Link(tx.SourceAccount, tx.Relation, tx.TargetAccount, tx.RiskWeight); err != nil {
+			return fmt.Errorf("link transfer %s -> %s: %w", tx.SourceAccount, tx.TargetAccount, err)
+		}
 	}
 	fmt.Printf("    [✓] Linked %d directed fund transfer edges across 5 relational hops.\n\n", len(transfers))
 
@@ -207,13 +228,17 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 	traversalLat := time.Since(t0)
 	if err != nil {
 		fmt.Printf("FATAL: CausalChain failed: %v\n", err)
-		return
+		return fmt.Errorf("causal-chain query: %w", err)
+	}
+	if len(chainResults) == 0 {
+		return fmt.Errorf("causal-chain query returned no downstream accounts")
 	}
 
 	fmt.Printf("    [✓] 5-Hop Causal Chain Completed in %v\n\n", traversalLat)
 
 	// Decision Evaluation Table
 	var decisions []FraudDecision
+	var lookupErrors int
 	for _, res := range chainResults {
 		targetAcc := res.Word
 		pathScore := res.Score
@@ -225,6 +250,8 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 		decLat := time.Since(tDec)
 
 		if err != nil {
+			lookupErrors++
+			fmt.Printf("Account lookup failed for %s: %v\n", targetAcc, err)
 			continue
 		}
 
@@ -247,6 +274,9 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 			Latency:       traversalLat + decLat,
 		})
 	}
+	if lookupErrors > 0 || len(decisions) != len(chainResults) {
+		return fmt.Errorf("evaluated %d of %d downstream accounts (%d lookup errors)", len(decisions), len(chainResults), lookupErrors)
+	}
 
 	fmt.Println("┌──────────────────────────────┬──────────────┬────────────┬────────────┬──────────────────────────────┬──────────────┐")
 	fmt.Println("│ Downstream Account (Hop 5)   │ Path Prob.   │ Risk Score │ Watchlist? │ Pre-Authorization Decision   │ Decision Time│")
@@ -261,13 +291,14 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) {
 	}
 	fmt.Println("└──────────────────────────────┴──────────────┴────────────┴────────────┴──────────────────────────────┴──────────────┘")
 	fmt.Println()
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------
 // SCENARIO 2: Impossible Travel & Spatial Velocity Anomaly
 // ------------------------------------------------------------------------------------------------
 
-func runImpossibleTravelScenario(ctx context.Context, client *driver.Client) {
+func runImpossibleTravelScenario(ctx context.Context, client *driver.Client) error {
 	fmt.Println("==========================================================================================")
 	fmt.Println(">>> [SCENARIO 2] Impossible Travel & Geolocation Anomaly Detection (ATM / POS Fraud)")
 	fmt.Println("    Method: 2D Spatial Index Euclidean Distance / In-Storage Physical Velocity Check.")
@@ -289,49 +320,66 @@ func runImpossibleTravelScenario(ctx context.Context, client *driver.Client) {
 	}
 
 	for _, t := range terminals {
-		_ = client.AppendNode(t.Name, t.Coord, [4]float32{1.0, 0.0, 0.0, 0.0})
+		if err := client.AppendNode(t.Name, t.Coord, [4]float32{1.0, 0.0, 0.0, 0.0}); err != nil {
+			return fmt.Errorf("register terminal %s: %w", t.Name, err)
+		}
 	}
 	fmt.Println("    [✓] Registered 3 ATM/POS physical coordinate nodes in 2D Spatial Index.")
 
 	// Test Case 1: Impossible Travel Fraud Event
 	// Card cloned! Used at Jakarta at 14:00:00, then used at Surabaya at 14:15:00 (15 minutes later).
-	t0Jakarta := float32(1729173600.0)  // 14:00:00
-	t1Surabaya := float32(1729174500.0) // 14:15:00 (Delta: 900 seconds = 0.25 hours)
+	t0Jakarta := int64(1729173600)  // 14:00:00 UTC
+	t1Surabaya := int64(1729174500) // 14:15:00 UTC (Delta: 900 seconds)
 
 	tSpatial := time.Now()
 	rawDistDeg, err := client.Math().Distance("atm_jkt_monas_01", "atm_sby_gubeng_02")
 	spatialLat := time.Since(tSpatial)
 	if err != nil {
 		fmt.Printf("Distance error: %v\n", err)
-		return
+		return fmt.Errorf("spatial distance query: %w", err)
 	}
 
-	// Approximate distance in kilometers: 1 degree latitude ~ 111.32 km
-	distKm := rawDistDeg * 111.32
-	timeDeltaHours := (t1Surabaya - t0Jakarta) / 3600.0
+	// The spatial index returns Euclidean degrees. Use a great-circle distance
+	// for the physical travel estimate instead of scaling degrees uniformly.
+	distKm := haversineKm(terminals[0].Coord, terminals[1].Coord)
+	timeDeltaHours := float64(t1Surabaya-t0Jakarta) / 3600.0
 	travelVelocityKmH := distKm / timeDeltaHours
 
-	fmt.Printf("    ▶ Distance Evaluated in-storage: %.1f km [Query Latency: %v]\n", distKm, spatialLat)
-	fmt.Printf("    ▶ Time Elapsed between swipes:   %.0f minutes (%.2f hours)\n", (t1Surabaya-t0Jakarta)/60.0, timeDeltaHours)
+	fmt.Printf("    ▶ Great-circle distance:         %.1f km [Spatial query: %.3f degrees, %v]\n", distKm, rawDistDeg, spatialLat)
+	fmt.Printf("    ▶ Time Elapsed between swipes:   %.0f minutes (%.2f hours)\n", float64(t1Surabaya-t0Jakarta)/60.0, timeDeltaHours)
 	fmt.Printf("    ▶ Required Travel Speed:         %.1f km/h\n", travelVelocityKmH)
 
 	if travelVelocityKmH > 250.0 {
 		fmt.Println("    🚨 [FRAUD ALERT TRIGGERED]: IMPOSSIBLE TRAVEL ANOMALY (CARD CLONING SUSPECTED)")
-		fmt.Println("       Action: Transaction at Surabaya ATM REJECTED. Card automatically FROZEN.")
+		fmt.Println("       Example recommendation: reject this transaction and freeze the card.")
 	} else {
 		fmt.Println("    [✓] Physical travel velocity within plausible bounds.")
 	}
 	fmt.Println()
+	return nil
+}
+
+func haversineKm(a, b spatial.Point2D) float64 {
+	const earthRadiusKm = 6371.0088
+	toRadians := func(degrees float32) float64 { return float64(degrees) * math.Pi / 180 }
+	lat1, lat2 := toRadians(a.Y), toRadians(b.Y)
+	dLat := lat2 - lat1
+	dLon := toRadians(b.X - a.X)
+	h := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1)*math.Cos(lat2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	if h > 1 {
+		h = 1
+	}
+	return 2 * earthRadiusKm * math.Asin(math.Sqrt(h))
 }
 
 // ------------------------------------------------------------------------------------------------
 // SCENARIO 3: Massive 1,000,000+ Scale Stress Test
 // ------------------------------------------------------------------------------------------------
 
-func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, totalRecords int) {
+func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, totalRecords int) error {
 	fmt.Println("==========================================================================================")
 	fmt.Printf(">>> [SCENARIO 3] Enterprise High-Throughput Scale Benchmark (%s Accounts)\n", formatNumber(totalRecords))
-	fmt.Println("    Testing zero-copy mmap ingestion throughput and pre-authorization query latency at scale.")
+	fmt.Println("    Measuring AnchorWire ingestion throughput and causal-query latency at scale.")
 	fmt.Println("==========================================================================================")
 
 	numWorkers := runtime.NumCPU() * 2
@@ -373,8 +421,9 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 					isBlacklisted = 1.0
 				}
 				props := map[string]float32{
-					"risk_score":        float32(i % 100),
-					"last_tx_timestamp": float32(1729170000 + (i % 86400)),
+					"risk_score": float32(i % 100),
+					// Store seconds relative to the sample epoch so float32 retains second-level precision.
+					"last_tx_timestamp": float32(i % 86400),
 					"daily_tx_volume":   float32(500 + (i % 50000)),
 					"is_blacklisted":    isBlacklisted,
 					"kyc_tier":          float32(1 + (i % 3)),
@@ -403,7 +452,7 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	if totalErrors > 0 {
 		fmt.Printf("    [!] Ingestion Completed with %d ERRORS: %s / %s records saved in %v (%.0f writes/sec)\n\n",
 			totalErrors, formatNumber(int(savedCount)), formatNumber(totalRecords), durIngest, throughput)
-		os.Exit(1)
+		return fmt.Errorf("ingestion failed: %d of %d writes failed; %d saved", totalErrors, totalRecords, savedCount)
 	}
 	fmt.Printf("    [✓] Ingestion Completed: %s records in %v (%.0f writes/sec)\n\n",
 		formatNumber(int(savedCount)), durIngest, throughput)
@@ -415,11 +464,20 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	for i := 0; i < numEdges; i++ {
 		src := fmt.Sprintf("acc_enterprise_%08d", i)
 		dst := fmt.Sprintf("acc_enterprise_%08d", (i+1)%totalRecords)
-		_ = client.Link(src, "transfers_to", dst, 0.90+float32(i%10)*0.01)
+		if err := client.Link(src, "transfers_to", dst, 0.90+float32(i%10)*0.01); err != nil {
+			errorCount.Add(1)
+			if errorCount.Load() <= 5 {
+				fmt.Printf("Link error %s -> %s: %v\n", src, dst, err)
+			}
+		}
 	}
 	durLink := time.Since(tLink)
-	fmt.Printf("    [✓] Linked %s edges in %v (%.0f edges/sec)\n\n",
-		formatNumber(numEdges), durLink, float64(numEdges)/durLink.Seconds())
+	linkErrors := errorCount.Load()
+	fmt.Printf("    Linked %s / %s edges (%d errors) in %v (%.0f successful edges/sec)\n\n",
+		formatNumber(numEdges-int(linkErrors)), formatNumber(numEdges), linkErrors, durLink, float64(numEdges-int(linkErrors))/durLink.Seconds())
+	if linkErrors > 0 {
+		return fmt.Errorf("%d of %d transfer links failed", linkErrors, numEdges)
+	}
 
 	// Measure Pre-Authorization Fraud Latency at 1M Scale
 	const fraudInspectionQueries = 50000
@@ -427,11 +485,15 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 
 	latencies := make([]time.Duration, fraudInspectionQueries)
 	tQueries := time.Now()
+	var queryErrors atomic.Int64
 
 	for i := 0; i < fraudInspectionQueries; i++ {
-		src := fmt.Sprintf("acc_enterprise_%08d", (i*13)%totalRecords)
+		src := fmt.Sprintf("acc_enterprise_%08d", (i*13)%numEdges)
 		qStart := time.Now()
-		_, _ = client.Causal(src, "transfers_to", 5)
+		results, err := client.Causal(src, "transfers_to", 5)
+		if err != nil || len(results) == 0 {
+			queryErrors.Add(1)
+		}
 		latencies[i] = time.Since(qStart)
 	}
 	durQueries := time.Since(tQueries)
@@ -447,15 +509,23 @@ func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, total
 	avgLat := durQueries / time.Duration(fraudInspectionQueries)
 
 	fmt.Println("------------------------------------------------------------------------------------------")
-	fmt.Printf("    [✓] Total Inspections Executed: %s queries\n", formatNumber(fraudInspectionQueries))
-	fmt.Printf("    [✓] Inspection Throughput:      %.0f fraud checks / sec\n", qps)
-	fmt.Printf("    [✓] Average Latency:            %v\n", avgLat)
-	fmt.Printf("    [✓] p50 Latency:                %v\n", p50)
-	fmt.Printf("    [✓] p95 Latency:                %v\n", p95)
-	fmt.Printf("    [✓] p99 Latency:                %v\n", p99)
+	fmt.Printf("    Inspections: %s queries (%d errors or empty results)\n", formatNumber(fraudInspectionQueries), queryErrors.Load())
+	fmt.Printf("    Inspection Throughput:          %.0f checks / sec\n", qps)
+	fmt.Printf("    Average Latency:                %v\n", avgLat)
+	fmt.Printf("    p50 Latency:                    %v\n", p50)
+	fmt.Printf("    p95 Latency:                    %v\n", p95)
+	fmt.Printf("    p99 Latency:                    %v\n", p99)
 	fmt.Println("------------------------------------------------------------------------------------------")
-	fmt.Println(">>> VERDICT: AnchorDB meets the < 10ms Banking Payment Authorization SLA budget.")
+	if queryErrors.Load() > 0 {
+		return fmt.Errorf("%d of %d fraud inspection queries failed", queryErrors.Load(), fraudInspectionQueries)
+	}
+	const authorizationBudget = time.Millisecond
+	if p99 >= authorizationBudget {
+		return fmt.Errorf("p99 latency %v exceeds the stated %v example budget", p99, authorizationBudget)
+	}
+	fmt.Printf(">>> Sample result: p99 is below the %v example budget; this benchmark alone is not an SLA guarantee.\n", authorizationBudget)
 	fmt.Println("==========================================================================================")
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------

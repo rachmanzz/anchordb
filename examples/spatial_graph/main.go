@@ -105,20 +105,32 @@ func main() {
 	mathEng := client.Math()
 
 	// A. Direct Euclidean Distance
-	dist, _ := mathEng.Distance("primary_cluster", "load_balancer")
+	dist, err := mathEng.Distance("primary_cluster", "load_balancer")
+	if err != nil {
+		log.Fatalf("distance calculation failed: %v", err)
+	}
 	fmt.Printf("1. Direct Spatial Distance 'primary_cluster' <-> 'load_balancer': %.4f\n", dist)
 
 	// B. Direct Centroid Calculation
-	centroid, _ := mathEng.Centroid("primary_cluster", "backup_cluster", "load_balancer")
+	centroid, err := mathEng.Centroid("primary_cluster", "backup_cluster", "load_balancer")
+	if err != nil {
+		log.Fatalf("centroid calculation failed: %v", err)
+	}
 	fmt.Printf("2. Center of Gravity (Centroid) ['primary_cluster', 'backup_cluster', 'load_balancer']: (%.2f, %.2f)\n",
 		centroid.Coord.X, centroid.Coord.Y)
 
 	// C. Semantic Role Cosine Similarity
-	sim, _ := mathEng.CosineSimilarity("primary_cluster", "backup_cluster")
+	sim, err := mathEng.CosineSimilarity("primary_cluster", "backup_cluster")
+	if err != nil {
+		log.Fatalf("cosine similarity calculation failed: %v", err)
+	}
 	fmt.Printf("3. Role Cosine Similarity 'primary_cluster' & 'backup_cluster': %.4f\n", sim)
 
 	// D. Nearest Spatial Neighbors
-	nearest, _ := mathEng.Nearest("primary_cluster", 3)
+	nearest, err := mathEng.Nearest("primary_cluster", 3)
+	if err != nil {
+		log.Fatalf("nearest-neighbor query failed: %v", err)
+	}
 	fmt.Println("4. Nearest Spatial Neighbors of 'primary_cluster':")
 	for i, n := range nearest {
 		fmt.Printf("   [%d] '%s' (Distance: %.4f)\n", i+1, n.Word, n.T)
@@ -128,14 +140,19 @@ func main() {
 	fmt.Println("\n----------------------------------------------------------")
 	fmt.Println(">>> QUERY 3: Entity Storage & In-Storage Division (Math Compute)")
 
-	_ = client.Save("vehicle_trip", map[string]float32{
+	if err := client.Save("vehicle_trip", map[string]float32{
 		"distance": 120.0,
 		"duration": 2.0,
-	})
+	}); err != nil {
+		log.Fatalf("failed to save vehicle trip: %v", err)
+	}
 
-	record, _ := client.Get("vehicle_trip").
+	record, err := client.Get("vehicle_trip").
 		Compute("speed", driver.Divide("distance", "duration")).
 		Execute(ctx)
+	if err != nil {
+		log.Fatalf("vehicle trip query failed: %v", err)
+	}
 
 	fmt.Printf("Saved: distance=%.0f km, duration=%.0f hours\n", record.Get("distance"), record.Get("duration"))
 	fmt.Printf("Calculated Speed (distance / duration): %.1f km/h\n", record.Get("speed"))
