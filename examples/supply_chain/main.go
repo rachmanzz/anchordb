@@ -635,16 +635,40 @@ func runLargeScaleBenchmark(serverURL, authToken, modelName string, totalRecords
 	}
 
 	var edgeErrors atomic.Int64
-	for i := 0; i < numEdges; i++ {
-		src := fmt.Sprintf("hub_logistics_%04d", i%100)
-		target := fmt.Sprintf("sku_auto_%08d", i)
-		if err := client.Link(src, "stocks_sku", target, 0.85+float32(i%15)*0.01); err != nil {
-			errCount := edgeErrors.Add(1)
-			if errCount <= 5 {
-				fmt.Printf("Error linking %s -> %s: %v\n", src, target, err)
+	var edgeWg sync.WaitGroup
+	edgesPerWorker := numEdges / numWorkers
+	edgeRemainder := numEdges % numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		edgeWg.Add(1)
+		workerID := w
+		go func() {
+			defer edgeWg.Done()
+			startIdx := workerID * edgesPerWorker
+			if workerID < edgeRemainder {
+				startIdx += workerID
+			} else {
+				startIdx += edgeRemainder
 			}
-		}
+			count := edgesPerWorker
+			if workerID < edgeRemainder {
+				count++
+			}
+			endIdx := startIdx + count
+
+			for i := startIdx; i < endIdx; i++ {
+				src := fmt.Sprintf("hub_logistics_%04d", i%100)
+				target := fmt.Sprintf("sku_auto_%08d", i)
+				if err := client.Link(src, "stocks_sku", target, 0.85+float32(i%15)*0.01); err != nil {
+					errCount := edgeErrors.Add(1)
+					if errCount <= 5 {
+						fmt.Printf("Worker %d error linking %s -> %s: %v\n", workerID, src, target, err)
+					}
+				}
+			}
+		}()
 	}
+	edgeWg.Wait()
 	if errs := edgeErrors.Load(); errs > 0 {
 		fmt.Printf("    [!] Warning: Edge linking encountered %d errors\n", errs)
 	}

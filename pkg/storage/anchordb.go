@@ -316,9 +316,10 @@ type AnchorDB struct {
 	// Causal edges are explicit per-edge relationships (source --relation--> target).
 	// edges holds every edge in insertion order; deleted edges are tombstoned with
 	// an empty Source. adjOut/adjIn index edges by source/target for O(1) traversal.
-	edges  []EdgeRecord
-	adjOut map[string][]int
-	adjIn  map[string][]int
+	edges     []EdgeRecord
+	adjOut    map[string][]int
+	adjIn     map[string][]int
+	edgeIndex map[edgeKey]int
 	// edgeLive counts live edges (O(1) EdgeCount); edgeTombstones counts
 	// tombstoned slots pending compaction.
 	edgeLive       int
@@ -804,6 +805,7 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		EntityOrder:    make([]string, 0),
 		adjOut:         make(map[string][]int),
 		adjIn:          make(map[string][]int),
+		edgeIndex:      make(map[edgeKey]int),
 		filePath:       filePath,
 		autoSyncChan:   make(chan struct{}, 1),
 		autoSyncDone:   make(chan struct{}),

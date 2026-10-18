@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -20,22 +21,37 @@ type Backend interface {
 	RequiresAuth() bool
 }
 
+type saveJob struct {
+	model     string
+	item      storage.BatchRecordItem
+	savedName string
+	err       error
+	done      chan struct{}
+}
+
 // Server is the AnchorWire binary TCP protocol daemon.
 type Server struct {
-	backend Backend
-	l       net.Listener
-	mu      sync.Mutex
-	conns   map[net.Conn]struct{}
-	closed  bool
-	wg      sync.WaitGroup
+	backend  Backend
+	l        net.Listener
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+	closed   bool
+	wg       sync.WaitGroup
+	saveJobs chan *saveJob
+	stopChan chan struct{}
 }
 
 // NewServer constructs an AnchorWire server instance.
 func NewServer(backend Backend) *Server {
-	return &Server{
-		backend: backend,
-		conns:   make(map[net.Conn]struct{}),
+	s := &Server{
+		backend:  backend,
+		conns:    make(map[net.Conn]struct{}),
+		saveJobs: make(chan *saveJob, 2048),
+		stopChan: make(chan struct{}),
 	}
+	s.wg.Add(1)
+	go s.runGroupCommitter()
+	return s
 }
 
 // Serve accepts incoming AnchorWire TCP connections.
@@ -82,6 +98,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.stopChan)
 	var err error
 	if s.l != nil {
 		err = s.l.Close()
@@ -93,6 +110,151 @@ func (s *Server) Close() error {
 
 	s.wg.Wait()
 	return err
+}
+
+func (s *Server) runGroupCommitter() {
+	defer s.wg.Done()
+	const maxBatch = 128
+
+	for {
+		var firstJob *saveJob
+		select {
+		case <-s.stopChan:
+			for {
+				select {
+				case j := <-s.saveJobs:
+					j.err = errors.New("server closing")
+					close(j.done)
+				default:
+					return
+				}
+			}
+		case firstJob = <-s.saveJobs:
+		}
+
+		batch := []*saveJob{firstJob}
+	drain:
+		for len(batch) < maxBatch {
+			select {
+			case j := <-s.saveJobs:
+				batch = append(batch, j)
+			default:
+				break drain
+			}
+		}
+
+		s.processSaveBatch(batch)
+	}
+}
+
+func (s *Server) processSaveBatch(batch []*saveJob) {
+	if len(batch) == 0 {
+		return
+	}
+
+	headroom := system.GetMemoryHeadroom()
+	if headroom.UsedPercent >= 93 {
+		err := fmt.Errorf("storage admission control: container memory pressure %d%%", headroom.UsedPercent)
+		for _, j := range batch {
+			j.err = err
+			close(j.done)
+		}
+		return
+	}
+
+	byModel := make(map[string][]*saveJob)
+	for _, j := range batch {
+		byModel[j.model] = append(byModel[j.model], j)
+	}
+
+	for model, jobs := range byModel {
+		db, err := s.backend.GetModel(model)
+		if err != nil {
+			for _, j := range jobs {
+				j.err = err
+				close(j.done)
+			}
+			continue
+		}
+
+		if headroom.UsedPercent >= 88 {
+			db.TriggerAutoSync()
+		}
+
+		if len(jobs) == 1 {
+			j := jobs[0]
+			opStatus := j.item.Operation
+			if opStatus == 0 {
+				opStatus = storage.OpStatusActive
+			}
+			if j.item.Coord != nil || j.item.Roles != nil {
+				coord := spatial.Point2D{}
+				if j.item.Coord != nil {
+					coord = *j.item.Coord
+				}
+				var roles [4]float32
+				if j.item.Roles != nil {
+					roles = *j.item.Roles
+				}
+				if len(j.item.Props) > 0 {
+					j.savedName, j.err = db.SaveRecordWithNode(j.item.Name, opStatus, j.item.Props, coord, roles)
+				} else {
+					j.savedName = j.item.Name
+					_, j.err = db.AppendNode(j.savedName, coord, roles, 1)
+				}
+			} else {
+				j.savedName, j.err = db.SaveRecordWithIDAndOp(j.item.Name, opStatus, j.item.Props)
+			}
+			close(j.done)
+			if j.err == nil {
+				system.RecordMutation(1)
+			}
+			continue
+		}
+
+		items := make([]storage.BatchRecordItem, len(jobs))
+		for i, j := range jobs {
+			items[i] = j.item
+		}
+
+		names, bErr := db.SaveRecordsBatch(items)
+		if bErr != nil {
+			for _, j := range jobs {
+				opStatus := j.item.Operation
+				if opStatus == 0 {
+					opStatus = storage.OpStatusActive
+				}
+				if j.item.Coord != nil || j.item.Roles != nil {
+					coord := spatial.Point2D{}
+					if j.item.Coord != nil {
+						coord = *j.item.Coord
+					}
+					var roles [4]float32
+					if j.item.Roles != nil {
+						roles = *j.item.Roles
+					}
+					if len(j.item.Props) > 0 {
+						j.savedName, j.err = db.SaveRecordWithNode(j.item.Name, opStatus, j.item.Props, coord, roles)
+					} else {
+						j.savedName = j.item.Name
+						_, j.err = db.AppendNode(j.savedName, coord, roles, 1)
+					}
+				} else {
+					j.savedName, j.err = db.SaveRecordWithIDAndOp(j.item.Name, opStatus, j.item.Props)
+				}
+				close(j.done)
+				if j.err == nil {
+					system.RecordMutation(1)
+				}
+			}
+		} else {
+			for i, j := range jobs {
+				j.savedName = names[i]
+				close(j.done)
+			}
+			system.RecordMutation(uint64(len(jobs)))
+		}
+	}
 }
 
 func (s *Server) removeConn(conn net.Conn) {
@@ -255,55 +417,42 @@ func (s *Server) handleConn(conn net.Conn) {
 		// 5. Dispatch Command
 		switch req.OpCode {
 		case OpSave:
-			headroom := system.GetMemoryHeadroom()
-			if headroom.UsedPercent >= 93 {
-				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(507, fmt.Sprintf("storage admission control: container memory pressure %d%%", headroom.UsedPercent))
-				break
-			}
-			if headroom.UsedPercent >= 88 {
-				db.TriggerAutoSync()
-			}
-
 			item, dErr := DecodeSavePayload(req.Payload)
 			if dErr != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
 			}
-			var savedName string
-			opStatus := item.Operation
-			if opStatus == 0 {
-				opStatus = storage.OpStatusActive
+
+			job := &saveJob{
+				model: currentModel,
+				item:  item,
+				done:  make(chan struct{}),
 			}
-			if item.Coord != nil || item.Roles != nil {
-				coord := spatial.Point2D{}
-				if item.Coord != nil {
-					coord = *item.Coord
-				}
-				var roles [4]float32
-				if item.Roles != nil {
-					roles = *item.Roles
-				}
-				if len(item.Props) > 0 {
-					savedName, err = db.SaveRecordWithNode(item.Name, opStatus, item.Props, coord, roles)
+
+			select {
+			case s.saveJobs <- job:
+				<-job.done
+				if job.err != nil {
+					if strings.Contains(job.err.Error(), "admission control") {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(507, job.err.Error())
+					} else {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(500, job.err.Error())
+					}
 				} else {
-					savedName = item.Name
-					_, err = db.AppendNode(savedName, coord, roles, 1)
+					resp.OpCode = OpResponseOK
+					resp.Payload = EncodeOKPayload(job.savedName)
 				}
-			} else {
-				savedName, err = db.SaveRecordWithIDAndOp(item.Name, opStatus, item.Props)
+			case <-s.stopChan:
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(503, "server stopping")
 			}
+
+			headroom := system.GetMemoryHeadroom()
 			if headroom.UsedPercent >= 85 {
 				resp.Flags |= FlagMemoryPressure
-			}
-			if err != nil {
-				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
-			} else {
-				system.RecordMutation(1)
-				resp.OpCode = OpResponseOK
-				resp.Payload = EncodeOKPayload(savedName)
 			}
 
 		case OpSaveBatch:

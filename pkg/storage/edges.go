@@ -37,6 +37,13 @@ type CausalResult struct {
 	Weight float32 `json:"weight"`
 }
 
+// edgeKey uniquely identifies a directed relation between source and target for O(1) deduplication and updates.
+type edgeKey struct {
+	Source   string
+	Relation string
+	Target   string
+}
+
 func validateEdge(source, relation, target string, weight float32) error {
 	if source == "" {
 		return fmt.Errorf("edge source must not be empty")
@@ -77,17 +84,29 @@ func (db *AnchorDB) AddEdge(source, relation, target string, weight float32) err
 // upsertEdge is the WAL-free mutation used both by AddEdge (after a successful
 // WAL write) and by WAL replay. Caller must hold db.mu.
 func (db *AnchorDB) upsertEdge(source, relation, target string, weight float32) {
-	for _, i := range db.adjOut[source] {
-		e := db.edges[i]
-		if e.Source == source && e.Relation == relation && e.Target == target {
-			db.edges[i].Weight = weight
+	key := edgeKey{Source: source, Relation: relation, Target: target}
+	if db.edgeIndex != nil {
+		if idx, ok := db.edgeIndex[key]; ok {
+			db.edges[idx].Weight = weight
 			return
+		}
+	} else {
+		for _, i := range db.adjOut[source] {
+			e := db.edges[i]
+			if e.Source == source && e.Relation == relation && e.Target == target {
+				db.edges[i].Weight = weight
+				return
+			}
 		}
 	}
 	idx := len(db.edges)
 	db.edges = append(db.edges, EdgeRecord{Source: source, Relation: relation, Target: target, Weight: weight})
 	db.adjOut[source] = append(db.adjOut[source], idx)
 	db.adjIn[target] = append(db.adjIn[target], idx)
+	if db.edgeIndex == nil {
+		db.edgeIndex = make(map[edgeKey]int)
+	}
+	db.edgeIndex[key] = idx
 	db.edgeLive++
 }
 
@@ -99,6 +118,9 @@ const edgeCompactionThreshold = 1024
 func (db *AnchorDB) tombstoneEdgeLocked(idx int) {
 	if idx < 0 || idx >= len(db.edges) || db.edges[idx].Source == "" {
 		return
+	}
+	if db.edgeIndex != nil {
+		delete(db.edgeIndex, edgeKey{Source: db.edges[idx].Source, Relation: db.edges[idx].Relation, Target: db.edges[idx].Target})
 	}
 	db.edges[idx] = EdgeRecord{}
 	db.edgeLive--
@@ -115,6 +137,7 @@ func (db *AnchorDB) maybeCompactEdgesLocked() {
 	live := make([]EdgeRecord, 0, db.edgeLive)
 	out := make(map[string][]int)
 	in := make(map[string][]int)
+	idxMap := make(map[edgeKey]int, db.edgeLive)
 	for _, e := range db.edges {
 		if e.Source == "" {
 			continue
@@ -123,10 +146,12 @@ func (db *AnchorDB) maybeCompactEdgesLocked() {
 		live = append(live, e)
 		out[e.Source] = append(out[e.Source], i)
 		in[e.Target] = append(in[e.Target], i)
+		idxMap[edgeKey{Source: e.Source, Relation: e.Relation, Target: e.Target}] = i
 	}
 	db.edges = live
 	db.adjOut = out
 	db.adjIn = in
+	db.edgeIndex = idxMap
 	db.edgeTombstones = 0
 }
 
@@ -156,6 +181,12 @@ func (db *AnchorDB) RemoveEdge(source, relation, target string) error {
 
 // findEdge returns the index of a live edge or -1. Caller must hold db.mu.
 func (db *AnchorDB) findEdge(source, relation, target string) int {
+	if db.edgeIndex != nil {
+		if idx, ok := db.edgeIndex[edgeKey{Source: source, Relation: relation, Target: target}]; ok {
+			return idx
+		}
+		return -1
+	}
 	for _, i := range db.adjOut[source] {
 		e := db.edges[i]
 		if e.Source == source && e.Relation == relation && e.Target == target {
@@ -389,6 +420,10 @@ func (db *AnchorDB) loadEdges() error {
 		db.edges = append(db.edges, e)
 		db.adjOut[e.Source] = append(db.adjOut[e.Source], idx)
 		db.adjIn[e.Target] = append(db.adjIn[e.Target], idx)
+		if db.edgeIndex == nil {
+			db.edgeIndex = make(map[edgeKey]int)
+		}
+		db.edgeIndex[edgeKey{Source: e.Source, Relation: e.Relation, Target: e.Target}] = idx
 		db.edgeLive++
 	}
 	if offset != len(rest) {
