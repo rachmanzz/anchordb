@@ -44,9 +44,9 @@ In AnchorDB, **Schema** and **Graph Traversal** have an orthogonal separation of
                     +---------------------------------------+
 ```
 
-* **Schema** guarantees that every entity stored in the database has guaranteed, valid, non-null properties.
+* **Schema** validates declared property types on writes; it does not ensure that every possible attribute is present or correct for an application's business rules.
 * **Graph Traversal** discovers dynamically which entities are affected across multiple relational hops.
-* **Combined Benefit**: When your application traverses the graph, you can immediately query and perform arithmetic math on the reached entities with 100% confidence that no attributes are missing or malformed.
+* **Combined Benefit**: The example checks selected entity fields and computed values after traversal; applications should still validate the properties required by their own business rules.
 
 ---
 
@@ -108,8 +108,10 @@ flowchart TD
 
 Execute directly from the repository root:
 
+If authentication is enabled, set `ANCHORDB_AUTH_TOKEN` to the server token first.
+
 ```bash
-go run ./examples/graph_traversal
+go run ./examples/graph_traversal -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN"
 ```
 
 ---
@@ -132,13 +134,23 @@ err := client.Attach(schema)
 ### 2. Linking Directed Weighted Edges
 ```go
 // Hop 1: triggers (Fan-out into 4 concurrent threads)
-_ = client.Link("dc_power_trip", "triggers", "ups_alpha_failure", 0.95)
-_ = client.Link("dc_power_trip", "triggers", "ups_beta_failure", 0.90)
-_ = client.Link("dc_power_trip", "triggers", "hvac_cooling_shutdown", 0.85)
-_ = client.Link("dc_power_trip", "triggers", "aux_bus_overload", 0.80)
+if err := client.Link("dc_power_trip", "triggers", "ups_alpha_failure", 0.95); err != nil {
+    log.Fatal(err)
+}
+if err := client.Link("dc_power_trip", "triggers", "ups_beta_failure", 0.90); err != nil {
+    log.Fatal(err)
+}
+if err := client.Link("dc_power_trip", "triggers", "hvac_cooling_shutdown", 0.85); err != nil {
+    log.Fatal(err)
+}
+if err := client.Link("dc_power_trip", "triggers", "aux_bus_overload", 0.80); err != nil {
+    log.Fatal(err)
+}
 
 // Hop 2 to 5: propagates, degrades, disrupts, escalates (including cross-edges)
-_ = client.Link("ups_alpha_failure", "propagates", "rack_alpha_blackout", 0.95)
+if err := client.Link("ups_alpha_failure", "propagates", "rack_alpha_blackout", 0.95); err != nil {
+    log.Fatal(err)
+}
 ...
 ```
 
@@ -158,15 +170,21 @@ for rank, r := range results {
 ### 4. Resolving Reached Nodes via `Get` and `List`
 ```go
 // A. Direct point resolution on discovered node
-node, _ := client.Get("direct_revenue_loss").Execute(ctx)
+node, err := client.Get("direct_revenue_loss").Execute(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 fmt.Println("Severity:", node.Get("severity"))
 fmt.Println("Impact USD:", node.Get("impact_usd"))
 
 // B. In-storage math projection on impacted nodes
-list, _ := client.List().
+list, err := client.List().
     Where("severity", ">=", 4.0).
     Compute("risk_index", driver.Multiply("impact_usd", "severity")).
     Execute(ctx)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 ---
@@ -176,7 +194,7 @@ list, _ := client.List().
 Ensure the AnchorDB server daemon is running with AnchorWire listening on port `7448`:
 
 ```bash
-go run ./examples/graph_traversal -url=wire://localhost:7448
+go run ./examples/graph_traversal -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN"
 ```
 
 ---
@@ -185,17 +203,17 @@ go run ./examples/graph_traversal -url=wire://localhost:7448
 
 ### 1. Multi-Hop Traversal Scores & Latencies
 
-| Hop Depth | Relations Traversed | Nodes Reached | Top Target | Cumulative Score | Latency |
-| :---: | :--- | :---: | :--- | :---: | :---: |
-| **Hop 1** | `["triggers"]` | 4 nodes | `ups_alpha_failure` | **0.9500** | **~5.5 µs** |
-| **Hop 2** | `[... "propagates"]` | 7 nodes | `rack_alpha_blackout` | **0.9025** | **~4.2 µs** |
-| **Hop 3** | `[... "degrades"]` | 6 nodes | `db_primary_crash` | **0.8574** | **~4.9 µs** |
-| **Hop 4** | `[... "disrupts"]` | 5 nodes | `checkout_api_down` | **0.8402** | **~6.1 µs** |
-| **Hop 5** | `[... "escalates"]`| 4 nodes | `direct_revenue_loss` | **0.7982** | **~11.3 µs** |
+| Hop Depth | Relations Traversed | Nodes Reached | Result scope | Latency |
+| :---: | :--- | :---: | :--- | :---: |
+| **Hop 1** | `["triggers"]` | 4 nodes | `ups_alpha_failure` leads | runtime |
+| **Hop 2** | `[..., "propagates"]` | 11 nodes | includes earlier-stage results | runtime |
+| **Hop 3** | `[..., "degrades"]` | 17 nodes | includes earlier-stage results | runtime |
+| **Hop 4** | `[..., "disrupts"]` | 22 nodes | includes earlier-stage results | runtime |
+| **Hop 5** | `[..., "escalates"]` | 26 nodes | includes earlier-stage results | runtime |
 
-> Scores and node counts are deterministic. Latency figures are indicative only and vary with host hardware, Go runtime version, and cache warm-up state.
+> These counts are from one run on a fresh model. Hop 2–5 results include matches from earlier relation stages; the server returned more than the requested limit of 10. Latency is measured at runtime, and accumulated counts/order may vary with server version and existing model data.
 
-### 2. Multi-Worker Concurrent Throughput (100,000 Queries)
+### 2. Historical Multi-Worker Throughput Snapshot (100,000 Queries)
 
 | Goroutines (Workers) | Total Queries | Latency | Traversal Throughput |
 | :---: | :---: | :---: | :---: |
@@ -204,9 +222,9 @@ go run ./examples/graph_traversal -url=wire://localhost:7448
 | **16 Workers** | 100,000 | 1.26 µs / op | **796,563 ops/sec** |
 | **64 Workers** | ~100,000 | 1.02 µs / op | **978,147 ops/sec** *(Peak)* |
 
-> Historical sample figures only; they are not generated by every run and depend on host/runtime conditions. The current example requires all 100,000 queries at each worker level to succeed; it exits non-zero if an error or shortfall occurs.
+> Historical sample figures only; they are not generated by every run and depend on host/runtime conditions. The example reports actual completed/error counts and exits non-zero if a worker level is incomplete.
 
-### 3. Schema-Guaranteed Resolution Tables
+### 3. Example Entity Resolution Tables
 
 #### Top Impacted Nodes (`client.Get`):
 ```

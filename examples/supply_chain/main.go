@@ -50,9 +50,9 @@ func main() {
 	wireURL := flag.String("url", "wire://localhost:7448", "AnchorWire TCP server URL: wire://host:7448 or localhost:7448")
 	authToken := flag.String("token", "", "Bearer auth token for AnchorWire (if required)")
 	modelName := flag.String("model", "supply_chain", "Model name to isolate supply chain data")
-	scenario := flag.String("scenario", "analysis", "Scenario: 'analysis' (6-hop Vietnam flood query), 'crash-test' (durability validation), or 'benchmark' (up to 5M stress test)")
+	scenario := flag.String("scenario", "analysis", "Scenario: 'analysis' (6-hop Vietnam flood query), 'crash-test' (selected restart checks), or 'benchmark' (up to 5M stress test)")
 	scale := flag.Int("scale", 100000, "Dataset scale for benchmark scenario (e.g. 100000, 1000000, 5000000)")
-	phase := flag.String("phase", "all", "For crash-test: 'populate', 'verify', or 'all' (auto wire durability verification)")
+	phase := flag.String("phase", "all", "For crash-test: 'populate', 'verify', or 'all' (session reconnect check; no restart)")
 	flag.Parse()
 	if *scenario == "benchmark" && (*scale < 50000 || *scale > 5000000) {
 		fmt.Fprintf(os.Stderr, "benchmark scale must be between 50,000 and 5,000,000 entities (got %d)\n", *scale)
@@ -290,17 +290,17 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 	// "Which products run out of stock within 30 days?"
 	fmt.Println(">>> [PHASE 5] Answering Business Question via Graph Scoring + In-Storage Math")
 	fmt.Println("    Question: \"If the factory in Vietnam floods, which products run out of stock within 30 days?\"")
-	fmt.Println("    Method: In-Storage Division (inventory_units / daily_burn_rate) on all Hop-6 reached SKUs.")
+	fmt.Println("    Method: In-Storage Division (inventory_units / daily_burn_rate) on all results returned for the full relation sequence.")
 	fmt.Println()
 
-	// Get full Hop-6 reached SKUs with their cumulative disruption probabilities
+	// Get all entities reached by the full relation sequence with their scores
 	skuResults, err := client.CausalChain(seed, relationsSequence, 50)
 	if err != nil {
 		fmt.Printf("FATAL: Failed to query Hop-6 causal chain: %v\n", err)
 		os.Exit(1)
 	}
 	if len(skuResults) == 0 {
-		fmt.Println("FATAL: Hop-6 causal chain returned no SKUs")
+		fmt.Println("FATAL: Hop-6 causal chain returned no entities")
 		os.Exit(1)
 	}
 
@@ -317,7 +317,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 			Compute("days_remaining", driver.Divide("inventory_units", "daily_burn_rate")).
 			Execute(ctx)
 		if err != nil {
-			fmt.Printf("Error evaluating SKU %s: %v\n", skuName, err)
+			fmt.Printf("Error evaluating entity %s: %v\n", skuName, err)
 			os.Exit(1)
 		}
 
@@ -352,7 +352,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 
 	// Print executive summary table
 	fmt.Println("┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────────┬──────────────────────────────────┐")
-	fmt.Println("│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status       │ Action Recommendation            │")
+	fmt.Println("│ Reached Entity Name       │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status       │ Action Recommendation            │")
 	fmt.Println("├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────────┼──────────────────────────────────┤")
 
 	for _, item := range analysisTable {
@@ -389,7 +389,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 	}
 
 	fmt.Println("==========================================================================================")
-	fmt.Printf(">>> ANALYSIS FINDINGS: Detected %d SKUs RUNNING OUT OF STOCK WITHIN 30 DAYS due to Vietnam flood!\n", criticalCount)
+	fmt.Printf(">>> ANALYSIS FINDINGS: Detected %d reached entities with stockout estimates within 30 days due to Vietnam flood!\n", criticalCount)
 	fmt.Println("==========================================================================================")
 	for idx, it := range analysisTable {
 		if it.StockoutIn30 {
@@ -405,7 +405,7 @@ func runSupplyChainAnalysis(serverURL, authToken, modelName string) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// SCENARIO 2: Crash Recovery & WAL Durability Test
+// SCENARIO 2: Selected Restart Checks
 // ------------------------------------------------------------------------------------------------
 
 func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
@@ -427,7 +427,7 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		client, cleanup := setupClient(serverURL, authToken, modelName)
 		defer cleanup()
 
-		fmt.Println("[STEP 1/3] Populating Schema, 6-Hop Links, and Sentinel Canary via AnchorWire...")
+		fmt.Println("[STEP 1/3] Populating Schema, Selected Entities, One Causal Link, and Sentinel Canary via AnchorWire...")
 		schema := driver.Schema{
 			"tier":            "int",
 			"inventory_units": "float",
@@ -437,6 +437,20 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		}
 		if err := client.Attach(schema); err != nil {
 			fmt.Printf("Attach error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := client.Save("factory_vietnam_bac_ninh", map[string]float32{
+			"tier": 0, "inventory_units": 100000, "daily_burn_rate": 500,
+			"lead_time_days": 14, "is_critical": 1,
+		}); err != nil {
+			fmt.Printf("Save factory node error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := client.Save("supplier_t1_soc_processor", map[string]float32{
+			"tier": 1, "inventory_units": 50000, "daily_burn_rate": 250,
+			"lead_time_days": 10, "is_critical": 1,
+		}); err != nil {
+			fmt.Printf("Save supplier node error: %v\n", err)
 			os.Exit(1)
 		}
 		if err := client.Save(canaryKey, canaryProps); err != nil {
@@ -451,13 +465,13 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 			fmt.Printf("Sync error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("    [✓] Data written and synced via AnchorWire. You may now stop/restart or kill the container manually.")
+		fmt.Println("    [✓] Selected sample data written and synced via AnchorWire. You may now stop and restart the container normally.")
 
 	case "verify":
 		client, cleanup := setupClient(serverURL, authToken, modelName)
 		defer cleanup()
 
-		fmt.Println("[STEP 2/3] Verifying Data & Graph Integrity Post-Crash via AnchorWire...")
+		fmt.Println("[STEP 2/3] Verifying Selected Data & Graph Integrity After Restart via AnchorWire...")
 		// 1. Schema must remain locked
 		sch, err := client.GetSchema(context.Background())
 		expectedSchema := driver.Schema{
@@ -487,11 +501,22 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		// 3. Multi-hop edge must be traversable
 		causalRes, err := client.Causal("factory_vietnam_bac_ninh", "supplies_t1", 5)
 		if err != nil || len(causalRes) == 0 {
-			fmt.Printf("FATAL: Causal edge lost after crash: %v\n", err)
+			fmt.Printf("FATAL: Expected causal edge missing after restart: %v\n", err)
+			os.Exit(1)
+		}
+		foundExpectedEdge := false
+		for _, result := range causalRes {
+			if result.Word == "supplier_t1_soc_processor" && result.Score == 0.96 {
+				foundExpectedEdge = true
+				break
+			}
+		}
+		if !foundExpectedEdge {
+			fmt.Println("FATAL: Expected supplier_t1_soc_processor edge and score were not found")
 			os.Exit(1)
 		}
 		fmt.Printf("    [✓] Causal graph verified: %s -> %s (Score: %.4f)\n",
-			"factory_vietnam_bac_ninh", causalRes[0].Word, causalRes[0].Score)
+			"factory_vietnam_bac_ninh", "supplier_t1_soc_processor", float32(0.96))
 
 		fmt.Println("\n==========================================================================================")
 		fmt.Println("    >>> POST-RESTART SAMPLE CHECKS PASSED (no full-dataset comparison performed)")
@@ -511,6 +536,22 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		if err := c1.Attach(schema); err != nil {
 			cleanup1()
 			fmt.Printf("Attach error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := c1.Save("factory_vietnam_bac_ninh", map[string]float32{
+			"tier": 0, "inventory_units": 100000, "daily_burn_rate": 500,
+			"lead_time_days": 14, "is_critical": 1,
+		}); err != nil {
+			cleanup1()
+			fmt.Printf("Save factory node error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := c1.Save("supplier_t1_soc_processor", map[string]float32{
+			"tier": 1, "inventory_units": 50000, "daily_burn_rate": 250,
+			"lead_time_days": 10, "is_critical": 1,
+		}); err != nil {
+			cleanup1()
+			fmt.Printf("Save supplier node error: %v\n", err)
 			os.Exit(1)
 		}
 		if err := c1.Save(canaryKey, canaryProps); err != nil {
@@ -560,6 +601,17 @@ func runCrashDurabilityTest(serverURL, authToken, modelName, phase string) {
 		graphRes, err := c2.Causal("factory_vietnam_bac_ninh", "supplies_t1", 5)
 		if err != nil || len(graphRes) == 0 {
 			fmt.Printf("FATAL: Graph edges lost: %v\n", err)
+			os.Exit(1)
+		}
+		foundExpectedEdge := false
+		for _, result := range graphRes {
+			if result.Word == "supplier_t1_soc_processor" && result.Score == float32(0.96) {
+				foundExpectedEdge = true
+				break
+			}
+		}
+		if !foundExpectedEdge {
+			fmt.Println("FATAL: Expected supplier_t1_soc_processor edge and score were not found after session reconnect")
 			os.Exit(1)
 		}
 
@@ -808,7 +860,11 @@ func setupClient(serverURL, authToken, modelName string) (*driver.Client, func()
 		fmt.Printf("FATAL: Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.\n", target, err)
 		os.Exit(1)
 	}
-	return client, func() { _ = client.Close() }
+	return client, func() {
+		if err := client.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "AnchorWire client close failed: %v\n", err)
+		}
+	}
 }
 
 func formatNumber(n int) string {

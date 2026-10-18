@@ -21,7 +21,7 @@ import (
 type BankAccountEntity struct {
 	AccountNumber   string
 	RiskScore       float32 // Continuous rating: 0.0 (safe) to 100.0 (high risk)
-	LastTxTimestamp float32 // Unix epoch seconds of last transaction
+	LastTxTimestamp float32 // Seconds since the sample epoch (float32 precision-safe)
 	DailyTxVolume   float32 // Cumulative transfer volume today in USD
 	IsBlacklisted   float32 // 1.0 = on financial crimes / mule watchlist, 0.0 = clean
 	KYCTier         float32 // 1: basic digital, 2: biometric verified, 3: enterprise KYC
@@ -75,7 +75,9 @@ func main() {
 	fmt.Printf("Logical CPUs:    %d cores\n", runtime.NumCPU())
 	fmt.Printf("Wire Server:     %s (Model: %s)\n", *wireURL, *modelName)
 	fmt.Printf("Target Scenario: %s\n", strings.ToUpper(*scenario))
-	fmt.Printf("Dataset Scale:   %s accounts (Minimum 1 Million)\n", formatNumber(*scale))
+	if *scenario == "all" || *scenario == "scale-benchmark" {
+		fmt.Printf("Configured Scale: %s accounts (used by scale-benchmark scenario)\n", formatNumber(*scale))
+	}
 	fmt.Println("------------------------------------------------------------------------------------------")
 	fmt.Println()
 
@@ -96,7 +98,7 @@ func main() {
 		fmt.Printf("FATAL: Failed to attach banking schema: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("    [✓] Schema permanently locked into model 'banking_fraud':")
+	fmt.Printf("    [✓] Schema attached and locked into model %q:\n", *modelName)
 	for k, v := range schema {
 		fmt.Printf("        - %-20s : %s\n", k, v)
 	}
@@ -135,34 +137,34 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) error {
 	fmt.Println("==========================================================================================")
 	fmt.Println(">>> [SCENARIO 1] Real-Time Multi-Hop Mule Account & Smurfing Layering Detection")
 	fmt.Println("    Goal: Trace stolen funds flowing across 5 hops from victim to offshore cashout.")
-	fmt.Println("    SLA Requirement: Pre-Authorization decision in < 1 millisecond (< 1,000 µs).")
+	fmt.Println("    Example target: Pre-Authorization decision in < 1 millisecond (< 1,000 µs).")
 	fmt.Println("==========================================================================================")
 
 	// Ingest representative network accounts
 	accounts := []BankAccountEntity{
 		// Compromised Victim Account (Hop 0)
-		{"acc_victim_retail_1092", 5.0, 1729170000.0, 15000.0, 0.0, 2.0},
+		{"acc_victim_retail_1092", 5.0, 0.0, 15000.0, 0.0, 2.0},
 
 		// Tier-1 Rapid Mule Relay (Hop 1)
-		{"acc_mule_t1_relay_alpha", 65.0, 1729170060.0, 14800.0, 0.0, 1.0},
-		{"acc_mule_t1_relay_beta", 60.0, 1729170075.0, 12000.0, 0.0, 1.0},
+		{"acc_mule_t1_relay_alpha", 65.0, 60.0, 14800.0, 0.0, 1.0},
+		{"acc_mule_t1_relay_beta", 60.0, 75.0, 12000.0, 0.0, 1.0},
 
 		// Tier-2 Aggregation Accounts (Hop 2)
-		{"acc_mule_t2_aggregator_east", 78.0, 1729170120.0, 45000.0, 0.0, 1.0},
-		{"acc_mule_t2_aggregator_west", 72.0, 1729170150.0, 38000.0, 0.0, 1.0},
+		{"acc_mule_t2_aggregator_east", 78.0, 120.0, 45000.0, 0.0, 1.0},
+		{"acc_mule_t2_aggregator_west", 72.0, 150.0, 38000.0, 0.0, 1.0},
 
 		// Tier-3 Structured Smurfing Nodes (Hop 3)
-		{"acc_mule_t3_smurf_node_01", 85.0, 1729170200.0, 9500.0, 0.0, 1.0},
-		{"acc_mule_t3_smurf_node_02", 82.0, 1729170210.0, 9200.0, 0.0, 1.0},
-		{"acc_mule_t3_smurf_node_03", 80.0, 1729170220.0, 8900.0, 0.0, 1.0},
+		{"acc_mule_t3_smurf_node_01", 85.0, 200.0, 9500.0, 0.0, 1.0},
+		{"acc_mule_t3_smurf_node_02", 82.0, 210.0, 9200.0, 0.0, 1.0},
+		{"acc_mule_t3_smurf_node_03", 80.0, 220.0, 8900.0, 0.0, 1.0},
 
 		// Tier-4 P2P Crypto Exchange Escrow Mules (Hop 4)
-		{"acc_mule_t4_p2p_escrow_a", 92.0, 1729170300.0, 85000.0, 0.0, 1.0},
-		{"acc_mule_t4_p2p_escrow_b", 89.0, 1729170320.0, 62000.0, 0.0, 1.0},
+		{"acc_mule_t4_p2p_escrow_a", 92.0, 300.0, 85000.0, 0.0, 1.0},
+		{"acc_mule_t4_p2p_escrow_b", 89.0, 320.0, 62000.0, 0.0, 1.0},
 
 		// Tier-5 Blacklisted Cash-Out Destination (Hop 5)
-		{"acc_offshore_crypto_drain", 99.5, 1729170400.0, 500000.0, 1.0, 1.0}, // BLACKLISTED
-		{"acc_legitimate_merchant_safe", 2.0, 1729170450.0, 4200.0, 0.0, 3.0}, // Clean merchant
+		{"acc_offshore_crypto_drain", 99.5, 400.0, 500000.0, 1.0, 1.0}, // BLACKLISTED
+		{"acc_legitimate_merchant_safe", 2.0, 450.0, 4200.0, 0.0, 3.0}, // Clean merchant
 	}
 
 	for _, acc := range accounts {
@@ -301,7 +303,7 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) error {
 func runImpossibleTravelScenario(ctx context.Context, client *driver.Client) error {
 	fmt.Println("==========================================================================================")
 	fmt.Println(">>> [SCENARIO 2] Impossible Travel & Geolocation Anomaly Detection (ATM / POS Fraud)")
-	fmt.Println("    Method: 2D Spatial Index Euclidean Distance / In-Storage Physical Velocity Check.")
+	fmt.Println("    Method: 2D spatial lookup plus great-circle distance estimate.")
 	fmt.Println("==========================================================================================")
 
 	// ATM / POS Terminal Coordinates in Indonesia (X: Longitude, Y: Latitude)
@@ -554,7 +556,11 @@ func setupClient(serverURL, authToken, modelName string) (*driver.Client, func()
 		fmt.Printf("FATAL: Failed to connect to AnchorWire server (%s): %v\nMake sure AnchorDB is running with AnchorWire listening on port 7448.\n", target, err)
 		os.Exit(1)
 	}
-	return client, func() { _ = client.Close() }
+	return client, func() {
+		if err := client.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "AnchorWire client close failed: %v\n", err)
+		}
+	}
 }
 
 func formatNumber(n int) string {

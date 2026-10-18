@@ -89,6 +89,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Query failed: %v", err)
 	}
+	if len(resp.Results) == 0 {
+		log.Fatal("spatial graph query returned no candidates")
+	}
 
 	fmt.Printf("Barycenter Anchor Point: (%.2f, %.2f)\n", resp.Anchor.X, resp.Anchor.Y)
 	fmt.Printf("Internal DB Computation Time: %v\n", qDuration)
@@ -130,6 +133,9 @@ func main() {
 	nearest, err := mathEng.Nearest("primary_cluster", 3)
 	if err != nil {
 		log.Fatalf("nearest-neighbor query failed: %v", err)
+	}
+	if len(nearest) == 0 {
+		log.Fatal("nearest-neighbor query returned no nodes")
 	}
 	fmt.Println("4. Nearest Spatial Neighbors of 'primary_cluster':")
 	for i, n := range nearest {

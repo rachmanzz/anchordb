@@ -148,8 +148,10 @@ func main() {
 
 	// Verify Schema Enforcement: attempt invalid write
 	invalidProps := map[string]float32{
-		"severity":   2.5, // Invalid: int schema rejects non-integer!
-		"impact_usd": 100.0,
+		"severity":    2.5, // Invalid: int schema rejects non-integer!
+		"impact_usd":  100.0,
+		"latency_ms":  10.0,
+		"is_critical": 1.0,
 	}
 	if err := client.Save("invalid_test_node", invalidProps); err != nil {
 		fmt.Printf("    ✓ Schema Guard Check Passed: Rejection of invalid int property: %v\n\n", err)
@@ -340,6 +342,10 @@ func main() {
 			fmt.Printf("    Error getting %s: %v\n", name, err)
 			os.Exit(1)
 		}
+		if rec.Name != name || rec.Get("severity") == 0 || rec.Get("impact_usd") == 0 {
+			fmt.Printf("    Get(%s) returned incomplete entity data\n", name)
+			os.Exit(1)
+		}
 		fmt.Printf("    %-28s | %-8.0f | $%-11.2f | %-12.1f | %-11.0f\n",
 			rec.Name,
 			rec.Get("severity"),
@@ -363,6 +369,16 @@ func main() {
 	if err != nil {
 		fmt.Printf("    List query error: %v\n", err)
 		os.Exit(1)
+	}
+	if len(listRes.Items) == 0 {
+		fmt.Println("    List query returned no entities")
+		os.Exit(1)
+	}
+	for _, item := range listRes.Items {
+		if item.Get("severity") < 4 || item.Get("risk_index") != item.Get("impact_usd")*item.Get("severity") {
+			fmt.Printf("    List query returned invalid risk_index for %s\n", item.Name)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Printf("    Matching Entities Count: %d (HasMore: %v)\n\n", len(listRes.Items), listRes.HasMore)

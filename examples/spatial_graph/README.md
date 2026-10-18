@@ -18,8 +18,10 @@ This example demonstrates AnchorDB's **2D Spatial Indexing, Vector Ray-Casting (
 
 Ensure the AnchorDB server is running with AnchorWire listening on port `7448`:
 
+If authentication is enabled, set `ANCHORDB_AUTH_TOKEN` to the same token configured on the server before running the command.
+
 ```bash
-go run ./examples/spatial_graph -url=wire://localhost:7448
+go run ./examples/spatial_graph -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN"
 ```
 
 ---
@@ -58,7 +60,7 @@ Saved: distance=120 km, duration=2 hours
 Calculated Speed (distance / duration): 60.0 km/h
 ```
 
-> **Note**: Connection and computation timings depend on host hardware and OS cache state. All scores, distances, and centroids are deterministic and reproducible.
+> **Note**: Connection and computation timings depend on host hardware and OS cache state. Scores, distances, centroids, and result sets above are from one observed run and may vary with server state and existing model data.
 
 ### How Candidates Are Scored
 

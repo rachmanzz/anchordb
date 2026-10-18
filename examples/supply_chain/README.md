@@ -19,7 +19,7 @@ Real-world implementation case study of AnchorDB for **multi-tier supply chain d
 
 In conventional database architectures (Relational SQL or Document/Key-Value stores), answering this question requires recursive multi-table queries (6-level nested joins) that suffer from high latency and lock contention, or slow overnight ETL jobs.
 
-AnchorDB solves this query in **microseconds** directly in-memory and zero-copy.
+The example evaluates this query using AnchorWire graph traversal and entity lookups; actual latency depends on the server and dataset.
 
 ---
 
@@ -85,7 +85,7 @@ If $\text{Days to Stockout} \le 30.0$, the engine triggers an **ALERT (<30 Days)
 
 ```
 examples/supply_chain/
-├── main.go               # Complete Go program (Embedded & Remote modes, 6-Hop Causal Graph, 30-Day Math, Crash-Test, 5M-Entity Benchmark)
+├── main.go               # AnchorWire program (6-hop causal graph, 30-day math, selected restart checks, 5M-entity benchmark)
 ├── docker-compose.yml    # Container service definition with persistent volume & WAL sync
 └── README.md             # Complete technical guide & operational instructions (this file)
 ```
@@ -96,55 +96,16 @@ examples/supply_chain/
 
 AnchorDB communicates via the high-performance **AnchorWire Binary TCP Protocol** (default port `7448`):
 
+Set `ANCHORDB_AUTH_TOKEN` to the server token before starting the server or running the client commands.
+
 ```bash
 # Run realistic Vietnam flood disruption analysis via AnchorWire TCP
-go run ./examples/supply_chain/main.go -url=wire://localhost:7448 -scenario=analysis
+go run ./examples/supply_chain/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -model=supply_chain_readme -scenario=analysis
 ```
 
-#### Real Execution Output:
-```text
->>> [PHASE 4] Executing Multi-Hop Causal Disruption Traversal (Hop 1 to Hop 6)
-    ▶ Hop 1 (supplies_t1) -> Reached 4 downstream targets [Latency: 45.2µs]
-    ▶ Hop 2 (supplies_t1 → subassembles) -> Reached 3 downstream targets [Latency: 2.2µs]
-    ▶ Hop 3 (supplies_t1 → subassembles → fabricates) -> Reached 3 downstream targets [Latency: 2.2µs]
-    ▶ Hop 4 (supplies_t1 → ... → transports) -> Reached 3 downstream targets [Latency: 13.5µs]
-    ▶ Hop 5 (supplies_t1 → ... → distributes) -> Reached 5 downstream targets [Latency: 3.6µs]
-    ▶ Hop 6 (supplies_t1 → ... → stocks_sku) -> Reached 6 downstream targets [Latency: 11.6µs]
+#### Observed Sample Output
 
-┌───────────────────────────┬──────────────┬────────────┬──────────────┬─────────────┬──────────────┬──────────────────────────────────┐
-│ Product SKU Name          │ Current Stock│ Burn Rate  │ Days to Empty│ Prob. Impact│ Status       │ Action Recommendation            │
-├───────────────────────────┼──────────────┼────────────┼──────────────┼─────────────┼──────────────┼──────────────────────────────────┤
-│ sku_ultrabook_pro_16in    │        150 u │     12.0/d │       12.5 d │       76.6% │ ALERT (<30d) │ EMERGENCY: Reroute air freight   │
-│ sku_smartphone_pro_1tb    │        240 u │     14.0/d │       17.1 d │       79.0% │ ALERT (<30d) │ EMERGENCY: Reroute air freight   │
-│ sku_smartwatch_fit_band   │        190 u │      9.0/d │       21.1 d │       71.1% │ ALERT (<30d) │ Allocate backup warehouse stock  │
-│ sku_smartphone_base_128gb │        520 u │     20.0/d │       26.0 d │       75.0% │ ALERT (<30d) │ Allocate backup warehouse stock  │
-│ sku_tablet_air_11in       │        480 u │     10.0/d │       48.0 d │       72.6% │ SAFE (>30d)  │ Monitor normal replenishment     │
-│ sku_smartwatch_ultra_49mm │        650 u │     11.0/d │       59.1 d │       70.3% │ SAFE (>30d)  │ Monitor normal replenishment     │
-└───────────────────────────┴──────────────┴────────────┴──────────────┴─────────────┴──────────────┴──────────────────────────────────┘
-
->>> ANALYSIS FINDINGS: Detected 4 SKUs RUNNING OUT OF STOCK WITHIN 30 DAYS due to Vietnam flood!
- [1] sku_ultrabook_pro_16in:
-     - Days of Stock Remaining: 12.5 DAYS (Stock: 150 units, Burn Rate: 12.0 units/day)
-     - Supply Chain Disruption Probability: 76.63%
-     - Component Criticality: SINGLE SOURCE BOTTLENECK (Composite Risk Score: 8.51)
-
- [2] sku_smartphone_pro_1tb:
-     - Days of Stock Remaining: 17.1 DAYS (Stock: 240 units, Burn Rate: 14.0 units/day)
-     - Supply Chain Disruption Probability: 79.05%
-     - Component Criticality: SINGLE SOURCE BOTTLENECK (Composite Risk Score: 6.54)
-
- [3] sku_smartwatch_fit_band:
-     - Days of Stock Remaining: 21.1 DAYS (Stock: 190 units, Burn Rate: 9.0 units/day)
-     - Supply Chain Disruption Probability: 71.11%
-     - Component Criticality: DUAL SOURCE (Composite Risk Score: 3.22)
-
- [4] sku_smartphone_base_128gb:
-     - Days of Stock Remaining: 26.0 DAYS (Stock: 520 units, Burn Rate: 20.0 units/day)
-     - Supply Chain Disruption Probability: 74.99%
-     - Component Criticality: DUAL SOURCE (Composite Risk Score: 2.78)
-```
-
-> Disruption probabilities and days-to-stockout are deterministic. Latency figures are indicative only; the Hop 1 value includes first-call warm-up (JIT, mmap page-in) and drops into single-digit microseconds on subsequent runs.
+On a fresh model (`-model=supply_chain_readme`), the run reached 4, 7, 10, 13, 18, then 24 entities across the six traversal depths, and reported 22 reached entities with stockout estimates within 30 days. Because each depth reuses the complete relation sequence, results accumulate entities from earlier hops; the final analysis is not limited to product SKUs. Use a fresh model to reproduce these counts; timings and data-dependent results may vary by server version or pre-existing data and are not performance guarantees.
 
 ---
 
@@ -172,7 +133,7 @@ podman run -d \
   -e ANCHORDB_DATA_DIR=/data \
   -e ANCHORDB_AUTH_TOKEN="$ANCHORDB_AUTH_TOKEN" \
   -e ANCHORDB_WAL_SYNC=always \
-  anchordb:latest
+  localhost/anchordb:latest
 ```
 
 #### Step 2: Execute Supply Chain Analysis via AnchorWire
@@ -185,9 +146,9 @@ go run ./examples/supply_chain/main.go \
 
 ---
 
-## 8. Crash Recovery & WAL Durability Scenario
+## 8. Sample Data Checks and Container Restart
 
-AnchorDB utilizes a **Write-Ahead Log (WAL)** with CRC32 frame checksums and strict fsync commit semantics.
+AnchorDB utilizes a **Write-Ahead Log (WAL)**; the restart check below verifies selected example records only.
 
 ### Automated AnchorWire Session Reconnect Check (no server restart):
 ```bash
@@ -202,8 +163,8 @@ Note: `-phase=all` may replace the canary value and should be run against a dedi
 
 1. **Populate initial graph & data in container via AnchorWire**:
    ```bash
-   go run ./examples/supply_chain/main.go \
-     -url=wire://localhost:7448 \
+    go run ./examples/supply_chain/main.go \
+      -url=wire://localhost:7448 \
       -token="$ANCHORDB_AUTH_TOKEN" \
      -scenario=crash-test \
      -phase=populate
@@ -223,17 +184,17 @@ Note: `-phase=all` may replace the canary value and should be run against a dedi
 
 4. **Verify selected data and graph reachability after restart**:
    ```bash
-   go run ./examples/supply_chain/main.go \
+    go run ./examples/supply_chain/main.go \
       -url=wire://localhost:7448 \
       -token="$ANCHORDB_AUTH_TOKEN" \
-     -scenario=crash-test \
-     -phase=verify
+      -scenario=crash-test \
+      -phase=verify
    ```
 
 This checks that the expected schema fields exist, the canary value matches, and the selected causal edge is traversable. It does not compare the full dataset or establish zero data loss.
 ```text
-[STEP 2/3] Verifying Data & Graph Integrity Post-Crash...
-    [✓] Schema survived crash: 5 fields locked
+[STEP 2/3] Verifying Selected Data & Graph Integrity After Restart...
+    [✓] Expected schema fields present: 5
     [✓] Canary record verified intact: inventory_units = 999999
     [✓] Causal graph verified: factory_vietnam_bac_ninh -> supplier_t1_soc_processor (Score: 0.9600)
 
@@ -246,28 +207,21 @@ This checks that the expected schema fields exist, the canary value matches, and
 
 ## 9. Large-Scale Stress Testing (Up to 5 Million Entities)
 
-To validate AnchorDB under massive enterprise supply chain topologies (e.g., 100,000 to 5,000,000 global parts and SKUs), the `benchmark` scenario ingests `-scale` entities into the model.
+To exercise the example under larger supply-chain datasets (50,000 to 5,000,000 entities), the `benchmark` scenario ingests `-scale` entities into the model.
 
-> **Scale Boundary**: Only **entities** scale with `-scale`. The benchmark graph always links a fixed **50,000** causal edges, independent of `-scale`. The scale must therefore be between **50,000 and 5,000,000**. The "5 million" figure refers to entities, not edges.
+> **Scale Boundary**: Only **entities** scale with `-scale`. The benchmark graph always links a fixed **50,000** causal edges, independent of `-scale`. The scale must therefore be between **50,000 and 5,000,000**. The "5 million" figure refers to entities, not edges. The 5-million command can consume substantial disk and memory; use a dedicated model and sufficient free space.
 
 ### Run 100,000 Entity Benchmark:
 ```bash
-go run ./examples/supply_chain/main.go -scenario=benchmark -scale=100000
+go run ./examples/supply_chain/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=benchmark -scale=100000
 ```
-- **Entities Ingested**: 100,000 in ~0.57s (**~174,000 writes/sec**)
-- **Causal Edges**: 50,000 (fixed) in ~0.36s (**~137,000 edges/sec**)
-- **Multi-Hop Query Latency**: ~237 microseconds
+The example reports actual elapsed time, throughput, and query results for the current run.
 
 ### Run Full 5,000,000 Entity Stress Test:
 ```bash
-go run ./examples/supply_chain/main.go -scenario=benchmark -scale=5000000
+go run ./examples/supply_chain/main.go -url=wire://localhost:7448 -token="$ANCHORDB_AUTH_TOKEN" -scenario=benchmark -scale=5000000
 ```
-Measured on an 8-logical-core host in embedded mode:
-- **Entities Ingested**: 5,000,000 in ~34s (**~147,000 writes/sec**)
-- **Causal Edges**: 50,000 (fixed) in ~0.39s (~128,000 edges/sec)
-- **Multi-Hop Query Latency**: ~232 microseconds/query (~4,300 queries/sec)
-- **Point Compute Latency**: ~11 microseconds
-- **Storage (WAL)**: ~586 MB
+The example reports actual elapsed time, throughput, and query results for the current run. Both commands require AnchorWire at `wire://localhost:7448`; run them from the repository root and include `-token="$ANCHORDB_AUTH_TOKEN"` when authentication is enabled.
 
 > **Memory Architecture Note**:
-> AnchorDB uses zero-copy memory mapping (`mmap`). The streaming ingestion pipeline operates in concurrent batches without allocating millions of heap objects into the Go runtime garbage collector, preserving stable RAM usage and eliminating GC pause spikes.
+> This example uses the AnchorWire client and concurrent individual writes. It does not establish zero-copy ingestion or a bounded-memory/GC guarantee.

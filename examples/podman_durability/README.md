@@ -1,6 +1,6 @@
 # Example: Podman Container Restart Checks
 
-This example demonstrates how to check selected AnchorDB data after a normal Podman container stop and restart, using a host-mounted storage volume. It does not by itself prove zero data loss for the complete database.
+This example demonstrates how to check selected AnchorDB data after a normal Podman container stop and restart, using a host-mounted storage volume. It does not by itself prove zero data loss for the complete database. The shown container command requires the host data directory to be writable by the image's `anchordb` user; `chmod -R 777` is a permissive local-demo workaround, not a production permission recommendation.
 
 It checks that:
 1. The expected schema fields are returned after restart.
@@ -33,22 +33,22 @@ It checks that:
 |  2. Ingest 28 Nodes               ---> Appended to WAL & mapped into RAM          |
 |  3. Link 35 Directed Edges        ---> Appended to WAL & Adjacency Index          |
 |  4. Run 1-5 Hop Causal Traversal  ---> Verified Pre-Shutdown                      |
-|  5. Flush Memory Sync             ---> Atomic msync(MS_SYNC) via /v1/sync         |
+|  5. Flush Memory Sync             ---> Request server sync before shutdown       |
 +-----------------------------------------------------------------------------------+
                                         |
                            podman stop anchordb-podman-test
                             (Normal container shutdown; TCP stops)
                                         |
                            podman start anchordb-podman-test
-                       (Engine Boots - Storage & WAL Replayed)
+                         (Server starts with persisted storage)
                                         |
                                         v
 +-----------------------------------------------------------------------------------+
 |  [PHASE 2: VERIFY]                                                                |
-|  1. Query Schema Contract         ---> Matches locked schema identically          |
-|  2. Run 1-5 Hop Traversal         ---> All 35 edges restored, scores match 100%   |
+|  1. Query Schema Contract         ---> Matches expected schema fields            |
+|  2. Run 1-5 Hop Traversal         ---> Example paths remain traversable          |
 |  3. Resolve Points via Get()      ---> All node attributes present and typed      |
-|  4. In-Storage Compute via List() ---> Arithmetic risk index matches pre-shutdown |
+|  4. In-Storage Compute via List() ---> Computed values checked for consistency   |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -60,9 +60,9 @@ It checks that:
    ```bash
    podman --version
    ```
-2. **Build Local Container Image**:
+2. **Use the existing local image** `localhost/anchordb:latest`, or build it from the repository root if needed:
    ```bash
-   podman build -t localhost/anchordb:latest .
+   podman build -t localhost/anchordb:latest -f Dockerfile .
    ```
 
 ---
@@ -110,15 +110,16 @@ go run ./examples/podman_durability -phase=populate -url=wire://localhost:7448 -
 
     --- Initial Traversal Verification (Pre-Shutdown) ---
     Hop 1 (triggers) -> Reached 4 nodes | Top: ups_alpha_failure          (Score: 0.9500)
-    Hop 2 (propagates) -> Reached 5 nodes | Top: rack_alpha_blackout        (Score: 0.9025)
-    Hop 3 (degrades) -> Reached 5 nodes | Top: db_primary_crash           (Score: 0.8574)
-    Hop 4 (disrupts) -> Reached 5 nodes | Top: checkout_api_down          (Score: 0.8402)
-    Hop 5 (escalates) -> Reached 4 nodes | Top: direct_revenue_loss        (Score: 0.7982)
+     Hop 2 (propagates) -> Reached 9 nodes | Top: ups_alpha_failure          (Score: 0.9500)
+     Hop 3 (degrades) -> Reached 14 nodes | Top: ups_alpha_failure          (Score: 0.9500)
+     Hop 4 (disrupts) -> Reached 19 nodes | Top: ups_alpha_failure          (Score: 0.9500)
+     Hop 5 (escalates) -> Reached 23 nodes | Top: ups_alpha_failure          (Score: 0.9500)
 ```
 
-Flush disk sync to ensure zero unflushed dirty pages:
+Request a server sync before stopping the container:
 ```bash
-curl -s http://localhost:7447/v1/sync
+curl -fsS -X POST -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  "http://localhost:7447/v1/sync?model=infra_causal"
 ```
 
 Inspect the host storage files:
@@ -131,7 +132,7 @@ ls -la ./podman_test_data
 
 ---
 
-### Step 3: Stop the Container (Simulate Power Off / Outage)
+### Step 3: Stop the Container Normally
 
 ```bash
 podman stop anchordb-podman-test
@@ -144,7 +145,7 @@ curl -s http://localhost:7447/health || echo "Server is DOWN"
 
 ---
 
-### Step 4: Restart the Container (Crash Recovery Boot)
+### Step 4: Restart the Container
 
 ```bash
 podman start anchordb-podman-test
@@ -183,32 +184,33 @@ go run ./examples/podman_durability -phase=verify -url=wire://localhost:7448 -to
        [3] hvac_cooling_shutdown        (Score: 0.8500)
        [4] aux_bus_overload             (Score: 0.8000)
 
-    ▶ Hop 2 (propagates) -> 5 nodes reached. Top Target: rack_alpha_blackout        | Score: 0.9025
-       [1] rack_alpha_blackout          (Score: 0.9025)
-       [2] rack_beta_blackout           (Score: 0.8100)
-       [3] spine_switch_restart         (Score: 0.8075)
-       [4] san_storage_bus_fault        (Score: 0.7650)
-       [5] thermal_throttling_core      (Score: 0.7650)
+    ▶ Hop 2 (propagates) -> 9 nodes reached. Top Target: ups_alpha_failure          | Score: 0.9500
+       [1] ups_alpha_failure            (Score: 0.9500)
+       [2] ups_beta_failure             (Score: 0.9000)
+       [3] hvac_cooling_shutdown        (Score: 0.8500)
+       [4] aux_bus_overload             (Score: 0.8000)
+       [5] rack_alpha_blackout          (Score: 0.9500)
 
-    ▶ Hop 3 (degrades  ) -> 5 nodes reached. Top Target: db_primary_crash           | Score: 0.8574
-       [1] db_primary_crash             (Score: 0.8574)
-       [2] kafka_broker_loss            (Score: 0.8122)
-       [3] ingress_api_timeout          (Score: 0.7429)
-       [4] db_replica_desync            (Score: 0.7290)
-       [5] san_io_lockup                (Score: 0.7267)
+      ▶ Hop 3 (degrades  ) -> 14 nodes reached. Top Target: ups_alpha_failure          | Score: 0.9500
+       [1] ups_alpha_failure            (Score: 0.9500)
+       [2] ups_beta_failure             (Score: 0.9000)
+       [3] hvac_cooling_shutdown        (Score: 0.8500)
+       [4] aux_bus_overload             (Score: 0.8000)
+       [5] rack_alpha_blackout          (Score: 0.9500)
 
-    ▶ Hop 4 (disrupts  ) -> 5 nodes reached. Top Target: checkout_api_down          | Score: 0.8402
-       [1] checkout_api_down            (Score: 0.8402)
-       [2] payment_gateway_v2_fail      (Score: 0.8145)
-       [3] inventory_sync_hang          (Score: 0.7310)
-       [4] streaming_telemetry_loss     (Score: 0.6904)
-       [5] auth_session_invalidation    (Score: 0.6196)
+      ▶ Hop 4 (disrupts  ) -> 19 nodes reached. Top Target: ups_alpha_failure          | Score: 0.9500
+       [1] ups_alpha_failure            (Score: 0.9500)
+       [2] ups_beta_failure             (Score: 0.9000)
+       [3] hvac_cooling_shutdown        (Score: 0.8500)
+       [4] aux_bus_overload             (Score: 0.8000)
+       [5] rack_alpha_blackout          (Score: 0.9500)
 
-    ▶ Hop 5 (escalates ) -> 4 nodes reached. Top Target: direct_revenue_loss        | Score: 0.7982
-       [1] direct_revenue_loss          (Score: 0.7982)
-       [2] sla_penalty_breach           (Score: 0.7738)
-       [3] customer_churn_escalation    (Score: 0.7562)
-       [4] regulatory_audit_alert       (Score: 0.7331)
+      ▶ Hop 5 (escalates ) -> 23 nodes reached. Top Target: ups_alpha_failure          | Score: 0.9500
+       [1] ups_alpha_failure            (Score: 0.9500)
+       [2] ups_beta_failure             (Score: 0.9000)
+       [3] hvac_cooling_shutdown        (Score: 0.8500)
+       [4] aux_bus_overload             (Score: 0.8000)
+       [5] rack_alpha_blackout          (Score: 0.9500)
 
     --- [B] Schema-Enforced GET Resolution on Top Discovered Nodes ---
     Entity Name                  | Severity | Impact (USD) | Latency (ms) | Is Critical
