@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestIPFilter_ExactIP_CIDR_And_Range(t *testing.T) {
@@ -188,5 +189,47 @@ func TestIPFilter_LiteralQuotesHandledGracefully(t *testing.T) {
 	}
 	if !f2.IsAllowed(net.ParseIP("127.0.0.1")) {
 		t.Errorf("expected 127.0.0.1 allowed in f2")
+	}
+}
+
+func TestIPFilter_WrapListener(t *testing.T) {
+	filter, err := NewIPFilter("127.0.0.1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	filtered := filter.WrapListener(l)
+	addr := l.Addr().String()
+
+	accepted := make(chan bool, 1)
+	go func() {
+		conn, aErr := filtered.Accept()
+		if aErr == nil {
+			_ = conn.Close()
+			accepted <- true
+		} else {
+			accepted <- false
+		}
+	}()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	select {
+	case ok := <-accepted:
+		if !ok {
+			t.Fatal("expected connection to be accepted from 127.0.0.1")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for accept")
 	}
 }

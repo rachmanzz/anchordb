@@ -131,6 +131,7 @@ docker pull ghcr.io/rachmanzz/anchordb:v0.1.0
 ```bash
 docker run -d \
   --name anchordb \
+  -p 7447:7447 \
   -p 7448:7448 \
   -v ./anchordb_data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="your-strong-secret-token" \
@@ -139,7 +140,7 @@ docker run -d \
   ghcr.io/rachmanzz/anchordb:latest
 ```
 
-*(Note: For Podman, replace `docker` with `podman`.)*
+*(Note: Port `7447` serves HTTP REST, health probes, and partition administration; port `7448` serves high-throughput AnchorWire TCP. For Podman, replace `docker` with `podman`.)*
 
 ### Running with Docker Compose
 
@@ -152,6 +153,7 @@ services:
     container_name: anchordb
     restart: unless-stopped
     ports:
+      - "7447:7447"
       - "7448:7448"
     environment:
       - ANCHORDB_PORT=7447
@@ -193,9 +195,14 @@ docker compose up -d
 | `ANCHORDB_PARTITION_SCHEDULE` | `"23:00"` | Daily wall-clock time for automated cold partition rollover |
 | `ANCHORDB_PARTITION_RETENTION_DAYS` | `180` | Retention days before archiving cold records |
 | `ANCHORDB_SYNC_INTERVAL` | `"5m"` | Automated periodic background disk sync interval |
+| `ANCHORDB_IP_WHITELIST` | `""` | Comma-separated IP/CIDR/range whitelist enforced across HTTP and AnchorWire TCP |
+| `ANCHORDB_TRUST_PROXY` | `false` | Accept client IP from trusted reverse proxy forwarding headers |
 | `ANCHORDB_WORKER_ENABLED` | `true` | Enables asynchronous task worker pool |
 | `ANCHORDB_WORKER_CONCURRENCY` | `runtime.NumCPU()` | Number of parallel worker goroutines |
 | `ANCHORDB_WORKER_QUEUE_SIZE` | `1000` | Bounded memory task queue capacity before backpressure |
+
+> [!WARNING]
+> **Network Security for AnchorWire**: Port `7448` communicates over raw TCP without built-in TLS encryption to maximize streaming throughput. Always isolate AnchorWire traffic within a private subnet, container network, or VPN (WireGuard/Tailscale), or terminate TLS using a reverse proxy (Envoy, HAProxy, NGINX stream, or stunnel) before routing traffic across public or untrusted networks.
 
 ---
 

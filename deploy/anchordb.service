@@ -13,11 +13,12 @@ RestartSec=5
 
 # Core Server Configuration
 Environment=ANCHORDB_PORT=7447
+Environment=ANCHORDB_WIRE_PORT=7448
 Environment=ANCHORDB_DATA_DIR=/var/lib/anchordb
-# Loopback-only whitelist below, so auth is intentionally disabled for local access.
-# For network exposure set ANCHORDB_AUTH_TOKEN and remove ANCHORDB_ALLOW_INSECURE.
-Environment=ANCHORDB_AUTH_TOKEN=
-Environment=ANCHORDB_ALLOW_INSECURE=true
+# Authentication is enforced by default. Set a secure secret token (e.g. `openssl rand -hex 32`).
+# For local-only development without a token, ANCHORDB_ALLOW_INSECURE can be set to true.
+Environment=ANCHORDB_AUTH_TOKEN=change-me-to-a-secure-random-token
+Environment=ANCHORDB_ALLOW_INSECURE=false
 Environment=ANCHORDB_MEMORY_LIMIT=800MB
 Environment=ANCHORDB_IP_WHITELIST=127.0.0.1,::1
 Environment=ANCHORDB_TRUST_PROXY=false

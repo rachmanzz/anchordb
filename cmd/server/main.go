@@ -2588,10 +2588,16 @@ func main() {
 	}
 
 	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
-		wireAddr := ":" + wirePortStr
+		wireAddr := wirePortStr
+		if !strings.Contains(wireAddr, ":") {
+			wireAddr = ":" + wireAddr
+		}
 		wireListener, wErr := net.Listen("tcp", wireAddr)
 		if wErr != nil {
 			log.Fatalf("[FATAL] Failed to bind AnchorWire TCP port %s: %v", wirePortStr, wErr)
+		}
+		if server.ipFilter != nil && !server.ipFilter.IsEmpty() {
+			wireListener = server.ipFilter.WrapListener(wireListener)
 		}
 		go func() {
 			log.Printf("[READY] AnchorWire TCP Binary Protocol listening on %s ...", wireAddr)

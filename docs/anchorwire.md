@@ -11,10 +11,11 @@ export ANCHORDB_AUTH_TOKEN="your-strong-secret-token"
 go run ./cmd/server -data-dir ./data -wire-port 7448
 ```
 
-For a container, publish the Wire port and pass the same token:
+For a container, publish both HTTP and AnchorWire ports and pass the same token:
 
 ```bash
 docker run -d --name anchordb \
+  -p 7447:7447 \
   -p 7448:7448 \
   -v ./data:/data:Z \
   -e ANCHORDB_AUTH_TOKEN="$ANCHORDB_AUTH_TOKEN" \
@@ -22,7 +23,7 @@ docker run -d --name anchordb \
   ghcr.io/rachmanzz/anchordb:latest
 ```
 
-The server also starts its HTTP listener; applications in this guide connect through AnchorWire. The Wire listener can be changed with `-wire-port` or `ANCHORDB_WIRE_PORT`.
+The server listens for REST administration on port `7447` and AnchorWire TCP clients on port `7448`. The Wire listener can be changed with `-wire-port` or `ANCHORDB_WIRE_PORT`.
 
 ## Connect, attach a schema, save, and query
 
@@ -83,3 +84,16 @@ AnchorWire supports record saves and batches, `Get`/`List`/`Update` builders, gr
 ## Operations that still use HTTP
 
 The Go driver's AnchorWire backend does not implement partition listing or inspection. Use the authenticated HTTP partition endpoints in the [REST reference](rest_api.md) for those operations. Server health, metrics, scheduler/worker administration, and starting partition or collector jobs are also HTTP endpoints. Keep application record, query, schema, and graph traffic on AnchorWire; use HTTP for these server operations when needed.
+
+## Security & Network Isolation
+
+AnchorWire communicates over raw TCP without built-in TLS to maximize data streaming throughput and avoid encryption overhead during local and cluster computation. The authentication token is transmitted as a binary payload during connection establishment (`OpAuth`).
+
+> [!WARNING]
+> **Do not expose unencrypted AnchorWire port 7448 directly to public or untrusted networks.**
+> Because tokens and records transit unencrypted, any eavesdropper on an untrusted path could capture authentication credentials and database mutations.
+
+### Recommended Deployment Practices:
+1. **Private Network / VPC**: AnchorWire should always run inside a private subnet, localhost, container network, or encrypted overlay network (e.g. WireGuard, Tailscale, IPSec).
+2. **IP Whitelisting**: Set `ANCHORDB_IP_WHITELIST` on the server so unauthorized client IP addresses are dropped immediately at the TCP layer.
+3. **TLS Termination Proxy**: When client traffic must cross untrusted public networks, place a TLS-terminating reverse proxy (such as Envoy, HAProxy, NGINX stream, or stunnel) in front of port `7448`.

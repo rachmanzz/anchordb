@@ -270,3 +270,36 @@ func ipToUint32(ip net.IP) uint32 {
 	}
 	return binary.BigEndian.Uint32(v4)
 }
+
+// FilteredListener wraps a net.Listener to enforce IP filtering on accepted TCP connections.
+type FilteredListener struct {
+	net.Listener
+	filter *IPFilter
+}
+
+// Accept waits for and returns the next connection to the listener, dropping connections from disallowed IPs.
+func (l *FilteredListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.filter == nil || l.filter.IsEmpty() {
+			return conn, nil
+		}
+		remoteIP := remoteAddrIP(conn.RemoteAddr().String())
+		if !l.filter.IsAllowed(remoteIP) {
+			_ = conn.Close()
+			continue
+		}
+		return conn, nil
+	}
+}
+
+// WrapListener returns a net.Listener that drops connections from IPs not allowed by the filter.
+func (f *IPFilter) WrapListener(l net.Listener) net.Listener {
+	if f == nil || f.IsEmpty() {
+		return l
+	}
+	return &FilteredListener{Listener: l, filter: f}
+}

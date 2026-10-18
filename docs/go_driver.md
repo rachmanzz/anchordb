@@ -52,6 +52,9 @@ You can also connect using standard URI DSN strings:
 client, err := driver.Connect("wire://localhost:7448", driver.WithToken("your_auth_token"), driver.WithModel("plant_iot"))
 ```
 
+> [!IMPORTANT]
+> **Network Security Advisory**: AnchorWire communicates over raw TCP without built-in TLS for raw computational throughput. For remote connections across untrusted networks, always run AnchorWire within a private VPC, behind a VPN/overlay network (such as Tailscale or WireGuard), or through a TLS-terminating reverse proxy (such as Envoy, HAProxy, or stunnel).
+
 ### Option B: Embedded Engine Mode (In-Process Runtime, Zero Network Overhead)
 
 For embedded applications, command-line utilities, or local unit tests that do not want to run a separate network server:
