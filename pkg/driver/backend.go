@@ -1821,12 +1821,61 @@ func (b *wireBackend) IsRemote() bool {
 	return true
 }
 
-func (b *wireBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
-	return nil, fmt.Errorf("partition management is not supported over AnchorWire binary transport; use HTTP engine")
+func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+	var out []PartitionMeta
+	err := b.withClient(ctx, "default", func(wc *wire.Client) error {
+		items, err := wc.PartitionCatalog("")
+		if err != nil {
+			return err
+		}
+		out = make([]PartitionMeta, len(items))
+		for i, item := range items {
+			out[i] = PartitionMeta{
+				Name:      item.PartitionFile,
+				SizeBytes: item.SizeBytes,
+				ModTime:   item.CreatedAt,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-func (b *wireBackend) InspectPartition(_ context.Context, _, _ string, _ int) (*PartitionInspectResult, error) {
-	return nil, fmt.Errorf("partition inspection is not supported over AnchorWire binary transport; use HTTP engine")
+func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	var result *PartitionInspectResult
+	err := b.withClient(ctx, "default", func(wc *wire.Client) error {
+		resp, err := wc.PartitionInspect(wire.PartitionInspectWireRequest{
+			PartitionFile: partitionFile,
+			RecordName:    recordName,
+			Limit:         limit,
+		})
+		if err != nil {
+			return err
+		}
+		records := make([]PartitionRecord, len(resp.Records))
+		for i, r := range resp.Records {
+			records[i] = PartitionRecord{
+				Name:  r.Name,
+				Props: r.Props,
+			}
+		}
+		result = &PartitionInspectResult{
+			Success:       true,
+			PartitionFile: resp.PartitionFile,
+			Name:          resp.RecordName,
+			Props:         resp.Props,
+			Records:       records,
+			Count:         len(records),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (b *wireBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {

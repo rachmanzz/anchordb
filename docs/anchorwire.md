@@ -79,21 +79,33 @@ func main() {
 
 `driver.Connect("wire://localhost:7448", ...)` also selects AnchorWire. Use `driver.WithModel` or `client.Model("other_model")` to route operations to another model. `driver.WithAttachSchema` checks the model contract while connecting; incompatible schemas fail before the client is returned.
 
-AnchorWire supports record saves and batches, `Get`/`List`/`Update` builders, graph and causal operations, schema attach/get/reset, and `client.Sync()`. See the [Go driver guide](go_driver.md) for these methods and the [spatial graph example](../examples/spatial_graph/README.md) for a short runnable Wire example. The [graph traversal](../examples/graph_traversal/README.md), [Podman durability](../examples/podman_durability/README.md), and [supply chain](../examples/supply_chain/README.md) examples cover more involved flows.
+AnchorWire supports record saves and batches, `Get`/`List`/`Update` builders, graph and causal operations, schema attach/get/reset, partition catalog/inspection, and `client.Sync()`. See the [Go driver guide](go_driver.md) for these methods and the [spatial graph example](../examples/spatial_graph/README.md) for a short runnable Wire example. The [graph traversal](../examples/graph_traversal/README.md), [Podman durability](../examples/podman_durability/README.md), and [supply chain](../examples/supply_chain/README.md) examples cover more involved flows.
 
-## Operations that still use HTTP
+## Cold Storage & Partition Operations on AnchorWire
 
-The Go driver's AnchorWire backend does not implement partition listing or inspection. Use the authenticated HTTP partition endpoints in the [REST reference](rest_api.md) for those operations. Server health, metrics, scheduler/worker administration, and starting partition or collector jobs are also HTTP endpoints. Keep application record, query, schema, and graph traffic on AnchorWire; use HTTP for these server operations when needed.
+AnchorWire extends beyond active memory-mapped operations to support cold partition discovery and inspection:
 
-## Security & Network Isolation
+* **`OpPartitionCatalog` (`0x20`)**: Retrieves the metadata manifest of archived partitions for a given model or all models, including file size, creation timestamp, and date range bounds.
+* **`OpPartitionInspect` (`0x21`)**: Safely inspects a specific archived record or lists sample records directly from an archived `.anchordb` partition file.
+* **Transparent Cold-Tier Query**: When executing `OpGet`, if the record has been pruned from the hot database, AnchorWire automatically searches cold tier storage. The response header carries `FlagColdTier = 0x08`, allowing the client to know whether data came from hot memory or cold archive.
 
-AnchorWire communicates over raw TCP without built-in TLS to maximize data streaming throughput and avoid encryption overhead during local and cluster computation. The authentication token is transmitted as a binary payload during connection establishment (`OpAuth`).
+## Operations that use HTTP
 
-> [!WARNING]
-> **Do not expose unencrypted AnchorWire port 7448 directly to public or untrusted networks.**
-> Because tokens and records transit unencrypted, any eavesdropper on an untrusted path could capture authentication credentials and database mutations.
+Server health (`/health`), Prometheus metrics (`/metrics`), scheduler/worker task cancellation (`/v1/worker/cancel`), and manual invocation of partition/collector background jobs (`/v1/partition/run`, `/v1/collector/run`) use HTTP endpoints. Keep application record mutations, queries, schemas, graphs, and partition catalog/inspection on AnchorWire.
 
-### Recommended Deployment Practices:
-1. **Private Network / VPC**: AnchorWire should always run inside a private subnet, localhost, container network, or encrypted overlay network (e.g. WireGuard, Tailscale, IPSec).
-2. **IP Whitelisting**: Set `ANCHORDB_IP_WHITELIST` on the server so unauthorized client IP addresses are dropped immediately at the TCP layer.
-3. **TLS Termination Proxy**: When client traffic must cross untrusted public networks, place a TLS-terminating reverse proxy (such as Envoy, HAProxy, NGINX stream, or stunnel) in front of port `7448`.
+## Security, Gateway Isolation & Staged Token Rotation
+
+### 1. Gateway Isolation Mode (`-gateway-mode`)
+When deployed behind an authenticated gateway (e.g. `anchor-connector`), pass `-gateway-mode` or set `ANCHORDB_GATEWAY_MODE=true`. This disables all direct HTTP `/v1/*` data routes (returning `403 Forbidden` with `gateway_mode_enforced`), strictly confining all data traffic through AnchorWire and the connector.
+
+### 2. Zero-Knowledge Staged Preimage Token Rotation
+For dynamic cluster topologies, AnchorWire supports one-time pairing and staged preimage rotation (`AuthTypeStagedReauth: 0x05`):
+* **Zero-Knowledge Storage**: The server never stores cleartext secrets on disk. It maintains cryptographic SHA-256 commitments ($E = \text{SHA256}(V)$) inside a flat binary file (`/data/auth/commitments.bin`) protected by IEEE CRC32 checksums.
+* **Commit-First Rotation**: When rotating, the new commitment $E_2$ is committed to durable disk as `STAGED_PENDING_CONFIRM` before the old $E_1$ is invalidated.
+* **Piggyback Pruning**: The old commitment is safely pruned only after the client's first valid operational frame is processed, guaranteeing zero deadlock during network partition.
+
+### 3. Network Isolation
+AnchorWire communicates over raw binary TCP to maximize throughput. When deploying across public or untrusted networks:
+1. **Private Subnet / VPC**: Run AnchorWire within a VPC, WireGuard/Tailscale overlay, or container network.
+2. **IP Whitelisting**: Set `ANCHORDB_IP_WHITELIST` to drop unauthorized TCP clients at connection handshake.
+3. **TLS Reverse Proxy**: When transiting untrusted networks, use an external TLS termination proxy (Envoy, NGINX, HAProxy).

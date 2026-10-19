@@ -94,33 +94,112 @@ The collector removes references from `EntityStore`, updates the spatial index, 
 
 ## 5. Cold Partition Inspection Through Engine
 
-Archived partitions are structured `.anchordb` binary files, but they are never meant to be opened directly by client file descriptors. The AnchorDB Engine exposes authenticated inspection endpoints and driver methods:
+Archived partitions are structured `.anchordb` binary files, but they are never meant to be opened directly by client file descriptors. The AnchorDB Engine exposes authenticated inspection endpoints across both HTTP and the AnchorWire binary TCP protocol:
+
+### Driver Usage (HTTP & AnchorWire)
 
 ```go
-// List available partition files
+// List available partition files (works seamlessly over HTTP and AnchorWire)
 partitions, err := client.ListPartitions(ctx)
 
 // Inspect a specific cold record via the engine
 coldRec, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
 ```
 
-Partition listing and inspection are not implemented by the AnchorWire driver backend. Use the authenticated HTTP administration endpoints when those operations are needed:
+### Local Partition Inspection Endpoints
+
 ```bash
-# List partitions
+# List local partitions
 curl -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" http://localhost:7447/v1/partition/list
 
-# Inspect record
+# Inspect record in local partition
 curl -X POST http://localhost:7447/v1/partition/inspect \
   -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"partition_file": "2026-10-16_part1.anchordb", "name": "sensor_archive_old_1"}'
 ```
 
+### Direct S3 Cold Partition Inspection
+
+AnchorDB supports inspecting archived partition files stored in S3 or MinIO **directly in-memory without downloading to local disk**:
+
+```bash
+# 1. List partition objects in S3
+curl -X POST http://localhost:7447/v1/partition/s3/list \
+  -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "endpoint": "https://s3.us-east-1.amazonaws.com",
+    "bucket": "my-archive-bucket",
+    "prefix": "anchordb/partitions/"
+  }'
+
+# 2. Inspect record directly from S3 (streamed into RAM buffer)
+curl -X POST http://localhost:7447/v1/partition/s3/inspect \
+  -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "endpoint": "https://s3.us-east-1.amazonaws.com",
+    "bucket": "my-archive-bucket",
+    "partition_file": "anchordb/partitions/2026-10-16_part1.anchordb",
+    "name": "sensor_archive_old_1"
+  }'
+```
+
 ---
 
-## 6. Design Boundaries & Limitations
+## 6. Partition Catalog & Manifest
+
+AnchorDB maintains a persistent manifest catalog (`pkg/partition/Catalog`) recording metadata for all archived partition files across models:
+
+* **File Tracking**: Registers partition file name, model, size in bytes, creation timestamp, and record count.
+* **Date Range Bounds**: Records `MinDate` and `MaxDate` (epoch days) present within the partition.
+* **Record Indexing**: Indexes specific record keys to their hosting partition file.
+
+```bash
+# View partition catalog manifest
+curl -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  "http://localhost:7447/v1/partition/catalog?model=transactions"
+
+# Lookup which partition file houses a specific record
+curl -X POST http://localhost:7447/v1/partition/catalog/record \
+  -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "transactions", "name": "tx_old_1092"}'
+```
+
+Over AnchorWire, the catalog can be queried via `OpPartitionCatalog (0x20)` and inspected via `OpPartitionInspect (0x21)`.
+
+---
+
+## 7. Transparent Tiered Query (Hot-to-Cold Fallback)
+
+When records are pruned from the Hot Database (`MAP_SHARED`) to conserve memory and disk footprint, client applications do not need separate querying logic for historical data.
+
+AnchorDB implements **Transparent Tiered Query** across both REST (`GET /v1/record`, `POST /v1/get`) and AnchorWire (`OpGet`):
+
+```mermaid
+flowchart TD
+    Client["Client (REST / AnchorWire)"] --> Query["Query Record (e.g. 'tx_old_1092')"]
+    Query --> CheckHot{"Exists in Hot DB?"}
+    CheckHot -- Yes --> ReturnHot["Return Record (tier: hot)"]
+    CheckHot -- No --> CheckCat{"Catalog / S3 Cache has record?"}
+    CheckCat -- Yes --> FetchCold["Fetch from Partition / S3 (tier: cold)"]
+    CheckCat -- No --> NotFound["Return 404 Not Found"]
+    ReturnHot --> Response["Client Receives Result"]
+    FetchCold --> Response
+```
+
+1. **Hot Tier Lookup**: AnchorDB checks the primary active memory-mapped store (`/data/{model}.anchordb`). If present, the record is returned with `"tier": "hot"`.
+2. **Cold Tier Lookup**: If missing from the active store, AnchorDB consults the Partition Catalog and checks cold partitions (local disk or S3 cache).
+3. **Transparent Delivery**: If found in cold storage, in-storage computations and property projections are evaluated and the record is returned with `"tier": "cold"` (or AnchorWire frame flag `FlagColdTier = 0x08`).
+
+---
+
+## 8. Design Boundaries & Limitations
 
 1. **Archive Writes**: The local sink does not overwrite an existing filename. Archived files are inspected read-only through the engine; inserts and in-place updates are not exposed there. The S3 sink currently uses an ordinary PUT, so an object with the same key can be replaced; use unique filenames or bucket versioning when that matters.
 2. **Date Field Requirement**: Automated partition archival requires an integer or float32 epoch-day attribute (e.g. `MustDate("YYYY-MM-DD")`). Records without a recognizable date attribute are not eligible for automated date-cutoff archival.
-3. **Engine-Mediated Inspection**: Direct host volume mounts of `/data/partitions` must not be read with raw file open calls; queries should always be routed through `client.InspectPartition` or `/v1/partition/inspect`.
+3. **Engine-Mediated Inspection**: Direct host volume mounts of `/data/partitions` must not be read with raw file open calls; queries should always be routed through `client.InspectPartitionRecord` or `/v1/partition/inspect`.
+4. **S3 Direct Inspection Resource Footprint**: Inspecting S3 partitions reads the object stream into an in-memory byte buffer for safe binary verification. Very large partition archives (>500MB) should be inspected using local volume mounts or paginated record limits.
 

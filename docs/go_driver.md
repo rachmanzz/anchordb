@@ -318,9 +318,29 @@ All builder execution methods (`.Execute(ctx)`) strictly honor `context.Context`
 
 ---
 
-## 12. Cold Partition Inspection
+## 12. Cold Partition Inspection & Catalog
 
-AnchorWire does not implement `ListPartitions`, `InspectPartition`, or `InspectPartitionRecord`; calling them on a Wire client returns an unsupported-transport error. These are server-management operations. Use the authenticated partition endpoints in the [REST reference](rest_api.md) when cold archive inspection is required.
+The Go driver supports querying archived partition files and inspecting cold records across Embedded, HTTP, and AnchorWire transports:
+
+```go
+// 1. List all available archived partitions in the engine
+partitions, err := client.ListPartitions(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+for _, p := range partitions {
+    fmt.Printf("Partition: %s, Size: %d bytes, Created: %s\n", p.Name, p.SizeBytes, p.ModTime)
+}
+
+// 2. Inspect a specific record in an archived partition file
+result, err := client.InspectPartitionRecord(ctx, "2026-10-16_part1.anchordb", "sensor_archive_old_1")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Record %s props: %+v\n", result.Name, result.Props)
+```
+
+Additionally, records pruned from the active database during partition archival are automatically and transparently resolved via `client.Get("old_record").Execute(ctx)` if the partition catalog contains them.
 
 ---
 

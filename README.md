@@ -86,7 +86,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
       +-----------------------------+   +--------------------+   +--------------------------+
 ```
 
-HTTP on port `7447` remains available for health, metrics, and administration, including partition inspection, which is not implemented by the AnchorWire driver backend.
+HTTP on port `7447` remains available for health, metrics, administration, and REST clients. Both HTTP and AnchorWire support transparent cold-tier querying, partition catalogs, and archived partition inspection.
 
 ---
 
@@ -408,7 +408,7 @@ filteredStats, _ := db.ComputeStatsWithOptions(storage.StatsOptions{
 
 Use `driver.ConnectWire("wire://localhost:7448", ...)` for record saves and batches, `Get`/`List`/`Update` queries, spatial and causal graphs, schema management, and `Sync`. The [AnchorWire guide](docs/anchorwire.md) includes a complete runnable client and links to larger examples.
 
-HTTP remains available for health, metrics, and server administration. The AnchorWire driver does not implement partition listing or inspection; those endpoints are documented in the [REST reference](docs/rest_api.md).
+HTTP remains available for health, metrics, and server administration. Both AnchorWire (via binary frames `OpPartitionCatalog`/`OpPartitionInspect`) and HTTP endpoints support partition cataloging and archive inspection; those endpoints are documented in the [Partitioning & Lifecycle Guide](docs/partitioning_and_lifecycle.md) and [REST reference](docs/rest_api.md).
 
 ---
 
@@ -436,6 +436,8 @@ Settings can be specified through command-line flags or environment variables:
 | **Data Directory** | `-data-dir` | `ANCHORDB_DATA_DIR` | `./data` | Directory for `.anchordb` files |
 | **Auth Token** | `-auth-token` | `ANCHORDB_AUTH_TOKEN` | `""` | Bearer token for API authentication |
 | **Allow Insecure** | — | `ANCHORDB_ALLOW_INSECURE` | `false` | Disable auth requirement for local testing |
+| **Gateway Mode** | `-gateway-mode` | `ANCHORDB_GATEWAY_MODE` | `false` | Enforce gateway isolation (disables direct HTTP /v1/*) |
+| **Join Mode** | `-join-mode` | `ANCHORDB_JOIN_MODE` | `pairing` | Cluster join mode: `pairing`, `otk`, `session`, `closed` |
 | **IP Whitelist** | `-ip-whitelist` | `ANCHORDB_IP_WHITELIST` | `""` | Comma-separated allowed IPs/CIDRs |
 | **Trust Proxy** | `-trust-proxy` | `ANCHORDB_TRUST_PROXY` | `false` | Parse client IP from `X-Forwarded-For` |
 | **Memory Limit** | `-memory-limit` | `ANCHORDB_MEMORY_LIMIT` | `""` | Soft memory budget (e.g. `1GB`) |
@@ -449,6 +451,8 @@ Settings can be specified through command-line flags or environment variables:
 | **WAL Sync Mode** | `-wal-sync` | `ANCHORDB_WAL_SYNC` | `always` | `always` (fsync per write), `interval`, or `none` |
 | **WAL Sync Interval** | `-wal-sync-interval`| `ANCHORDB_WAL_SYNC_INTERVAL` | `200ms` | Interval when WAL sync mode is `interval` |
 | **Rate Limit** | `-rate-limit` | `ANCHORDB_RATE_LIMIT` | `0` (off) | Max requests per second per client IP |
+| **S3 Private Endpoint** | — | `ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT` | `false` | Allow loopback/private S3 endpoints (testing) |
+| **Insecure S3 HTTP** | — | `ANCHORDB_ALLOW_INSECURE_S3_HTTP` | `false` | Allow unencrypted HTTP for local S3/MinIO |
 
 ---
 

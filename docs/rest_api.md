@@ -9,6 +9,7 @@ The AnchorDB HTTP server daemon operates on port `7447` by default. `/v1/*` endp
 ## 1. Authentication & Security
 
 * **Bearer Token**: All endpoints under `/v1/*` require an `Authorization: Bearer <token>` header matching `ANCHORDB_AUTH_TOKEN`.
+* **Gateway Mode (`-gateway-mode` / `ANCHORDB_GATEWAY_MODE=true`)**: When enabled, direct HTTP `/v1/*` routes return `403 Forbidden` (`gateway_mode_enforced`). All application mutations and queries must route through the `anchor-connector` gateway over AnchorWire.
 * **Insecure Mode**: Set `ANCHORDB_ALLOW_INSECURE=true` to disable authentication for local testing.
 * **Public Endpoints**: `/health` (liveness check) and `/metrics` (Prometheus) are unauthenticated.
 * **Rate Limiting**: Configurable request rate per client IP with standard HTTP `429 Too Many Requests` responses.
@@ -70,11 +71,10 @@ Stores an entity with key-value properties.
 }
 ```
 
-### `POST /v1/get`
-Retrieves an entity by name with optional in-storage computations and selective attribute projection.
+### `POST /v1/get` & `GET /v1/record?name={name}&model={model}`
+Retrieves an entity by name with optional in-storage computations and selective attribute projection. Supports **Transparent Tiered Storage**: if the record has been pruned from the active Hot DB, AnchorDB transparently retrieves it from the Cold Tier (local or S3 partition) via the Partition Catalog.
 
-
-**Request Payload**:
+**Request Payload (`POST /v1/get`)**:
 ```json
 {
   "model": "vehicles",
@@ -85,6 +85,22 @@ Retrieves an entity by name with optional in-storage computations and selective 
   }
 }
 ```
+
+**Response**:
+```json
+{
+  "success": true,
+  "name": "vehicle_101",
+  "operation": 1,
+  "props": {
+    "distance": 120.0,
+    "duration": 2.0,
+    "speed": 60.0
+  },
+  "tier": "hot"
+}
+```
+*(If fetched from cold S3 or disk partition, `"tier"` will be `"cold"`)*.
 
 ### `POST /v1/list`
 Queries records matching attribute ranges or date criteria with pagination.
@@ -293,6 +309,101 @@ Safely inspects records inside an archived partition file without exposing raw s
 {
   "partition_file": "2026-10-16_transactions_part1.anchordb",
   "limit": 10
+}
+```
+
+### `POST /v1/partition/s3/list`
+Lists `.anchordb` partition files directly from an S3 bucket or prefix.
+
+**Request Payload**:
+```json
+{
+  "endpoint": "https://s3.us-east-1.amazonaws.com",
+  "bucket": "my-archive-bucket",
+  "prefix": "anchordb/partitions/"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "objects": [
+    {
+      "key": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
+      "size_bytes": 145020,
+      "mod_time": "2026-10-16T12:00:00Z"
+    }
+  ]
+}
+```
+
+### `POST /v1/partition/s3/inspect`
+Inspects records inside an archived partition stored in S3 directly in-memory without downloading to local disk storage.
+
+**Request Payload (Inspect Record)**:
+```json
+{
+  "endpoint": "https://s3.us-east-1.amazonaws.com",
+  "bucket": "my-archive-bucket",
+  "partition_file": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
+  "name": "tx_old_1092"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "partition_file": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
+  "name": "tx_old_1092",
+  "props": {
+    "amount": 250.0,
+    "date": 20580.0
+  }
+}
+```
+
+### `GET /v1/partition/catalog?model={name}`
+Retrieves the manifest of registered partition files and their date ranges.
+
+**Response**:
+```json
+{
+  "success": true,
+  "model": "transactions",
+  "items": [
+    {
+      "partition_file": "2026-10-16_transactions_part1.anchordb",
+      "model": "transactions",
+      "record_count": 500,
+      "min_date": 20400.0,
+      "max_date": 20580.0,
+      "created_at": "2026-10-16T12:00:00Z",
+      "size_bytes": 145020
+    }
+  ]
+}
+```
+
+### `POST /v1/partition/catalog/record`
+Discovers which partition file contains a specific historical record.
+
+**Request Payload**:
+```json
+{
+  "model": "transactions",
+  "name": "tx_old_1092"
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "name": "tx_old_1092",
+  "model": "transactions",
+  "partition_file": "2026-10-16_transactions_part1.anchordb"
 }
 ```
 
