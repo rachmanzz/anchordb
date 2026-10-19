@@ -21,6 +21,18 @@ type Backend interface {
 	RequiresAuth() bool
 }
 
+// TieredBackend defines cold storage tiered fallback for wire queries.
+type TieredBackend interface {
+	GetRecordTiered(model, name string) (props map[string]float32, op uint8, err error)
+	GetRecordWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (props map[string]float32, op uint8, err error)
+}
+
+// PartitionBackend defines AnchorWire handler interfaces for catalog and direct inspection.
+type PartitionBackend interface {
+	GetPartitionCatalog(model string) ([]PartitionCatalogItemDTO, error)
+	InspectPartition(fileOrLoc, recordName string, limit int) (PartitionInspectWireResponse, error)
+}
+
 type saveJob struct {
 	model     string
 	item      storage.BatchRecordItem
@@ -597,6 +609,72 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		// 3.6. Handle OpPartitionCatalog
+		if req.OpCode == OpPartitionCatalog {
+			model, _ := DecodePartitionCatalogRequest(req.Payload)
+			if model == "" {
+				model = currentModel
+			}
+			pb, ok := s.backend.(PartitionBackend)
+			if !ok {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(501, "partition catalog backend not supported")
+			} else {
+				items, cErr := pb.GetPartitionCatalog(model)
+				if cErr != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(500, cErr.Error())
+				} else {
+					payload, encErr := EncodePartitionCatalogResponse(items)
+					if encErr != nil {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(500, encErr.Error())
+					} else {
+						resp.OpCode = OpResponseOK
+						resp.Payload = payload
+					}
+				}
+			}
+			if err := WriteFrame(conn, resp); err != nil {
+				return
+			}
+			continue
+		}
+
+		// 3.7. Handle OpPartitionInspect
+		if req.OpCode == OpPartitionInspect {
+			inspectReq, dErr := DecodePartitionInspectRequest(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+			} else {
+				pb, ok := s.backend.(PartitionBackend)
+				if !ok {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(501, "partition inspect backend not supported")
+				} else {
+					inspectResp, iErr := pb.InspectPartition(inspectReq.PartitionFile, inspectReq.RecordName, inspectReq.Limit)
+					if iErr != nil {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(500, iErr.Error())
+					} else {
+						payload, encErr := EncodePartitionInspectResponse(inspectResp)
+						if encErr != nil {
+							resp.OpCode = OpResponseError
+							resp.Payload = EncodeErrorPayload(500, encErr.Error())
+						} else {
+							resp.OpCode = OpResponseOK
+							resp.Payload = payload
+						}
+					}
+				}
+			}
+			if err := WriteFrame(conn, resp); err != nil {
+				return
+			}
+			continue
+		}
+
 		// 4. Resolve Model Database
 		db, err := s.backend.GetModel(currentModel)
 		if err != nil {
@@ -695,6 +773,21 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 			} else {
 				props, op, err = db.GetRecordWithOperation(getReq.Name)
+			}
+			if err != nil {
+				// Fallback to Cold Storage Tier if supported by backend
+				if tb, ok := s.backend.(TieredBackend); ok {
+					var coldErr error
+					if len(getReq.Computations) > 0 || len(getReq.Select) > 0 {
+						props, op, coldErr = tb.GetRecordWithComputeTiered(currentModel, getReq.Name, getReq.Computations, getReq.Select)
+					} else {
+						props, op, coldErr = tb.GetRecordTiered(currentModel, getReq.Name)
+					}
+					if coldErr == nil {
+						err = nil
+						resp.Flags |= FlagColdTier
+					}
+				}
 			}
 			if err != nil {
 				resp.OpCode = OpResponseError

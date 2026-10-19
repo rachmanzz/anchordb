@@ -4,11 +4,13 @@ package wire
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
+	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -52,6 +54,10 @@ const (
 	OpMath         byte = 0x1C
 	OpResetModel   byte = 0x1D
 
+	// Cold Storage & Tiered Partition Extensions
+	OpPartitionCatalog byte = 0x20
+	OpPartitionInspect byte = 0x21
+
 	// Cluster Administration & Replication Extensions
 	OpPromoteToPrimary  byte = 0x30
 	OpDemoteToReplica   byte = 0x31
@@ -68,6 +74,7 @@ const (
 	FlagCompressed     byte = 0x01
 	FlagOneway         byte = 0x02
 	FlagMemoryPressure byte = 0x04
+	FlagColdTier       byte = 0x08 // Carried when record was retrieved from Cold Storage Tier
 
 	// Connector Routing Extensions
 	FlagRoutePrimary byte = 0x10 // Forces routing to Primary (Read-Your-Own-Writes)
@@ -1633,3 +1640,94 @@ func DecodeResetModelPayload(data []byte) (bool, error) {
 	}
 	return data[0] == 1, nil
 }
+
+// --- PARTITION CATALOG & INSPECT CODECS ---
+
+// PartitionCatalogItemDTO represents a single partition catalog entry over AnchorWire.
+type PartitionCatalogItemDTO struct {
+	ID             string    `json:"id"`
+	Model          string    `json:"model"`
+	PartitionFile  string    `json:"partition_file"`
+	TargetLocation string    `json:"target_location"`
+	SinkType       string    `json:"sink_type"`
+	RecordCount    int       `json:"record_count"`
+	CutoffDate     string    `json:"cutoff_date"`
+	MinDate        float32   `json:"min_date"`
+	MaxDate        float32   `json:"max_date"`
+	CreatedAt      time.Time `json:"created_at"`
+	SizeBytes      int64     `json:"size_bytes"`
+}
+
+// EncodePartitionCatalogRequest encodes model filter for OpPartitionCatalog.
+func EncodePartitionCatalogRequest(model string) []byte {
+	return []byte(model)
+}
+
+// DecodePartitionCatalogRequest decodes model filter for OpPartitionCatalog.
+func DecodePartitionCatalogRequest(data []byte) (string, error) {
+	return string(data), nil
+}
+
+// EncodePartitionCatalogResponse encodes catalog items for OpPartitionCatalog.
+func EncodePartitionCatalogResponse(items []PartitionCatalogItemDTO) ([]byte, error) {
+	return json.Marshal(items)
+}
+
+// DecodePartitionCatalogResponse decodes catalog items from OpPartitionCatalog response.
+func DecodePartitionCatalogResponse(data []byte) ([]PartitionCatalogItemDTO, error) {
+	var items []PartitionCatalogItemDTO
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil, fmt.Errorf("failed decoding partition catalog response: %w", err)
+	}
+	return items, nil
+}
+
+// PartitionInspectWireRequest represents parameters for OpPartitionInspect.
+type PartitionInspectWireRequest struct {
+	PartitionFile string `json:"partition_file"`
+	RecordName    string `json:"record_name,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+}
+
+// PartitionRecordWireItem holds a record in an inspected partition.
+type PartitionRecordWireItem struct {
+	Name  string             `json:"name"`
+	Props map[string]float32 `json:"props"`
+}
+
+// PartitionInspectWireResponse represents result of OpPartitionInspect.
+type PartitionInspectWireResponse struct {
+	PartitionFile string                    `json:"partition_file"`
+	RecordName    string                    `json:"record_name,omitempty"`
+	Props         map[string]float32        `json:"props,omitempty"`
+	Records       []PartitionRecordWireItem `json:"records,omitempty"`
+}
+
+// EncodePartitionInspectRequest encodes request for OpPartitionInspect.
+func EncodePartitionInspectRequest(req PartitionInspectWireRequest) ([]byte, error) {
+	return json.Marshal(req)
+}
+
+// DecodePartitionInspectRequest decodes request for OpPartitionInspect.
+func DecodePartitionInspectRequest(data []byte) (PartitionInspectWireRequest, error) {
+	var req PartitionInspectWireRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return req, fmt.Errorf("failed decoding partition inspect request: %w", err)
+	}
+	return req, nil
+}
+
+// EncodePartitionInspectResponse encodes response for OpPartitionInspect.
+func EncodePartitionInspectResponse(resp PartitionInspectWireResponse) ([]byte, error) {
+	return json.Marshal(resp)
+}
+
+// DecodePartitionInspectResponse decodes response for OpPartitionInspect.
+func DecodePartitionInspectResponse(data []byte) (PartitionInspectWireResponse, error) {
+	var resp PartitionInspectWireResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return resp, fmt.Errorf("failed decoding partition inspect response: %w", err)
+	}
+	return resp, nil
+}
+

@@ -2,9 +2,12 @@ package partition
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -295,6 +298,203 @@ func (s *S3Sink) put(filename string, body io.ReadSeeker, size int64) (string, e
 	}
 
 	return fmt.Sprintf("s3://%s/%s", s.Bucket, key), nil
+}
+
+// S3ObjectInfo represents an object entry in an S3 bucket partition listing.
+type S3ObjectInfo struct {
+	Key          string    `xml:"Key" json:"key"`
+	LastModified time.Time `xml:"LastModified" json:"last_modified"`
+	Size         int64     `xml:"Size" json:"size"`
+}
+
+type listBucketResult struct {
+	XMLName  xml.Name       `xml:"ListBucketResult"`
+	Contents []S3ObjectInfo `xml:"Contents"`
+}
+
+// FetchPartition downloads an object from S3 using SigV4 authentication and atomically writes it to destPath.
+func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath string) error {
+	if keyOrFilename == "" {
+		return errors.New("S3Sink: object key or filename cannot be empty")
+	}
+	if s.Bucket == "" {
+		return errors.New("S3Sink: bucket name cannot be empty")
+	}
+
+	endpoint := s.Endpoint
+	if endpoint == "" {
+		endpoint = "https://s3.amazonaws.com"
+	}
+	baseURL, err := url.Parse(endpoint)
+	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
+		return fmt.Errorf("S3Sink: invalid endpoint %q", endpoint)
+	}
+	if baseURL.Scheme == "http" && s.AccessKey != "" && !s.AllowInsecureHTTP {
+		return fmt.Errorf("S3Sink: refusing to send credentials over plaintext http endpoint %q", s.Endpoint)
+	}
+
+	// Clean key
+	key := keyOrFilename
+	if strings.HasPrefix(key, "s3://") {
+		prefix := fmt.Sprintf("s3://%s/", s.Bucket)
+		key = strings.TrimPrefix(key, prefix)
+	}
+	key = strings.TrimPrefix(key, "/")
+	if !strings.Contains(key, "/") && s.Prefix != "" {
+		key = path.Join(strings.Trim(s.Prefix, "/"), key)
+	}
+
+	objectPath := path.Join(strings.TrimSuffix(baseURL.Path, "/"), s.Bucket, key)
+	baseURL.Path = objectPath
+	baseURL.RawPath = ""
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL.String(), nil)
+	if err != nil {
+		return fmt.Errorf("S3Sink: create GET request: %w", err)
+	}
+
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if s.AccessKey != "" {
+		if s.SecretKey == "" {
+			return errors.New("S3Sink: secret key cannot be empty when access key is set")
+		}
+		region := s.Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		signS3Request(req, emptySHA256, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+	}
+
+	client := s.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("S3Sink: download from %s failed: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("S3Sink: download returned HTTP %d: %s", resp.StatusCode, string(snippet))
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o750); err != nil {
+		return fmt.Errorf("S3Sink: create destination directory: %w", err)
+	}
+
+	tmpFile := fmt.Sprintf("%s.download.%d", destPath, time.Now().UnixNano())
+	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("S3Sink: create temporary download file: %w", err)
+	}
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("S3Sink: stream download: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("S3Sink: sync temporary download file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("S3Sink: close temporary download file: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, destPath); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("S3Sink: atomic rename download file: %w", err)
+	}
+
+	return nil
+}
+
+// ListPartitions lists all .anchordb partition objects in the S3 bucket with the configured prefix.
+func (s *S3Sink) ListPartitions(ctx context.Context) ([]S3ObjectInfo, error) {
+	if s.Bucket == "" {
+		return nil, errors.New("S3Sink: bucket name cannot be empty")
+	}
+
+	endpoint := s.Endpoint
+	if endpoint == "" {
+		endpoint = "https://s3.amazonaws.com"
+	}
+	baseURL, err := url.Parse(endpoint)
+	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
+		return nil, fmt.Errorf("S3Sink: invalid endpoint %q", endpoint)
+	}
+	if baseURL.Scheme == "http" && s.AccessKey != "" && !s.AllowInsecureHTTP {
+		return nil, fmt.Errorf("S3Sink: refusing to send credentials over plaintext http endpoint %q", s.Endpoint)
+	}
+
+	bucketPath := path.Join(strings.TrimSuffix(baseURL.Path, "/"), s.Bucket)
+	baseURL.Path = bucketPath
+	baseURL.RawPath = ""
+
+	q := url.Values{}
+	q.Set("list-type", "2")
+	cleanPrefix := strings.Trim(s.Prefix, "/")
+	if cleanPrefix != "" {
+		q.Set("prefix", cleanPrefix)
+	}
+	baseURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("S3Sink: create list request: %w", err)
+	}
+
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if s.AccessKey != "" {
+		if s.SecretKey == "" {
+			return nil, errors.New("S3Sink: secret key cannot be empty when access key is set")
+		}
+		region := s.Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		signS3Request(req, emptySHA256, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+	}
+
+	client := s.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("S3Sink: list request to %s failed: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("S3Sink: list returned HTTP %d: %s", resp.StatusCode, string(snippet))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("S3Sink: read list response: %w", err)
+	}
+
+	var res listBucketResult
+	if err := xml.Unmarshal(bodyBytes, &res); err != nil {
+		return nil, fmt.Errorf("S3Sink: parse XML list response: %w", err)
+	}
+
+	var partitions []S3ObjectInfo
+	for _, item := range res.Contents {
+		if strings.HasSuffix(item.Key, ".anchordb") {
+			partitions = append(partitions, item)
+		}
+	}
+
+	return partitions, nil
 }
 
 func signS3Request(req *http.Request, payloadHex, accessKey, secretKey, region string, now time.Time) {

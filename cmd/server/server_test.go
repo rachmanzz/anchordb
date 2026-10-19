@@ -54,6 +54,9 @@ func cleanupServer(t *testing.T, s *Server, dir string) {
 	if s.worker != nil {
 		_ = s.worker.Shutdown()
 	}
+	if s.wireServer != nil {
+		_ = s.wireServer.Close()
+	}
 	s.mu.Lock()
 	for _, db := range s.models {
 		_ = db.Close()

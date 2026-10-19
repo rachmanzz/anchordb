@@ -539,6 +539,28 @@ func (c *Client) Sync() error {
 	return err
 }
 
+// PartitionCatalog retrieves registered partition archives for a model (or all models) over AnchorWire.
+func (c *Client) PartitionCatalog(model string) ([]PartitionCatalogItemDTO, error) {
+	resp, err := c.call(OpPartitionCatalog, EncodePartitionCatalogRequest(model))
+	if err != nil {
+		return nil, err
+	}
+	return DecodePartitionCatalogResponse(resp.Payload)
+}
+
+// PartitionInspect inspects an archived partition file over AnchorWire, returning specific record properties or a record list.
+func (c *Client) PartitionInspect(req PartitionInspectWireRequest) (PartitionInspectWireResponse, error) {
+	payload, err := EncodePartitionInspectRequest(req)
+	if err != nil {
+		return PartitionInspectWireResponse{}, err
+	}
+	resp, err := c.call(OpPartitionInspect, payload)
+	if err != nil {
+		return PartitionInspectWireResponse{}, err
+	}
+	return DecodePartitionInspectResponse(resp.Payload)
+}
+
 // Close closes the underlying TCP connection.
 func (c *Client) Close() error {
 	c.mu.Lock()

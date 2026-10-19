@@ -24,6 +24,7 @@ type PartitionPolicy struct {
 	Sink          PartitionSink // LocalDiskSink or S3Sink
 	FileFormat    string        // e.g. "{date}_{uuid}.anchordb"
 	PruneHotDB    bool          // If true, deletes archived records from active hot database
+	Catalog       *Catalog      // Optional: registers completed partition into persistent catalog
 }
 
 // Policy is an alias for PartitionPolicy without package stutter.
@@ -39,6 +40,10 @@ type PartitionResult struct {
 	CutoffDate     string    `json:"cutoff_date"`
 	ExecutionTime  time.Time `json:"execution_time"`
 	DurationMs     float64   `json:"duration_ms"`
+	PartitionFile  string    `json:"partition_file,omitempty"`
+	RecordNames    []string  `json:"record_names,omitempty"`
+	MinDate        float32   `json:"min_date,omitempty"`
+	MaxDate        float32   `json:"max_date,omitempty"`
 }
 
 // ExecutePartition archives historical records older than RetentionDays into an isolated partition file
@@ -80,8 +85,16 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	archivedNames := make([]string, len(records))
+	var minDate, maxDate float32
 	for i, r := range records {
 		archivedNames[i] = r.Name
+		val := r.Props[policy.DateField]
+		if i == 0 || val < minDate {
+			minDate = val
+		}
+		if i == 0 || val > maxDate {
+			maxDate = val
+		}
 	}
 
 	// Helper for rollback if archival fails -> marks records as OpStatusRetry (3)
@@ -122,6 +135,11 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 	_ = partDB.Close()
 
+	var tempFileSize int64
+	if fi, err := os.Stat(tempDBPath); err == nil {
+		tempFileSize = fi.Size()
+	}
+
 	// 5. Hand the partition file straight to the sink. Streaming from disk means
 	//    a large archive is never buffered entirely in memory (OOM risk). The
 	//    temp file lives until the deferred RemoveAll above runs.
@@ -149,6 +167,36 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		}
 	}
 
+	if policy.Catalog != nil {
+		sinkType := "local"
+		var s3Meta *CatalogS3Metadata
+		if s3Sink, isS3 := policy.Sink.(*S3Sink); isS3 {
+			sinkType = "s3"
+			s3Meta = &CatalogS3Metadata{
+				Endpoint:  s3Sink.Endpoint,
+				Bucket:    s3Sink.Bucket,
+				Prefix:    s3Sink.Prefix,
+				Region:    s3Sink.Region,
+				AccessKey: s3Sink.AccessKey,
+			}
+		}
+		_ = policy.Catalog.RegisterPartition(&CatalogEntry{
+			ID:             partitionFilename,
+			Model:          policy.ModelName,
+			PartitionFile:  partitionFilename,
+			TargetLocation: targetLoc,
+			SinkType:       sinkType,
+			RecordCount:    len(records),
+			CutoffDate:     cutoffDateStr,
+			MinDate:        minDate,
+			MaxDate:        maxDate,
+			RecordNames:    archivedNames,
+			CreatedAt:      t0,
+			SizeBytes:      tempFileSize,
+			S3Metadata:     s3Meta,
+		})
+	}
+
 	return &PartitionResult{
 		ModelName:      policy.ModelName,
 		ArchivedCount:  len(records),
@@ -156,5 +204,9 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		CutoffDate:     cutoffDateStr,
 		ExecutionTime:  t0,
 		DurationMs:     time.Since(t0).Seconds() * 1000,
+		PartitionFile:  partitionFilename,
+		RecordNames:    archivedNames,
+		MinDate:        minDate,
+		MaxDate:        maxDate,
 	}, nil
 }

@@ -78,6 +78,14 @@ type ServerConfig struct {
 	PairingTimeout     time.Duration
 	PairingAllowedCIDR string
 	SessionSecret      string
+
+	// Cold Storage & S3 defaults
+	S3DefaultEndpoint  string
+	S3DefaultBucket    string
+	S3DefaultPrefix    string
+	S3DefaultRegion    string
+	S3DefaultAccessKey string
+	S3DefaultSecretKey string
 }
 
 // Server holds active AnchorDB database instances and background subsystems
@@ -102,6 +110,16 @@ type Server struct {
 	gatewayMode bool
 	joinManager *wire.JoinManager
 
+	// Cold storage & partition catalog
+	catalog            *partition.Catalog
+	s3Cache            *partition.S3PartitionCache
+	s3DefaultEndpoint  string
+	s3DefaultBucket    string
+	s3DefaultPrefix    string
+	s3DefaultRegion    string
+	s3DefaultAccessKey string
+	s3DefaultSecretKey string
+
 	// Lifecycle state.
 	draining        atomic.Bool   // true once Shutdown began (readiness = 503)
 	closed          bool          // guarded by mu; registry sealed after Shutdown
@@ -121,6 +139,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	ipFilter, err := security.NewIPFilter(cfg.IPWhitelist, cfg.TrustProxy)
 	if err != nil {
 		return nil, fmt.Errorf("invalid IP whitelist %q: %w", cfg.IPWhitelist, err)
+	}
+
+	// Initialize Partition Catalog and S3 Cache
+	catalogPath := filepath.Join(cfg.DataDir, "partitions", "catalog.json")
+	cat, err := partition.OpenCatalog(catalogPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open partition catalog: %w", err)
+	}
+
+	s3CacheDir := filepath.Join(cfg.DataDir, ".s3_cache")
+	s3Cache, err := partition.NewS3PartitionCache(s3CacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot initialize s3 partition cache: %w", err)
 	}
 
 	// 1. Initialize Worker Pool
@@ -154,7 +185,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		wirePort:    cfg.WirePort,
 		gatewayMode: cfg.GatewayMode,
 		joinManager: joinMgr,
-		models:      make(map[string]*storage.AnchorDB),
+		catalog:            cat,
+		s3Cache:            s3Cache,
+		s3DefaultEndpoint:  cfg.S3DefaultEndpoint,
+		s3DefaultBucket:    cfg.S3DefaultBucket,
+		s3DefaultPrefix:    cfg.S3DefaultPrefix,
+		s3DefaultRegion:    cfg.S3DefaultRegion,
+		s3DefaultAccessKey: cfg.S3DefaultAccessKey,
+		s3DefaultSecretKey: cfg.S3DefaultSecretKey,
+		models:             make(map[string]*storage.AnchorDB),
 		scheduler:   sched,
 		cronEnabled: cfg.CronEnabled,
 		worker:      workerPool,
@@ -206,9 +245,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/causal", s.authMiddleware(s.handleCausal))
 	mux.HandleFunc("/v1/math", s.authMiddleware(s.handleMath))
 	mux.HandleFunc("/v1/sync", s.authMiddleware(s.handleSync))
+	mux.HandleFunc("/v1/record", s.authMiddleware(s.handleGet))
 	mux.HandleFunc("/v1/partition/run", s.authMiddleware(s.handlePartitionRun))
 	mux.HandleFunc("/v1/partition/list", s.authMiddleware(s.handlePartitionList))
 	mux.HandleFunc("/v1/partition/inspect", s.authMiddleware(s.handlePartitionInspect))
+	mux.HandleFunc("/v1/partition/catalog", s.authMiddleware(s.handlePartitionCatalog))
+	mux.HandleFunc("/v1/partition/catalog/record", s.authMiddleware(s.handlePartitionCatalogRecord))
+	mux.HandleFunc("/v1/partition/s3/list", s.authMiddleware(s.handlePartitionS3List))
+	mux.HandleFunc("/v1/partition/s3/inspect", s.authMiddleware(s.handlePartitionS3Inspect))
 	mux.HandleFunc("/v1/collector/run", s.authMiddleware(s.handleCollectorRun))
 	mux.HandleFunc("/v1/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
 	mux.HandleFunc("/v1/scheduler/run", s.authMiddleware(s.handleSchedulerRun))
@@ -512,6 +556,7 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 					Sink:          partition.NewLocalDiskSink(filepath.Join(t.server.dataDir, "partitions")),
 					FileFormat:    "{date}_{uuid}.anchordb",
 					PruneHotDB:    true,
+					Catalog:       t.server.catalog,
 				})
 				if err == nil && partRes.ArchivedCount > 0 {
 					log.Printf("[WORKER] Model %q partitioned: %d records archived to %s",
@@ -1130,24 +1175,25 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodPost) {
+	if !requireMethod(w, r, http.MethodPost, http.MethodGet) {
 		return
 	}
 	var req GetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
-		return
+	if r.Method == http.MethodGet {
+		req.Model = r.URL.Query().Get("model")
+		if req.Model == "" {
+			req.Model = "default"
+		}
+		req.Name = r.URL.Query().Get("name")
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
 	}
 
-	db, err := s.getModel(req.Model)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	_, op, err := db.GetRecordWithOperation(req.Name)
-	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
+	if req.Name == "" {
+		writeJSONError(w, http.StatusBadRequest, "name is required")
 		return
 	}
 
@@ -1161,18 +1207,44 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		computations[outField] = opCompute
 	}
 
-	props, err := db.GetRecordWithCompute(req.Name, computations, req.Select...)
-	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
+	// 1. Try Hot DB first
+	db, err := s.getModel(req.Model)
+	if err == nil {
+		_, op, gErr := db.GetRecordWithOperation(req.Name)
+		if gErr == nil {
+			var props map[string]float32
+			if len(computations) > 0 || len(req.Select) > 0 {
+				props, err = db.GetRecordWithCompute(req.Name, computations, req.Select...)
+			} else {
+				props, err = db.GetRecord(req.Name)
+			}
+			if err == nil {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"success":   true,
+					"name":      req.Name,
+					"operation": op,
+					"props":     props,
+					"tier":      "hot",
+				})
+				return
+			}
+		}
+	}
+
+	// 2. Transparent Cold Storage Fallback
+	props, op, coldErr := s.GetRecordWithComputeTiered(req.Model, req.Name, computations, req.Select)
+	if coldErr == nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"name":      req.Name,
+			"operation": op,
+			"props":     props,
+			"tier":      "cold",
+		})
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"name":      req.Name,
-		"operation": op,
-		"props":     props,
-	})
+	writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in model %q (hot or cold tiers)", req.Name, req.Model))
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -1787,6 +1859,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 						Sink:          sink,
 						FileFormat:    "{date}_{uuid}.anchordb",
 						PruneHotDB:    prune,
+						Catalog:       s.catalog,
 					})
 					if err != nil {
 						errs = append(errs, fmt.Errorf("partition %s: %w", m, err))
@@ -1833,6 +1906,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			Sink:          sink,
 			FileFormat:    "{date}_{uuid}.anchordb",
 			PruneHotDB:    prune,
+			Catalog:       s.catalog,
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Partition failed for model %s: %s", m, err.Error()))
@@ -1904,6 +1978,7 @@ type PartitionInspectRequest struct {
 }
 
 // handlePartitionInspect safely reads records from an archived partition file via the engine.
+// It transparently handles local partition files as well as remote S3 partition archives.
 func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -1918,6 +1993,48 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	limit := req.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+
+	// 1. Check if S3 partition (either starts with s3:// or registered in catalog with SinkType == "s3")
+	var entry *partition.CatalogEntry
+	if s.catalog != nil {
+		entry, _ = s.catalog.GetEntry(req.PartitionFile)
+	}
+
+	if strings.HasPrefix(req.PartitionFile, "s3://") || (entry != nil && entry.SinkType == "s3") {
+		sink := s.buildS3SinkForEntry(entry, req.PartitionFile)
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+
+		records, specificProps, err := s.s3Cache.InspectPartition(ctx, sink, req.PartitionFile, req.Name, limit)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
+			return
+		}
+		if req.Name != "" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":        true,
+				"partition_file": req.PartitionFile,
+				"name":           req.Name,
+				"props":          specificProps,
+				"source":         "s3",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"partition_file": req.PartitionFile,
+			"records":        records,
+			"count":          len(records),
+			"source":         "s3",
+		})
+		return
+	}
+
+	// 2. Local disk partition inspection
 	cleanFilename := filepath.Base(req.PartitionFile)
 	fullPath := filepath.Join(s.dataDir, "partitions", cleanFilename)
 	if _, err := os.Stat(fullPath); err != nil {
@@ -1947,10 +2064,6 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	limit := req.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
 	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list records in partition: %s", err.Error()))
@@ -1972,6 +2085,455 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		"records":        out,
 		"count":          len(out),
 	})
+}
+
+// handlePartitionCatalog returns all registered partition manifest entries from the persistent catalog.
+func (s *Server) handlePartitionCatalog(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
+		return
+	}
+	model := r.URL.Query().Get("model")
+	var entries []*partition.CatalogEntry
+	if s.catalog != nil {
+		entries = s.catalog.ListEntries(model)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"count":      len(entries),
+		"partitions": entries,
+	})
+}
+
+// PartitionCatalogRecordRequest represents payload to query which partition file contains a record.
+type PartitionCatalogRecordRequest struct {
+	Model string `json:"model"`
+	Name  string `json:"name"`
+}
+
+// handlePartitionCatalogRecord returns the partition manifest entry for a specific record.
+func (s *Server) handlePartitionCatalogRecord(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req PartitionCatalogRecordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.Model == "" || req.Name == "" {
+		writeJSONError(w, http.StatusBadRequest, "model and name are required")
+		return
+	}
+	if s.catalog == nil {
+		writeJSONError(w, http.StatusNotFound, "catalog is not initialized")
+		return
+	}
+
+	entry, found := s.catalog.FindRecord(req.Model, req.Name)
+	if !found {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in partition catalog for model %q", req.Name, req.Model))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"model":     req.Model,
+		"name":      req.Name,
+		"partition": entry,
+	})
+}
+
+// PartitionS3ListRequest represents parameters to list partition files directly in an S3 bucket.
+type PartitionS3ListRequest struct {
+	S3Endpoint  string `json:"s3_endpoint"`
+	S3Bucket    string `json:"s3_bucket"`
+	S3Prefix    string `json:"s3_prefix,omitempty"`
+	S3AccessKey string `json:"s3_access_key,omitempty"`
+	S3SecretKey string `json:"s3_secret_key,omitempty"`
+	S3Region    string `json:"s3_region,omitempty"`
+}
+
+// handlePartitionS3List queries an S3 bucket via SigV4 and lists all available .anchordb files.
+func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req PartitionS3ListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	endpoint := req.S3Endpoint
+	if endpoint == "" {
+		endpoint = s.s3DefaultEndpoint
+	}
+	if err := validateS3Endpoint(endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
+		return
+	}
+
+	bucket := req.S3Bucket
+	if bucket == "" {
+		bucket = s.s3DefaultBucket
+	}
+	if bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "s3_bucket is required")
+		return
+	}
+
+	prefix := req.S3Prefix
+	if prefix == "" {
+		prefix = s.s3DefaultPrefix
+	}
+	accessKey := req.S3AccessKey
+	if accessKey == "" {
+		accessKey = s.s3DefaultAccessKey
+	}
+	secretKey := req.S3SecretKey
+	if secretKey == "" {
+		secretKey = s.s3DefaultSecretKey
+	}
+
+	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
+	sink.Region = req.S3Region
+	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	partitions, err := sink.ListPartitions(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed listing s3 partitions: %s", err.Error()))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"endpoint":   endpoint,
+		"bucket":     bucket,
+		"prefix":     prefix,
+		"count":      len(partitions),
+		"partitions": partitions,
+	})
+}
+
+// PartitionS3InspectRequest represents parameters to directly inspect an S3 partition file.
+type PartitionS3InspectRequest struct {
+	S3Endpoint    string `json:"s3_endpoint"`
+	S3Bucket      string `json:"s3_bucket"`
+	S3Prefix      string `json:"s3_prefix,omitempty"`
+	S3Key         string `json:"s3_key"`
+	PartitionFile string `json:"partition_file,omitempty"`
+	S3AccessKey   string `json:"s3_access_key,omitempty"`
+	S3SecretKey   string `json:"s3_secret_key,omitempty"`
+	S3Region      string `json:"s3_region,omitempty"`
+	Name          string `json:"name,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+}
+
+// handlePartitionS3Inspect reads records from an S3 partition file without requiring manual pre-downloading.
+func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	var req PartitionS3InspectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	targetKey := req.S3Key
+	if targetKey == "" {
+		targetKey = req.PartitionFile
+	}
+	if targetKey == "" {
+		writeJSONError(w, http.StatusBadRequest, "s3_key or partition_file is required")
+		return
+	}
+
+	endpoint := req.S3Endpoint
+	if endpoint == "" {
+		endpoint = s.s3DefaultEndpoint
+	}
+	if err := validateS3Endpoint(endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
+		return
+	}
+
+	bucket := req.S3Bucket
+	if bucket == "" {
+		bucket = s.s3DefaultBucket
+	}
+	if bucket == "" {
+		writeJSONError(w, http.StatusBadRequest, "s3_bucket is required")
+		return
+	}
+
+	prefix := req.S3Prefix
+	if prefix == "" {
+		prefix = s.s3DefaultPrefix
+	}
+	accessKey := req.S3AccessKey
+	if accessKey == "" {
+		accessKey = s.s3DefaultAccessKey
+	}
+	secretKey := req.S3SecretKey
+	if secretKey == "" {
+		secretKey = s.s3DefaultSecretKey
+	}
+
+	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
+	sink.Region = req.S3Region
+	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+
+	limit := req.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	records, specificProps, err := s.s3Cache.InspectPartition(ctx, sink, targetKey, req.Name, limit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if req.Name != "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"target":  targetKey,
+			"name":    req.Name,
+			"props":   specificProps,
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"target":  targetKey,
+		"count":   len(records),
+		"records": records,
+	})
+}
+
+func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc string) *partition.S3Sink {
+	endpoint := s.s3DefaultEndpoint
+	bucket := s.s3DefaultBucket
+	prefix := s.s3DefaultPrefix
+	accessKey := s.s3DefaultAccessKey
+	secretKey := s.s3DefaultSecretKey
+	region := s.s3DefaultRegion
+
+	if entry != nil && entry.S3Metadata != nil {
+		if entry.S3Metadata.Endpoint != "" {
+			endpoint = entry.S3Metadata.Endpoint
+		}
+		if entry.S3Metadata.Bucket != "" {
+			bucket = entry.S3Metadata.Bucket
+		}
+		if entry.S3Metadata.Prefix != "" {
+			prefix = entry.S3Metadata.Prefix
+		}
+		if entry.S3Metadata.Region != "" {
+			region = entry.S3Metadata.Region
+		}
+		if entry.S3Metadata.AccessKey != "" {
+			accessKey = entry.S3Metadata.AccessKey
+		}
+	} else if strings.HasPrefix(keyOrLoc, "s3://") {
+		trimmed := strings.TrimPrefix(keyOrLoc, "s3://")
+		parts := strings.SplitN(trimmed, "/", 2)
+		if len(parts) >= 1 && parts[0] != "" {
+			bucket = parts[0]
+		}
+	}
+
+	if endpoint == "" {
+		endpoint = os.Getenv("AWS_S3_ENDPOINT")
+		if endpoint == "" {
+			endpoint = os.Getenv("MINIO_ENDPOINT")
+		}
+	}
+	if accessKey == "" {
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+		if accessKey == "" {
+			accessKey = os.Getenv("MINIO_ROOT_USER")
+		}
+	}
+	if secretKey == "" {
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+		if secretKey == "" {
+			secretKey = os.Getenv("MINIO_ROOT_PASSWORD")
+		}
+	}
+
+	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
+	sink.Region = region
+	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	return sink
+}
+
+func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, error) {
+	var localFile string
+	if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
+		sink := s.buildS3SinkForEntry(entry, entry.PartitionFile)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		var err error
+		localFile, err = s.s3Cache.EnsurePartition(ctx, sink, entry.PartitionFile)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		localFile = filepath.Join(s.dataDir, "partitions", entry.PartitionFile)
+	}
+
+	pdb, err := storage.Open(localFile)
+	if err != nil {
+		return nil, err
+	}
+	defer pdb.Close()
+
+	if len(computations) > 0 || len(selectFields) > 0 {
+		return pdb.GetRecordWithCompute(name, computations, selectFields...)
+	}
+	return pdb.GetRecord(name)
+}
+
+// GetRecordTiered implements wire.TieredBackend.
+func (s *Server) GetRecordTiered(model, name string) (map[string]float32, uint8, error) {
+	return s.GetRecordWithComputeTiered(model, name, nil, nil)
+}
+
+// GetRecordWithComputeTiered implements wire.TieredBackend.
+func (s *Server) GetRecordWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, uint8, error) {
+	// 1. Check Hot DB
+	db, err := s.getModel(model)
+	if err == nil {
+		if len(computations) > 0 || len(selectFields) > 0 {
+			props, cErr := db.GetRecordWithCompute(name, computations, selectFields...)
+			if cErr == nil {
+				_, op, _ := db.GetRecordWithOperation(name)
+				return props, op, nil
+			}
+		} else {
+			props, op, gErr := db.GetRecordWithOperation(name)
+			if gErr == nil {
+				return props, op, nil
+			}
+		}
+	}
+
+	// 2. Check Cold Tier via Partition Catalog
+	if s.catalog != nil {
+		entry, found := s.catalog.FindRecord(model, name)
+		if found {
+			props, err := s.fetchRecordFromCatalogEntry(entry, name, computations, selectFields)
+			if err == nil {
+				return props, storage.OpStatusActive, nil
+			}
+		}
+	}
+
+	return nil, 0, fmt.Errorf("record %q not found in model %q", name, model)
+}
+
+// GetPartitionCatalog implements wire.PartitionBackend.
+func (s *Server) GetPartitionCatalog(model string) ([]wire.PartitionCatalogItemDTO, error) {
+	if s.catalog == nil {
+		return nil, nil
+	}
+	entries := s.catalog.ListEntries(model)
+	out := make([]wire.PartitionCatalogItemDTO, len(entries))
+	for i, e := range entries {
+		out[i] = wire.PartitionCatalogItemDTO{
+			ID:             e.ID,
+			Model:          e.Model,
+			PartitionFile:  e.PartitionFile,
+			TargetLocation: e.TargetLocation,
+			SinkType:       e.SinkType,
+			RecordCount:    e.RecordCount,
+			CutoffDate:     e.CutoffDate,
+			MinDate:        e.MinDate,
+			MaxDate:        e.MaxDate,
+			CreatedAt:      e.CreatedAt,
+			SizeBytes:      e.SizeBytes,
+		}
+	}
+	return out, nil
+}
+
+// InspectPartition implements wire.PartitionBackend.
+func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire.PartitionInspectWireResponse, error) {
+	var entry *partition.CatalogEntry
+	if s.catalog != nil {
+		entry, _ = s.catalog.GetEntry(fileOrLoc)
+	}
+
+	if (entry != nil && entry.SinkType == "s3") || strings.HasPrefix(fileOrLoc, "s3://") {
+		sink := s.buildS3SinkForEntry(entry, fileOrLoc)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		records, props, err := s.s3Cache.InspectPartition(ctx, sink, fileOrLoc, recordName, limit)
+		if err != nil {
+			return wire.PartitionInspectWireResponse{}, err
+		}
+		var wireItems []wire.PartitionRecordWireItem
+		for _, r := range records {
+			wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props})
+		}
+		return wire.PartitionInspectWireResponse{
+			PartitionFile: fileOrLoc,
+			RecordName:    recordName,
+			Props:         props,
+			Records:       wireItems,
+		}, nil
+	}
+
+	cleanFilename := filepath.Base(fileOrLoc)
+	fullPath := filepath.Join(s.dataDir, "partitions", cleanFilename)
+	pdb, err := storage.Open(fullPath)
+	if err != nil {
+		return wire.PartitionInspectWireResponse{}, err
+	}
+	defer pdb.Close()
+
+	if recordName != "" {
+		props, err := pdb.GetRecord(recordName)
+		if err != nil {
+			return wire.PartitionInspectWireResponse{}, err
+		}
+		return wire.PartitionInspectWireResponse{
+			PartitionFile: cleanFilename,
+			RecordName:    recordName,
+			Props:         props,
+		}, nil
+	}
+
+	if limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	recs, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	if err != nil {
+		return wire.PartitionInspectWireResponse{}, err
+	}
+	var wireItems []wire.PartitionRecordWireItem
+	for _, r := range recs {
+		wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props})
+	}
+	return wire.PartitionInspectWireResponse{
+		PartitionFile: cleanFilename,
+		Records:       wireItems,
+	}, nil
 }
 
 func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
