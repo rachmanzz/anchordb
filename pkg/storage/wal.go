@@ -34,6 +34,7 @@ const (
 	WalOpSaveNode byte = 6
 )
 
+// ErrWALCorrupt indicates that the write-ahead log contains unrecoverable corrupted data.
 var ErrWALCorrupt = errors.New("anchordb: corrupt wal")
 
 // SyncMode controls how often mutations are flushed to stable storage. The
@@ -300,7 +301,7 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 		offset += len(nameBytes)
 
 		buf[offset] = cr.Operation
-		offset += 1
+		offset++
 
 		copy(buf[offset:], cr.Raw)
 		return buf, nil
@@ -326,7 +327,7 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 	offset += len(nameBytes)
 
 	buf[offset] = cr.Operation
-	offset += 1
+	offset++
 
 	binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(cr.Attrs)))
 	offset += 2
@@ -795,13 +796,13 @@ func (w *WALManager) Checkpoint(checkpointOffset int64) error {
 	if err := old.Close(); err != nil {
 		return fmt.Errorf("close previous wal after checkpoint: %w", err)
 	}
-	if dir, err := os.Open(filepath.Dir(w.path)); err != nil {
+	dir, err := os.Open(filepath.Dir(w.path))
+	if err != nil {
 		return fmt.Errorf("open wal directory for sync: %w", err)
-	} else {
-		defer dir.Close()
-		if err := dir.Sync(); err != nil {
-			return fmt.Errorf("sync wal directory after checkpoint: %w", err)
-		}
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sync wal directory after checkpoint: %w", err)
 	}
 	return nil
 }

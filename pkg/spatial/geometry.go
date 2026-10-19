@@ -1,3 +1,4 @@
+// Package spatial provides geometric primitives, bounding boxes, and 2D spatial calculations.
 package spatial
 
 import (

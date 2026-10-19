@@ -1,3 +1,4 @@
+// Package partition provides partition policies, historical data archiving, and cold storage sinks.
 package partition
 
 import (
@@ -10,9 +11,12 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
+// ErrPartitionConflict is returned when records selected for partitioning mutate before archival completes.
 var ErrPartitionConflict = errors.New("partition records changed before archival lock")
 
-// PartitionPolicy defines rules for archiving and partitioning historical records
+// PartitionPolicy defines rules for archiving and partitioning historical records.
+//
+//nolint:revive // Stutter maintained for API backward compatibility.
 type PartitionPolicy struct {
 	ModelName     string        // e.g. "logs" or "transactions"
 	DateField     string        // e.g. "date" or "timestamp"
@@ -22,7 +26,12 @@ type PartitionPolicy struct {
 	PruneHotDB    bool          // If true, deletes archived records from active hot database
 }
 
-// PartitionResult contains execution details of a completed partition run
+// Policy is an alias for PartitionPolicy without package stutter.
+type Policy = PartitionPolicy
+
+// PartitionResult contains execution details of a completed partition run.
+//
+//nolint:revive // Stutter maintained for API backward compatibility.
 type PartitionResult struct {
 	ModelName      string    `json:"model_name"`
 	ArchivedCount  int       `json:"archived_count"`

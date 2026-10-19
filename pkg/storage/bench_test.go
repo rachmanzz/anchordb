@@ -83,7 +83,7 @@ func BenchmarkSpatial_TraverseRayDDA(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		TraverseRayDDA(ray, GridDim, 1.5, func(c CellCoord) bool {
+		TraverseRayDDA(ray, GridDim, 1.5, func(_ CellCoord) bool {
 			return true
 		})
 	}

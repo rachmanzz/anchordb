@@ -27,7 +27,7 @@ func TestSaveRecordWithNodeRejectsSchemaWithoutOrphan(t *testing.T) {
 	if _, exists := db.EntityStore["orphan"]; exists {
 		t.Fatal("rejected save left an entity")
 	}
-	count, err := db.wal.ReplayEvents(func(ev WALEvent) error { return nil })
+	count, err := db.wal.ReplayEvents(func(_ WALEvent) error { return nil })
 	if err != nil || count != 0 {
 		t.Fatalf("rejected save wrote WAL events: count=%d err=%v", count, err)
 	}

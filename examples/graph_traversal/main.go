@@ -1,3 +1,4 @@
+// Package main demonstrates deep multi-hop graph traversal and beam search reasoning in AnchorDB.
 package main
 
 import (

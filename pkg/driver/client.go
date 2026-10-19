@@ -768,14 +768,14 @@ func (b *ListBuilder) WhereAfter(field string, value any) *ListBuilder {
 	return b.Where(field, ">", value)
 }
 
-// Between matches records within range [min, max].
-func (b *ListBuilder) Between(field string, min, max any) *ListBuilder {
-	low, err := toFloat32Value(min)
+// Between matches records within range [minVal, maxVal].
+func (b *ListBuilder) Between(field string, minVal, maxVal any) *ListBuilder {
+	low, err := toFloat32Value(minVal)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	high, err := toFloat32Value(max)
+	high, err := toFloat32Value(maxVal)
 	if err != nil {
 		b.err = err
 		return b
@@ -790,8 +790,8 @@ func (b *ListBuilder) Between(field string, min, max any) *ListBuilder {
 }
 
 // From is an alias for Between.
-func (b *ListBuilder) From(field string, min, max any) *ListBuilder {
-	return b.Between(field, min, max)
+func (b *ListBuilder) From(field string, minVal, maxVal any) *ListBuilder {
+	return b.Between(field, minVal, maxVal)
 }
 
 // BetweenDate matches records where date is in [startDate, endDate].
@@ -909,14 +909,14 @@ func (b *UpdateBuilder) WhereAfter(field string, value any) *UpdateBuilder {
 	return b.Where(field, ">", value)
 }
 
-// Between bounds update to records within [min, max].
-func (b *UpdateBuilder) Between(field string, min, max any) *UpdateBuilder {
-	low, err := toFloat32Value(min)
+// Between bounds update to records within [minVal, maxVal].
+func (b *UpdateBuilder) Between(field string, minVal, maxVal any) *UpdateBuilder {
+	low, err := toFloat32Value(minVal)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	high, err := toFloat32Value(max)
+	high, err := toFloat32Value(maxVal)
 	if err != nil {
 		b.err = err
 		return b
@@ -931,8 +931,8 @@ func (b *UpdateBuilder) Between(field string, min, max any) *UpdateBuilder {
 }
 
 // From is an alias for Between.
-func (b *UpdateBuilder) From(field string, min, max any) *UpdateBuilder {
-	return b.Between(field, min, max)
+func (b *UpdateBuilder) From(field string, minVal, maxVal any) *UpdateBuilder {
+	return b.Between(field, minVal, maxVal)
 }
 
 // BetweenDate bounds update to records where date is in [startDate, endDate].

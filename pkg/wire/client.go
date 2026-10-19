@@ -320,8 +320,8 @@ func (c *Client) GetNegotiation() *MemoryNegotiationResponse {
 	if c.negotiation == nil {
 		return nil
 	}
-	copy := *c.negotiation
-	return &copy
+	negoCopy := *c.negotiation
+	return &negoCopy
 }
 
 // Save stores an entity record and returns its effective name.
@@ -355,8 +355,8 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	pacing := c.pacingEnabled
 	var nego *MemoryNegotiationResponse
 	if c.negotiation != nil {
-		copy := *c.negotiation
-		nego = &copy
+		negoCopy := *c.negotiation
+		nego = &negoCopy
 	}
 	c.negoMu.RUnlock()
 

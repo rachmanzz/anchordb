@@ -1,3 +1,4 @@
+// Package main demonstrates spatial graph reasoning and path traversal with AnchorDB.
 package main
 
 import (

@@ -1,3 +1,4 @@
+// Package main demonstrates supply chain tracking and fraud anomaly detection with AnchorDB.
 package main
 
 import (

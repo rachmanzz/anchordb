@@ -1,3 +1,4 @@
+// Package driver provides high-level client drivers, query builders, and backend connectors for AnchorDB.
 package driver
 
 import (
@@ -92,7 +93,7 @@ func newLocalBackend(filePath string) (*localBackend, error) {
 	return &localBackend{filePath: filePath, db: db}, nil
 }
 
-func (b *localBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
+func (b *localBackend) Save(ctx context.Context, _, name string, op *uint8, props map[string]float32) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -103,14 +104,14 @@ func (b *localBackend) Save(ctx context.Context, model, name string, op *uint8, 
 	return b.db.SaveRecordWithIDAndOp(name, opStatus, props)
 }
 
-func (b *localBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
+func (b *localBackend) SaveBatch(ctx context.Context, _ string, records []storage.BatchRecordItem) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return b.db.SaveRecordsBatch(records)
 }
 
-func (b *localBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
+func (b *localBackend) Get(ctx context.Context, _, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -127,7 +128,7 @@ func (b *localBackend) Get(ctx context.Context, model, name string, selectFields
 	return &EntityResult{Name: name, props: props}, nil
 }
 
-func (b *localBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
+func (b *localBackend) List(ctx context.Context, _ string, opts storage.QueryOptions) (*PagedListResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -149,7 +150,7 @@ func (b *localBackend) List(ctx context.Context, model string, opts storage.Quer
 	}, nil
 }
 
-func (b *localBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
+func (b *localBackend) Update(ctx context.Context, _ string, opts storage.UpdateOptions) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -157,7 +158,7 @@ func (b *localBackend) Update(ctx context.Context, model string, opts storage.Up
 	return b.db.UpdateRecords(opts)
 }
 
-func (b *localBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
+func (b *localBackend) Graph(ctx context.Context, _ string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -168,7 +169,7 @@ func (b *localBackend) Graph(ctx context.Context, model string, inputs []string,
 	return &GraphResponse{Anchor: anchor, Results: results}, nil
 }
 
-func (b *localBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
+func (b *localBackend) GraphChain(ctx context.Context, _ string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -186,7 +187,7 @@ func (b *localBackend) GraphChain(ctx context.Context, model string, inputs []st
 	}, nil
 }
 
-func (b *localBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
+func (b *localBackend) Edge(ctx context.Context, _, action, source, relation, target string, weight float32) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -198,7 +199,7 @@ func (b *localBackend) Edge(ctx context.Context, model, action, source, relation
 	}
 }
 
-func (b *localBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
+func (b *localBackend) Causal(ctx context.Context, _ string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -208,24 +209,24 @@ func (b *localBackend) Causal(ctx context.Context, model string, seeds []string,
 	return b.db.ExecuteCausalStep(ctx, seeds, relation, limitK)
 }
 
-func (b *localBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
+func (b *localBackend) Distance(_ context.Context, _, wordA, wordB string) (float32, error) {
 	return b.db.CalculateDistance(wordA, wordB)
 }
 
-func (b *localBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
+func (b *localBackend) Centroid(_ context.Context, _ string, words []string) (CentroidResult, error) {
 	coord, roles, err := b.db.CalculateCentroid(words)
 	return CentroidResult{Coord: coord, Roles: roles}, err
 }
 
-func (b *localBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
+func (b *localBackend) CosineSimilarity(_ context.Context, _, wordA, wordB string) (float32, error) {
 	return b.db.CalculateCosineSimilarity(wordA, wordB)
 }
 
-func (b *localBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
+func (b *localBackend) Nearest(_ context.Context, _, word string, limitK int) ([]storage.GraphQueryResult, error) {
 	return b.db.FindNearestNeighbors(word, limitK)
 }
 
-func (b *localBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
+func (b *localBackend) AppendNode(ctx context.Context, _, word string, coord spatial.Point2D, roles [4]float32) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -233,14 +234,14 @@ func (b *localBackend) AppendNode(ctx context.Context, model, word string, coord
 	return err
 }
 
-func (b *localBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
+func (b *localBackend) SetRelation(ctx context.Context, _, name string, direction spatial.Point2D) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return b.db.SetRelation(name, direction)
 }
 
-func (b *localBackend) Sync(ctx context.Context, model string) error {
+func (b *localBackend) Sync(_ context.Context, _ string) error {
 	return b.db.Sync()
 }
 
@@ -256,7 +257,7 @@ func (b *localBackend) IsRemote() bool {
 	return false
 }
 
-func (b *localBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
 	partDir := filepath.Join(filepath.Dir(b.filePath), "partitions")
 	entries, err := os.ReadDir(partDir)
 	if err != nil {
@@ -330,14 +331,14 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 	}, nil
 }
 
-func (b *localBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
+func (b *localBackend) Attach(ctx context.Context, _ string, schema storage.ModelSchema) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return b.db.AttachSchema(schema)
 }
 
-func (b *localBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
+func (b *localBackend) GetSchema(ctx context.Context, _ string) (storage.ModelSchema, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -348,7 +349,7 @@ func (b *localBackend) GetSchema(ctx context.Context, model string) (storage.Mod
 	return s, nil
 }
 
-func (b *localBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
+func (b *localBackend) ResetModel(ctx context.Context, _ string, confirm bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -617,7 +618,7 @@ func (b *embeddedBackend) Causal(ctx context.Context, model string, seeds []stri
 	return db.ExecuteCausalStep(ctx, seeds, relation, limitK)
 }
 
-func (b *embeddedBackend) Distance(ctx context.Context, model, wordA, wordB string) (float32, error) {
+func (b *embeddedBackend) Distance(_ context.Context, model, wordA, wordB string) (float32, error) {
 	db, err := b.getDB(model)
 	if err != nil {
 		return 0, err
@@ -625,7 +626,7 @@ func (b *embeddedBackend) Distance(ctx context.Context, model, wordA, wordB stri
 	return db.CalculateDistance(wordA, wordB)
 }
 
-func (b *embeddedBackend) Centroid(ctx context.Context, model string, words []string) (CentroidResult, error) {
+func (b *embeddedBackend) Centroid(_ context.Context, model string, words []string) (CentroidResult, error) {
 	db, err := b.getDB(model)
 	if err != nil {
 		return CentroidResult{}, err
@@ -634,7 +635,7 @@ func (b *embeddedBackend) Centroid(ctx context.Context, model string, words []st
 	return CentroidResult{Coord: coord, Roles: roles}, err
 }
 
-func (b *embeddedBackend) CosineSimilarity(ctx context.Context, model, wordA, wordB string) (float32, error) {
+func (b *embeddedBackend) CosineSimilarity(_ context.Context, model, wordA, wordB string) (float32, error) {
 	db, err := b.getDB(model)
 	if err != nil {
 		return 0, err
@@ -642,7 +643,7 @@ func (b *embeddedBackend) CosineSimilarity(ctx context.Context, model, wordA, wo
 	return db.CalculateCosineSimilarity(wordA, wordB)
 }
 
-func (b *embeddedBackend) Nearest(ctx context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
+func (b *embeddedBackend) Nearest(_ context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
 	db, err := b.getDB(model)
 	if err != nil {
 		return nil, err
@@ -673,7 +674,7 @@ func (b *embeddedBackend) SetRelation(ctx context.Context, model, name string, d
 	return db.SetRelation(name, direction)
 }
 
-func (b *embeddedBackend) Sync(ctx context.Context, model string) error {
+func (b *embeddedBackend) Sync(_ context.Context, model string) error {
 	if model != "" && model != "all" {
 		db, err := b.getDB(model)
 		if err != nil {
@@ -734,7 +735,7 @@ func (b *embeddedBackend) IsRemote() bool {
 	return false
 }
 
-func (b *embeddedBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+func (b *embeddedBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
 	partDir := filepath.Join(b.dataDir, "partitions")
 	entries, err := os.ReadDir(partDir)
 	if err != nil {
@@ -1820,11 +1821,11 @@ func (b *wireBackend) IsRemote() bool {
 	return true
 }
 
-func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+func (b *wireBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
 	return nil, fmt.Errorf("partition management is not supported over AnchorWire binary transport; use HTTP engine")
 }
 
-func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *wireBackend) InspectPartition(_ context.Context, _, _ string, _ int) (*PartitionInspectResult, error) {
 	return nil, fmt.Errorf("partition inspection is not supported over AnchorWire binary transport; use HTTP engine")
 }
 

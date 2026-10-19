@@ -1,3 +1,4 @@
+// Package main provides the command-line interface (CLI) for AnchorDB.
 package main
 
 import (
@@ -271,7 +272,7 @@ func cmdGet(ctx context.Context, client *driver.Client, args []string) error {
 	return nil
 }
 
-func cmdSave(ctx context.Context, client *driver.Client, args []string) error {
+func cmdSave(_ context.Context, client *driver.Client, args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: anchordb save <entity_name> <field1=value1> [field2=value2 ...]")
 	}
@@ -408,7 +409,7 @@ func parseTraversalArgs(args []string) (positional []string, k int, err error) {
 	return positional, k, nil
 }
 
-func cmdCausal(ctx context.Context, client *driver.Client, args []string) error {
+func cmdCausal(_ context.Context, client *driver.Client, args []string) error {
 	positional, k, err := parseTraversalArgs(args)
 	if err != nil {
 		return fmt.Errorf("usage: anchordb causal <seed> <relation> [-k 5]: %w", err)
@@ -428,7 +429,7 @@ func cmdCausal(ctx context.Context, client *driver.Client, args []string) error 
 	return nil
 }
 
-func cmdChain(ctx context.Context, client *driver.Client, args []string) error {
+func cmdChain(_ context.Context, client *driver.Client, args []string) error {
 	positional, k, err := parseTraversalArgs(args)
 	if err != nil {
 		return fmt.Errorf("usage: anchordb chain <seed> <rel1,rel2,...> [-k 5]: %w", err)
@@ -448,7 +449,7 @@ func cmdChain(ctx context.Context, client *driver.Client, args []string) error {
 	return nil
 }
 
-func cmdSync(ctx context.Context, client *driver.Client) error {
+func cmdSync(_ context.Context, client *driver.Client) error {
 	if err := client.Sync(); err != nil {
 		return fmt.Errorf("sync failed: %w", err)
 	}

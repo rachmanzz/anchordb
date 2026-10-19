@@ -1,3 +1,4 @@
+// Package system provides memory monitoring, runtime metrics, and memory bounds management.
 package system
 
 import (

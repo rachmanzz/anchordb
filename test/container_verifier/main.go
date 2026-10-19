@@ -1,3 +1,4 @@
+// Package main executes end-to-end container verification against running AnchorDB instances.
 package main
 
 import (
@@ -493,7 +494,7 @@ func runPersistenceRestartTest(ctx context.Context) {
 // Phase (D): Short Scheduling Verification
 // -----------------------------------------------------------------------------
 
-func runSchedulerTests(ctx context.Context) {
+func runSchedulerTests(_ context.Context) {
 	fmt.Println("[1/3] Inspecting active scheduler status from engine...")
 	req, _ := http.NewRequest(http.MethodGet, baseURL+"/v1/scheduler/status", nil)
 	req.Header.Set("Authorization", "Bearer "+authToken)
@@ -795,9 +796,8 @@ func runSchemaStressTest(ctx context.Context) {
 	}
 	if err := client.Attach(conflictingSchema); err == nil {
 		log.Fatalf("Expected schema mismatch rejection, but Attach succeeded!")
-	} else {
-		fmt.Printf("      -> Rejected as expected: %v [IMMUTABLE]\n", err)
 	}
+	fmt.Printf("      -> Rejected as expected: %v [IMMUTABLE]\n", err)
 
 	// 5. ConnectRemote with Matching vs Mismatched Schema
 	fmt.Println("[5/6] Testing ConnectRemote WithAttachSchema contract enforcement...")

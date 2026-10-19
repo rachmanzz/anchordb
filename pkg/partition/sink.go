@@ -23,7 +23,9 @@ func GenerateUUID() string {
 	return uuid.NewString()
 }
 
-// PartitionSink defines the storage destination for archived partition files (Local Disk or S3)
+// PartitionSink defines the storage destination for archived partition files (Local Disk or S3).
+//
+//nolint:revive // Stutter maintained for API backward compatibility.
 type PartitionSink interface {
 	// SavePartitionFromFile stores the file at srcPath under the partition name
 	// filename, streaming it so an arbitrarily large archive is never buffered
@@ -32,19 +34,25 @@ type PartitionSink interface {
 	Name() string
 }
 
+// Sink is an alias for PartitionSink without package stutter.
+type Sink = PartitionSink
+
 // LocalDiskSink saves partition files to a local directory (e.g. /data/partitions/...)
 type LocalDiskSink struct {
 	BaseDir string
 }
 
+// NewLocalDiskSink creates a sink targeting a local filesystem directory.
 func NewLocalDiskSink(baseDir string) *LocalDiskSink {
 	return &LocalDiskSink{BaseDir: baseDir}
 }
 
+// Name returns the descriptive name of the local disk sink.
 func (s *LocalDiskSink) Name() string {
 	return fmt.Sprintf("LocalDisk (%s)", s.BaseDir)
 }
 
+// SavePartitionFromFile copies the partition file from srcPath into the sink.
 func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
@@ -151,6 +159,7 @@ func syncPartitionDir(dir string) error {
 	return d.Sync()
 }
 
+// SavePartition writes raw byte payload to the target partition file.
 func (s *LocalDiskSink) SavePartition(filename string, data []byte) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
@@ -173,6 +182,7 @@ type S3Sink struct {
 	AllowInsecureHTTP bool
 }
 
+// NewS3Sink creates an S3-compatible partition sink.
 func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 	return &S3Sink{
 		Endpoint:   endpoint,
@@ -185,10 +195,12 @@ func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 	}
 }
 
+// Name returns the descriptive name of the S3 sink.
 func (s *S3Sink) Name() string {
 	return fmt.Sprintf("S3 (%s/%s/%s)", s.Endpoint, s.Bucket, s.Prefix)
 }
 
+// SavePartitionFromFile streams the local partition file into the S3 bucket.
 func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
@@ -202,6 +214,7 @@ func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error)
 	return s.put(filename, src, fi.Size())
 }
 
+// SavePartition uploads raw bytes as an object to the S3 bucket.
 func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 	return s.put(filename, bytes.NewReader(data), int64(len(data)))
 }

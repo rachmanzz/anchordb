@@ -1,3 +1,4 @@
+// Package main tests and demonstrates storage durability across Podman container crashes and restarts.
 package main
 
 import (

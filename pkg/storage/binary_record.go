@@ -15,10 +15,12 @@ const (
 	// every version from 1..DBVersion, so v1/v2 files remain openable.
 	DBVersion = 3
 
+	// HeaderSize is the fixed size in bytes of the .anchordb file header.
 	HeaderSize = 64
-	RecordSize = 40 // Exact 40-byte fixed binary record per node
-
-	GridDim = 256 // 256x256 spatial cells
+	// RecordSize is the exact 40-byte fixed binary record per node.
+	RecordSize = 40
+	// GridDim is the dimension of the 256x256 spatial grid cells.
+	GridDim = 256
 )
 
 // Header represents the 64-byte file header of .anchordb

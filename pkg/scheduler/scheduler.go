@@ -85,17 +85,17 @@ type registeredTask struct {
 	nextRun    time.Time
 }
 
-// nextDaily returns the next occurrence of hour:min strictly after from, using
+// nextDaily returns the next occurrence of hour:minute strictly after from, using
 // calendar arithmetic so DST transitions do not shift the wall-clock time.
-func nextDaily(from time.Time, hour, min int) time.Time {
+func nextDaily(from time.Time, hour, minute int) time.Time {
 	loc := from.Location()
 	y, mo, d := from.Date()
-	cand := time.Date(y, mo, d, hour, min, 0, 0, loc)
+	cand := time.Date(y, mo, d, hour, minute, 0, 0, loc)
 	if cand.After(from) {
 		return cand
 	}
 	// Advance by one calendar day (handles month/year rollover and DST).
-	return time.Date(y, mo, d+1, hour, min, 0, 0, loc)
+	return time.Date(y, mo, d+1, hour, minute, 0, 0, loc)
 }
 
 // nextAt computes the next fire instant given a reference instant.
@@ -219,12 +219,12 @@ func NormalizeSchedule(schedule string) (string, error) {
 		parts := strings.Split(schedule, ":")
 		if len(parts) == 2 {
 			hour, errH := strconv.Atoi(strings.TrimSpace(parts[0]))
-			min, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
+			minute, errM := strconv.Atoi(strings.TrimSpace(parts[1]))
 			if errH == nil && errM == nil {
-				if hour < 0 || hour > 23 || min < 0 || min > 59 {
+				if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
 					return "", fmt.Errorf("invalid time %q: hour must be 0-23 and minute 0-59", schedule)
 				}
-				return fmt.Sprintf("%d %d * * *", min, hour), nil
+				return fmt.Sprintf("%d %d * * *", minute, hour), nil
 			}
 		}
 	}

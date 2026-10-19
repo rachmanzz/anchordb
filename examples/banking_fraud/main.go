@@ -1,3 +1,4 @@
+// Package main demonstrates real-time banking fraud analysis with AnchorDB.
 package main
 
 import (
@@ -300,7 +301,7 @@ func runMuleTrackingScenario(ctx context.Context, client *driver.Client) error {
 // SCENARIO 2: Impossible Travel & Spatial Velocity Anomaly
 // ------------------------------------------------------------------------------------------------
 
-func runImpossibleTravelScenario(ctx context.Context, client *driver.Client) error {
+func runImpossibleTravelScenario(_ context.Context, client *driver.Client) error {
 	fmt.Println("==========================================================================================")
 	fmt.Println(">>> [SCENARIO 2] Impossible Travel & Geolocation Anomaly Detection (ATM / POS Fraud)")
 	fmt.Println("    Method: 2D spatial lookup plus great-circle distance estimate.")
@@ -378,7 +379,7 @@ func haversineKm(a, b spatial.Point2D) float64 {
 // SCENARIO 3: Massive 1,000,000+ Scale Stress Test
 // ------------------------------------------------------------------------------------------------
 
-func runScaleBenchmarkScenario(ctx context.Context, client *driver.Client, totalRecords int) error {
+func runScaleBenchmarkScenario(_ context.Context, client *driver.Client, totalRecords int) error {
 	fmt.Println("==========================================================================================")
 	fmt.Printf(">>> [SCENARIO 3] Enterprise High-Throughput Scale Benchmark (%s Accounts)\n", formatNumber(totalRecords))
 	fmt.Println("    Measuring AnchorWire ingestion throughput and causal-query latency at scale.")

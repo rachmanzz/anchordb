@@ -231,7 +231,7 @@ func TestWire_GetRequestPayload(t *testing.T) {
 }
 
 func TestWire_ListRequestPayload(t *testing.T) {
-	opVal := uint8(storage.OpStatusActive)
+	opVal := storage.OpStatusActive
 	req := ListRequest{
 		Limit:                25,
 		Offset:               50,

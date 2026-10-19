@@ -19,7 +19,7 @@ func TestWorkerPool(t *testing.T) {
 
 	var executed int32
 
-	err := pool.Dispatch(context.Background(), "test_job", func(ctx context.Context) error {
+	err := pool.Dispatch(context.Background(), "test_job", func(_ context.Context) error {
 		atomic.AddInt32(&executed, 1)
 		return nil
 	})
@@ -40,7 +40,7 @@ func TestWorkerPool(t *testing.T) {
 	}
 
 	// Test failing job
-	_ = pool.Dispatch(context.Background(), "failing_job", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "failing_job", func(_ context.Context) error {
 		return errors.New("simulated error")
 	})
 
@@ -70,7 +70,7 @@ func TestWorkerPoolDisabled(t *testing.T) {
 	pool.Start()
 
 	var syncExecuted int32
-	err := pool.Dispatch(context.Background(), "sync_job", func(ctx context.Context) error {
+	err := pool.Dispatch(context.Background(), "sync_job", func(_ context.Context) error {
 		atomic.AddInt32(&syncExecuted, 1)
 		return nil
 	})

@@ -17,7 +17,7 @@ func TestRetrySucceedsEventually(t *testing.T) {
 	defer func() { _ = pool.Shutdown() }()
 
 	var attempts int32
-	err := pool.Dispatch(context.Background(), "flaky", func(ctx context.Context) error {
+	err := pool.Dispatch(context.Background(), "flaky", func(_ context.Context) error {
 		if atomic.AddInt32(&attempts, 1) < 3 {
 			return errors.New("transient")
 		}
@@ -50,15 +50,15 @@ func TestFallbackRecoversTask(t *testing.T) {
 	defer func() { _ = pool.Shutdown() }()
 
 	var success, fallbackHit int32
-	err := pool.Dispatch(context.Background(), "always-fail", func(ctx context.Context) error {
+	err := pool.Dispatch(context.Background(), "always-fail", func(_ context.Context) error {
 		return errors.New("boom")
 	},
 		WithRetry(1, time.Millisecond),
-		WithFallback(func(ctx context.Context, err error) error {
+		WithFallback(func(_ context.Context, _ error) error {
 			atomic.AddInt32(&fallbackHit, 1)
 			return nil // recover
 		}),
-		WithOnSuccess(func(ctx context.Context) { atomic.AddInt32(&success, 1) }),
+		WithOnSuccess(func(_ context.Context) { atomic.AddInt32(&success, 1) }),
 	)
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -87,9 +87,9 @@ func TestOnErrorCalledOnFinalFailure(t *testing.T) {
 	defer func() { _ = pool.Shutdown() }()
 
 	var onErr int32
-	_ = pool.Dispatch(context.Background(), "fail", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "fail", func(_ context.Context) error {
 		return errors.New("nope")
-	}, WithOnError(func(ctx context.Context, err error) {
+	}, WithOnError(func(_ context.Context, err error) {
 		if err != nil {
 			atomic.AddInt32(&onErr, 1)
 		}
@@ -114,13 +114,13 @@ func TestPanicRecoveryKeepsPoolAlive(t *testing.T) {
 	pool.Start()
 	defer func() { _ = pool.Shutdown() }()
 
-	_ = pool.Dispatch(context.Background(), "panicker", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "panicker", func(_ context.Context) error {
 		panic("explode")
 	})
 
 	// Pool must survive and still process work.
 	var ok int32
-	_ = pool.Dispatch(context.Background(), "ok", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "ok", func(_ context.Context) error {
 		atomic.AddInt32(&ok, 1)
 		return nil
 	})
@@ -149,7 +149,7 @@ func TestMemoryAdmissionRejectsWhenFull(t *testing.T) {
 	pool.Start()
 	defer func() { _ = pool.Shutdown() }()
 
-	err := pool.Dispatch(context.Background(), "big", func(ctx context.Context) error { return nil })
+	err := pool.Dispatch(context.Background(), "big", func(_ context.Context) error { return nil })
 	if !errors.Is(err, ErrMemoryFull) {
 		t.Fatalf("expected ErrMemoryFull, got %v", err)
 	}
@@ -168,7 +168,7 @@ func TestWaitBeforeShutdownAndDraining(t *testing.T) {
 
 	var done int32
 	for i := 0; i < 5; i++ {
-		if err := pool.Dispatch(context.Background(), fmt.Sprintf("t%d", i), func(ctx context.Context) error {
+		if err := pool.Dispatch(context.Background(), fmt.Sprintf("t%d", i), func(context.Context) error {
 			atomic.AddInt32(&done, 1)
 			return nil
 		}); err != nil {
@@ -187,7 +187,7 @@ func TestWaitBeforeShutdownAndDraining(t *testing.T) {
 	if !pool.Draining() {
 		t.Fatalf("pool should be draining after WaitBeforeShutdown")
 	}
-	if err := pool.Dispatch(context.Background(), "after", func(ctx context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
+	if err := pool.Dispatch(context.Background(), "after", func(context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
 		t.Fatalf("expected ErrDraining after drain, got %v", err)
 	}
 }
@@ -202,7 +202,7 @@ func TestSafeCancelQueuedTasks(t *testing.T) {
 
 	release := make(chan struct{})
 	started := make(chan struct{})
-	_ = pool.Dispatch(context.Background(), "blocker", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "blocker", func(context.Context) error {
 		close(started)
 		<-release
 		return nil
@@ -212,8 +212,8 @@ func TestSafeCancelQueuedTasks(t *testing.T) {
 	var canceled int32
 	for i := 0; i < 3; i++ {
 		_ = pool.Dispatch(context.Background(), fmt.Sprintf("queued%d", i),
-			func(ctx context.Context) error { return nil },
-			WithOnError(func(ctx context.Context, err error) {
+			func(context.Context) error { return nil },
+			WithOnError(func(_ context.Context, err error) {
 				if errors.Is(err, ErrCanceled) {
 					atomic.AddInt32(&canceled, 1)
 				}
@@ -296,7 +296,7 @@ func TestCancelByModelAndID(t *testing.T) {
 
 	release := make(chan struct{})
 	started := make(chan struct{})
-	_ = pool.Dispatch(context.Background(), "blocker", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "blocker", func(context.Context) error {
 		close(started)
 		<-release
 		return nil
@@ -310,9 +310,9 @@ func TestCancelByModelAndID(t *testing.T) {
 	// Queue 2 tasks for tenant/model "modelA"
 	for i := 0; i < 2; i++ {
 		_ = pool.Dispatch(context.Background(), fmt.Sprintf("jobA_%d", i),
-			func(ctx context.Context) error { return nil },
+			func(context.Context) error { return nil },
 			WithModel("modelA"),
-			WithOnError(func(ctx context.Context, err error) {
+			WithOnError(func(_ context.Context, err error) {
 				if errors.Is(err, ErrCanceled) {
 					atomic.AddInt32(&modelACanceled, 1)
 				}
@@ -322,7 +322,7 @@ func TestCancelByModelAndID(t *testing.T) {
 
 	// Queue 1 task for "modelB"
 	_ = pool.Dispatch(context.Background(), "jobB_1",
-		func(ctx context.Context) error {
+		func(context.Context) error {
 			atomic.AddInt32(&modelBExecuted, 1)
 			return nil
 		},
@@ -331,7 +331,7 @@ func TestCancelByModelAndID(t *testing.T) {
 
 	// Queue 1 task with specific ID "target-task-id"
 	_ = pool.Dispatch(context.Background(), "jobC_specific",
-		func(ctx context.Context) error {
+		func(context.Context) error {
 			atomic.AddInt32(&taskCExecuted, 1)
 			return nil
 		},
@@ -379,7 +379,7 @@ func TestResumeAfterWaitBeforeShutdown(t *testing.T) {
 	if err := pool.WaitBeforeShutdown(ctx); err != nil {
 		t.Fatalf("WaitBeforeShutdown: %v", err)
 	}
-	if err := pool.Dispatch(context.Background(), "blocked", func(ctx context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
+	if err := pool.Dispatch(context.Background(), "blocked", func(context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
 		t.Fatalf("expected ErrDraining while draining, got %v", err)
 	}
 
@@ -389,7 +389,7 @@ func TestResumeAfterWaitBeforeShutdown(t *testing.T) {
 		t.Fatalf("pool should not be draining after Resume")
 	}
 	var ran int32
-	if err := pool.Dispatch(context.Background(), "after-resume", func(ctx context.Context) error {
+	if err := pool.Dispatch(context.Background(), "after-resume", func(context.Context) error {
 		atomic.AddInt32(&ran, 1)
 		return nil
 	}); err != nil {
@@ -414,7 +414,7 @@ func TestRestartAfterCleanShutdown(t *testing.T) {
 	// A clean shutdown must be restartable.
 	pool.Start()
 	var ran int32
-	if err := pool.Dispatch(context.Background(), "second-life", func(ctx context.Context) error {
+	if err := pool.Dispatch(context.Background(), "second-life", func(context.Context) error {
 		atomic.AddInt32(&ran, 1)
 		return nil
 	}); err != nil {
@@ -440,7 +440,7 @@ func TestShutdownRespectsTimeout(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
-	_ = pool.Dispatch(context.Background(), "stuck", func(ctx context.Context) error {
+	_ = pool.Dispatch(context.Background(), "stuck", func(context.Context) error {
 		close(started)
 		<-release // ignores ctx entirely
 		return nil
@@ -462,7 +462,7 @@ func TestShutdownRespectsTimeout(t *testing.T) {
 
 	// Restart after a forced shutdown must be refused (no overlapping workers).
 	pool.Start()
-	if err := pool.Dispatch(context.Background(), "post-force", func(ctx context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
+	if err := pool.Dispatch(context.Background(), "post-force", func(context.Context) error { return nil }); !errors.Is(err, ErrDraining) {
 		t.Fatalf("expected pool to stay stopped after forced shutdown, got %v", err)
 	}
 }

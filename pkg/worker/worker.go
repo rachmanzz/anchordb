@@ -1,3 +1,4 @@
+// Package worker provides background task pools, worker concurrency controls, and task scheduling.
 package worker
 
 import (
@@ -801,7 +802,7 @@ func (p *Pool) WaitIdle(ctx context.Context) error {
 // canceled via its OnError hook. In-flight tasks are left untouched, so this is
 // safe to call concurrently and repeatedly. Returns the number of canceled tasks.
 func (p *Pool) SafeCancel() int {
-	return p.CancelMatching(func(t Task) bool { return true })
+	return p.CancelMatching(func(_ Task) bool { return true })
 }
 
 // CancelMatching drains queued tasks matching the predicate. Non-matching tasks

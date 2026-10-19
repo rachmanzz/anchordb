@@ -251,7 +251,7 @@ func TestWorkerCancelScopedEndpoint(t *testing.T) {
 	blockerDone := make(chan struct{})
 	blockerStarted := make(chan struct{})
 	for i := 0; i < 2; i++ {
-		_ = s.worker.Dispatch(context.Background(), "blocker", func(ctx context.Context) error {
+		_ = s.worker.Dispatch(context.Background(), "blocker", func(_ context.Context) error {
 			select {
 			case blockerStarted <- struct{}{}:
 			default:
@@ -267,7 +267,7 @@ func TestWorkerCancelScopedEndpoint(t *testing.T) {
 	var taskBExecuted int32
 
 	_ = s.worker.Dispatch(context.Background(), "job_a",
-		func(ctx context.Context) error {
+		func(_ context.Context) error {
 			atomic.AddInt32(&taskAExecuted, 1)
 			return nil
 		},
@@ -276,7 +276,7 @@ func TestWorkerCancelScopedEndpoint(t *testing.T) {
 	)
 
 	_ = s.worker.Dispatch(context.Background(), "job_b",
-		func(ctx context.Context) error {
+		func(_ context.Context) error {
 			atomic.AddInt32(&taskBExecuted, 1)
 			return nil
 		},

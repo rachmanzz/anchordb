@@ -108,10 +108,10 @@ func (cs *CommitmentStore) load() error {
 	for {
 		var lenBuf [2]byte
 		if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-			return err
+			return fmt.Errorf("%w: truncated record header: %v", ErrCorruptCommitmentFile, err)
 		}
 		nodeIDLen := int(binary.LittleEndian.Uint16(lenBuf[:]))
 
@@ -327,6 +327,13 @@ func (cs *CommitmentStore) persistSyncLocked() error {
 
 	// 5. Fsync directory metadata
 	return syncWireDir(filepath.Dir(cs.filePath))
+}
+
+// Close flushes and synchronizes any pending in-memory commitment records to disk.
+func (cs *CommitmentStore) Close() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.persistSyncLocked()
 }
 
 // syncWireDir flushes directory changes to durable storage.

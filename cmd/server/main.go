@@ -1,3 +1,4 @@
+// Package main runs the AnchorDB server engine daemon.
 package main
 
 import (
@@ -111,12 +112,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		return nil, fmt.Errorf("cannot create data dir %q: %w", cfg.DataDir, err)
 	}
-	if probe, err := os.CreateTemp(cfg.DataDir, ".anchordb_write_check_*"); err != nil {
+	probe, err := os.CreateTemp(cfg.DataDir, ".anchordb_write_check_*")
+	if err != nil {
 		return nil, fmt.Errorf("data dir %q is not writable: %w", cfg.DataDir, err)
-	} else {
-		_ = probe.Close()
-		_ = os.Remove(probe.Name())
 	}
+	_ = probe.Close()
+	_ = os.Remove(probe.Name())
 	ipFilter, err := security.NewIPFilter(cfg.IPWhitelist, cfg.TrustProxy)
 	if err != nil {
 		return nil, fmt.Errorf("invalid IP whitelist %q: %w", cfg.IPWhitelist, err)
@@ -499,7 +500,7 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 		err := t.server.worker.Dispatch(
 			ctx,
 			"cron_partition_"+modelName,
-			func(wCtx context.Context) error {
+			func(_ context.Context) error {
 				db, err := t.server.getModel(modelName)
 				if err != nil {
 					return err
@@ -530,11 +531,11 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 	return dispatchErr
 }
 
-func (t *AutoPartitionCronTask) OnError(ctx context.Context, err error) {
+func (t *AutoPartitionCronTask) OnError(_ context.Context, err error) {
 	log.Printf("[SCHEDULER] AutoPartitionCronTask recoverable error: %v", err)
 }
 
-func (t *AutoPartitionCronTask) OnFail(ctx context.Context, err error) {
+func (t *AutoPartitionCronTask) OnFail(_ context.Context, err error) {
 	log.Printf("[SCHEDULER] AutoPartitionCronTask fatal failure: %v", err)
 }
 
@@ -559,7 +560,7 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 	return t.server.worker.Dispatch(
 		ctx,
 		"periodic_disk_sync",
-		func(wCtx context.Context) error {
+		func(_ context.Context) error {
 			t.server.mu.RLock()
 			var dbs []*storage.AnchorDB
 			for _, d := range t.server.models {
@@ -591,11 +592,11 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 	)
 }
 
-func (t *PeriodicSyncCronTask) OnError(ctx context.Context, err error) {
+func (t *PeriodicSyncCronTask) OnError(_ context.Context, err error) {
 	log.Printf("[SCHEDULER] PeriodicSyncCronTask recoverable error: %v", err)
 }
 
-func (t *PeriodicSyncCronTask) OnFail(ctx context.Context, err error) {
+func (t *PeriodicSyncCronTask) OnFail(_ context.Context, err error) {
 	log.Printf("[SCHEDULER] PeriodicSyncCronTask fatal failure: %v", err)
 }
 
@@ -779,7 +780,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleMetrics exposes dependency-free Prometheus text-format metrics for
 // scraping. It is intentionally unauthenticated, like /health, so that standard
 // scrapers work; put it behind your reverse proxy if that is not acceptable.
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	models := len(s.models)
 	s.mu.RUnlock()
@@ -1282,7 +1283,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		err := s.worker.DispatchAsync(
 			context.Background(),
 			"update_"+req.Model,
-			func(ctx context.Context) error {
+			func(_ context.Context) error {
 				count, err := db.UpdateRecords(storage.UpdateOptions{
 					TargetEntities: req.In,
 					Filters:        filters,
@@ -1620,7 +1621,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		err := s.worker.DispatchAsync(
 			context.Background(),
 			"sync_"+modelName,
-			func(ctx context.Context) error {
+			func(_ context.Context) error {
 				return db.Sync()
 			},
 			worker.WithID(jobID),
@@ -1771,7 +1772,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		err := s.worker.DispatchAsync(
 			context.Background(),
 			"partition_run_async",
-			func(ctx context.Context) error {
+			func(_ context.Context) error {
 				var errs []error
 				for _, m := range targetModels {
 					db, err := s.getModel(m)
@@ -2088,7 +2089,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		err := s.worker.DispatchAsync(
 			context.Background(),
 			"collector_run_async",
-			func(ctx context.Context) error {
+			func(_ context.Context) error {
 				total := 0
 				var errs []error
 				for _, m := range targetModels {

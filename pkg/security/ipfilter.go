@@ -1,3 +1,4 @@
+// Package security provides IP-based access control, CIDR filtering, and security middleware.
 package security
 
 import (

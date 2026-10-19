@@ -1,3 +1,5 @@
+// Package storage implements the core AnchorDB storage engine, write-ahead log,
+// and in-memory spatial graph indexes.
 package storage
 
 import (
@@ -32,9 +34,12 @@ var ErrRecordLocked = errors.New("anchordb: record is locked for partitioning")
 type OrderByMode int
 
 const (
-	OrderByCompositeDesc OrderByMode = iota // Default: Score descending with t tie-breaker
-	OrderByDistanceAsc                      // Distance along ray t ascending
-	OrderByScoreDesc                        // Pure score descending
+	// OrderByCompositeDesc sorts by score descending with distance tie-breaker.
+	OrderByCompositeDesc OrderByMode = iota
+	// OrderByDistanceAsc sorts by distance along ray t ascending.
+	OrderByDistanceAsc
+	// OrderByScoreDesc sorts by pure score descending.
+	OrderByScoreDesc
 )
 
 // GraphQueryResult holds a result produced by internal storage computation
@@ -70,6 +75,7 @@ type CompactRecord struct {
 	Raw       []byte
 }
 
+// Get retrieves the float32 value associated with key, returning false if not found.
 func (cr CompactRecord) Get(key string) (float32, bool) {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
@@ -103,6 +109,7 @@ func (cr CompactRecord) Get(key string) (float32, bool) {
 	return 0, false
 }
 
+// Set updates or inserts an attribute key-value pair, expanding raw records if necessary.
 func (cr CompactRecord) Set(key string, val float32) CompactRecord {
 	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
 		cr.Attrs = cr.expandAttrs()
@@ -146,6 +153,7 @@ func (cr CompactRecord) expandAttrs() []AttrEntry {
 	return attrs
 }
 
+// ToMap decodes and returns all attributes as a standard Go map.
 func (cr CompactRecord) ToMap() map[string]float32 {
 	if len(cr.Attrs) > 0 {
 		m := make(map[string]float32, len(cr.Attrs))
@@ -178,6 +186,7 @@ func (cr CompactRecord) ToMap() map[string]float32 {
 	return make(map[string]float32)
 }
 
+// Project extracts only the requested field subset as a map.
 func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
 	if len(selectFields) == 0 {
 		return cr.ToMap()
@@ -191,6 +200,7 @@ func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
 	return m
 }
 
+// ForEachAttr iterates over all attributes without allocating an intermediate map.
 func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
@@ -223,6 +233,7 @@ func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
 	}
 }
 
+// AttrCount returns the total number of attributes stored in the record.
 func (cr CompactRecord) AttrCount() int {
 	if len(cr.Attrs) > 0 {
 		return len(cr.Attrs)
@@ -433,6 +444,7 @@ type OpDivide struct {
 	FieldB string
 }
 
+// Apply calculates FieldA / FieldB across properties.
 func (op OpDivide) Apply(props map[string]float32) (float32, error) {
 	valA, err := resolveValue(op.FieldA, props)
 	if err != nil {
@@ -454,6 +466,7 @@ type OpMultiply struct {
 	FieldB string
 }
 
+// Apply calculates FieldA * FieldB across properties.
 func (op OpMultiply) Apply(props map[string]float32) (float32, error) {
 	valA, err := resolveValue(op.FieldA, props)
 	if err != nil {
@@ -472,6 +485,7 @@ type OpAdd struct {
 	FieldB string
 }
 
+// Apply calculates FieldA + FieldB across properties.
 func (op OpAdd) Apply(props map[string]float32) (float32, error) {
 	valA, err := resolveValue(op.FieldA, props)
 	if err != nil {
@@ -490,6 +504,7 @@ type OpSubtract struct {
 	FieldB string
 }
 
+// Apply calculates FieldA - FieldB across properties.
 func (op OpSubtract) Apply(props map[string]float32) (float32, error) {
 	valA, err := resolveValue(op.FieldA, props)
 	if err != nil {
@@ -508,6 +523,7 @@ type OpAddDays struct {
 	Days  float32
 }
 
+// Apply adds N days to the specified date field.
 func (op OpAddDays) Apply(props map[string]float32) (float32, error) {
 	val, err := resolveValue(op.Field, props)
 	if err != nil {
@@ -522,6 +538,7 @@ type OpSubtractDays struct {
 	Days  float32
 }
 
+// Apply subtracts N days from the specified date field.
 func (op OpSubtractDays) Apply(props map[string]float32) (float32, error) {
 	val, err := resolveValue(op.Field, props)
 	if err != nil {
@@ -536,6 +553,7 @@ type OpDaysBetween struct {
 	FieldB string
 }
 
+// Apply computes the days difference between FieldA and FieldB.
 func (op OpDaysBetween) Apply(props map[string]float32) (float32, error) {
 	valA, err := resolveValue(op.FieldA, props)
 	if err != nil {
@@ -553,6 +571,7 @@ type OpAssign struct {
 	Value string
 }
 
+// Apply assigns the resolved numeric or property value.
 func (op OpAssign) Apply(props map[string]float32) (float32, error) {
 	return resolveValue(op.Value, props)
 }
@@ -565,6 +584,7 @@ type FilterCondition struct {
 	ValueHigh float32 // Used for "BETWEEN" range [Value, ValueHigh]
 }
 
+// Matches evaluates the filter condition against the given property map.
 func (f FilterCondition) Matches(props map[string]float32) bool {
 	val, exists := props[f.Field]
 	if !exists {
@@ -1161,7 +1181,7 @@ func (db *AnchorDB) loadEntities() error {
 				return fmt.Errorf("corrupt file: truncated operation status at entity %d", i)
 			}
 			opStatus = data[offset]
-			offset += 1
+			offset++
 		}
 
 		if offset+2 > len(data) {
@@ -1239,7 +1259,7 @@ func (db *AnchorDB) remapEntitiesLocked() {
 				break
 			}
 			opStatus = data[offset]
-			offset += 1
+			offset++
 		}
 
 		if offset+2 > len(data) {

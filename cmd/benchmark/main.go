@@ -1,3 +1,4 @@
+// Package main runs performance benchmarks for AnchorDB storage and indexing.
 package main
 
 import (
@@ -67,7 +68,7 @@ func benchSpatialDDA() {
 	t0 := time.Now()
 	cellsVisited := 0
 	for i := 0; i < n; i++ {
-		storage.TraverseRayDDA(ray, storage.GridDim, 1.5, func(c storage.CellCoord) bool {
+		storage.TraverseRayDDA(ray, storage.GridDim, 1.5, func(_ storage.CellCoord) bool {
 			cellsVisited++
 			return true
 		})

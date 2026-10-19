@@ -139,9 +139,16 @@ func (s *Server) Close() error {
 	for conn := range s.conns {
 		_ = conn.Close()
 	}
+	jm := s.joinManager
 	s.mu.Unlock()
 
 	s.wg.Wait()
+
+	if jm != nil {
+		if jmErr := jm.Close(); jmErr != nil && err == nil {
+			err = jmErr
+		}
+	}
 	return err
 }
 

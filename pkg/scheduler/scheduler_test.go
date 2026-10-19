@@ -194,7 +194,7 @@ func TestWaitUntilFiresWhenClockJumpsForward(t *testing.T) {
 	calls := 0
 	// Simulate a wait slice elapsing; after the first slice the wall clock
 	// jumps forward past the target (as an NTP correction would).
-	s.after = func(d time.Duration) <-chan time.Time {
+	s.after = func(_ time.Duration) <-chan time.Time {
 		calls++
 		if calls == 1 {
 			current = base.Add(2 * time.Hour)
@@ -217,7 +217,7 @@ func TestWaitUntilFiresWhenClockJumpsForward(t *testing.T) {
 
 func TestWaitUntilResponsiveToStop(t *testing.T) {
 	s := NewInternalScheduler()
-	s.after = func(d time.Duration) <-chan time.Time { return make(chan time.Time) } // never fires
+	s.after = func(_ time.Duration) <-chan time.Time { return make(chan time.Time) } // never fires
 
 	rs := &runState{ctx: context.Background(), cancel: func() {}, stop: make(chan struct{})}
 	task := &registeredTask{stop: make(chan struct{})}

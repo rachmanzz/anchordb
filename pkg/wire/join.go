@@ -207,6 +207,19 @@ func (jm *JoinManager) ClosePairing() {
 	jm.pairingActive = false
 }
 
+// Close gracefully flushes any resources held by JoinManager.
+func (jm *JoinManager) Close() error {
+	if jm == nil {
+		return nil
+	}
+	jm.mu.Lock()
+	defer jm.mu.Unlock()
+	if jm.commitmentStore != nil {
+		return jm.commitmentStore.Close()
+	}
+	return nil
+}
+
 // GenerateOTK creates an ephemeral one-time join key.
 func (jm *JoinManager) GenerateOTK(role string, epoch uint64, ttl time.Duration) (string, error) {
 	if jm == nil {

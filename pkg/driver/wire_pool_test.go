@@ -33,7 +33,7 @@ func (m *wireTestBackend) GetModel(name string) (*storage.AnchorDB, error) {
 	return db, nil
 }
 
-func (m *wireTestBackend) Authenticate(token string) bool {
+func (m *wireTestBackend) Authenticate(_ string) bool {
 	return true
 }
 

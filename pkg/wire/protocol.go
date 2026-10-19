@@ -1,3 +1,5 @@
+// Package wire implements the AnchorWire binary protocol, connection pooling,
+// and cryptographic authentication for AnchorDB.
 package wire
 
 import (

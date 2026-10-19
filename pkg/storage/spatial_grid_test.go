@@ -95,7 +95,7 @@ func TestTraverseRayDDA_VisitsCellsAndEarlyTerminates(t *testing.T) {
 
 	// Test early termination after 3 cells
 	var count int
-	TraverseRayDDA(ray, GridDim, 0.5, func(c CellCoord) bool {
+	TraverseRayDDA(ray, GridDim, 0.5, func(_ CellCoord) bool {
 		count++
 		return count < 3 // stop when count reaches 3
 	})

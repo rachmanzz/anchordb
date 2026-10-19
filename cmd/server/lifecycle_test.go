@@ -105,7 +105,7 @@ func TestShutdownHTTPTimeoutForcesCloseAndKeepsDB(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/slow", func(_ http.ResponseWriter, _ *http.Request) {
 		close(entered)
 		<-release
 	})

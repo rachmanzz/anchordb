@@ -2,6 +2,7 @@ package wire
 
 import (
 	"crypto/sha256"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -110,5 +111,27 @@ func TestCommitmentStore_LifecycleAndReopen(t *testing.T) {
 	codeUnknown, errUnknown := store2.StageReauth("unknown-node", v3, [32]byte{})
 	if errUnknown != ErrUnknownNodeID || codeUnknown != ErrCodeUnauthorized {
 		t.Fatalf("expected ErrUnknownNodeID, got code=%d, err=%v", codeUnknown, errUnknown)
+	}
+}
+
+func TestCommitmentStore_CorruptFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	badPath := filepath.Join(tmpDir, "corrupt.bin")
+
+	// 1. Invalid magic
+	if err := os.WriteFile(badPath, []byte("NOTMAGIC12345678"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenCommitmentStore(badPath); err == nil {
+		t.Fatal("expected error opening file with invalid magic")
+	}
+
+	// 2. Truncated record header (1 byte instead of 2-byte uint16 length)
+	validHeader := []byte("ANCHCOMM\x01\x00\x00\x00\x00\x00\x00\x00\x01")
+	if err := os.WriteFile(badPath, validHeader, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenCommitmentStore(badPath); err == nil {
+		t.Fatal("expected error opening file with truncated record header")
 	}
 }
