@@ -38,30 +38,53 @@ type edgeJob struct {
 
 // Server is the AnchorWire binary TCP protocol daemon.
 type Server struct {
-	backend  Backend
-	l        net.Listener
-	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	closed   bool
-	wg       sync.WaitGroup
-	saveJobs chan *saveJob
-	edgeJobs chan *edgeJob
-	stopChan chan struct{}
+	backend     Backend
+	joinManager *JoinManager
+	gatewayMode bool
+	l           net.Listener
+	mu          sync.Mutex
+	conns       map[net.Conn]struct{}
+	closed      bool
+	wg          sync.WaitGroup
+	saveJobs    chan *saveJob
+	edgeJobs    chan *edgeJob
+	stopChan    chan struct{}
 }
 
 // NewServer constructs an AnchorWire server instance.
 func NewServer(backend Backend) *Server {
+	return NewServerWithJoinManager(backend, nil)
+}
+
+// NewServerWithJoinManager constructs an AnchorWire server instance with an optional JoinManager.
+func NewServerWithJoinManager(backend Backend, jm *JoinManager) *Server {
+	gatewayMode := false
+	if jm != nil {
+		gatewayMode = jm.IsGatewayMode()
+	}
 	s := &Server{
-		backend:  backend,
-		conns:    make(map[net.Conn]struct{}),
-		saveJobs: make(chan *saveJob, 2048),
-		edgeJobs: make(chan *edgeJob, 2048),
-		stopChan: make(chan struct{}),
+		backend:     backend,
+		joinManager: jm,
+		gatewayMode: gatewayMode,
+		conns:       make(map[net.Conn]struct{}),
+		saveJobs:    make(chan *saveJob, 2048),
+		edgeJobs:    make(chan *edgeJob, 2048),
+		stopChan:    make(chan struct{}),
 	}
 	s.wg.Add(2)
 	go s.runGroupCommitter()
 	go s.runEdgeGroupCommitter()
 	return s
+}
+
+// SetJoinManager assigns the JoinManager.
+func (s *Server) SetJoinManager(jm *JoinManager) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.joinManager = jm
+	if jm != nil {
+		s.gatewayMode = jm.IsGatewayMode()
+	}
 }
 
 // Serve accepts incoming AnchorWire TCP connections.
@@ -369,12 +392,22 @@ func (s *Server) handleConn(conn net.Conn) {
 	}()
 
 	currentModel := "default"
-	authenticated := !s.backend.RequiresAuth()
+	authenticated := !s.gatewayMode && !s.backend.RequiresAuth()
+	var authenticatedNodeID string
+	var stagedPendingConfirm bool
 
 	for {
 		req, err := ReadFrame(conn)
 		if err != nil {
 			return
+		}
+
+		// Piggyback Pruning: confirm operational state upon receiving the first operational frame after reauth
+		if stagedPendingConfirm && req.OpCode != OpAuth {
+			if s.joinManager != nil && s.joinManager.CommitmentStore() != nil {
+				_ = s.joinManager.CommitmentStore().ConfirmOperational(authenticatedNodeID)
+			}
+			stagedPendingConfirm = false
 		}
 
 		resp := Frame{
@@ -395,6 +428,62 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		// 2. Handle Auth
 		if req.OpCode == OpAuth {
+			// Check if payload is structured (anchor-connector handshake)
+			if len(req.Payload) > 0 && req.Payload[0] == StructuredAuthMagic {
+				authReq, dErr := DecodeStructuredAuth(req.Payload)
+				if dErr != nil {
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(400, "invalid structured auth payload")
+					_ = WriteFrame(conn, resp)
+					continue
+				}
+
+				if s.joinManager != nil {
+					sessKey, errCode, aErr := s.joinManager.HandleStructuredAuth(authReq, conn.RemoteAddr())
+					if aErr != nil {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(errCode, aErr.Error())
+						_ = WriteFrame(conn, resp)
+						return
+					}
+					authenticated = true
+					resp.OpCode = OpResponseOK
+					if authReq.Type == AuthTypeStagedReauth {
+						authenticatedNodeID = authReq.NodeID
+						stagedPendingConfirm = true
+						resp.Payload = EncodeRotationStagedResponse("Commitment staged successfully")
+					} else if sessKey != "" {
+						resp.Payload = EncodeAuthResponse(sessKey)
+					} else {
+						resp.Payload = EncodeOKPayload("authenticated")
+					}
+				} else {
+					// Fallback when joinManager is nil: evaluate static token
+					if authReq.Type == AuthTypeStatic && s.backend.Authenticate(authReq.Credential) {
+						authenticated = true
+						resp.OpCode = OpResponseOK
+						resp.Payload = EncodeAuthResponse("SESS.default." + authReq.NodeID + ".static")
+					} else {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(ErrCodeUnauthorized, "unauthorized: invalid credentials")
+						_ = WriteFrame(conn, resp)
+						return
+					}
+				}
+				if err := WriteFrame(conn, resp); err != nil {
+					return
+				}
+				continue
+			}
+
+			// Legacy auth payload (plain string token)
+			if s.gatewayMode {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(ErrCodeUnauthorized, "unauthorized: direct client access disabled in gateway mode; connection must route through anchor-connector")
+				_ = WriteFrame(conn, resp)
+				return
+			}
+
 			token, dErr := DecodeAuthPayload(req.Payload)
 			if dErr != nil {
 				resp.OpCode = OpResponseError

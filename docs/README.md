@@ -71,3 +71,9 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
    * HTTP health, metrics, partition inspection, and server administration.
    * Graph math operations and in-storage statistics endpoints (`POST /v1/math`).
    * Endpoint details for applications that explicitly use the HTTP transport.
+
+12. **[Workload Suitability, Limitations & Anti-Patterns](workload_suitability.md)**
+   * Optimal workload profiles: semantic word graphs, IoT telemetry, and causal inference.
+   * Unsuitable workloads: rich-text dictionaries, general-purpose JSON catalogs, and multi-entity OLTP transactions.
+   * Design anti-patterns ("what to avoid"): string-in-float encoding, monolithic models, and unbounded log ingestion.
+   * Recommended hybrid architectures: dual-engine design pairing AnchorDB with document/relational stores.

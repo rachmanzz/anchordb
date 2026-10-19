@@ -50,6 +50,11 @@ const (
 	OpMath         byte = 0x1C
 	OpResetModel   byte = 0x1D
 
+	// Cluster Administration & Replication Extensions
+	OpPromoteToPrimary  byte = 0x30
+	OpDemoteToReplica   byte = 0x31
+	OpReplicationStream byte = 0x32
+
 	// Responses
 	OpResponseOK    byte = 0x80
 	OpResponseError byte = 0x81
@@ -61,6 +66,11 @@ const (
 	FlagCompressed     byte = 0x01
 	FlagOneway         byte = 0x02
 	FlagMemoryPressure byte = 0x04
+
+	// Connector Routing Extensions
+	FlagRoutePrimary byte = 0x10 // Forces routing to Primary (Read-Your-Own-Writes)
+	FlagRouteReplica byte = 0x20 // Permits routing to Read Replicas
+	FlagEpochFenced  byte = 0x40 // Carries Monotonic Epoch fencing token
 )
 
 // Memory Admission Status
@@ -187,8 +197,15 @@ func EncodeAuthPayload(token string) []byte {
 	return appendString(nil, token)
 }
 
-// DecodeAuthPayload decodes auth token
+// DecodeAuthPayload decodes auth token, transparently supporting structured auth requests.
 func DecodeAuthPayload(data []byte) (string, error) {
+	if len(data) > 0 && data[0] == StructuredAuthMagic {
+		req, err := DecodeStructuredAuth(data)
+		if err != nil {
+			return "", err
+		}
+		return req.Credential, nil
+	}
 	token, _, err := readString(data, 0)
 	return token, err
 }

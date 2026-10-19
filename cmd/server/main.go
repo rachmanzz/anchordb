@@ -70,6 +70,13 @@ type ServerConfig struct {
 	RateLimitPerSec float64
 	RateLimitBurst  int
 	WirePort        string
+
+	// Gateway & Cluster Join options
+	GatewayMode        bool
+	JoinMode           string
+	PairingTimeout     time.Duration
+	PairingAllowedCIDR string
+	SessionSecret      string
 }
 
 // Server holds active AnchorDB database instances and background subsystems
@@ -89,6 +96,10 @@ type Server struct {
 
 	dbOptions storage.Options
 	limiter   *rateLimiter
+
+	// Gateway & Cluster Join state
+	gatewayMode bool
+	joinManager *wire.JoinManager
 
 	// Lifecycle state.
 	draining        atomic.Bool   // true once Shutdown began (readiness = 503)
@@ -124,11 +135,24 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sched.SetJitter(cfg.CronJitter)
 	}
 
+	joinMgr := wire.NewJoinManager(wire.JoinConfig{
+		GatewayMode:         cfg.GatewayMode,
+		JoinMode:            cfg.JoinMode,
+		PairingTimeout:      cfg.PairingTimeout,
+		PairingAllowedCIDR:  cfg.PairingAllowedCIDR,
+		SessionSecret:       cfg.SessionSecret,
+		AuthToken:           cfg.AuthToken,
+		ClusterID:           "cluster-01",
+		CommitmentStorePath: filepath.Join(cfg.DataDir, "auth", "commitments.bin"),
+	})
+
 	s := &Server{
 		dataDir:     cfg.DataDir,
 		authToken:   cfg.AuthToken,
 		port:        cfg.Port,
 		wirePort:    cfg.WirePort,
+		gatewayMode: cfg.GatewayMode,
+		joinManager: joinMgr,
 		models:      make(map[string]*storage.AnchorDB),
 		scheduler:   sched,
 		cronEnabled: cfg.CronEnabled,
@@ -140,7 +164,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 		shutdownTimeout: cfg.ShutdownTimeout,
 	}
-	s.wireServer = wire.NewServer(s)
+	s.wireServer = wire.NewServerWithJoinManager(s, joinMgr)
 
 	if cfg.RateLimitPerSec > 0 {
 		s.limiter = newRateLimiter(cfg.RateLimitPerSec, cfg.RateLimitBurst)
@@ -425,6 +449,9 @@ func (s *Server) GetModel(name string) (*storage.AnchorDB, error) {
 
 // Authenticate implements wire.Backend.
 func (s *Server) Authenticate(token string) bool {
+	if s.gatewayMode {
+		return false
+	}
 	if s.authToken == "" {
 		return true
 	}
@@ -433,7 +460,7 @@ func (s *Server) Authenticate(token string) bool {
 
 // RequiresAuth implements wire.Backend.
 func (s *Server) RequiresAuth() bool {
-	return s.authToken != ""
+	return s.authToken != "" || s.gatewayMode
 }
 
 // --- TOP-GLOBAL CRON TASK HANDLERS -------------------------------------------
@@ -665,7 +692,11 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 
 // isAuthorized reports whether the request carries a valid bearer token. When no
 // token is configured (explicit insecure mode) every request is authorized.
+// In gateway mode, direct HTTP access is always unauthorized.
 func (s *Server) isAuthorized(r *http.Request) bool {
+	if s.gatewayMode {
+		return false
+	}
 	if s.authToken == "" {
 		return true
 	}
@@ -679,6 +710,16 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	// succeed, so unauthenticated clients cannot force large allocations.
 	limited := limitRequestBody(next)
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.gatewayMode {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "gateway_mode_enforced",
+				"message": "direct HTTP queries are disabled in gateway mode; all requests must route through anchor-connector",
+			})
+			return
+		}
 		if !s.isAuthorized(r) {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -2420,7 +2461,44 @@ func main() {
 	flagRateLimit := flag.Float64("rate-limit", 0, "Per-client request rate limit in req/s; 0 disables (overrides ANCHORDB_RATE_LIMIT)")
 	flagRateLimitBurst := flag.Int("rate-limit-burst", 0, "Per-client burst capacity; defaults to the rate (overrides ANCHORDB_RATE_LIMIT_BURST)")
 
+	// 5. Gateway & Cluster Join Flags
+	flagGatewayMode := flag.Bool("gateway-mode", false, "Enable Gateway Mode: requires anchor-connector proxy, disables direct client hits (overrides ANCHORDB_GATEWAY_MODE)")
+	flagJoinMode := flag.String("join-mode", "pairing", "Cluster join mode: pairing|otk|session|closed (overrides ANCHORDB_JOIN_MODE)")
+	flagPairingTimeout := flag.String("pairing-timeout", "120s", "Pairing window duration e.g. 120s (overrides ANCHORDB_PAIRING_TIMEOUT)")
+	flagPairingCIDR := flag.String("pairing-cidr", "", "Allowed CIDR subnet for pairing requests (overrides ANCHORDB_PAIRING_ALLOWED_CIDR)")
+	flagSessionSecret := flag.String("session-secret", "", "HMAC secret for connector session tokens (overrides ANCHORDB_SESSION_SECRET)")
+
 	flag.Parse()
+
+	// Resolve Gateway & Cluster Join Parameters
+	gatewayMode := *flagGatewayMode
+	if !gatewayMode || !flagPassed("gateway-mode") {
+		gatewayMode = getEnvBool("ANCHORDB_GATEWAY_MODE", false)
+	}
+
+	joinMode := *flagJoinMode
+	if joinMode == "" || !flagPassed("join-mode") {
+		joinMode = getEnv("ANCHORDB_JOIN_MODE", "pairing")
+	}
+
+	pairingTimeout := 120 * time.Second
+	pairingTimeoutStr := *flagPairingTimeout
+	if pairingTimeoutStr == "" || !flagPassed("pairing-timeout") {
+		pairingTimeoutStr = getEnv("ANCHORDB_PAIRING_TIMEOUT", "120s")
+	}
+	if d, perr := time.ParseDuration(pairingTimeoutStr); perr == nil && d > 0 {
+		pairingTimeout = d
+	}
+
+	pairingCIDR := *flagPairingCIDR
+	if pairingCIDR == "" || !flagPassed("pairing-cidr") {
+		pairingCIDR = getEnv("ANCHORDB_PAIRING_ALLOWED_CIDR", "")
+	}
+
+	sessionSecret := *flagSessionSecret
+	if sessionSecret == "" || !flagPassed("session-secret") {
+		sessionSecret = getEnv("ANCHORDB_SESSION_SECRET", "")
+	}
 
 	// Resolve Core Parameters with precedence: Flag > ENV > Default
 	portStr := *flagPort
@@ -2451,9 +2529,12 @@ func main() {
 	if *flagToken != "" {
 		log.Printf("[WARN] Auth token provided via CLI flag; its value is visible in `ps`/cmdline. Use ANCHORDB_AUTH_TOKEN instead.")
 	}
-	if authToken == "" && !getEnvBool("ANCHORDB_ALLOW_INSECURE", false) {
+	if authToken == "" && !gatewayMode && !getEnvBool("ANCHORDB_ALLOW_INSECURE", false) {
 		log.Fatalf("[FATAL] ANCHORDB_AUTH_TOKEN is not set. Server refuses to run without authentication. " +
-			"Set a strong token (e.g. `openssl rand -hex 32`), or for trusted LOCAL access only set ANCHORDB_ALLOW_INSECURE=true.")
+			"Set a strong token (e.g. `openssl rand -hex 32`), enable ANCHORDB_GATEWAY_MODE=true, or for trusted LOCAL access only set ANCHORDB_ALLOW_INSECURE=true.")
+	}
+	if gatewayMode {
+		log.Printf("[INFO] AnchorDB Gateway Mode ACTIVE: direct HTTP/Wire client queries disabled; routing via anchor-connector enforced (JoinMode: %s, PairingTimeout: %v)", joinMode, pairingTimeout)
 	}
 
 	memLimitStr := *flagMemLimit
@@ -2570,24 +2651,29 @@ func main() {
 	}
 
 	serverConfig := ServerConfig{
-		Port:              portStr,
-		WirePort:          wirePortStr,
-		DataDir:           dataDir,
-		AuthToken:         authToken,
-		MemoryLimit:       memLimitStr,
-		IPWhitelist:       ipWhitelist,
-		TrustProxy:        trustProxy,
-		MemorySummary:     memSummary,
-		CronEnabled:       cronEnabled,
-		PartitionSchedule: partitionSched,
-		RetentionDays:     retentionDays,
-		SyncInterval:      syncInterval,
-		CronTaskTimeout:   cronTaskTimeout,
-		CronJitter:        cronJitter,
-		ShutdownTimeout:   shutdownTimeout,
-		DBOptions:         dbOptions,
-		RateLimitPerSec:   rateLimit,
-		RateLimitBurst:    rateLimitBurst,
+		Port:               portStr,
+		WirePort:           wirePortStr,
+		DataDir:            dataDir,
+		AuthToken:          authToken,
+		MemoryLimit:        memLimitStr,
+		IPWhitelist:        ipWhitelist,
+		TrustProxy:         trustProxy,
+		MemorySummary:      memSummary,
+		CronEnabled:        cronEnabled,
+		PartitionSchedule:  partitionSched,
+		RetentionDays:      retentionDays,
+		SyncInterval:       syncInterval,
+		CronTaskTimeout:    cronTaskTimeout,
+		CronJitter:         cronJitter,
+		ShutdownTimeout:    shutdownTimeout,
+		DBOptions:          dbOptions,
+		RateLimitPerSec:    rateLimit,
+		RateLimitBurst:     rateLimitBurst,
+		GatewayMode:        gatewayMode,
+		JoinMode:           joinMode,
+		PairingTimeout:     pairingTimeout,
+		PairingAllowedCIDR: pairingCIDR,
+		SessionSecret:      sessionSecret,
 		WorkerConfig: worker.Config{
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,

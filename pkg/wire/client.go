@@ -189,6 +189,82 @@ func (c *Client) Auth(token string) error {
 	return err
 }
 
+// AuthStructured performs a structured handshake authentication with the server,
+// returning an issued session key or status message if one was provided in the response.
+func (c *Client) AuthStructured(req AuthRequest) (string, error) {
+	resp, err := c.call(OpAuth, EncodeStructuredAuth(req))
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Payload) > 0 && resp.Payload[0] == StructuredRespMagic {
+		if len(resp.Payload) > 1 && resp.Payload[1] == SubCodeRotationStaged {
+			_, msg, dErr := DecodeRotationStagedResponse(resp.Payload)
+			return msg, dErr
+		}
+		return DecodeAuthResponse(resp.Payload)
+	}
+	return "", nil
+}
+
+// AuthPairing performs an initial pairing handshake with the server, returning a session key.
+func (c *Client) AuthPairing(nodeID string) (string, error) {
+	return c.AuthStructured(AuthRequest{
+		Type:   AuthTypePairing,
+		NodeID: nodeID,
+	})
+}
+
+// AuthPairingWithCommitment performs initial pairing while registering an initial preimage commitment.
+func (c *Client) AuthPairingWithCommitment(nodeID string, commitment [32]byte) (string, error) {
+	return c.AuthStructured(AuthRequest{
+		Type:              AuthTypePairing,
+		NodeID:            nodeID,
+		InitialCommitment: commitment,
+		HasCommitment:     true,
+	})
+}
+
+// AuthOTK performs an ephemeral One-Time Key join handshake with the server.
+func (c *Client) AuthOTK(nodeID, otk string) (string, error) {
+	return c.AuthStructured(AuthRequest{
+		Type:       AuthTypeOTK,
+		NodeID:     nodeID,
+		Credential: otk,
+	})
+}
+
+// AuthOTKWithCommitment performs OTK join while registering an initial preimage commitment.
+func (c *Client) AuthOTKWithCommitment(nodeID, otk string, commitment [32]byte) (string, error) {
+	return c.AuthStructured(AuthRequest{
+		Type:              AuthTypeOTK,
+		NodeID:            nodeID,
+		Credential:        otk,
+		InitialCommitment: commitment,
+		HasCommitment:     true,
+	})
+}
+
+// AuthSession authenticates using an established session key ticket.
+func (c *Client) AuthSession(nodeID, sessionKey string) error {
+	_, err := c.AuthStructured(AuthRequest{
+		Type:       AuthTypeSession,
+		NodeID:     nodeID,
+		Credential: sessionKey,
+	})
+	return err
+}
+
+// AuthStagedReauth performs Staged Preimage Commitment Rotation re-handshake.
+func (c *Client) AuthStagedReauth(nodeID string, currentValidator [32]byte, nextCommitment [32]byte) error {
+	_, err := c.AuthStructured(AuthRequest{
+		Type:           AuthTypeStagedReauth,
+		NodeID:         nodeID,
+		Validator:      currentValidator,
+		NextCommitment: nextCommitment,
+	})
+	return err
+}
+
 // ModelName returns the currently active model name.
 func (c *Client) ModelName() string {
 	c.mu.Lock()
