@@ -47,6 +47,7 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 - **[REST API Reference](docs/rest_api.md)**: HTTP server administration and transport-specific endpoints.
 - **[Benchmark & Verification Guide](docs/benchmark_and_verification.md)**: Reproducible test suite, Little's Law validation, and container durability.
 - **[Installation & Deployment Guide](docs/installation_and_deployment.md)**: Native packages (.deb, .rpm), systemd service management, Docker/Podman container images, and universal archives.
+- **[Data Citizenship & Engine Convergence](docs/data_citizenship.md)**: First-class binary citizenship, spatial and causal convergence, Fast Voxel DDA efficiency, and decoupled multi-model patterns.
 
 
 
@@ -464,8 +465,8 @@ AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D 
 2. **Computational Property Storage**: Attribute values are stored as contiguous `float32` scalar primitives (`float`, `int`, `bool`, `date`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
 3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (AnchorWire server or embedded in-process engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
-5. **Geometry & Spherical Navigation**: 2D geofencing operates on planar coordinates. Great-circle distance calculation (`HaversineDistanceKM`) uses the mean spherical Earth radius ($R = 6371.0\text{ km}$), which is computationally efficient for high-frequency geofencing and proximity filtering without the latency overhead of ellipsoidal geodesic algorithms.
-6. **Single-Pass Streaming Statistics**: In-storage statistics calculate 1st and 2nd central moments (mean, variance, standard deviation) in a single streaming pass ($O(N)$ time, $O(1)$ space). Order statistics (such as percentiles and medians) are intentionally excluded to maintain zero heap allocations and sub-millisecond execution.
+5. **Geometry & Spherical Navigation**: 2D geofencing operates on planar coordinates. Great-circle distance calculation (`HaversineDistanceKM`) uses the mean spherical Earth radius (R = 6371.0 km), which is computationally efficient for high-frequency geofencing and proximity filtering without the latency overhead of ellipsoidal geodesic algorithms.
+6. **Single-Pass Streaming Statistics**: In-storage statistics calculate 1st and 2nd central moments (mean, variance, standard deviation) in a single streaming pass (O(N) time, O(1) space). Order statistics (such as percentiles and medians) are intentionally excluded to maintain zero heap allocations and sub-millisecond execution.
 
 ---
 

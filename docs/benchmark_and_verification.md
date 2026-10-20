@@ -101,8 +101,9 @@ Simulates concurrent worker pools scaling from 5 to 100 parallel workers:
 * **100 concurrent workers** (10,000 requests)
 
 #### Little's Law Mathematical Invariant
-According to queuing theory (Little's Law, $L = \lambda \cdot W$):
-$$\text{Expected Average Latency } (W) = \frac{\text{Concurrency } (L)}{\text{Throughput } (\lambda)}$$
+According to queuing theory (Little's Law, `L = λ * W`):
+
+> **Expected Average Latency (W)** = Concurrency (L) / Throughput (λ)
 
 The verifier measures complete latency distributions (`min`, `p50`, `avg`, `p95`, `p99`, `max`) and confirms that measured average latencies match theoretical expectations.
 

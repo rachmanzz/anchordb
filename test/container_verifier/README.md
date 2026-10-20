@@ -20,7 +20,7 @@ The suite connects over HTTP/REST to a running AnchorDB server (e.g. `http://loc
 2. **Phase (B): Concurrency Polling Ramp-Up**:
    - Ramps up concurrent workers across 4 tiers: 5, 25, 50, and 100 concurrent goroutines.
    - Measures min, avg, p50, p95, p99, and max latencies.
-   - Verifies Little's Law ($L = \lambda \cdot W$) and ensures 0% error rate under load.
+   - Verifies Little's Law (L = λ · W) and ensures 0% error rate under load.
 
 3. **Phase (C): Container Restart & Data Persistence**:
    - Writes canary sentinel records and causal edges, flushing to disk.

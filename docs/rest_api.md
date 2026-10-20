@@ -190,7 +190,7 @@ Supported `op` values:
 - `centroid`: Centroid coordinate and semantic role vector of one or more spatial nodes (`words: ["nodeA", "nodeB", ...]`).
 - `cosine_similarity`: Cosine similarity between 4D semantic role vectors of two nodes (`words: ["nodeA", "nodeB"]`).
 - `nearest`: Nearest neighbor search for a given spatial node (`words: ["nodeA"]`, `limit_k: 5`).
-- `haversine` *(Next release)*: Great-circle distance in kilometers using the WGS84 spherical Earth model ($R = 6371.0\text{ km}$, where $X = \text{Longitude}, Y = \text{Latitude}$) between two spatial nodes (`words: ["nodeA", "nodeB"]`).
+- `haversine` *(Next release)*: Great-circle distance in kilometers using the WGS84 spherical Earth model (R = 6371.0 km, where X = Longitude, Y = Latitude) between two spatial nodes (`words: ["nodeA", "nodeB"]`).
 - `stats` *(Next release)*: Single-pass statistical aggregates (`count`, `sum`, `min`, `max`, `mean`, `variance`, `std_dev`) for a specified numeric field using Welford's algorithm (`field: "fieldname"`).
 
 > [!NOTE]

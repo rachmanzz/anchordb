@@ -23,7 +23,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Go driver supports `client.ListPartitions` and `client.InspectPartitionRecord` across Embedded, HTTP, and AnchorWire transports.
 - **Security Hardening & Gateway Mode**:
   - Gateway Mode (`-gateway-mode` / `ANCHORDB_GATEWAY_MODE=true`): blocks all direct HTTP `/v1/*` routes with `403 Forbidden` (`gateway_mode_enforced`), strictly enforcing ingress through `anchor-connector`.
-  - Zero-Knowledge Staged Preimage Token Rotation (`AuthTypeStagedReauth: 0x05`): eliminates static shared secrets; server stores one-way SHA-256 hashes ($E$) in flat binary file `/data/auth/commitments.bin` protected by IEEE CRC32 checksums.
+  - Zero-Knowledge Staged Preimage Token Rotation (`AuthTypeStagedReauth: 0x05`): eliminates static shared secrets; server stores one-way SHA-256 hashes (E) in flat binary file `/data/auth/commitments.bin` protected by IEEE CRC32 checksums.
   - Dynamic OTK memory auto-pruning and 128-bit HMAC token generation.
 - **WAL durability modes** (`SyncMode`): `always` (default, fsync per write),
   `interval` (background fsync), and `none` (OS-managed). Configurable via

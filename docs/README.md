@@ -57,7 +57,7 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
 
 9. **[Benchmark & Integration Verification Guide](benchmark_and_verification.md)**
    * Reproducible 6-phase test suite execution (`test/container_verifier`).
-   * Little's Law validation ($L = \lambda \cdot W$) across concurrent worker pools.
+   * Little's Law validation (L = lambda * W) across concurrent worker pools.
    * Container crash durability, background sync, and cold partition archival.
    * High-load schema attachment, validation, and fail-fast rejection stress testing.
 
@@ -77,3 +77,9 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
    * Unsuitable workloads: rich-text dictionaries, general-purpose JSON catalogs, and multi-entity OLTP transactions.
    * Design anti-patterns ("what to avoid"): string-in-float encoding, monolithic models, and unbounded log ingestion.
    * Recommended hybrid architectures: dual-engine design pairing AnchorDB with document/relational stores.
+
+13. **[Data Citizenship & Engine Convergence](data_citizenship.md)**
+   * Structural citizenship: fixed 40-byte binary nodes, compact scalar metrics, and causal graph edges.
+   * Rationale for combining spatial indexing and causal graph traversal into a single unified engine.
+   * Performance analysis: why Fast Voxel DDA and contiguous flat memory prevent bloat on edge hardware.
+   * Architectural flexibility: converged models (all-in-one) versus decoupled multi-models.

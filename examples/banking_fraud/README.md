@@ -64,13 +64,13 @@ Payment networks (Visa, Mastercard, FedNow, SEPA Instant, Faster Payments, BI-FA
 
 ### Scenario 1: Multi-Hop Mule Account & Smurfing Layering Detection
 - **Structure**: 5 relational hops connecting a compromised victim account through Tier-1 rapid relays, Tier-2 aggregators, Tier-3 smurfing nodes, Tier-4 P2P crypto escrow mules, down to a blacklisted offshore cash-out wallet.
-- **Scoring**: Edge weights represent transaction anomaly risk confidence. `CausalChain` multiplies weights along the path ($P = \prod w_i$).
+- **Scoring**: Edge weights represent transaction anomaly risk confidence. `CausalChain` multiplies weights along the path (P = w₁ · w₂ · ... · wₙ).
 - **Illustrative decision logic**: Combines path probability with entity attributes (`risk_score`, `is_blacklisted`) and prints a sample recommendation. It does not integrate with a payment switch or freeze accounts.
 
 ### Scenario 2: Impossible Travel & Spatial Velocity Anomaly
 - **Structure**: ATM and POS physical coordinates mapped into AnchorDB's **2D Spatial Grid**.
 - **Velocity Formula**:
-  $$\text{Travel Velocity (km/h)} = \frac{\text{Great-circle distance}(\text{ATM}_A, \text{ATM}_B)}{\text{Time}(\text{Swipe}_B) - \text{Time}(\text{Swipe}_A)}$$
+  > **Travel Velocity (km/h)** = Great-circle distance(ATM_A, ATM_B) / (Time(Swipe_B) - Time(Swipe_A))
 - **Detection**: A sample card swipe from Jakarta to Surabaya 15 minutes later uses a great-circle distance estimate and compares the implied speed with the example threshold. The output is an illustrative recommendation, not a real card freeze or production decision.
 
 ### Scenario 3: Massive 1,000,000+ Scale Stress Test

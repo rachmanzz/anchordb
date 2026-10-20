@@ -5,7 +5,7 @@ This example demonstrates how AnchorDB unifies **Strict Model Schema Contracts**
 It showcases:
 1. **Schema Contract Enforcement**: Declaring and locking typed node properties (`severity`, `impact_usd`, `latency_ms`, `is_critical`).
 2. **Multi-Branching DAG Network**: Constructing 35 weighted directed causal edges across 5 relational tiers (`triggers`, `propagates`, `degrades`, `disrupts`, `escalates`) with path fan-out and re-convergent bottlenecks.
-3. **Multi-Hop Traversal (1-Hop to 5-Hops)**: Computing cumulative path probabilities ($Score = \prod Weight$) with automatic frontier deduplication (`highest incoming score`).
+3. **Multi-Hop Traversal (1-Hop to 5-Hops)**: Computing cumulative path probabilities (Score = product of edge weights) with automatic frontier deduplication (`highest incoming score`).
 4. **Concurrent Stress Testing**: Measuring read-lock traversal throughput and latency under high-concurrency multi-worker loads (hundreds of thousands of traversals/second; scales with available CPU cores).
 5. **Schema-Enforced Resolution**: Inspecting reached nodes using `client.Get()` and performing in-storage arithmetic filtering using `client.List().Compute()`.
 

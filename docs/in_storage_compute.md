@@ -120,21 +120,21 @@ fmt.Printf("Updated %d records\n", updatedCount)
 > [!NOTE]
 > Single-pass in-storage statistical computations (`ComputeStats`, `ComputeStatsWithOptions`, `StatsResult`, `StatsOptions`) are scheduled for the **next release**.
 
-When computing summary statistics across large datasets, naive algorithms that calculate variance using $\sum x^2 - (\sum x)^2 / N$ suffer from catastrophic numerical cancellation when the variance is small relative to the mean. Conversely, standard two-pass formulas require either traversing storage twice or materializing large slices in heap memory.
+When computing summary statistics across large datasets, naive algorithms that calculate variance using standard sum-of-squares formulas suffer from catastrophic numerical cancellation when the variance is small relative to the mean. Conversely, standard two-pass formulas require either traversing storage twice or materializing large slices in heap memory.
 
-AnchorDB implements **B.P. Welford's algorithm (1962)** directly within the storage engine (`pkg/storage`). It calculates the running count, sum, minimum, maximum, mean, variance, and standard deviation in a **single sequential streaming pass** ($O(N)$ time, $O(1)$ auxiliary space, 0 heap allocations per entity).
+AnchorDB implements **B.P. Welford's algorithm (1962)** directly within the storage engine (`pkg/storage`). It calculates the running count, sum, minimum, maximum, mean, variance, and standard deviation in a **single sequential streaming pass** (O(N) time, O(1) auxiliary space, 0 heap allocations per entity).
 
 ### 5.1 Mathematical Formulation
 
-For each entity $n$ with scalar property value $x_n$:
+For each entity `n` with scalar property value `x_n`:
 1. **Delta from previous mean**:
-   $$d = x_n - \bar{x}_{n-1}$$
+   `d = x_n - mean_{n-1}`
 2. **Mean update**:
-   $$\bar{x}_n = \bar{x}_{n-1} + \frac{d}{n}$$
-3. **Sum of squared differences ($M_2$) update**:
-   $$M_{2, n} = M_{2, n-1} + d \cdot (x_n - \bar{x}_n)$$
+   `mean_n = mean_{n-1} + (d / n)`
+3. **Sum of squared differences (M2) update**:
+   `M2_n = M2_{n-1} + d * (x_n - mean_n)`
 4. **Final population variance & standard deviation**:
-   $$\sigma^2 = \frac{M_{2, N}}{N}, \quad \sigma = \sqrt{\sigma^2}$$
+   `variance = M2_N / N`, `std_dev = sqrt(variance)`
 
 ### 5.2 Go Engine API
 
@@ -176,8 +176,8 @@ filteredStats, err := db.ComputeStatsWithOptions(opts)
 
 ### 5.4 Performance Characteristics
 
-* **Time Complexity**: $O(N)$ where $N$ is the number of active entities in the model.
-* **Space Complexity**: $O(1)$ auxiliary heap allocation. The accumulators (`count`, `sum`, `min`, `max`, `m`, `s`) reside on the stack.
+* **Time Complexity**: O(N) where N is the number of active entities in the model.
+* **Space Complexity**: O(1) auxiliary heap allocation. The accumulators (`count`, `sum`, `min`, `max`, `m`, `s`) reside on the stack.
 * **Benchmark Profile**: Evaluates 100,000 entities in ~7.8 ms with **0 B/op** and **0 allocs/op**, without spawning background goroutines or acquiring long-lived write locks.
 
 ---
@@ -215,5 +215,5 @@ See the [AnchorWire guide](anchorwire.md) for a complete runnable program.
 1. **Numeric Precision**: AnchorDB optimizes attribute storage as IEEE 754 single-precision floats (`float32`). It is tailored for telemetry, IoT, metrics, and spatial coordinates, rather than arbitrary-precision banking decimals.
 2. **Deterministic Binary Operations**: Supported operators are limited to arithmetic (`+`, `-`, `*`, `/`) and date offsets (`+days`, `-days`, `days_between`). AnchorDB intentionally avoids embedding a general-purpose programming language (e.g. Lua or JavaScript) in storage to maintain zero-GPU, sub-microsecond latency.
 3. **Strict Division-by-Zero Semantics**: Division operations strictly validate that the divisor is non-zero. If the divisor resolves to zero, the engine returns an error (`division by zero: <field> is 0`) and rolls back the active mutation or query pass, preserving mathematical and financial integrity.
-4. **Single-Pass Scalar Statistics**: `ComputeStats` computes 1st and 2nd central moments (mean, variance, standard deviation) along with min, max, count, and sum. Order statistics such as Median, Percentiles, or Mode are intentionally omitted because they require $O(N \log N)$ sorting or auxiliary histogram allocations, conflicting with AnchorDB's predictable streaming design.
+4. **Single-Pass Scalar Statistics**: `ComputeStats` computes 1st and 2nd central moments (mean, variance, standard deviation) along with min, max, count, and sum. Order statistics such as Median, Percentiles, or Mode are intentionally omitted because they require O(N log N) sorting or auxiliary histogram allocations, conflicting with AnchorDB's predictable streaming design.
 

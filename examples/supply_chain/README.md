@@ -57,12 +57,13 @@ If query traversal halts at **Hop 2**, decision makers only know that *"Mainboar
 ## 4. Why Historical Probability Scoring Matters
 
 Supply chain dependencies are not binary (`true`/`false`):
-- **Single-Source Bottlenecks**: Components with no alternative supplier have very high failure transmission coefficients ($0.95 - 0.98$). If the upstream plant halts, downstream assembly stops immediately.
-- **Dual-Source Components**: Components with qualified secondary suppliers have lower transmission coefficients ($0.70 - 0.85$), as production orders can be partially re-routed.
+- **Single-Source Bottlenecks**: Components with no alternative supplier have very high failure transmission coefficients (0.95 - 0.98). If the upstream plant halts, downstream assembly stops immediately.
+- **Dual-Source Components**: Components with qualified secondary suppliers have lower transmission coefficients (0.70 - 0.85), as production orders can be partially re-routed.
 - **Logistics Routes**: Shipping lanes with buffer buffers dampen shock waves.
 
 AnchorDB multiplies edge transmission weights along the multi-hop path automatically via `CausalChain`:
-$$P(\text{Disruption}) = \prod_{i=1}^{n} w_i$$
+
+> **P(Disruption)** = w₁ · w₂ · ... · wₙ (product of path edge weights)
 
 ---
 
@@ -75,9 +76,10 @@ AnchorDB stores entity attributes:
 - `daily_burn_rate`: Daily sales or consumption rate (units/day).
 
 AnchorDB calculates the time-to-stockout on-the-fly directly inside the storage engine without round-trip data transfer:
-$$\text{Days to Stockout} = \frac{\text{inventory units}}{\text{daily burn rate}}$$
 
-If $\text{Days to Stockout} \le 30.0$, the engine triggers an **ALERT (<30 Days)** and outputs priority mitigation recommendations (e.g., expediting air freight or reallocating regional buffer stock).
+> **Days to Stockout** = inventory units / daily burn rate
+
+If `Days to Stockout <= 30.0`, the engine triggers an **ALERT (<30 Days)** and outputs priority mitigation recommendations (e.g., expediting air freight or reallocating regional buffer stock).
 
 ---
 

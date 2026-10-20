@@ -31,7 +31,7 @@ Version 3 stores the optional causal-edge section after the entity section; its 
 * **Spatial Nodes (40 Bytes Fixed)**:
   * Node ID: 8 bytes; domain ID: 2 bytes
   * Word offset: 4 bytes; word length: 2 bytes
-  * 2D Coordinates $(X, Y)$: two `float32` values (8 bytes)
+  * 2D Coordinates (X, Y): two `float32` values (8 bytes)
   * Semantic Role Vector: four `float32` values (16 bytes)
 * **Entity Records (`CompactRecord`)**:
   * Stored in contiguous byte slices with interned string keys to avoid duplicated key strings across millions of records.

@@ -100,8 +100,8 @@ When deployed behind an authenticated gateway (e.g. `anchor-connector`), pass `-
 
 ### 2. Zero-Knowledge Staged Preimage Token Rotation
 For dynamic cluster topologies, AnchorWire supports one-time pairing and staged preimage rotation (`AuthTypeStagedReauth: 0x05`):
-* **Zero-Knowledge Storage**: The server never stores cleartext secrets on disk. It maintains cryptographic SHA-256 commitments ($E = \text{SHA256}(V)$) inside a flat binary file (`/data/auth/commitments.bin`) protected by IEEE CRC32 checksums.
-* **Commit-First Rotation**: When rotating, the new commitment $E_2$ is committed to durable disk as `STAGED_PENDING_CONFIRM` before the old $E_1$ is invalidated.
+* **Zero-Knowledge Storage**: The server never stores cleartext secrets on disk. It maintains cryptographic SHA-256 commitments (`E = SHA256(V)`) inside a flat binary file (`/data/auth/commitments.bin`) protected by IEEE CRC32 checksums.
+* **Commit-First Rotation**: When rotating, the new commitment `E2` is committed to durable disk as `STAGED_PENDING_CONFIRM` before the old `E1` is invalidated.
 * **Piggyback Pruning**: The old commitment is safely pruned only after the client's first valid operational frame is processed, guaranteeing zero deadlock during network partition.
 
 ### 3. Network Isolation

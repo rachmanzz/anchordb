@@ -66,7 +66,7 @@ Calculated Speed (distance / duration): 60.0 km/h
 
 Query 1 does not order nodes by raw distance alone. For every candidate that passes the DDA beam and Pythagoras filter, the engine computes:
 
-$$\text{score} = \text{beamEnergy}(d_\perp^2) \times \frac{1 + 1.5 \cdot \text{roleFit}}{1 + 0.5 \cdot t}$$
+> **score** = beamEnergy(d⊥²) × (1 + 1.5 · roleFit) / (1 + 0.5 · t)
 
 - `beamEnergy = exp(-d⊥² / (2·beamWidth²))` — exponential beam absorption (equal to `1.0` for on-axis nodes where `d⊥ = 0`).
 - `roleFit = roles · deficit`, where `deficit` is the per-dimension shortfall of the combined anchor roles from the target equilibrium `[1, 1, 1, 0]`.
