@@ -65,7 +65,7 @@ Welcome to the technical documentation for **AnchorDB**. Start with [AnchorWire:
    * Native OS packages (`.deb` / `.rpm`) with background `systemd` service.
    * Multi-architecture containers (`ghcr.io/rachmanzz/anchordb:latest`).
    * Pre-compiled standalone archives for Linux and macOS.
-   * Go driver client installation (`go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.2`) and compiling from source.
+   * Go driver client installation (`go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.3`) and compiling from source.
 
 11. **[REST API Reference](rest_api.md)**
    * HTTP health, metrics, partition inspection, and server administration.

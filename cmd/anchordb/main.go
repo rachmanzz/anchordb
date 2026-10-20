@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	cliVersion = "v0.1.2"
+	cliVersion = "v0.1.3"
 )
 
 func main() {

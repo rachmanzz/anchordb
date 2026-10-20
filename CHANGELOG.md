@@ -6,7 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-20
+
 ### Added
+- **Computational Geometry & Spatial Analytics**:
+  - `pkg/spatial`: `Box2D`, `Polygon2D`, Jordan's curve theorem Point-in-Polygon (Ray-Casting), Shoelace planar polygon area and perimeter calculation, and zero-sqrt Euclidean distance.
+  - Great-circle distance calculation via `HaversineDistanceKM` (mean Earth radius 6371.0 km).
+- **In-Storage Streaming Statistics**:
+  - `pkg/storage`: Welford's single-pass numerically stable algorithm for streaming mean, variance, and standard deviation over memory-mapped entity attributes (`db.ComputeStats`).
+- **Data Citizenship & Multi-Model Engine Architecture**:
+  - Comprehensive architectural guide in `docs/data_citizenship.md` documenting first-class binary nodes (`BinaryNodeRecord`), scalar entities (`CompactRecord`), and causal graph edges (`EDG3`).
+  - Universal markdown typography normalization across all repository documentation.
 - **Direct S3 Partition Inspection & Listing**:
   - `POST /v1/partition/s3/list`: Inspects available `.anchordb` partitions directly from S3/MinIO bucket prefixes.
   - `POST /v1/partition/s3/inspect`: Reads records and partitions directly from S3 into memory buffers without local disk writes.
@@ -60,6 +70,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opening a half-durable database.
 - **32-bit mmap guard**: database files larger than `MaxInt` are rejected with a
   clear error instead of silently truncating the mapping length.
+- **Universal Markdown math rendering**: converted raw LaTeX formatting (`$$...$$`, `$..$`) across all documentation files to native Markdown blockquotes and Unicode mathematical symbols for consistent rendering.
 
 ## [0.1.0] - 2026-10-15
 

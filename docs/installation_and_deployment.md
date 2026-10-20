@@ -20,12 +20,12 @@ Download and install the `.deb` package matching your server architecture:
 
 ```bash
 # For AMD64 (x86_64)
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_amd64.deb
-sudo dpkg -i anchordb_0.1.2_amd64.deb
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.3_amd64.deb
+sudo dpkg -i anchordb_0.1.3_amd64.deb
 
 # For ARM64 (aarch64)
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_arm64.deb
-sudo dpkg -i anchordb_0.1.2_arm64.deb
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.3_arm64.deb
+sudo dpkg -i anchordb_0.1.3_arm64.deb
 ```
 
 ### RHEL / CentOS / Rocky Linux / Fedora Installation
@@ -34,10 +34,10 @@ Download and install the `.rpm` package:
 
 ```bash
 # For AMD64 (x86_64)
-sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_amd64.rpm
+sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.3_amd64.rpm
 
 # For ARM64 (aarch64)
-sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_arm64.rpm
+sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.3_arm64.rpm
 ```
 
 ### Automated Systemd Lifecycle
@@ -123,7 +123,7 @@ Official multi-architecture container images (`linux/amd64` and `linux/arm64`) a
 docker pull ghcr.io/rachmanzz/anchordb:latest
 
 # Pull specific version
-docker pull ghcr.io/rachmanzz/anchordb:v0.1.2
+docker pull ghcr.io/rachmanzz/anchordb:v0.1.3
 ```
 
 ### Running with Docker CLI
@@ -212,23 +212,23 @@ For environments where installing system packages or running containers is not p
 
 | Archive File | Operating System | Architecture |
 | :--- | :--- | :--- |
-| `anchordb_0.1.2_linux_amd64.tar.gz` | Linux | x86_64 / AMD64 |
-| `anchordb_0.1.2_linux_arm64.tar.gz` | Linux | aarch64 / ARM64 |
-| `anchordb_0.1.2_darwin_amd64.tar.gz` | macOS | Intel |
-| `anchordb_0.1.2_darwin_arm64.tar.gz` | macOS | Apple Silicon (M1/M2/M3/M4) |
+| `anchordb_0.1.3_linux_amd64.tar.gz` | Linux | x86_64 / AMD64 |
+| `anchordb_0.1.3_linux_arm64.tar.gz` | Linux | aarch64 / ARM64 |
+| `anchordb_0.1.3_darwin_amd64.tar.gz` | macOS | Intel |
+| `anchordb_0.1.3_darwin_arm64.tar.gz` | macOS | Apple Silicon (M1/M2/M3/M4) |
 
 ### Installation Steps
 
 ```bash
 # 1. Download archive and checksums
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.2_linux_amd64.tar.gz
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.1.3_linux_amd64.tar.gz
 wget https://github.com/rachmanzz/anchordb/releases/latest/download/SHA256SUMS.txt
 
 # 2. Verify integrity
 sha256sum --check --ignore-missing SHA256SUMS.txt
 
 # 3. Extract binaries
-tar -xzf anchordb_0.1.2_linux_amd64.tar.gz
+tar -xzf anchordb_0.1.3_linux_amd64.tar.gz
 
 # 4. Move binaries to system PATH (optional)
 sudo install -m 0755 anchordb-server /usr/local/bin/
@@ -248,7 +248,7 @@ Binaries included in the archive:
 To use AnchorDB from within another Go application, import the official client driver SDK:
 
 ```bash
-go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.2
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.1.3
 ```
 *(or `go get github.com/rachmanzz/anchordb/pkg/driver` for the latest revision)*
 
