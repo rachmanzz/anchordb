@@ -179,12 +179,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	})
 
 	s := &Server{
-		dataDir:     cfg.DataDir,
-		authToken:   cfg.AuthToken,
-		port:        cfg.Port,
-		wirePort:    cfg.WirePort,
-		gatewayMode: cfg.GatewayMode,
-		joinManager: joinMgr,
+		dataDir:            cfg.DataDir,
+		authToken:          cfg.AuthToken,
+		port:               cfg.Port,
+		wirePort:           cfg.WirePort,
+		gatewayMode:        cfg.GatewayMode,
+		joinManager:        joinMgr,
 		catalog:            cat,
 		s3Cache:            s3Cache,
 		s3DefaultEndpoint:  cfg.S3DefaultEndpoint,
@@ -194,11 +194,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		s3DefaultAccessKey: cfg.S3DefaultAccessKey,
 		s3DefaultSecretKey: cfg.S3DefaultSecretKey,
 		models:             make(map[string]*storage.AnchorDB),
-		scheduler:   sched,
-		cronEnabled: cfg.CronEnabled,
-		worker:      workerPool,
-		ipFilter:    ipFilter,
-		startTime:   time.Now(),
+		scheduler:          sched,
+		cronEnabled:        cfg.CronEnabled,
+		worker:             workerPool,
+		ipFilter:           ipFilter,
+		startTime:          time.Now(),
 
 		dbOptions: cfg.DBOptions,
 

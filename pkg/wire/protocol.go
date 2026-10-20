@@ -1730,4 +1730,3 @@ func DecodePartitionInspectResponse(data []byte) (PartitionInspectWireResponse, 
 	}
 	return resp, nil
 }
-
