@@ -19,7 +19,7 @@ import (
 // WAL OpCodes
 const (
 	walMagic byte = 0xA1 // AnchorDB WAL Magic
-	walVer   byte = 2
+	walVer   byte = 3
 	// WAL entries are expected to be small; cap untrusted on-disk lengths before
 	// allocation so a corrupt or malicious WAL cannot request multi-gigabyte RAM.
 	maxWALPayloadSize = 64 << 20
@@ -284,35 +284,46 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 	if len(nameBytes) > math.MaxUint16 {
 		return nil, fmt.Errorf("wal record name exceeds %d bytes", math.MaxUint16)
 	}
-	if cr.AttrCount() > math.MaxUint16 {
-		return nil, fmt.Errorf("wal record has more than %d attributes", math.MaxUint16)
+	if cr.AttrCount() > MaxAttrCount {
+		return nil, fmt.Errorf("wal record has more than %d attributes", MaxAttrCount)
 	}
 	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
-		payloadLen := 2 + len(nameBytes) + 1 + len(cr.Raw)
-		if payloadLen > maxWALPayloadSize {
-			return nil, fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+		if (countRaw & RawTypedFlag) != 0 {
+			payloadLen := 2 + len(nameBytes) + 1 + len(cr.Raw)
+			if payloadLen > maxWALPayloadSize {
+				return nil, fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+			}
+			buf := make([]byte, payloadLen)
+			offset := 0
+
+			binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(nameBytes)))
+			offset += 2
+			copy(buf[offset:], nameBytes)
+			offset += len(nameBytes)
+
+			buf[offset] = cr.Operation
+			offset++
+
+			copy(buf[offset:], cr.Raw)
+			return buf, nil
 		}
-		buf := make([]byte, payloadLen)
-		offset := 0
-
-		binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(nameBytes)))
-		offset += 2
-		copy(buf[offset:], nameBytes)
-		offset += len(nameBytes)
-
-		buf[offset] = cr.Operation
-		offset++
-
-		copy(buf[offset:], cr.Raw)
-		return buf, nil
 	}
 
+	attrs := cr.expandAttrs()
 	payloadLen := 2 + len(nameBytes) + 1 + 2
-	for _, attr := range cr.Attrs {
+	for _, attr := range attrs {
+		if attr.Type > AttrTypeFloat64 {
+			return nil, fmt.Errorf("wal invalid attribute type %d for key %q", attr.Type, attr.Key)
+		}
 		if len(attr.Key) > math.MaxUint16 {
 			return nil, fmt.Errorf("wal attribute key exceeds %d bytes", math.MaxUint16)
 		}
-		payloadLen += 2 + len(attr.Key) + 4
+		valSize := 4
+		if attr.Type == AttrTypeInt64 || attr.Type == AttrTypeUint64 || attr.Type == AttrTypeFloat64 {
+			valSize = 8
+		}
+		payloadLen += 1 + 2 + len(attr.Key) + valSize
 		if payloadLen > maxWALPayloadSize {
 			return nil, fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
 		}
@@ -329,18 +340,26 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 	buf[offset] = cr.Operation
 	offset++
 
-	binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(cr.Attrs)))
+	binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(attrs))|RawTypedFlag)
 	offset += 2
 
-	for _, attr := range cr.Attrs {
+	for _, attr := range attrs {
+		buf[offset] = byte(attr.Type)
+		offset++
+
 		kBytes := []byte(attr.Key)
 		binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(len(kBytes)))
 		offset += 2
 		copy(buf[offset:], kBytes)
 		offset += len(kBytes)
 
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], math.Float32bits(attr.Value))
-		offset += 4
+		if attr.Type == AttrTypeFloat32 {
+			binary.LittleEndian.PutUint32(buf[offset:offset+4], math.Float32bits(attr.Value))
+			offset += 4
+		} else {
+			binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(attr.IntVal))
+			offset += 8
+		}
 	}
 
 	return buf, nil
@@ -962,25 +981,84 @@ func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncompl
 					}
 					var attrs []AttrEntry
 					if valid {
-						attrCount := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+						attrCountRaw := binary.LittleEndian.Uint16(payload[offset : offset+2])
+						isTyped := (hdr[1] >= 3) || ((attrCountRaw & RawTypedFlag) != 0)
+						attrCount := int(attrCountRaw &^ RawTypedFlag)
 						offset += 2
 						attrs = make([]AttrEntry, 0, attrCount)
 						for a := 0; a < attrCount; a++ {
-							if offset+2 > len(payload) {
-								valid = false
-								break
+							if !isTyped {
+								if offset+2 > len(payload) {
+									valid = false
+									break
+								}
+								kLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+								offset += 2
+								if offset+kLen+4 > len(payload) {
+									valid = false
+									break
+								}
+								key := string(payload[offset : offset+kLen])
+								offset += kLen
+								value := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+								offset += 4
+								attrs = append(attrs, NewFloat32Attr(key, value))
+							} else {
+								if offset+1 > len(payload) {
+									valid = false
+									break
+								}
+								tTag := AttrType(payload[offset])
+								offset++
+								if offset+2 > len(payload) {
+									valid = false
+									break
+								}
+								kLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+								offset += 2
+								if offset+kLen > len(payload) {
+									valid = false
+									break
+								}
+								key := string(payload[offset : offset+kLen])
+								offset += kLen
+								if tTag == AttrTypeFloat32 {
+									if offset+4 > len(payload) {
+										valid = false
+										break
+									}
+									val := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+									offset += 4
+									attrs = append(attrs, NewFloat32Attr(key, val))
+								} else if tTag == AttrTypeInt64 {
+									if offset+8 > len(payload) {
+										valid = false
+										break
+									}
+									val := int64(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+									offset += 8
+									attrs = append(attrs, NewInt64Attr(key, val))
+								} else if tTag == AttrTypeUint64 {
+									if offset+8 > len(payload) {
+										valid = false
+										break
+									}
+									val := binary.LittleEndian.Uint64(payload[offset : offset+8])
+									offset += 8
+									attrs = append(attrs, NewUint64Attr(key, val))
+								} else if tTag == AttrTypeFloat64 {
+									if offset+8 > len(payload) {
+										valid = false
+										break
+									}
+									valBits := binary.LittleEndian.Uint64(payload[offset : offset+8])
+									offset += 8
+									attrs = append(attrs, NewFloat64Attr(key, math.Float64frombits(valBits)))
+								} else {
+									valid = false
+									break
+								}
 							}
-							kLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-							offset += 2
-							if offset+kLen+4 > len(payload) {
-								valid = false
-								break
-							}
-							key := string(payload[offset : offset+kLen])
-							offset += kLen
-							value := math.Float32frombits(binary.LittleEndian.Uint32(payload[offset : offset+4]))
-							offset += 4
-							attrs = append(attrs, AttrEntry{Key: key, Value: value})
 						}
 					}
 					if valid && offset != len(payload) {

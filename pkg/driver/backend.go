@@ -51,8 +51,10 @@ type PartitionInspectResult struct {
 // backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
 type backend interface {
 	Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error)
+	SaveTyped(ctx context.Context, model, name string, op *uint8, attrs []storage.AttrEntry) (string, error)
 	SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error)
 	Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error)
+	GetTyped(ctx context.Context, model, name string) (storage.CompactRecord, error)
 	List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error)
 	Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error)
 	Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error)
@@ -102,6 +104,24 @@ func (b *localBackend) Save(ctx context.Context, _, name string, op *uint8, prop
 		opStatus = *op
 	}
 	return b.db.SaveRecordWithIDAndOp(name, opStatus, props)
+}
+
+func (b *localBackend) SaveTyped(ctx context.Context, _, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	opStatus := storage.OpStatusActive
+	if op != nil {
+		opStatus = *op
+	}
+	return b.db.SaveRecordTypedWithIDAndOp(name, opStatus, attrs)
+}
+
+func (b *localBackend) GetTyped(ctx context.Context, _, name string) (storage.CompactRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.CompactRecord{}, err
+	}
+	return b.db.GetRecordTyped(name)
 }
 
 func (b *localBackend) SaveBatch(ctx context.Context, _ string, records []storage.BatchRecordItem) ([]string, error) {
@@ -480,6 +500,32 @@ func (b *embeddedBackend) Save(ctx context.Context, model, name string, op *uint
 		opStatus = *op
 	}
 	return db.SaveRecordWithIDAndOp(name, opStatus, props)
+}
+
+func (b *embeddedBackend) SaveTyped(ctx context.Context, model, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return "", err
+	}
+	opStatus := storage.OpStatusActive
+	if op != nil {
+		opStatus = *op
+	}
+	return db.SaveRecordTypedWithIDAndOp(name, opStatus, attrs)
+}
+
+func (b *embeddedBackend) GetTyped(ctx context.Context, model, name string) (storage.CompactRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.CompactRecord{}, err
+	}
+	db, err := b.getDB(model)
+	if err != nil {
+		return storage.CompactRecord{}, err
+	}
+	return db.GetRecordTyped(name)
 }
 
 func (b *embeddedBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
@@ -962,6 +1008,14 @@ func (b *remoteBackend) Save(ctx context.Context, model, name string, op *uint8,
 	return resp.Name, nil
 }
 
+func (b *remoteBackend) SaveTyped(_ context.Context, _, _ string, _ *uint8, _ []storage.AttrEntry) (string, error) {
+	return "", fmt.Errorf("SaveTyped is only supported in local/embedded mode in Phase 1")
+}
+
+func (b *remoteBackend) GetTyped(_ context.Context, _, _ string) (storage.CompactRecord, error) {
+	return storage.CompactRecord{}, fmt.Errorf("GetTyped is only supported in local/embedded mode in Phase 1")
+}
+
 func (b *remoteBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
 	req := map[string]interface{}{
 		"model":   model,
@@ -1400,13 +1454,21 @@ func serializeComputeOp(op storage.ComputeOp) string {
 func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 	out := make([]map[string]string, len(filters))
 	for i, f := range filters {
+		valStr := fmt.Sprintf("%g", f.Value)
+		if f.HasFloat64 {
+			valStr = fmt.Sprintf("%.17g", f.Value64)
+		}
 		m := map[string]string{
 			"field":    f.Field,
 			"operator": f.Operator,
-			"value":    fmt.Sprintf("%g", f.Value),
+			"value":    valStr,
 		}
 		if f.Operator == "BETWEEN" {
-			m["value_high"] = fmt.Sprintf("%g", f.ValueHigh)
+			if f.HasFloat64 {
+				m["value_high"] = fmt.Sprintf("%.17g", f.ValueHigh64)
+			} else {
+				m["value_high"] = fmt.Sprintf("%g", f.ValueHigh)
+			}
 		}
 		out[i] = m
 	}
@@ -1543,6 +1605,30 @@ func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, p
 		return err
 	})
 	return res, err
+}
+
+func (b *wireBackend) SaveTyped(ctx context.Context, model, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
+	opStatus := storage.OpStatusActive
+	if op != nil {
+		opStatus = *op
+	}
+	var res string
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		var err error
+		res, err = wc.SaveTyped(name, opStatus, attrs)
+		return err
+	})
+	return res, err
+}
+
+func (b *wireBackend) GetTyped(ctx context.Context, model, name string) (storage.CompactRecord, error) {
+	var cr storage.CompactRecord
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		var err error
+		cr, err = wc.GetTyped(name)
+		return err
+	})
+	return cr, err
 }
 
 func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {

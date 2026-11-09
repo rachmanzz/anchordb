@@ -123,9 +123,15 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	for _, r := range records {
-		if err := partDB.SaveRecord(r.Name, r.Props); err != nil {
+		var saveErr error
+		if len(r.Attrs) > 0 {
+			_, saveErr = partDB.SaveRecordTyped(r.Name, r.Attrs)
+		} else {
+			saveErr = partDB.SaveRecord(r.Name, r.Props)
+		}
+		if saveErr != nil {
 			_ = partDB.Close()
-			return nil, rollback(fmt.Errorf("failed adding record %q to partition: %w", r.Name, err))
+			return nil, rollback(fmt.Errorf("failed adding record %q to partition: %w", r.Name, saveErr))
 		}
 	}
 

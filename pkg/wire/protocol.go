@@ -236,14 +236,42 @@ func EncodeSavePayload(item storage.BatchRecordItem) []byte {
 	buf = append(buf, item.Operation)
 
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(item.Props)))
-	buf = append(buf, countBytes[:]...)
+	if len(item.Attrs) > 0 {
+		attrSlice := item.Attrs
+		if len(attrSlice) > storage.MaxAttrCount {
+			attrSlice = attrSlice[:storage.MaxAttrCount]
+		}
+		binary.LittleEndian.PutUint16(countBytes[:], uint16(len(attrSlice))|storage.RawTypedFlag)
+		buf = append(buf, countBytes[:]...)
+		for _, a := range attrSlice {
+			buf = append(buf, byte(a.Type))
+			buf = appendString(buf, a.Key)
+			if a.Type == storage.AttrTypeInt64 || a.Type == storage.AttrTypeUint64 || a.Type == storage.AttrTypeFloat64 {
+				var valBytes [8]byte
+				binary.LittleEndian.PutUint64(valBytes[:], uint64(a.IntVal))
+				buf = append(buf, valBytes[:]...)
+			} else {
+				var valBytes [4]byte
+				binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(a.Value))
+				buf = append(buf, valBytes[:]...)
+			}
+		}
+	} else {
+		propCount := min(len(item.Props), storage.MaxAttrCount)
+		binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
+		buf = append(buf, countBytes[:]...)
 
-	for k, v := range item.Props {
-		buf = appendString(buf, k)
-		var valBytes [4]byte
-		binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
-		buf = append(buf, valBytes[:]...)
+		written := 0
+		for k, v := range item.Props {
+			if written >= propCount {
+				break
+			}
+			buf = appendString(buf, k)
+			var valBytes [4]byte
+			binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
+			buf = append(buf, valBytes[:]...)
+			written++
+		}
 	}
 
 	if item.Coord != nil || item.Roles != nil {
@@ -286,28 +314,87 @@ func DecodeSavePayload(data []byte) (storage.BatchRecordItem, error) {
 	if offset+2 > len(data) {
 		return storage.BatchRecordItem{}, errors.New("truncated attr count")
 	}
-	attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	rawCount := binary.LittleEndian.Uint16(data[offset : offset+2])
 	offset += 2
 
+	isTyped := (rawCount & storage.RawTypedFlag) != 0
+	attrCount := int(rawCount & ^storage.RawTypedFlag)
+
 	props := make(map[string]float32, attrCount)
-	for i := 0; i < attrCount; i++ {
-		key, nextOffset, err := readString(data, offset)
-		if err != nil {
-			return storage.BatchRecordItem{}, err
+	var attrs []storage.AttrEntry
+	if isTyped {
+		attrs = make([]storage.AttrEntry, 0, attrCount)
+		for i := 0; i < attrCount; i++ {
+			if offset+1 > len(data) {
+				return storage.BatchRecordItem{}, errors.New("truncated attr type")
+			}
+			t := storage.AttrType(data[offset])
+			offset++
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return storage.BatchRecordItem{}, err
+			}
+			offset = nextOffset
+			var entry storage.AttrEntry
+			switch t {
+			case storage.AttrTypeFloat32:
+				if offset+4 > len(data) {
+					return storage.BatchRecordItem{}, errors.New("truncated float32 attr value")
+				}
+				v := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+				offset += 4
+				entry = storage.NewFloat32Attr(key, v)
+				props[key] = v
+			case storage.AttrTypeInt64:
+				if offset+8 > len(data) {
+					return storage.BatchRecordItem{}, errors.New("truncated int64 attr value")
+				}
+				v := int64(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				entry = storage.NewInt64Attr(key, v)
+				props[key] = float32(v)
+			case storage.AttrTypeUint64:
+				if offset+8 > len(data) {
+					return storage.BatchRecordItem{}, errors.New("truncated uint64 attr value")
+				}
+				v := binary.LittleEndian.Uint64(data[offset : offset+8])
+				offset += 8
+				entry = storage.NewUint64Attr(key, v)
+				props[key] = float32(v)
+			case storage.AttrTypeFloat64:
+				if offset+8 > len(data) {
+					return storage.BatchRecordItem{}, errors.New("truncated float64 attr value")
+				}
+				v := math.Float64frombits(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				entry = storage.NewFloat64Attr(key, v)
+				props[key] = float32(v)
+			default:
+				return storage.BatchRecordItem{}, fmt.Errorf("invalid attribute type %d", t)
+			}
+			attrs = append(attrs, entry)
 		}
-		offset = nextOffset
-		if offset+4 > len(data) {
-			return storage.BatchRecordItem{}, errors.New("truncated attr value")
+	} else {
+		for i := 0; i < attrCount; i++ {
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return storage.BatchRecordItem{}, err
+			}
+			offset = nextOffset
+			if offset+4 > len(data) {
+				return storage.BatchRecordItem{}, errors.New("truncated attr value")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
+			props[key] = val
 		}
-		val := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-		props[key] = val
 	}
 
 	item := storage.BatchRecordItem{
 		Name:      name,
 		Operation: opStatus,
 		Props:     props,
+		Attrs:     attrs,
 	}
 
 	if offset < len(data) && data[offset] == 1 {
@@ -457,14 +544,47 @@ func DecodeGetPayload(data []byte) (string, error) {
 func EncodeGetResultPayload(opStatus uint8, props map[string]float32) []byte {
 	buf := []byte{opStatus}
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(props)))
+	propCount := min(len(props), storage.MaxAttrCount)
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
 	buf = append(buf, countBytes[:]...)
 
+	written := 0
 	for k, v := range props {
+		if written >= propCount {
+			break
+		}
 		buf = appendString(buf, k)
 		var valBytes [4]byte
 		binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
 		buf = append(buf, valBytes[:]...)
+		written++
+	}
+	return buf
+}
+
+// EncodeGetResultTypedPayload serializes typed properties for OpGetResponse
+func EncodeGetResultTypedPayload(opStatus uint8, attrs []storage.AttrEntry) []byte {
+	buf := []byte{opStatus}
+	var countBytes [2]byte
+	attrSlice := attrs
+	if len(attrSlice) > storage.MaxAttrCount {
+		attrSlice = attrSlice[:storage.MaxAttrCount]
+	}
+	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(attrSlice))|storage.RawTypedFlag)
+	buf = append(buf, countBytes[:]...)
+
+	for _, a := range attrSlice {
+		buf = append(buf, byte(a.Type))
+		buf = appendString(buf, a.Key)
+		if a.Type == storage.AttrTypeInt64 || a.Type == storage.AttrTypeUint64 || a.Type == storage.AttrTypeFloat64 {
+			var valBytes [8]byte
+			binary.LittleEndian.PutUint64(valBytes[:], uint64(a.IntVal))
+			buf = append(buf, valBytes[:]...)
+		} else {
+			var valBytes [4]byte
+			binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(a.Value))
+			buf = append(buf, valBytes[:]...)
+		}
 	}
 	return buf
 }
@@ -475,24 +595,148 @@ func DecodeGetResultPayload(data []byte) (uint8, map[string]float32, error) {
 		return 0, nil, errors.New("truncated get result payload")
 	}
 	opStatus := data[0]
-	attrCount := int(binary.LittleEndian.Uint16(data[1:3]))
+	rawCount := binary.LittleEndian.Uint16(data[1:3])
+	isTyped := (rawCount & storage.RawTypedFlag) != 0
+	attrCount := int(rawCount & ^storage.RawTypedFlag)
 	offset := 3
 
 	props := make(map[string]float32, attrCount)
-	for i := 0; i < attrCount; i++ {
-		key, nextOffset, err := readString(data, offset)
-		if err != nil {
-			return 0, nil, err
+	if isTyped {
+		for i := 0; i < attrCount; i++ {
+			if offset+1 > len(data) {
+				return 0, nil, errors.New("truncated attr type in get result")
+			}
+			t := storage.AttrType(data[offset])
+			offset++
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return 0, nil, err
+			}
+			offset = nextOffset
+			switch t {
+			case storage.AttrTypeFloat32:
+				if offset+4 > len(data) {
+					return 0, nil, errors.New("truncated float32 attr value in get result")
+				}
+				v := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+				offset += 4
+				props[key] = v
+			case storage.AttrTypeInt64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated int64 attr value in get result")
+				}
+				v := int64(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				props[key] = float32(v)
+			case storage.AttrTypeUint64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated uint64 attr value in get result")
+				}
+				v := binary.LittleEndian.Uint64(data[offset : offset+8])
+				offset += 8
+				props[key] = float32(v)
+			case storage.AttrTypeFloat64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated float64 attr value in get result")
+				}
+				v := math.Float64frombits(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				props[key] = float32(v)
+			default:
+				return 0, nil, fmt.Errorf("invalid attribute type %d in get result", t)
+			}
 		}
-		offset = nextOffset
-		if offset+4 > len(data) {
-			return 0, nil, errors.New("truncated attr value in get result")
+	} else {
+		for i := 0; i < attrCount; i++ {
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return 0, nil, err
+			}
+			offset = nextOffset
+			if offset+4 > len(data) {
+				return 0, nil, errors.New("truncated attr value in get result")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
+			props[key] = val
 		}
-		val := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
-		offset += 4
-		props[key] = val
 	}
 	return opStatus, props, nil
+}
+
+// DecodeGetResultTypedPayload deserializes typed properties from OpGetResponse
+func DecodeGetResultTypedPayload(data []byte) (uint8, []storage.AttrEntry, error) {
+	if len(data) < 3 {
+		return 0, nil, errors.New("truncated get result payload")
+	}
+	opStatus := data[0]
+	rawCount := binary.LittleEndian.Uint16(data[1:3])
+	isTyped := (rawCount & storage.RawTypedFlag) != 0
+	attrCount := int(rawCount & ^storage.RawTypedFlag)
+	offset := 3
+
+	attrs := make([]storage.AttrEntry, 0, attrCount)
+	if isTyped {
+		for i := 0; i < attrCount; i++ {
+			if offset+1 > len(data) {
+				return 0, nil, errors.New("truncated attr type in get result")
+			}
+			t := storage.AttrType(data[offset])
+			offset++
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return 0, nil, err
+			}
+			offset = nextOffset
+			switch t {
+			case storage.AttrTypeFloat32:
+				if offset+4 > len(data) {
+					return 0, nil, errors.New("truncated float32 attr value in get result")
+				}
+				v := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+				offset += 4
+				attrs = append(attrs, storage.NewFloat32Attr(key, v))
+			case storage.AttrTypeInt64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated int64 attr value in get result")
+				}
+				v := int64(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				attrs = append(attrs, storage.NewInt64Attr(key, v))
+			case storage.AttrTypeUint64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated uint64 attr value in get result")
+				}
+				v := binary.LittleEndian.Uint64(data[offset : offset+8])
+				offset += 8
+				attrs = append(attrs, storage.NewUint64Attr(key, v))
+			case storage.AttrTypeFloat64:
+				if offset+8 > len(data) {
+					return 0, nil, errors.New("truncated float64 attr value in get result")
+				}
+				v := math.Float64frombits(binary.LittleEndian.Uint64(data[offset : offset+8]))
+				offset += 8
+				attrs = append(attrs, storage.NewFloat64Attr(key, v))
+			default:
+				return 0, nil, fmt.Errorf("invalid attribute type %d in get result", t)
+			}
+		}
+	} else {
+		for i := 0; i < attrCount; i++ {
+			key, nextOffset, err := readString(data, offset)
+			if err != nil {
+				return 0, nil, err
+			}
+			offset = nextOffset
+			if offset+4 > len(data) {
+				return 0, nil, errors.New("truncated attr value in get result")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			offset += 4
+			attrs = append(attrs, storage.NewFloat32Attr(key, val))
+		}
+	}
+	return opStatus, attrs, nil
 }
 
 // EncodeEdgePayloadWithDirection serializes edge mutation or relation vector configuration for OpEdge.
@@ -751,8 +995,27 @@ func DecodeMemoryNegotiationResponse(data []byte) (MemoryNegotiationResponse, er
 
 // --- FILTER & COMPUTATION CODECS ---
 
+const filterFloat64Marker = "\x01"
+
 func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 	buf = appendString(buf, f.Field)
+	if f.HasFloat64 {
+		buf = appendString(buf, filterFloat64Marker+f.Operator)
+		var valBytes [24]byte
+		v32 := f.Value
+		if v32 == 0 && f.Value64 != 0 {
+			v32 = float32(f.Value64)
+		}
+		vh32 := f.ValueHigh
+		if vh32 == 0 && f.ValueHigh64 != 0 {
+			vh32 = float32(f.ValueHigh64)
+		}
+		binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(v32))
+		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
+		binary.LittleEndian.PutUint64(valBytes[8:16], math.Float64bits(f.Value64))
+		binary.LittleEndian.PutUint64(valBytes[16:24], math.Float64bits(f.ValueHigh64))
+		return append(buf, valBytes[:]...)
+	}
 	buf = appendString(buf, f.Operator)
 	var valBytes [8]byte
 	binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(f.Value))
@@ -768,6 +1031,25 @@ func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int,
 	op, nextOffset, err := readString(data, nextOffset)
 	if err != nil {
 		return storage.FilterCondition{}, offset, err
+	}
+	if len(op) > 0 && op[0] == filterFloat64Marker[0] {
+		op = op[1:]
+		if nextOffset+24 > len(data) {
+			return storage.FilterCondition{}, offset, errors.New("truncated 64-bit filter values")
+		}
+		val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+		valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+		val64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16]))
+		valHigh64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24]))
+		return storage.FilterCondition{
+			Field:       field,
+			Operator:    op,
+			Value:       val,
+			ValueHigh:   valHigh,
+			Value64:     val64,
+			ValueHigh64: valHigh64,
+			HasFloat64:  true,
+		}, nextOffset + 24, nil
 	}
 	if nextOffset+8 > len(data) {
 		return storage.FilterCondition{}, offset, errors.New("truncated filter values")

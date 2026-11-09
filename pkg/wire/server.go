@@ -239,7 +239,21 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 			if opStatus == 0 {
 				opStatus = storage.OpStatusActive
 			}
-			if j.item.Coord != nil || j.item.Roles != nil {
+			if len(j.item.Attrs) > 0 {
+				if j.item.Coord != nil || j.item.Roles != nil {
+					coord := spatial.Point2D{}
+					if j.item.Coord != nil {
+						coord = *j.item.Coord
+					}
+					var roles [4]float32
+					if j.item.Roles != nil {
+						roles = *j.item.Roles
+					}
+					j.savedName, j.err = db.SaveRecordTypedWithNode(j.item.Name, opStatus, j.item.Attrs, coord, roles)
+				} else {
+					j.savedName, j.err = db.SaveRecordTypedWithIDAndOp(j.item.Name, opStatus, j.item.Attrs)
+				}
+			} else if j.item.Coord != nil || j.item.Roles != nil {
 				coord := spatial.Point2D{}
 				if j.item.Coord != nil {
 					coord = *j.item.Coord
@@ -276,7 +290,21 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 				if opStatus == 0 {
 					opStatus = storage.OpStatusActive
 				}
-				if j.item.Coord != nil || j.item.Roles != nil {
+				if len(j.item.Attrs) > 0 {
+					if j.item.Coord != nil || j.item.Roles != nil {
+						coord := spatial.Point2D{}
+						if j.item.Coord != nil {
+							coord = *j.item.Coord
+						}
+						var roles [4]float32
+						if j.item.Roles != nil {
+							roles = *j.item.Roles
+						}
+						j.savedName, j.err = db.SaveRecordTypedWithNode(j.item.Name, opStatus, j.item.Attrs, coord, roles)
+					} else {
+						j.savedName, j.err = db.SaveRecordTypedWithIDAndOp(j.item.Name, opStatus, j.item.Attrs)
+					}
+				} else if j.item.Coord != nil || j.item.Roles != nil {
 					coord := spatial.Point2D{}
 					if j.item.Coord != nil {
 						coord = *j.item.Coord
@@ -766,13 +794,27 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			var props map[string]float32
 			var op uint8
+			var attrs []storage.AttrEntry
+			isTyped := false
+
 			if len(getReq.Computations) > 0 || len(getReq.Select) > 0 {
-				props, err = db.GetRecordWithCompute(getReq.Name, getReq.Computations, getReq.Select...)
-				if err == nil {
-					_, op, _ = db.GetRecordWithOperation(getReq.Name)
+				cr, cErr := db.GetRecordTypedWithCompute(getReq.Name, getReq.Computations, getReq.Select...)
+				if cErr == nil {
+					op = cr.Operation
+					attrs = cr.ExpandAttrs()
+					isTyped = true
+				} else {
+					err = cErr
 				}
 			} else {
-				props, op, err = db.GetRecordWithOperation(getReq.Name)
+				cr, cErr := db.GetRecordTyped(getReq.Name)
+				if cErr == nil {
+					op = cr.Operation
+					attrs = cr.ExpandAttrs()
+					isTyped = true
+				} else {
+					err = cErr
+				}
 			}
 			if err != nil {
 				// Fallback to Cold Storage Tier if supported by backend
@@ -785,6 +827,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					}
 					if coldErr == nil {
 						err = nil
+						isTyped = false
 						resp.Flags |= FlagColdTier
 					}
 				}
@@ -794,7 +837,11 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.Payload = EncodeErrorPayload(404, err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
-				resp.Payload = EncodeGetResultPayload(op, props)
+				if isTyped {
+					resp.Payload = EncodeGetResultTypedPayload(op, attrs)
+				} else {
+					resp.Payload = EncodeGetResultPayload(op, props)
+				}
 			}
 
 		case OpEdge:

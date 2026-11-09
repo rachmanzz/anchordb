@@ -15,6 +15,26 @@ import (
 // Schema defines the contract for an AnchorDB model (e.g. {"voltage": "float", "age": "int", "active": "bool?"}).
 type Schema = storage.ModelSchema
 
+// Export typed attribute types and constructors
+type (
+	AttrType  = storage.AttrType
+	AttrEntry = storage.AttrEntry
+)
+
+const (
+	AttrTypeFloat32 = storage.AttrTypeFloat32
+	AttrTypeInt64   = storage.AttrTypeInt64
+	AttrTypeUint64  = storage.AttrTypeUint64
+	AttrTypeFloat64 = storage.AttrTypeFloat64
+)
+
+var (
+	NewFloat32Attr = storage.NewFloat32Attr
+	NewInt64Attr   = storage.NewInt64Attr
+	NewUint64Attr  = storage.NewUint64Attr
+	NewFloat64Attr = storage.NewFloat64Attr
+)
+
 // Export schema error constants from storage for client convenience
 var (
 	ErrSchemaMismatch       = storage.ErrSchemaMismatch
@@ -606,6 +626,26 @@ func (c *Client) SaveBatchContext(ctx context.Context, records []BatchRecord) ([
 		return nil, nil
 	}
 	return c.backend.SaveBatch(ctx, c.model, records)
+}
+
+// SaveTyped stores an entity with typed attributes (e.g. exact int64 and uint64).
+func (c *Client) SaveTyped(name string, attrs []storage.AttrEntry) (string, error) {
+	return c.backend.SaveTyped(context.Background(), c.model, name, nil, attrs)
+}
+
+// SaveTypedContext stores an entity with typed attributes with context cancellation support.
+func (c *Client) SaveTypedContext(ctx context.Context, name string, attrs []storage.AttrEntry) (string, error) {
+	return c.backend.SaveTyped(ctx, c.model, name, nil, attrs)
+}
+
+// GetTyped retrieves the raw CompactRecord for an entity, allowing exact 64-bit integer access via GetInt and GetUint.
+func (c *Client) GetTyped(name string) (storage.CompactRecord, error) {
+	return c.backend.GetTyped(context.Background(), c.model, name)
+}
+
+// GetTypedContext retrieves the raw CompactRecord with context cancellation support.
+func (c *Client) GetTypedContext(ctx context.Context, name string) (storage.CompactRecord, error) {
+	return c.backend.GetTyped(ctx, c.model, name)
 }
 
 // Get creates a query builder to retrieve an entity and optionally compute derived fields.

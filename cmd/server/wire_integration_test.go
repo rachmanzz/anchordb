@@ -362,3 +362,80 @@ func TestServer_AnchorWire_MultiModel_Isolation(t *testing.T) {
 		}
 	}
 }
+
+func TestServer_AnchorWire_TypedAttributes(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	wireListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind dynamic wire port: %v", err)
+	}
+	wireAddr := wireListener.Addr().String()
+
+	go func() {
+		_ = s.WireServer().Serve(wireListener)
+	}()
+
+	client, err := driver.Connect("wire://" + wireAddr + "?model=typed_model")
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	const exactInt64 = int64(9007199254740995)
+	const exactUint64 = uint64(18446744073709551614)
+	const exactFloat64 = 9007199254740993.5
+
+	attrs := []storage.AttrEntry{
+		driver.NewInt64Attr("big_int", exactInt64),
+		driver.NewUint64Attr("big_uint", exactUint64),
+		driver.NewFloat64Attr("big_f64", exactFloat64),
+		driver.NewFloat32Attr("standard_f32", 42.5),
+	}
+
+	savedName, err := client.SaveTyped("typed_wire_rec", attrs)
+	if err != nil {
+		t.Fatalf("SaveTyped via wire failed: %v", err)
+	}
+	if savedName != "typed_wire_rec" {
+		t.Fatalf("expected savedName typed_wire_rec, got %s", savedName)
+	}
+
+	// 1. GetTyped via wire
+	cr, err := client.GetTyped("typed_wire_rec")
+	if err != nil {
+		t.Fatalf("GetTyped via wire failed: %v", err)
+	}
+
+	if val, ok := cr.GetInt("big_int"); !ok || val != exactInt64 {
+		t.Fatalf("GetInt expected %d, got %d (ok=%v)", exactInt64, val, ok)
+	}
+	if val, ok := cr.GetUint("big_uint"); !ok || val != exactUint64 {
+		t.Fatalf("GetUint expected %d, got %d (ok=%v)", exactUint64, val, ok)
+	}
+	if val, ok := cr.GetFloat64("big_f64"); !ok || val != exactFloat64 {
+		t.Fatalf("GetFloat64 expected %f, got %f (ok=%v)", exactFloat64, val, ok)
+	}
+	if val, ok := cr.Get("standard_f32"); !ok || val != 42.5 {
+		t.Fatalf("Get expected 42.5, got %f (ok=%v)", val, ok)
+	}
+
+	// 2. Backward compatibility: standard Get().Execute() still retrieves float32 representations
+	ctx := context.Background()
+	res, err := client.Get("typed_wire_rec").Execute(ctx)
+	if err != nil {
+		t.Fatalf("Get().Execute() failed: %v", err)
+	}
+	if res.Get("standard_f32") != 42.5 {
+		t.Fatalf("standard_f32 expected 42.5, got %f", res.Get("standard_f32"))
+	}
+
+	// 3. Invalid attribute type tag must be rejected by server wire decoder
+	_, err = client.SaveTyped("bad_wire_rec", []storage.AttrEntry{
+		{Key: "corrupt", Type: storage.AttrType(77), IntVal: 1},
+	})
+	if err == nil {
+		t.Fatalf("expected error saving invalid AttrType(77) over wire, got nil")
+	}
+}

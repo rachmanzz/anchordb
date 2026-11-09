@@ -10,10 +10,16 @@ import (
 const (
 	// MagicHeader is "ANCH" in ASCII (0x41, 0x4E, 0x43, 0x48)
 	MagicHeader = 0x48434E41 // Little-endian for "ANCH"
-	// DBVersion is the on-disk format version written by Sync. Version 3 appends
-	// an optional causal-edge section after the entity section; readers accept
-	// every version from 1..DBVersion, so v1/v2 files remain openable.
-	DBVersion = 3
+	// DBVersion is the on-disk format version written by Sync.
+	// Version 3 appends an optional causal-edge section after the entity section.
+	// Version 4 introduces typed numeric attributes (int64, uint64, float32) with RawTypedFlag.
+	// Readers accept every version from 1..DBVersion, so v1/v2/v3 files remain openable.
+	DBVersion = 4
+
+	// RawTypedFlag is set on the upper bit of attrCount in binary entity records to indicate typed attributes.
+	RawTypedFlag uint16 = 0x8000
+	// MaxAttrCount is the maximum number of attributes per entity record (32,767) so bit 15 remains reserved for RawTypedFlag.
+	MaxAttrCount = int(RawTypedFlag - 1)
 
 	// HeaderSize is the fixed size in bytes of the .anchordb file header.
 	HeaderSize = 64

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -59,10 +60,139 @@ const (
 	OpStatusRetry      uint8 = 3 // Execution failed or interrupted by crash/shutdown; pending retry
 )
 
-// AttrEntry stores a single numeric attribute key-value pair in a compact flat slice
+// AttrType identifies the numeric precision and signedness of a stored attribute.
+type AttrType uint8
+
+const (
+	// AttrTypeFloat32 stores a 4-byte IEEE 754 floating point number (default legacy format).
+	AttrTypeFloat32 AttrType = 0
+	// AttrTypeInt64 stores a signed exact 8-byte integer.
+	AttrTypeInt64 AttrType = 1
+	// AttrTypeUint64 stores an unsigned exact 8-byte integer.
+	AttrTypeUint64 AttrType = 2
+	// AttrTypeFloat64 stores an 8-byte IEEE 754 floating point number.
+	AttrTypeFloat64 AttrType = 3
+)
+
+// AttrEntry stores a single numeric attribute key-value pair in a compact flat slice.
+// It maintains exact 64-bit integer values without precision truncation while preserving
+// float32 compatibility for legacy readers and callers.
 type AttrEntry struct {
-	Key   string
-	Value float32
+	Key    string
+	Type   AttrType
+	Value  float32
+	IntVal int64
+}
+
+// Float32 returns the float32 representation of the attribute.
+func (a AttrEntry) Float32() float32 {
+	return a.Value
+}
+
+func float32ToInt64Safe(val float32) int64 {
+	if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) || val < -0x1p63 || val >= 0x1p63 {
+		return 0
+	}
+	return int64(val)
+}
+
+func float32ToUint64Safe(val float32) uint64 {
+	if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) || val < 0 || val >= 0x1p64 {
+		return 0
+	}
+	return uint64(val)
+}
+
+func float64ToInt64Safe(val float64) int64 {
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < -0x1p63 || val >= 0x1p63 {
+		return 0
+	}
+	return int64(val)
+}
+
+func float64ToUint64Safe(val float64) uint64 {
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 || val >= 0x1p64 {
+		return 0
+	}
+	return uint64(val)
+}
+
+// Float64 returns the float64 representation of the attribute.
+func (a AttrEntry) Float64() float64 {
+	switch a.Type {
+	case AttrTypeFloat64:
+		return math.Float64frombits(uint64(a.IntVal))
+	case AttrTypeInt64:
+		return float64(a.IntVal)
+	case AttrTypeUint64:
+		return float64(uint64(a.IntVal))
+	case AttrTypeFloat32:
+		return float64(a.Value)
+	default:
+		return float64(a.Value)
+	}
+}
+
+// Int64 returns the exact int64 representation when typed as int64 or uint64, or converts from Value.
+func (a AttrEntry) Int64() int64 {
+	if a.Type == AttrTypeInt64 || a.Type == AttrTypeUint64 {
+		return a.IntVal
+	}
+	if a.Type == AttrTypeFloat64 {
+		return float64ToInt64Safe(math.Float64frombits(uint64(a.IntVal)))
+	}
+	return float32ToInt64Safe(a.Value)
+}
+
+// Uint64 returns the exact uint64 representation when typed as uint64 or int64, or converts from Value.
+func (a AttrEntry) Uint64() uint64 {
+	if a.Type == AttrTypeUint64 || a.Type == AttrTypeInt64 {
+		return uint64(a.IntVal)
+	}
+	if a.Type == AttrTypeFloat64 {
+		return float64ToUint64Safe(math.Float64frombits(uint64(a.IntVal)))
+	}
+	return float32ToUint64Safe(a.Value)
+}
+
+// NewFloat32Attr creates an AttrEntry for a float32 value.
+func NewFloat32Attr(key string, val float32) AttrEntry {
+	return AttrEntry{
+		Key:    key,
+		Type:   AttrTypeFloat32,
+		Value:  val,
+		IntVal: float32ToInt64Safe(val),
+	}
+}
+
+// NewFloat64Attr creates an AttrEntry for an exact float64 value.
+func NewFloat64Attr(key string, val float64) AttrEntry {
+	return AttrEntry{
+		Key:    key,
+		Type:   AttrTypeFloat64,
+		Value:  float32(val),
+		IntVal: int64(math.Float64bits(val)),
+	}
+}
+
+// NewInt64Attr creates an AttrEntry for an exact int64 value.
+func NewInt64Attr(key string, val int64) AttrEntry {
+	return AttrEntry{
+		Key:    key,
+		Type:   AttrTypeInt64,
+		Value:  float32(val),
+		IntVal: val,
+	}
+}
+
+// NewUint64Attr creates an AttrEntry for an exact uint64 value.
+func NewUint64Attr(key string, val uint64) AttrEntry {
+	return AttrEntry{
+		Key:    key,
+		Type:   AttrTypeUint64,
+		Value:  float32(val),
+		IntVal: int64(val),
+	}
 }
 
 // CompactRecord stores properties and operation lifecycle state in a compact structure.
@@ -75,54 +205,186 @@ type CompactRecord struct {
 	Raw       []byte
 }
 
+// NewCompactRecord creates a new CompactRecord with operation and typed attributes.
+func NewCompactRecord(op uint8, attrs []AttrEntry) CompactRecord {
+	return CompactRecord{
+		Operation: op,
+		Attrs:     attrs,
+	}
+}
+
 // Get retrieves the float32 value associated with key, returning false if not found.
 func (cr CompactRecord) Get(key string) (float32, bool) {
-	if len(cr.Attrs) > 0 {
-		for i := range cr.Attrs {
-			if cr.Attrs[i].Key == key {
-				return cr.Attrs[i].Value, true
-			}
-		}
-		return 0, false
-	}
-	if len(cr.Raw) >= 2 {
-		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
-		offset := 2
-		for a := 0; a < attrCount; a++ {
-			if offset+2 > len(cr.Raw) {
-				break
-			}
-			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-			offset += 2
-			if offset+kLen+4 > len(cr.Raw) {
-				break
-			}
-			kBytes := cr.Raw[offset : offset+kLen]
-			offset += kLen
-			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-			offset += 4
-			if string(kBytes) == key {
-				return math.Float32frombits(valBits), true
-			}
-		}
+	if attr, ok := cr.GetTyped(key); ok {
+		return attr.Value, true
 	}
 	return 0, false
 }
 
-// Set updates or inserts an attribute key-value pair, expanding raw records if necessary.
+// GetInt retrieves the exact int64 value associated with key, returning false if not found.
+func (cr CompactRecord) GetInt(key string) (int64, bool) {
+	if attr, ok := cr.GetTyped(key); ok {
+		return attr.Int64(), true
+	}
+	return 0, false
+}
+
+// GetUint retrieves the exact uint64 value associated with key, returning false if not found.
+func (cr CompactRecord) GetUint(key string) (uint64, bool) {
+	if attr, ok := cr.GetTyped(key); ok {
+		return attr.Uint64(), true
+	}
+	return 0, false
+}
+
+// GetFloat64 retrieves the exact float64 value associated with key, returning false if not found.
+func (cr CompactRecord) GetFloat64(key string) (float64, bool) {
+	if attr, ok := cr.GetTyped(key); ok {
+		return attr.Float64(), true
+	}
+	return 0, false
+}
+
+// GetTyped retrieves the full typed AttrEntry associated with key, returning false if not found.
+func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
+	if len(cr.Attrs) > 0 {
+		for i := range cr.Attrs {
+			if cr.Attrs[i].Key == key {
+				return cr.Attrs[i], true
+			}
+		}
+		return AttrEntry{}, false
+	}
+	if len(cr.Raw) >= 2 {
+		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+		isTyped := (countRaw & RawTypedFlag) != 0
+		attrCount := int(countRaw &^ RawTypedFlag)
+		offset := 2
+		for a := 0; a < attrCount; a++ {
+			if !isTyped {
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen+4 > len(cr.Raw) {
+					break
+				}
+				kBytes := cr.Raw[offset : offset+kLen]
+				offset += kLen
+				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+				offset += 4
+				if string(kBytes) == key {
+					val := math.Float32frombits(valBits)
+					return NewFloat32Attr(key, val), true
+				}
+			} else {
+				if offset+1 > len(cr.Raw) {
+					break
+				}
+				tTag := AttrType(cr.Raw[offset])
+				offset++
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen > len(cr.Raw) {
+					break
+				}
+				kBytes := cr.Raw[offset : offset+kLen]
+				offset += kLen
+				if tTag == AttrTypeFloat32 {
+					if offset+4 > len(cr.Raw) {
+						break
+					}
+					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+					offset += 4
+					if string(kBytes) == key {
+						val := math.Float32frombits(valBits)
+						return NewFloat32Attr(key, val), true
+					}
+				} else if tTag == AttrTypeInt64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+					offset += 8
+					if string(kBytes) == key {
+						return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
+					}
+				} else if tTag == AttrTypeUint64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					if string(kBytes) == key {
+						return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
+					}
+				} else if tTag == AttrTypeFloat64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					if string(kBytes) == key {
+						f64 := math.Float64frombits(u64)
+						return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true
+					}
+				} else {
+					break
+				}
+			}
+		}
+	}
+	return AttrEntry{}, false
+}
+
+// Set updates or inserts an attribute key-value pair as float32, expanding raw records if necessary.
 func (cr CompactRecord) Set(key string, val float32) CompactRecord {
+	return cr.SetAttr(NewFloat32Attr(key, val))
+}
+
+// SetInt updates or inserts an exact int64 attribute, expanding raw records if necessary.
+func (cr CompactRecord) SetInt(key string, val int64) CompactRecord {
+	return cr.SetAttr(NewInt64Attr(key, val))
+}
+
+// SetUint updates or inserts an exact uint64 attribute, expanding raw records if necessary.
+func (cr CompactRecord) SetUint(key string, val uint64) CompactRecord {
+	return cr.SetAttr(NewUint64Attr(key, val))
+}
+
+// SetFloat64 updates or inserts an exact float64 attribute, expanding raw records if necessary.
+func (cr CompactRecord) SetFloat64(key string, val float64) CompactRecord {
+	return cr.SetAttr(NewFloat64Attr(key, val))
+}
+
+// SetAttr updates or inserts a typed AttrEntry, expanding raw records if necessary.
+func (cr CompactRecord) SetAttr(entry AttrEntry) CompactRecord {
 	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
 		cr.Attrs = cr.expandAttrs()
 		cr.Raw = nil
+	} else if len(cr.Attrs) > 0 {
+		cr.Attrs = slices.Clone(cr.Attrs)
 	}
 	for i := range cr.Attrs {
-		if cr.Attrs[i].Key == key {
-			cr.Attrs[i].Value = val
+		if cr.Attrs[i].Key == entry.Key {
+			cr.Attrs[i] = entry
 			return cr
 		}
 	}
-	cr.Attrs = append(cr.Attrs, AttrEntry{Key: key, Value: val})
+	cr.Attrs = append(cr.Attrs, entry)
 	return cr
+}
+
+// ExpandAttrs returns the full slice of typed attributes for the record.
+func (cr CompactRecord) ExpandAttrs() []AttrEntry {
+	if len(cr.Attrs) > 0 {
+		return slices.Clone(cr.Attrs)
+	}
+	return cr.expandAttrs()
 }
 
 func (cr CompactRecord) expandAttrs() []AttrEntry {
@@ -132,58 +394,23 @@ func (cr CompactRecord) expandAttrs() []AttrEntry {
 	if len(cr.Raw) < 2 {
 		return nil
 	}
-	attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
-	attrs := make([]AttrEntry, 0, attrCount)
-	offset := 2
-	for a := 0; a < attrCount; a++ {
-		if offset+2 > len(cr.Raw) {
-			break
-		}
-		kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-		offset += 2
-		if offset+kLen+4 > len(cr.Raw) {
-			break
-		}
-		kStr := string(cr.Raw[offset : offset+kLen])
-		offset += kLen
-		valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-		offset += 4
-		attrs = append(attrs, AttrEntry{Key: kStr, Value: math.Float32frombits(valBits)})
-	}
+	attrs := make([]AttrEntry, 0, cr.AttrCount())
+	cr.ForEachAttrTyped(func(attr AttrEntry) bool {
+		attr.Key = strings.Clone(attr.Key)
+		attrs = append(attrs, attr)
+		return true
+	})
 	return attrs
 }
 
 // ToMap decodes and returns all attributes as a standard Go map.
 func (cr CompactRecord) ToMap() map[string]float32 {
-	if len(cr.Attrs) > 0 {
-		m := make(map[string]float32, len(cr.Attrs))
-		for i := range cr.Attrs {
-			m[cr.Attrs[i].Key] = cr.Attrs[i].Value
-		}
-		return m
-	}
-	if len(cr.Raw) >= 2 {
-		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
-		m := make(map[string]float32, attrCount)
-		offset := 2
-		for a := 0; a < attrCount; a++ {
-			if offset+2 > len(cr.Raw) {
-				break
-			}
-			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-			offset += 2
-			if offset+kLen+4 > len(cr.Raw) {
-				break
-			}
-			kStr := string(cr.Raw[offset : offset+kLen])
-			offset += kLen
-			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-			offset += 4
-			m[kStr] = math.Float32frombits(valBits)
-		}
-		return m
-	}
-	return make(map[string]float32)
+	m := make(map[string]float32, cr.AttrCount())
+	cr.ForEachAttrTyped(func(attr AttrEntry) bool {
+		m[strings.Clone(attr.Key)] = attr.Value
+		return true
+	})
+	return m
 }
 
 // Project extracts only the requested field subset as a map.
@@ -200,7 +427,7 @@ func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
 	return m
 }
 
-// ForEachAttr iterates over all attributes without allocating an intermediate map.
+// ForEachAttr iterates over all attributes without allocating an intermediate map or slice.
 func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
@@ -211,23 +438,190 @@ func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
 		return
 	}
 	if len(cr.Raw) >= 2 {
-		attrCount := int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+		isTyped := (countRaw & RawTypedFlag) != 0
+		attrCount := int(countRaw &^ RawTypedFlag)
 		offset := 2
 		for a := 0; a < attrCount; a++ {
-			if offset+2 > len(cr.Raw) {
-				break
+			if !isTyped {
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen+4 > len(cr.Raw) {
+					break
+				}
+				var kStr string
+				if kLen > 0 {
+					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				}
+				offset += kLen
+				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+				offset += 4
+				if !fn(kStr, math.Float32frombits(valBits)) {
+					return
+				}
+			} else {
+				if offset+1 > len(cr.Raw) {
+					break
+				}
+				tTag := AttrType(cr.Raw[offset])
+				offset++
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen > len(cr.Raw) {
+					break
+				}
+				var kStr string
+				if kLen > 0 {
+					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				}
+				offset += kLen
+				if tTag == AttrTypeFloat32 {
+					if offset+4 > len(cr.Raw) {
+						break
+					}
+					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+					offset += 4
+					if !fn(kStr, math.Float32frombits(valBits)) {
+						return
+					}
+				} else if tTag == AttrTypeInt64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+					offset += 8
+					if !fn(kStr, float32(v)) {
+						return
+					}
+				} else if tTag == AttrTypeUint64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					if !fn(kStr, float32(v)) {
+						return
+					}
+				} else if tTag == AttrTypeFloat64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					f64 := math.Float64frombits(u64)
+					if !fn(kStr, float32(f64)) {
+						return
+					}
+				} else {
+					break
+				}
 			}
-			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-			offset += 2
-			if offset+kLen+4 > len(cr.Raw) {
-				break
-			}
-			kStr := string(cr.Raw[offset : offset+kLen])
-			offset += kLen
-			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-			offset += 4
-			if !fn(kStr, math.Float32frombits(valBits)) {
+		}
+	}
+}
+
+// ForEachAttrTyped iterates over all typed attributes without allocating an intermediate map or slice.
+func (cr CompactRecord) ForEachAttrTyped(fn func(attr AttrEntry) bool) {
+	if len(cr.Attrs) > 0 {
+		for i := range cr.Attrs {
+			if !fn(cr.Attrs[i]) {
 				return
+			}
+		}
+		return
+	}
+	if len(cr.Raw) >= 2 {
+		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+		isTyped := (countRaw & RawTypedFlag) != 0
+		attrCount := int(countRaw &^ RawTypedFlag)
+		offset := 2
+		for a := 0; a < attrCount; a++ {
+			if !isTyped {
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen+4 > len(cr.Raw) {
+					break
+				}
+				var kStr string
+				if kLen > 0 {
+					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				}
+				offset += kLen
+				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+				offset += 4
+				val := math.Float32frombits(valBits)
+				if !fn(NewFloat32Attr(kStr, val)) {
+					return
+				}
+			} else {
+				if offset+1 > len(cr.Raw) {
+					break
+				}
+				tTag := AttrType(cr.Raw[offset])
+				offset++
+				if offset+2 > len(cr.Raw) {
+					break
+				}
+				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+				offset += 2
+				if offset+kLen > len(cr.Raw) {
+					break
+				}
+				var kStr string
+				if kLen > 0 {
+					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				}
+				offset += kLen
+				if tTag == AttrTypeFloat32 {
+					if offset+4 > len(cr.Raw) {
+						break
+					}
+					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+					offset += 4
+					val := math.Float32frombits(valBits)
+					if !fn(NewFloat32Attr(kStr, val)) {
+						return
+					}
+				} else if tTag == AttrTypeInt64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+					offset += 8
+					if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
+						return
+					}
+				} else if tTag == AttrTypeUint64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
+						return
+					}
+				} else if tTag == AttrTypeFloat64 {
+					if offset+8 > len(cr.Raw) {
+						break
+					}
+					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+					offset += 8
+					f64 := math.Float64frombits(u64)
+					if !fn(AttrEntry{Key: kStr, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}) {
+						return
+					}
+				} else {
+					break
+				}
 			}
 		}
 	}
@@ -239,17 +633,47 @@ func (cr CompactRecord) AttrCount() int {
 		return len(cr.Attrs)
 	}
 	if len(cr.Raw) >= 2 {
-		return int(binary.LittleEndian.Uint16(cr.Raw[:2]))
+		return int(binary.LittleEndian.Uint16(cr.Raw[:2]) &^ RawTypedFlag)
 	}
 	return 0
 }
 
 // MatchesFilter evaluates a FilterCondition directly on CompactRecord without allocating a map on the heap.
 func (cr CompactRecord) MatchesFilter(f FilterCondition) bool {
-	val, exists := cr.Get(f.Field)
+	attr, exists := cr.GetTyped(f.Field)
 	if !exists {
 		return false
 	}
+	if f.HasFloat64 || attr.Type == AttrTypeFloat64 || attr.Type == AttrTypeInt64 || attr.Type == AttrTypeUint64 {
+		val := attr.Float64()
+		cmpVal := float64(f.Value)
+		if f.HasFloat64 {
+			cmpVal = f.Value64
+		}
+		cmpHigh := float64(f.ValueHigh)
+		if f.HasFloat64 {
+			cmpHigh = f.ValueHigh64
+		}
+		switch f.Operator {
+		case "=":
+			return val == cmpVal
+		case "!=":
+			return val != cmpVal
+		case ">":
+			return val > cmpVal
+		case ">=":
+			return val >= cmpVal
+		case "<":
+			return val < cmpVal
+		case "<=":
+			return val <= cmpVal
+		case "BETWEEN":
+			return val >= cmpVal && val <= cmpHigh
+		default:
+			return false
+		}
+	}
+	val := attr.Value
 	switch f.Operator {
 	case "=":
 		return val == f.Value
@@ -433,6 +857,261 @@ func resolveValue(token string, props map[string]float32) (float32, error) {
 	return 0, fmt.Errorf("field, numeric constant, or date %q not found", token)
 }
 
+func resolveTypedOperand(token string, lookup func(string) (AttrEntry, bool)) (AttrEntry, bool, error) {
+	if attr, ok := lookup(token); ok {
+		return attr, false, nil
+	}
+	if !strings.ContainsAny(token, ".eE") {
+		if i64, err := strconv.ParseInt(token, 10, 64); err == nil {
+			return NewInt64Attr(token, i64), true, nil
+		}
+		if u64, err := strconv.ParseUint(token, 10, 64); err == nil {
+			return NewUint64Attr(token, u64), true, nil
+		}
+	}
+	if parsed, err := strconv.ParseFloat(token, 64); err == nil {
+		if float64(float32(parsed)) == parsed {
+			return NewFloat32Attr(token, float32(parsed)), true, nil
+		}
+		return NewFloat64Attr(token, parsed), true, nil
+	}
+	if t, err := time.Parse("2006-01-02", token); err == nil {
+		return NewInt64Attr(token, t.Unix()/86400), true, nil
+	}
+	return AttrEntry{}, false, fmt.Errorf("field, numeric constant, or date %q not found", token)
+}
+
+func resolveTypedValue(token string, lookup func(string) (AttrEntry, bool)) (AttrEntry, error) {
+	attr, _, err := resolveTypedOperand(token, lookup)
+	return attr, err
+}
+
+func isFloatResultFloat32(valA AttrEntry, litA bool, valB AttrEntry, litB bool) bool {
+	if (!litA && valA.Type == AttrTypeFloat64) || (!litB && valB.Type == AttrTypeFloat64) {
+		return false
+	}
+	if (!litA && (valA.Type == AttrTypeInt64 || valA.Type == AttrTypeUint64)) ||
+		(!litB && (valB.Type == AttrTypeInt64 || valB.Type == AttrTypeUint64)) {
+		return false
+	}
+	if (!litA && valA.Type == AttrTypeFloat32) || (!litB && valB.Type == AttrTypeFloat32) {
+		return true
+	}
+	return valA.Type == AttrTypeFloat32 && valB.Type == AttrTypeFloat32
+}
+
+func combineIntegerArithmeticTyped(outputField string, op byte, valA AttrEntry, litA bool, valB AttrEntry, litB bool) (AttrEntry, bool) {
+	isIntA := valA.Type == AttrTypeInt64 || valA.Type == AttrTypeUint64
+	isIntB := valB.Type == AttrTypeInt64 || valB.Type == AttrTypeUint64
+	if !isIntA || !isIntB {
+		return AttrEntry{}, false
+	}
+	if (valA.Type == AttrTypeUint64 && !litA) || (valB.Type == AttrTypeUint64 && !litB) || (valA.Type == AttrTypeUint64 && valB.Type == AttrTypeUint64) {
+		if (valA.Type == AttrTypeInt64 && valA.IntVal < 0) || (valB.Type == AttrTypeInt64 && valB.IntVal < 0) {
+			// Negative signed operand mixed with uint64 falls back to signed or float64
+			return AttrEntry{}, false
+		}
+		uA := valA.Uint64()
+		uB := valB.Uint64()
+		switch op {
+		case '+':
+			return NewUint64Attr(outputField, uA+uB), true
+		case '-':
+			if uA >= uB {
+				return NewUint64Attr(outputField, uA-uB), true
+			}
+			return AttrEntry{}, false
+		case '*':
+			return NewUint64Attr(outputField, uA*uB), true
+		}
+	}
+	iA := valA.Int64()
+	iB := valB.Int64()
+	switch op {
+	case '+':
+		return NewInt64Attr(outputField, iA+iB), true
+	case '-':
+		return NewInt64Attr(outputField, iA-iB), true
+	case '*':
+		return NewInt64Attr(outputField, iA*iB), true
+	}
+	return AttrEntry{}, false
+}
+
+func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (AttrEntry, bool)) (AttrEntry, error) {
+	switch o := op.(type) {
+	case OpDivide:
+		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		valB, litB, err := resolveTypedOperand(o.FieldB, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		fB := valB.Float64()
+		if fB == 0 {
+			return AttrEntry{}, fmt.Errorf("division by zero: %s is 0", o.FieldB)
+		}
+		res := valA.Float64() / fB
+		if isFloatResultFloat32(valA, litA, valB, litB) {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpMultiply:
+		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		valB, litB, err := resolveTypedOperand(o.FieldB, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if intRes, ok := combineIntegerArithmeticTyped(outputField, '*', valA, litA, valB, litB); ok {
+			return intRes, nil
+		}
+		res := valA.Float64() * valB.Float64()
+		if isFloatResultFloat32(valA, litA, valB, litB) {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpAdd:
+		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		valB, litB, err := resolveTypedOperand(o.FieldB, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if intRes, ok := combineIntegerArithmeticTyped(outputField, '+', valA, litA, valB, litB); ok {
+			return intRes, nil
+		}
+		res := valA.Float64() + valB.Float64()
+		if isFloatResultFloat32(valA, litA, valB, litB) {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpSubtract:
+		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		valB, litB, err := resolveTypedOperand(o.FieldB, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if intRes, ok := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB); ok {
+			return intRes, nil
+		}
+		res := valA.Float64() - valB.Float64()
+		if isFloatResultFloat32(valA, litA, valB, litB) {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpAddDays:
+		val, _, err := resolveTypedOperand(o.Field, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
+			return NewInt64Attr(outputField, val.Int64()+int64(o.Days)), nil
+		}
+		res := val.Float64() + float64(o.Days)
+		if val.Type == AttrTypeFloat32 {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpSubtractDays:
+		val, _, err := resolveTypedOperand(o.Field, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
+			return NewInt64Attr(outputField, val.Int64()-int64(o.Days)), nil
+		}
+		res := val.Float64() - float64(o.Days)
+		if val.Type == AttrTypeFloat32 {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpDaysBetween:
+		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		valB, litB, err := resolveTypedOperand(o.FieldB, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if intRes, ok := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB); ok {
+			return intRes, nil
+		}
+		res := valA.Float64() - valB.Float64()
+		if isFloatResultFloat32(valA, litA, valB, litB) {
+			return NewFloat32Attr(outputField, float32(res)), nil
+		}
+		return NewFloat64Attr(outputField, res), nil
+
+	case OpAssign:
+		val, isLit, err := resolveTypedOperand(o.Value, lookup)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if isLit {
+			if existing, ok := lookup(outputField); ok {
+				switch existing.Type {
+				case AttrTypeFloat32:
+					return NewFloat32Attr(outputField, float32(val.Float64())), nil
+				case AttrTypeFloat64:
+					return NewFloat64Attr(outputField, val.Float64()), nil
+				case AttrTypeInt64:
+					if val.Type == AttrTypeInt64 || (val.Type == AttrTypeUint64 && val.Uint64() <= math.MaxInt64) {
+						return NewInt64Attr(outputField, val.Int64()), nil
+					}
+				case AttrTypeUint64:
+					if val.Type == AttrTypeUint64 || (val.Type == AttrTypeInt64 && val.IntVal >= 0) {
+						return NewUint64Attr(outputField, val.Uint64()), nil
+					}
+				}
+			}
+		}
+		val.Key = outputField
+		return val, nil
+
+	default:
+		props := make(map[string]float32)
+		v, err := op.Apply(props)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		return NewFloat32Attr(outputField, v), nil
+	}
+}
+
+func coerceAttrToSchemaSpec(attr AttrEntry, spec FieldSpec) AttrEntry {
+	switch spec.BaseType {
+	case "float32":
+		if attr.Type != AttrTypeFloat32 {
+			f64 := attr.Float64()
+			if !math.IsNaN(f64) && !math.IsInf(f64, 0) {
+				return NewFloat32Attr(attr.Key, float32(f64))
+			}
+		}
+	case "float64":
+		if attr.Type == AttrTypeInt64 || attr.Type == AttrTypeUint64 {
+			return NewFloat64Attr(attr.Key, attr.Float64())
+		}
+	}
+	return attr
+}
+
 // ComputeOp defines an in-flight computation rule
 type ComputeOp interface {
 	Apply(props map[string]float32) (float32, error)
@@ -578,10 +1257,13 @@ func (op OpAssign) Apply(props map[string]float32) (float32, error) {
 
 // FilterCondition defines a field comparison in Where clauses
 type FilterCondition struct {
-	Field     string
-	Operator  string // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
-	Value     float32
-	ValueHigh float32 // Used for "BETWEEN" range [Value, ValueHigh]
+	Field       string
+	Operator    string  // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
+	Value       float32
+	ValueHigh   float32 // Used for "BETWEEN" range [Value, ValueHigh]
+	Value64     float64 // Optional exact 64-bit precision value
+	ValueHigh64 float64 // Optional exact 64-bit precision range
+	HasFloat64  bool
 }
 
 // Matches evaluates the filter condition against the given property map.
@@ -590,21 +1272,27 @@ func (f FilterCondition) Matches(props map[string]float32) bool {
 	if !exists {
 		return false
 	}
+	cmpVal := f.Value
+	cmpHigh := f.ValueHigh
+	if f.HasFloat64 {
+		cmpVal = float32(f.Value64)
+		cmpHigh = float32(f.ValueHigh64)
+	}
 	switch f.Operator {
 	case "=":
-		return val == f.Value
+		return val == cmpVal
 	case "!=":
-		return val != f.Value
+		return val != cmpVal
 	case ">":
-		return val > f.Value
+		return val > cmpVal
 	case ">=":
-		return val >= f.Value
+		return val >= cmpVal
 	case "<":
-		return val < f.Value
+		return val < cmpVal
 	case "<=":
-		return val <= f.Value
+		return val <= cmpVal
 	case "BETWEEN":
-		return val >= f.Value && val <= f.ValueHigh
+		return val >= cmpVal && val <= cmpHigh
 	default:
 		return false
 	}
@@ -643,6 +1331,7 @@ type EntityRecord struct {
 	Name      string             `json:"name"`
 	Operation uint8              `json:"operation"`
 	Props     map[string]float32 `json:"props"`
+	Attrs     []AttrEntry        `json:"attrs,omitempty"`
 }
 
 func (db *AnchorDB) internAttr(s string) string {
@@ -1001,8 +1690,10 @@ func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
 	internedAttrs := make([]AttrEntry, 0, len(cr.Attrs))
 	for _, attr := range cr.Attrs {
 		internedAttrs = append(internedAttrs, AttrEntry{
-			Key:   db.internAttr(attr.Key),
-			Value: attr.Value,
+			Key:    db.internAttr(attr.Key),
+			Type:   attr.Type,
+			Value:  attr.Value,
+			IntVal: attr.IntVal,
 		})
 	}
 	if _, exists := db.EntityStore[name]; !exists {
@@ -1188,19 +1879,45 @@ func (db *AnchorDB) loadEntities() error {
 			return fmt.Errorf("corrupt file: truncated attribute count at entity %d", i)
 		}
 		attrStart := offset
-		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		countRaw := binary.LittleEndian.Uint16(data[offset : offset+2])
+		isTyped := (countRaw & RawTypedFlag) != 0
+		attrCount := int(countRaw &^ RawTypedFlag)
 		offset += 2
 
 		for a := 0; a < attrCount; a++ {
-			if offset+2 > len(data) {
-				return fmt.Errorf("corrupt file: truncated attribute key length at entity %d", i)
+			if !isTyped {
+				if offset+2 > len(data) {
+					return fmt.Errorf("corrupt file: truncated attribute key length at entity %d", i)
+				}
+				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+				offset += 2
+				if offset+keyLen+4 > len(data) {
+					return fmt.Errorf("corrupt file: truncated attribute value at entity %d", i)
+				}
+				offset += keyLen + 4
+			} else {
+				if offset+1 > len(data) {
+					return fmt.Errorf("corrupt file: truncated attribute type at entity %d", i)
+				}
+				tTag := AttrType(data[offset])
+				offset++
+				if tTag > AttrTypeFloat64 {
+					return fmt.Errorf("corrupt file: invalid attribute type %d at entity %d", tTag, i)
+				}
+				if offset+2 > len(data) {
+					return fmt.Errorf("corrupt file: truncated attribute key length at entity %d", i)
+				}
+				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+				offset += 2
+				valSize := 4
+				if tTag == AttrTypeInt64 || tTag == AttrTypeUint64 || tTag == AttrTypeFloat64 {
+					valSize = 8
+				}
+				if offset+keyLen+valSize > len(data) {
+					return fmt.Errorf("corrupt file: truncated attribute value at entity %d", i)
+				}
+				offset += keyLen + valSize
 			}
-			keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
-			offset += 2
-			if offset+keyLen+4 > len(data) {
-				return fmt.Errorf("corrupt file: truncated attribute value at entity %d", i)
-			}
-			offset += keyLen + 4
 		}
 		raw := data[attrStart:offset]
 		db.EntityStore[name] = CompactRecord{Operation: opStatus, Raw: raw}
@@ -1236,6 +1953,7 @@ func (db *AnchorDB) remapEntitiesLocked() {
 	}
 	data := db.mmapData[db.Header.EntityOffset:]
 	offset := 0
+entityLoop:
 	for i := uint64(0); i < db.Header.EntityCount; i++ {
 		if offset+2 > len(data) {
 			break
@@ -1266,19 +1984,45 @@ func (db *AnchorDB) remapEntitiesLocked() {
 			break
 		}
 		attrStart := offset
-		attrCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		countRaw := binary.LittleEndian.Uint16(data[offset : offset+2])
+		isTyped := (countRaw & RawTypedFlag) != 0
+		attrCount := int(countRaw &^ RawTypedFlag)
 		offset += 2
 
 		for a := 0; a < attrCount; a++ {
-			if offset+2 > len(data) {
-				break
+			if !isTyped {
+				if offset+2 > len(data) {
+					break entityLoop
+				}
+				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+				offset += 2
+				if offset+keyLen+4 > len(data) {
+					break entityLoop
+				}
+				offset += keyLen + 4
+			} else {
+				if offset+1 > len(data) {
+					break entityLoop
+				}
+				tTag := AttrType(data[offset])
+				offset++
+				if tTag > AttrTypeFloat64 {
+					break entityLoop
+				}
+				if offset+2 > len(data) {
+					break entityLoop
+				}
+				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+				offset += 2
+				valSize := 4
+				if tTag == AttrTypeInt64 || tTag == AttrTypeUint64 || tTag == AttrTypeFloat64 {
+					valSize = 8
+				}
+				if offset+keyLen+valSize > len(data) {
+					break entityLoop
+				}
+				offset += keyLen + valSize
 			}
-			keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
-			offset += 2
-			if offset+keyLen+4 > len(data) {
-				break
-			}
-			offset += keyLen + 4
 		}
 		raw := data[attrStart:offset]
 
@@ -1400,6 +2144,10 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
 	}
 
+	if len(props) > MaxAttrCount {
+		return "", fmt.Errorf("record has more than %d attributes", MaxAttrCount)
+	}
+
 	if db.schemaLocked && db.schema != nil {
 		if err := db.schema.ValidateProps(props); err != nil {
 			return "", err
@@ -1408,7 +2156,7 @@ func (db *AnchorDB) SaveRecordWithIDAndOp(name string, opStatus uint8, props map
 
 	attrs := make([]AttrEntry, 0, len(props))
 	for k, v := range props {
-		attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
+		attrs = append(attrs, NewFloat32Attr(db.internAttr(k), v))
 	}
 	cr := CompactRecord{
 		Operation: opStatus,
@@ -1469,6 +2217,10 @@ func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[st
 	if db.partitionLocks[name] {
 		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
 	}
+	if len(props) > MaxAttrCount {
+		return "", fmt.Errorf("record has more than %d attributes", MaxAttrCount)
+	}
+
 	if db.schemaLocked && db.schema != nil {
 		if err := db.schema.ValidateProps(props); err != nil {
 			return "", err
@@ -1477,7 +2229,7 @@ func (db *AnchorDB) SaveRecordWithNode(name string, opStatus uint8, props map[st
 
 	attrs := make([]AttrEntry, 0, len(props))
 	for k, v := range props {
-		attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
+		attrs = append(attrs, NewFloat32Attr(db.internAttr(k), v))
 	}
 	cr := CompactRecord{Operation: opStatus, Attrs: attrs}
 	if db.wal != nil {
@@ -1505,6 +2257,7 @@ type BatchRecordItem struct {
 	Name      string             `json:"name"`
 	Operation uint8              `json:"operation,omitempty"`
 	Props     map[string]float32 `json:"props"`
+	Attrs     []AttrEntry        `json:"attrs,omitempty"`
 	Coord     *spatial.Point2D   `json:"coord,omitempty"`
 	Roles     *[4]float32        `json:"roles,omitempty"`
 }
@@ -1544,9 +2297,33 @@ func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) 
 			return nil, fmt.Errorf("%w: %q", ErrRecordLocked, name)
 		}
 
-		if db.schemaLocked && db.schema != nil {
-			if err := db.schema.ValidateProps(item.Props); err != nil {
+		var attrs []AttrEntry
+		var err error
+		if len(item.Attrs) > 0 {
+			if len(item.Attrs) > MaxAttrCount {
+				return nil, fmt.Errorf("record %q has more than %d attributes", name, MaxAttrCount)
+			}
+			attrs, err = db.normalizeAndDedupeAttrsLocked(item.Attrs)
+			if err != nil {
 				return nil, fmt.Errorf("record %q: %w", name, err)
+			}
+			if db.schemaLocked && db.schema != nil {
+				if err := db.schema.ValidateAttrs(attrs); err != nil {
+					return nil, fmt.Errorf("record %q: %w", name, err)
+				}
+			}
+		} else {
+			if len(item.Props) > MaxAttrCount {
+				return nil, fmt.Errorf("record %q has more than %d attributes", name, MaxAttrCount)
+			}
+			if db.schemaLocked && db.schema != nil {
+				if err := db.schema.ValidateProps(item.Props); err != nil {
+					return nil, fmt.Errorf("record %q: %w", name, err)
+				}
+			}
+			attrs = make([]AttrEntry, 0, len(item.Props))
+			for k, v := range item.Props {
+				attrs = append(attrs, NewFloat32Attr(db.internAttr(k), v))
 			}
 		}
 
@@ -1564,10 +2341,6 @@ func (db *AnchorDB) SaveRecordsBatch(items []BatchRecordItem) ([]string, error) 
 			}
 		}
 
-		attrs := make([]AttrEntry, 0, len(item.Props))
-		for k, v := range item.Props {
-			attrs = append(attrs, AttrEntry{Key: db.internAttr(k), Value: v})
-		}
 		cr := CompactRecord{
 			Operation: opStatus,
 			Attrs:     attrs,
@@ -1635,6 +2408,182 @@ func (db *AnchorDB) SaveRecordWithID(name string, props map[string]float32) (str
 	return db.SaveRecordWithIDAndOp(name, OpStatusActive, props)
 }
 
+func (db *AnchorDB) normalizeAndDedupeAttrsLocked(attrs []AttrEntry) ([]AttrEntry, error) {
+	capHint := min(len(attrs), MaxAttrCount)
+	keyIndex := make(map[string]int, capHint)
+	dedupedAttrs := make([]AttrEntry, 0, capHint)
+	for _, a := range attrs {
+		k := db.internAttr(a.Key)
+		var entry AttrEntry
+		switch a.Type {
+		case AttrTypeFloat32:
+			entry = NewFloat32Attr(k, a.Value)
+		case AttrTypeInt64:
+			entry = NewInt64Attr(k, a.IntVal)
+		case AttrTypeUint64:
+			entry = NewUint64Attr(k, uint64(a.IntVal))
+		case AttrTypeFloat64:
+			entry = NewFloat64Attr(k, a.Float64())
+		default:
+			return nil, fmt.Errorf("%w: field %q has invalid attribute type %d", ErrInvalidFieldType, a.Key, a.Type)
+		}
+		if idx, exists := keyIndex[k]; exists {
+			dedupedAttrs[idx] = entry
+		} else {
+			if len(dedupedAttrs) >= MaxAttrCount {
+				return nil, fmt.Errorf("record has more than %d attributes", MaxAttrCount)
+			}
+			keyIndex[k] = len(dedupedAttrs)
+			dedupedAttrs = append(dedupedAttrs, entry)
+		}
+	}
+	return dedupedAttrs, nil
+}
+
+// SaveRecordTypedWithIDAndOp stores an entity with explicit lifecycle state and typed attributes (int64, uint64, float32).
+func (db *AnchorDB) SaveRecordTypedWithIDAndOp(name string, opStatus uint8, attrs []AttrEntry) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = uuid.NewString()
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return "", ErrDatabaseClosed
+	}
+	if opStatus == OpStatusSafeDelete {
+		return "", fmt.Errorf("cannot save record with internal partition-lock status")
+	}
+	if db.partitionLocks[name] {
+		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
+	}
+
+	dedupedAttrs, err := db.normalizeAndDedupeAttrsLocked(attrs)
+	if err != nil {
+		return "", err
+	}
+
+	if db.schemaLocked && db.schema != nil {
+		if err := db.schema.ValidateAttrs(dedupedAttrs); err != nil {
+			return "", err
+		}
+	}
+
+	cr := CompactRecord{
+		Operation: opStatus,
+		Attrs:     dedupedAttrs,
+	}
+
+	if db.wal != nil {
+		if err := db.wal.WriteSave(name, cr); err != nil {
+			return "", fmt.Errorf("failed to write to wal: %w", err)
+		}
+	}
+
+	if _, exists := db.EntityStore[name]; !exists {
+		db.EntityOrder = append(db.EntityOrder, name)
+	} else {
+		db.syncedEntitiesModified = true
+	}
+	db.EntityStore[name] = cr
+	db.markEntityDirtyLocked(name)
+	db.pendingEntitiesCount++
+	if db.pendingEntitiesCount >= AutoSyncPendingThreshold {
+		db.TriggerAutoSync()
+	}
+
+	if _, exists := db.Lexicon[name]; !exists {
+		angle := float32(len(name)) * 0.5
+		coord := spatial.Point2D{
+			X: float32(math.Cos(float64(angle))) * 0.5,
+			Y: float32(math.Sin(float64(angle))) * 0.5,
+		}
+		db.appendNodeLocked(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
+	}
+
+	return name, nil
+}
+
+// SaveRecordTyped stores an entity with default OpStatusActive (1) and typed attributes.
+func (db *AnchorDB) SaveRecordTyped(name string, attrs []AttrEntry) (string, error) {
+	return db.SaveRecordTypedWithIDAndOp(name, OpStatusActive, attrs)
+}
+
+// SaveRecordTypedWithNode commits an entity with typed attributes and its geometric node as one WAL event.
+func (db *AnchorDB) SaveRecordTypedWithNode(name string, opStatus uint8, attrs []AttrEntry, coord spatial.Point2D, roles [4]float32) (string, error) {
+	if err := validateNodeGeometry(coord, roles); err != nil {
+		return "", err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = uuid.NewString()
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return "", ErrDatabaseClosed
+	}
+	if opStatus == OpStatusSafeDelete {
+		return "", fmt.Errorf("cannot save record with internal partition-lock status")
+	}
+	if db.partitionLocks[name] {
+		return "", fmt.Errorf("%w: %q", ErrRecordLocked, name)
+	}
+
+	dedupedAttrs, err := db.normalizeAndDedupeAttrsLocked(attrs)
+	if err != nil {
+		return "", err
+	}
+
+	if db.schemaLocked && db.schema != nil {
+		if err := db.schema.ValidateAttrs(dedupedAttrs); err != nil {
+			return "", err
+		}
+	}
+
+	cr := CompactRecord{Operation: opStatus, Attrs: dedupedAttrs}
+	if db.wal != nil {
+		if err := db.wal.WriteSaveNode(name, cr, coord, roles, uint16(opStatus)); err != nil {
+			return "", fmt.Errorf("failed to write entity and node to wal: %w", err)
+		}
+	}
+	db.appendNodeLocked(name, coord, roles, uint16(opStatus))
+	if _, exists := db.EntityStore[name]; !exists {
+		db.EntityOrder = append(db.EntityOrder, name)
+	} else {
+		db.syncedEntitiesModified = true
+	}
+	db.EntityStore[name] = cr
+	db.markEntityDirtyLocked(name)
+	db.pendingEntitiesCount++
+	if db.pendingEntitiesCount >= AutoSyncPendingThreshold {
+		db.TriggerAutoSync()
+	}
+	return name, nil
+}
+
+// GetRecordTyped retrieves the CompactRecord for an entity, allowing access to typed attributes (int64, uint64, float32).
+func (db *AnchorDB) GetRecordTyped(name string) (CompactRecord, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return CompactRecord{}, ErrDatabaseClosed
+	}
+
+	cr, exists := db.EntityStore[name]
+	if !exists || cr.Operation == OpStatusTombstone {
+		return CompactRecord{}, fmt.Errorf("record not found: %q", name)
+	}
+
+	return CompactRecord{
+		Operation: cr.Operation,
+		Attrs:     slices.Clone(cr.Attrs),
+		Raw:       slices.Clone(cr.Raw),
+	}, nil
+}
+
 // GetRecord retrieves stored raw properties of an entity (GETTING), optionally selecting specific fields.
 // Returns error if entity does not exist or has been marked as OpStatusTombstone (2).
 func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]float32, error) {
@@ -1689,6 +2638,82 @@ func (db *AnchorDB) GetRecordWithCompute(name string, computations map[string]Co
 	}
 
 	return projectProperties(props, selectFields), nil
+}
+
+// GetRecordTypedWithCompute retrieves typed attributes and calculates derived fields in-storage with mixed arithmetic,
+// optionally projecting to selectFields.
+func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[string]ComputeOp, selectFields ...string) (CompactRecord, error) {
+	cr, err := db.GetRecordTyped(name)
+	if err != nil {
+		return CompactRecord{}, err
+	}
+	if len(computations) == 0 {
+		if len(selectFields) == 0 {
+			return cr, nil
+		}
+		selectedAttrs := make([]AttrEntry, 0, len(selectFields))
+		for _, f := range selectFields {
+			if a, ok := cr.GetTyped(f); ok {
+				selectedAttrs = append(selectedAttrs, a)
+			}
+		}
+		return CompactRecord{
+			Operation: cr.Operation,
+			Attrs:     selectedAttrs,
+		}, nil
+	}
+
+	attrs := cr.expandAttrs()
+	attrMap := make(map[string]AttrEntry, len(attrs)+len(computations))
+	order := make([]string, 0, len(attrs)+len(computations))
+	for _, a := range attrs {
+		if _, exists := attrMap[a.Key]; !exists {
+			order = append(order, a.Key)
+		}
+		attrMap[a.Key] = a
+	}
+	lookup := func(key string) (AttrEntry, bool) {
+		a, ok := attrMap[key]
+		return a, ok
+	}
+	compKeys := make([]string, 0, len(computations))
+	for k := range computations {
+		compKeys = append(compKeys, k)
+	}
+	slices.Sort(compKeys)
+	for _, outputField := range compKeys {
+		op := computations[outputField]
+		newAttr, err := applyComputeOpTyped(outputField, op, lookup)
+		if err != nil {
+			return CompactRecord{}, fmt.Errorf("calculation failed for field %q: %w", outputField, err)
+		}
+		if _, exists := attrMap[outputField]; !exists {
+			order = append(order, outputField)
+		}
+		attrMap[outputField] = newAttr
+	}
+
+	if len(selectFields) > 0 {
+		resAttrs := make([]AttrEntry, 0, len(selectFields))
+		for _, f := range selectFields {
+			if a, ok := attrMap[f]; ok {
+				resAttrs = append(resAttrs, a)
+			}
+		}
+		return CompactRecord{
+			Operation: cr.Operation,
+			Attrs:     resAttrs,
+		}, nil
+	}
+
+	resAttrs := make([]AttrEntry, 0, len(order))
+	for _, k := range order {
+		resAttrs = append(resAttrs, attrMap[k])
+	}
+	return CompactRecord{
+		Operation: cr.Operation,
+		Attrs:     resAttrs,
+	}, nil
 }
 
 // ListRecordsWithPaging retrieves entities with filtering, on-the-fly computation, and constant-time bounded paging.
@@ -1899,24 +2924,27 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				continue
 			}
 
-			props := cr.ToMap()
-
 			// Apply in-place mathematical mutations based on snapshot
-			pending := make(map[string]float32, len(opts.Mutations))
+			lookup := func(key string) (AttrEntry, bool) {
+				return cr.GetTyped(key)
+			}
+			pending := make([]AttrEntry, 0, len(opts.Mutations))
 			for field, op := range opts.Mutations {
-				newVal, err := op.Apply(props)
+				newAttr, err := applyComputeOpTyped(field, op, lookup)
 				if err != nil {
 					return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
 				}
 				if schemaSpecs != nil {
-					if err := validateFieldValue(field, newVal, schemaSpecs[field]); err != nil {
+					newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
+					if err := validateAttrEntry(newAttr, schemaSpecs[field]); err != nil {
 						return updatedCount, fmt.Errorf("update %q: %w", name, err)
 					}
 				}
-				pending[field] = newVal
+				pending = append(pending, newAttr)
 			}
-			for k, v := range pending {
-				cr = cr.Set(db.internAttr(k), v)
+			for _, attr := range pending {
+				attr.Key = db.internAttr(attr.Key)
+				cr = cr.SetAttr(attr)
 			}
 			if db.wal != nil {
 				if err := db.wal.WriteSave(name, cr); err != nil {
@@ -1971,24 +2999,27 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			continue
 		}
 
-		props := cr.ToMap()
-
 		// Apply in-place mathematical mutations based on snapshot
-		pending := make(map[string]float32, len(opts.Mutations))
+		lookup := func(key string) (AttrEntry, bool) {
+			return cr.GetTyped(key)
+		}
+		pending := make([]AttrEntry, 0, len(opts.Mutations))
 		for field, op := range opts.Mutations {
-			newVal, err := op.Apply(props)
+			newAttr, err := applyComputeOpTyped(field, op, lookup)
 			if err != nil {
 				return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
 			}
 			if schemaSpecs != nil {
-				if err := validateFieldValue(field, newVal, schemaSpecs[field]); err != nil {
+				newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
+				if err := validateAttrEntry(newAttr, schemaSpecs[field]); err != nil {
 					return updatedCount, fmt.Errorf("update %q: %w", name, err)
 				}
 			}
-			pending[field] = newVal
+			pending = append(pending, newAttr)
 		}
-		for k, v := range pending {
-			cr = cr.Set(db.internAttr(k), v)
+		for _, attr := range pending {
+			attr.Key = db.internAttr(attr.Key)
+			cr = cr.SetAttr(attr)
 		}
 		if db.wal != nil {
 			if err := db.wal.WriteSave(name, cr); err != nil {
@@ -2109,6 +3140,7 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 			Name:      name,
 			Operation: cr.Operation,
 			Props:     cr.ToMap(),
+			Attrs:     slices.Clone(cr.expandAttrs()),
 		})
 	}
 	if len(records) == 0 {
@@ -2298,7 +3330,8 @@ func (db *AnchorDB) Sync() error {
 		db.syncedEntityCount > 0 &&
 		db.syncedEntityCount <= uint64(len(db.EntityOrder)) &&
 		db.entitySectionEnd > int(db.Header.EntityOffset) &&
-		db.entitySectionEnd <= len(db.mmapData)
+		db.entitySectionEnd <= len(db.mmapData) &&
+		db.Header.Version >= DBVersion
 
 	var syncedEntityBytes int
 	var pendingEntitiesSnapshot []entitySnapshotEntry
@@ -2457,7 +3490,7 @@ func (db *AnchorDB) Sync() error {
 
 	// 4. Entity Section (streamed directly to disk buffer from snapshot)
 	var lBuf [2]byte
-	var vBuf [4]byte
+	var vBuf [8]byte
 	var opBuf [1]byte
 
 	writeEntityEntry := func(entry entitySnapshotEntry) error {
@@ -2465,8 +3498,8 @@ func (db *AnchorDB) Sync() error {
 		if len(nameBytes) > math.MaxUint16 {
 			return fmt.Errorf("entity name %q too long (%d bytes) for binary format", entry.Name, len(nameBytes))
 		}
-		if entry.CR.AttrCount() > math.MaxUint16 {
-			return fmt.Errorf("entity %q has too many attributes (%d) for binary format", entry.Name, entry.CR.AttrCount())
+		if entry.CR.AttrCount() > MaxAttrCount {
+			return fmt.Errorf("entity %q has too many attributes (%d) for binary format (max: %d)", entry.Name, entry.CR.AttrCount(), MaxAttrCount)
 		}
 
 		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
@@ -2483,28 +3516,47 @@ func (db *AnchorDB) Sync() error {
 		}
 
 		if len(entry.CR.Attrs) == 0 && len(entry.CR.Raw) >= 2 {
-			if _, err := writer.Write(entry.CR.Raw); err != nil {
+			countRaw := binary.LittleEndian.Uint16(entry.CR.Raw[:2])
+			if (countRaw & RawTypedFlag) != 0 {
+				if _, err := writer.Write(entry.CR.Raw); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+
+		attrs := entry.CR.expandAttrs()
+		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(attrs))|RawTypedFlag)
+		if _, err := writer.Write(lBuf[:]); err != nil {
+			return err
+		}
+		for _, attr := range attrs {
+			if attr.Type > AttrTypeFloat64 {
+				return fmt.Errorf("invalid attribute type %d for key %q in entity %q", attr.Type, attr.Key, entry.Name)
+			}
+			kBytes := []byte(attr.Key)
+			if len(kBytes) > math.MaxUint16 {
+				return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), entry.Name)
+			}
+			tBuf := [1]byte{byte(attr.Type)}
+			if _, err := writer.Write(tBuf[:]); err != nil {
 				return err
 			}
-		} else {
-			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(entry.CR.Attrs)))
+			binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
 			if _, err := writer.Write(lBuf[:]); err != nil {
 				return err
 			}
-			for _, attr := range entry.CR.Attrs {
-				kBytes := []byte(attr.Key)
-				if len(kBytes) > math.MaxUint16 {
-					return fmt.Errorf("attribute key %q too long (%d bytes) for entity %q", attr.Key, len(kBytes), entry.Name)
-				}
-				binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
-				if _, err := writer.Write(lBuf[:]); err != nil {
+			if _, err := writer.Write(kBytes); err != nil {
+				return err
+			}
+			if attr.Type == AttrTypeFloat32 {
+				binary.LittleEndian.PutUint32(vBuf[:4], math.Float32bits(attr.Value))
+				if _, err := writer.Write(vBuf[:4]); err != nil {
 					return err
 				}
-				if _, err := writer.Write(kBytes); err != nil {
-					return err
-				}
-				binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(attr.Value))
-				if _, err := writer.Write(vBuf[:]); err != nil {
+			} else {
+				binary.LittleEndian.PutUint64(vBuf[:8], uint64(attr.IntVal))
+				if _, err := writer.Write(vBuf[:8]); err != nil {
 					return err
 				}
 			}
@@ -3179,20 +4231,21 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 			}
 		}
 
-		val, exists := cr.Get(opts.Field)
+		attr, exists := cr.GetTyped(opts.Field)
 		if !exists {
 			continue
 		}
 
 		count++
-		val64 := float64(val)
+		val64 := attr.Float64()
 		sum += val64
 
-		if val < minVal {
-			minVal = val
+		val32 := float32(val64)
+		if val32 < minVal {
+			minVal = val32
 		}
-		if val > maxVal {
-			maxVal = val
+		if val32 > maxVal {
+			maxVal = val32
 		}
 
 		// Welford's single-pass update

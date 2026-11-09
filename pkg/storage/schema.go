@@ -54,14 +54,20 @@ func ParseFieldSpec(raw string) (FieldSpec, error) {
 	switch base {
 	case "int", "integer", "int32", "int64":
 		base = "int"
-	case "float", "float32", "float64", "number":
+	case "uint", "uint32", "uint64":
+		base = "uint"
+	case "float", "number":
 		base = "float"
+	case "float32":
+		base = "float32"
+	case "float64":
+		base = "float64"
 	case "bool", "boolean":
 		base = "bool"
 	case "date", "datetime":
 		base = "date"
 	default:
-		return FieldSpec{}, fmt.Errorf("%w: unsupported base type %q (supported types: int, float, bool, date)", ErrInvalidFieldType, base)
+		return FieldSpec{}, fmt.Errorf("%w: unsupported base type %q (supported types: int, uint, float, float32, float64, bool, date)", ErrInvalidFieldType, base)
 	}
 
 	norm := base
@@ -126,6 +132,34 @@ func (s ModelSchema) Compare(other ModelSchema) error {
 	return nil
 }
 
+func isFiniteFloat32SignedInt(val float32) bool {
+	if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) || val < -0x1p63 || val >= 0x1p63 {
+		return false
+	}
+	return float32(math.Trunc(float64(val))) == val
+}
+
+func isFiniteFloat32UnsignedInt(val float32) bool {
+	if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) || val < 0 || val >= 0x1p64 {
+		return false
+	}
+	return float32(math.Trunc(float64(val))) == val
+}
+
+func isFiniteFloat64SignedInt(val float64) bool {
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < -0x1p63 || val >= 0x1p63 {
+		return false
+	}
+	return math.Trunc(val) == val
+}
+
+func isFiniteFloat64UnsignedInt(val float64) bool {
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 || val >= 0x1p64 {
+		return false
+	}
+	return math.Trunc(val) == val
+}
+
 // validateFieldValue enforces type-level value constraints for a single scalar float32 attribute.
 func validateFieldValue(field string, val float32, spec FieldSpec) error {
 	if spec.IsArray {
@@ -136,17 +170,21 @@ func validateFieldValue(field string, val float32, spec FieldSpec) error {
 	}
 	switch spec.BaseType {
 	case "int":
-		if val != float32(int64(val)) {
+		if !isFiniteFloat32SignedInt(val) {
 			return fmt.Errorf("%w: field %q expects integer value, got %v", ErrInvalidFieldType, field, val)
+		}
+	case "uint":
+		if !isFiniteFloat32UnsignedInt(val) {
+			return fmt.Errorf("%w: field %q expects unsigned integer value, got %v", ErrInvalidFieldType, field, val)
 		}
 	case "bool":
 		if val != 0.0 && val != 1.0 {
 			return fmt.Errorf("%w: field %q expects boolean (0.0 or 1.0), got %v", ErrInvalidFieldType, field, val)
 		}
-	case "float":
+	case "float", "float32", "float64":
 		// Any finite float32 is valid.
 	case "date":
-		if val != float32(int64(val)) {
+		if !isFiniteFloat32SignedInt(val) {
 			return fmt.Errorf("%w: field %q expects integer epoch day/timestamp for date, got %v", ErrInvalidFieldType, field, val)
 		}
 	default:
@@ -185,6 +223,147 @@ func (s ModelSchema) ValidateProps(props map[string]float32) error {
 		}
 	}
 
+	return nil
+}
+
+// ValidateAttrs validates that typed record attributes conform to the schema contract.
+func (s ModelSchema) ValidateAttrs(attrs []AttrEntry) error {
+	specs, err := s.Parse()
+	if err != nil {
+		return err
+	}
+
+	present := make(map[string]AttrEntry, len(attrs))
+	for _, a := range attrs {
+		spec, ok := specs[a.Key]
+		if !ok {
+			return fmt.Errorf("%w: field %q is not defined in model schema", ErrUnknownField, a.Key)
+		}
+		if err := validateAttrEntry(a, spec); err != nil {
+			return err
+		}
+		present[a.Key] = a
+	}
+
+	for k, spec := range specs {
+		if !spec.Optional {
+			if _, exists := present[k]; !exists {
+				return fmt.Errorf("%w: field %q is required", ErrMissingRequiredField, k)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateAttrEntries is an alias for ValidateAttrs.
+func (s ModelSchema) ValidateAttrEntries(attrs []AttrEntry) error {
+	return s.ValidateAttrs(attrs)
+}
+
+func validateAttrEntry(attr AttrEntry, spec FieldSpec) error {
+	if spec.IsArray {
+		return fmt.Errorf("%w: field %q array type %q is not supported", ErrInvalidFieldType, attr.Key, spec.Raw)
+	}
+	if attr.Type > AttrTypeFloat64 {
+		return fmt.Errorf("%w: field %q has invalid attribute type %d", ErrInvalidFieldType, attr.Key, attr.Type)
+	}
+	switch spec.BaseType {
+	case "int", "date":
+		if attr.Type == AttrTypeInt64 {
+			return nil
+		}
+		if attr.Type == AttrTypeUint64 {
+			if attr.Uint64() > uint64(math.MaxInt64) {
+				return fmt.Errorf("%w: field %q unsigned value %d exceeds max signed integer", ErrInvalidFieldType, attr.Key, attr.Uint64())
+			}
+			return nil
+		}
+		if attr.Type == AttrTypeFloat64 {
+			f64 := attr.Float64()
+			if !isFiniteFloat64SignedInt(f64) {
+				return fmt.Errorf("%w: field %q expects integer value, got %v", ErrInvalidFieldType, attr.Key, f64)
+			}
+			return nil
+		}
+		if !isFiniteFloat32SignedInt(attr.Value) {
+			return fmt.Errorf("%w: field %q expects integer value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+		}
+	case "uint":
+		if attr.Type == AttrTypeUint64 {
+			return nil
+		}
+		if attr.Type == AttrTypeInt64 {
+			if attr.IntVal < 0 {
+				return fmt.Errorf("%w: field %q expects unsigned value, got %d", ErrInvalidFieldType, attr.Key, attr.IntVal)
+			}
+			return nil
+		}
+		if attr.Type == AttrTypeFloat64 {
+			f64 := attr.Float64()
+			if !isFiniteFloat64UnsignedInt(f64) {
+				return fmt.Errorf("%w: field %q expects unsigned integer value, got %v", ErrInvalidFieldType, attr.Key, f64)
+			}
+			return nil
+		}
+		if !isFiniteFloat32UnsignedInt(attr.Value) {
+			return fmt.Errorf("%w: field %q expects unsigned integer value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+		}
+	case "bool":
+		if attr.Type == AttrTypeInt64 || attr.Type == AttrTypeUint64 {
+			if attr.IntVal != 0 && attr.IntVal != 1 {
+				return fmt.Errorf("%w: field %q expects boolean (0 or 1), got %d", ErrInvalidFieldType, attr.Key, attr.IntVal)
+			}
+			return nil
+		}
+		if attr.Type == AttrTypeFloat64 {
+			f64 := attr.Float64()
+			if f64 != 0.0 && f64 != 1.0 {
+				return fmt.Errorf("%w: field %q expects boolean (0.0 or 1.0), got %v", ErrInvalidFieldType, attr.Key, f64)
+			}
+			return nil
+		}
+		if attr.Value != 0.0 && attr.Value != 1.0 {
+			return fmt.Errorf("%w: field %q expects boolean (0.0 or 1.0), got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+		}
+	case "float":
+		if attr.Type == AttrTypeFloat64 {
+			f64 := attr.Float64()
+			if math.IsNaN(f64) || math.IsInf(f64, 0) {
+				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, f64)
+			}
+			return nil
+		}
+		if attr.Type == AttrTypeFloat32 {
+			if math.IsNaN(float64(attr.Value)) || math.IsInf(float64(attr.Value), 0) {
+				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+			}
+		}
+	case "float32":
+		if attr.Type == AttrTypeFloat32 {
+			if math.IsNaN(float64(attr.Value)) || math.IsInf(float64(attr.Value), 0) {
+				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: field %q expects float32 value, got type %d", ErrInvalidFieldType, attr.Key, attr.Type)
+	case "float64":
+		if attr.Type == AttrTypeFloat64 {
+			f64 := attr.Float64()
+			if math.IsNaN(f64) || math.IsInf(f64, 0) {
+				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, f64)
+			}
+			return nil
+		}
+		if attr.Type == AttrTypeFloat32 {
+			if math.IsNaN(float64(attr.Value)) || math.IsInf(float64(attr.Value), 0) {
+				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: field %q expects float64 value, got type %d", ErrInvalidFieldType, attr.Key, attr.Type)
+	default:
+		return fmt.Errorf("%w: field %q has unsupported base type %q", ErrInvalidFieldType, attr.Key, spec.BaseType)
+	}
 	return nil
 }
 

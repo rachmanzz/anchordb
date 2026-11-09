@@ -351,3 +351,44 @@ func TestDriver_SaveBatch_RemoteMock(t *testing.T) {
 		t.Errorf("unexpected names: %+v", names)
 	}
 }
+
+func TestDriver_SaveAndGetTyped(t *testing.T) {
+	dataDir := t.TempDir()
+	client, err := OpenEmbedded(dataDir)
+	if err != nil {
+		t.Fatalf("OpenEmbedded failed: %v", err)
+	}
+	defer client.Close()
+
+	exactViews := int64(10_000_000_001)
+	exactUID := uint64(99_888_777_666)
+
+	attrs := []AttrEntry{
+		NewInt64Attr("views", exactViews),
+		NewUint64Attr("uid", exactUID),
+		NewFloat32Attr("rating", 4.8),
+	}
+
+	name, err := client.SaveTyped("product_99", attrs)
+	if err != nil {
+		t.Fatalf("SaveTyped failed: %v", err)
+	}
+	if name != "product_99" {
+		t.Fatalf("expected name product_99, got %q", name)
+	}
+
+	cr, err := client.GetTyped("product_99")
+	if err != nil {
+		t.Fatalf("GetTyped failed: %v", err)
+	}
+
+	v, ok := cr.GetInt("views")
+	if !ok || v != exactViews {
+		t.Fatalf("expected exact views %d, got %d (ok=%v)", exactViews, v, ok)
+	}
+
+	u, ok := cr.GetUint("uid")
+	if !ok || u != exactUID {
+		t.Fatalf("expected exact uid %d, got %d (ok=%v)", exactUID, u, ok)
+	}
+}

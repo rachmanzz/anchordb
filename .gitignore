@@ -22,6 +22,7 @@ data/partitions/
 
 # Environment & OS
 .env
+knl-config.json
 .DS_Store
 Thumbs.db
 

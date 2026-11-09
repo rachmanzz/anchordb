@@ -345,6 +345,15 @@ func (c *Client) Save(item storage.BatchRecordItem) (string, error) {
 	return DecodeOKPayload(resp.Payload)
 }
 
+// SaveTyped stores an entity record with typed attributes.
+func (c *Client) SaveTyped(name string, opStatus uint8, attrs []storage.AttrEntry) (string, error) {
+	return c.Save(storage.BatchRecordItem{
+		Name:      name,
+		Operation: opStatus,
+		Attrs:     attrs,
+	})
+}
+
 // SaveBatch stores multiple records in a single high-throughput frame, automatically pacing if enabled.
 func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) {
 	if len(records) == 0 {
@@ -440,6 +449,20 @@ func (c *Client) GetWithOptions(req GetRequest) (map[string]float32, uint8, erro
 	}
 	op, props, err := DecodeGetResultPayload(resp.Payload)
 	return props, op, err
+}
+
+// GetTyped retrieves an entity's typed attributes and operation lifecycle state.
+func (c *Client) GetTyped(name string) (storage.CompactRecord, error) {
+	resp, err := c.call(OpGet, EncodeGetRequest(GetRequest{Name: name}))
+	if err != nil {
+		return storage.CompactRecord{}, err
+	}
+	op, attrs, err := DecodeGetResultTypedPayload(resp.Payload)
+	if err != nil {
+		return storage.CompactRecord{}, err
+	}
+	cr := storage.NewCompactRecord(op, attrs)
+	return cr, nil
 }
 
 // Edge adds or removes an explicit graph edge.
