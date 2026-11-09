@@ -270,11 +270,11 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 				if offset+kLen+4 > len(cr.Raw) {
 					break
 				}
-				kBytes := cr.Raw[offset : offset+kLen]
+				match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
 				offset += kLen
 				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
 				offset += 4
-				if string(kBytes) == key {
+				if match {
 					val := math.Float32frombits(valBits)
 					return NewFloat32Attr(key, val), true
 				}
@@ -292,7 +292,7 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 				if offset+kLen > len(cr.Raw) {
 					break
 				}
-				kBytes := cr.Raw[offset : offset+kLen]
+				match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
 				offset += kLen
 				if tTag == AttrTypeFloat32 {
 					if offset+4 > len(cr.Raw) {
@@ -300,7 +300,7 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 					}
 					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
 					offset += 4
-					if string(kBytes) == key {
+					if match {
 						val := math.Float32frombits(valBits)
 						return NewFloat32Attr(key, val), true
 					}
@@ -310,7 +310,7 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 					}
 					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
 					offset += 8
-					if string(kBytes) == key {
+					if match {
 						return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
 					}
 				} else if tTag == AttrTypeUint64 {
@@ -319,7 +319,7 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 					}
 					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
 					offset += 8
-					if string(kBytes) == key {
+					if match {
 						return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
 					}
 				} else if tTag == AttrTypeFloat64 {
@@ -328,7 +328,7 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 					}
 					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
 					offset += 8
-					if string(kBytes) == key {
+					if match {
 						f64 := math.Float64frombits(u64)
 						return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true
 					}

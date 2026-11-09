@@ -28,6 +28,7 @@ func main() {
 	benchCausalChain()
 	benchEmbeddedEngineIO()
 	benchSchemaValidation()
+	benchStorageLayout()
 
 	fmt.Println("================================================================================")
 	fmt.Println("Benchmark suite completed successfully. All metrics verified independently.")
@@ -35,7 +36,7 @@ func main() {
 }
 
 func benchInStorageCompute() {
-	fmt.Println("[1/5] Benchmarking In-Storage Arithmetic Math...")
+	fmt.Println("[1/6] Benchmarking In-Storage Arithmetic Math...")
 	props := map[string]float32{
 		"distance": 120.0,
 		"duration": 2.0,
@@ -58,7 +59,7 @@ func benchInStorageCompute() {
 }
 
 func benchSpatialDDA() {
-	fmt.Println("[2/5] Benchmarking Spatial Grid Fast Voxel DDA Raycasting (256x256)...")
+	fmt.Println("[2/6] Benchmarking Spatial Grid Fast Voxel DDA Raycasting (256x256)...")
 	ray := spatial.Ray{
 		Origin:    spatial.Point2D{X: -0.8, Y: -0.8},
 		Direction: spatial.Point2D{X: 1.0, Y: 1.0},
@@ -84,7 +85,7 @@ func benchSpatialDDA() {
 }
 
 func benchCausalChain() {
-	fmt.Println("[3/5] Benchmarking Multi-Hop Causal Chain Reasoning (Multi-Branching Mesh)...")
+	fmt.Println("[3/6] Benchmarking Multi-Hop Causal Chain Reasoning (Multi-Branching Mesh)...")
 	dir, err := os.MkdirTemp("", "bench_causal_*")
 	if err != nil {
 		fmt.Printf("error creating temp dir: %v\n", err)
@@ -166,7 +167,7 @@ func benchCausalChain() {
 }
 
 func benchEmbeddedEngineIO() {
-	fmt.Println("[4/5] Benchmarking Embedded Engine Mutation & Query Ingestion...")
+	fmt.Println("[4/6] Benchmarking Embedded Engine Mutation & Query Ingestion...")
 	dir, err := os.MkdirTemp("", "bench_io_*")
 	if err != nil {
 		fmt.Printf("error creating temp dir: %v\n", err)
@@ -221,7 +222,7 @@ func benchEmbeddedEngineIO() {
 }
 
 func benchSchemaValidation() {
-	fmt.Println("[5/5] Benchmarking Strict Model Schema Validation Overhead...")
+	fmt.Println("[5/6] Benchmarking Strict Model Schema Validation Overhead...")
 	schema := storage.ModelSchema{
 		"voltage":     "float",
 		"current":     "float",
@@ -251,4 +252,37 @@ func benchSchemaValidation() {
 	fmt.Printf("      -> Total Time:  %v\n", dur)
 	fmt.Printf("      -> Latency:     %.2f ns/validation\n", nsPerOp)
 	fmt.Printf("      -> Throughput:  %.0f validations/sec (Fail-Fast Memory Bound)\n\n", opsPerSec)
+}
+
+func benchStorageLayout() {
+	fmt.Println("[6/6] Benchmarking Storage Layout & Numeric Precision Candidates (Phase 3)...")
+	const n = 1_000_000
+	report := storage.RunLayoutBenchmark(n)
+
+	fmt.Printf("      -> Evaluation Pass: %d iterations per candidate layout\n", n)
+	fmt.Println("      -> Physical Memory & Disk Space Footprint (8 mixed attributes):")
+	fmt.Printf("         - Candidate A [Baseline Sequential TLV]:  %d bytes (Optimal / Most Compact)\n", report.BaselineSizeBytes)
+	fmt.Printf("         - Candidate B [Fixed-Width 8-Byte Slot]: %d bytes (+%.1f%% bloat)\n",
+		report.FixedWidthSizeBytes, float64(report.FixedWidthSizeBytes-report.BaselineSizeBytes)/float64(report.BaselineSizeBytes)*100)
+	fmt.Printf("         - Candidate C [Packed Typed Columns]:    %d bytes (+%.1f%% bloat)\n",
+		report.PackedColSizeBytes, float64(report.PackedColSizeBytes-report.BaselineSizeBytes)/float64(report.BaselineSizeBytes)*100)
+
+	fmt.Println("      -> Sequential Scan Throughput:")
+	fmt.Printf("         - Baseline Sequential TLV:  %.0f ops/sec (%.1f MB/s)\n", report.BaselineScanOpsSec, report.BaselineScanThroughput)
+	fmt.Printf("         - Fixed-Width 8-Byte Slot: %.0f ops/sec (%.1f MB/s)\n", report.FixedWidthScanOpsSec, report.FixedWidthScanThroughput)
+	fmt.Printf("         - Packed Typed Columns:    %.0f ops/sec (%.1f MB/s)\n", report.PackedColScanOpsSec, report.PackedColScanThroughput)
+
+	fmt.Println("      -> Random Point Read (Zero-Copy Mmap):")
+	fmt.Printf("         - Baseline Sequential TLV:  %.2f ns/read (%.0f reads/sec)\n", report.BaselineReadLatencyNs, report.BaselineReadOpsSec)
+	fmt.Printf("         - Fixed-Width 8-Byte Slot: %.2f ns/read (%.0f reads/sec)\n", report.FixedWidthReadLatencyNs, report.FixedWidthReadOpsSec)
+	fmt.Printf("         - Packed Typed Columns:    %.2f ns/read (%.0f reads/sec)\n", report.PackedColReadLatencyNs, report.PackedColReadOpsSec)
+
+	fmt.Println("      -> WAL Write & Recovery Throughput (Typed 64-Bit Attributes):")
+	fmt.Printf("         - WAL Write Throughput:    %.0f writes/sec\n", report.WALWriteOpsSec)
+	fmt.Printf("         - WAL Crash Recovery:      %.0f records/sec\n", report.WALRecoveryOpsSec)
+
+	fmt.Println("      -> Mmap Zero-Copy & GC Memory Pressure:")
+	fmt.Printf("         - Mmap Point Read Speed:   %.0f reads/sec\n", report.MmapZeroCopyReadOpsSec)
+	fmt.Printf("         - Heap Alloc During Read:  %d B/record (Zero-Copy Mmap)\n", report.MmapHeapBytesPerRecord)
+	fmt.Printf("         - GC Pause Duration:       %v\n\n", report.MmapGCPauseDuration)
 }
