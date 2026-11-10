@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -154,6 +155,21 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("cannot initialize s3 partition cache: %w", err)
 	}
 
+	// 0. Validate cron schedules before starting any subsystem: a typo must
+	// fail startup with a clear error, never a silently unregistered task.
+	if cfg.CronEnabled {
+		if cfg.PartitionSchedule != "" {
+			if err := scheduler.ValidateSchedule(cfg.PartitionSchedule); err != nil {
+				return nil, fmt.Errorf("invalid partition schedule %q: %w", cfg.PartitionSchedule, err)
+			}
+		}
+		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
+			if err := scheduler.ValidateSchedule(cfg.SyncInterval); err != nil {
+				return nil, fmt.Errorf("invalid sync interval %q: %w", cfg.SyncInterval, err)
+			}
+		}
+	}
+
 	// 1. Initialize Worker Pool
 	workerPool := worker.NewPool(cfg.WorkerConfig)
 	workerPool.Start()
@@ -210,17 +226,24 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		s.limiter = newRateLimiter(cfg.RateLimitPerSec, cfg.RateLimitBurst)
 	}
 
-	// Register top-global scheduled tasks if cron is enabled
+	// Register top-global scheduled tasks if cron is enabled. Schedules were
+	// validated before subsystem start, so a failure here is unexpected: stop
+	// everything and fail startup rather than running without retention/sync.
+	failStartup := func(task string, err error) (*Server, error) {
+		s.scheduler.Stop()
+		_ = workerPool.Shutdown()
+		return nil, fmt.Errorf("failed to register cron task %s: %w", task, err)
+	}
 	if cfg.CronEnabled {
 		if cfg.PartitionSchedule != "" {
 			if err := s.scheduler.RegisterTask("auto_partition_maintenance", NewAutoPartitionCronTask(s, cfg.PartitionSchedule, cfg.RetentionDays)); err != nil {
-				log.Printf("[ERROR] Failed to register cron task auto_partition_maintenance: %v", err)
+				return failStartup("auto_partition_maintenance", err)
 			}
 		}
 
 		if cfg.SyncInterval != "" && cfg.SyncInterval != "0" && cfg.SyncInterval != "off" {
 			if err := s.scheduler.RegisterTask("periodic_background_sync", NewPeriodicSyncCronTask(s, cfg.SyncInterval)); err != nil {
-				log.Printf("[ERROR] Failed to register cron task periodic_background_sync: %v", err)
+				return failStartup("periodic_background_sync", err)
 			}
 		}
 
@@ -302,10 +325,16 @@ func limitRequestBody(next http.Handler) http.Handler {
 }
 
 func dispatchErrorStatus(err error) int {
-	if errors.Is(err, worker.ErrWorkerUnavailable) {
+	switch {
+	case errors.Is(err, storage.ErrRecordNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, storage.ErrComputeFailed):
+		return http.StatusUnprocessableEntity
+	case errors.Is(err, worker.ErrWorkerUnavailable), errors.Is(err, storage.ErrDatabaseClosed):
 		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
 	}
-	return http.StatusInternalServerError
 }
 
 // requireMethod writes a 405 response and reports false when r.Method is not one
@@ -874,12 +903,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 
 // Request / Response types for REST API
 type SaveRequest struct {
-	Model     string             `json:"model"`
-	Name      string             `json:"name"`
-	Operation *uint8             `json:"operation,omitempty"`
-	Props     map[string]float32 `json:"props"`
-	Coord     *spatial.Point2D   `json:"coord,omitempty"`
-	Roles     *[4]float32        `json:"roles,omitempty"`
+	Model     string              `json:"model"`
+	Name      string              `json:"name"`
+	Operation *uint8              `json:"operation,omitempty"`
+	Props     map[string]float32  `json:"props"`
+	Attrs     []storage.AttrEntry `json:"attrs,omitempty"`
+	Coord     *spatial.Point2D    `json:"coord,omitempty"`
+	Roles     *[4]float32         `json:"roles,omitempty"`
 }
 
 type SaveBatchRequest struct {
@@ -920,6 +950,7 @@ type UpdateRequest struct {
 	Filters   []FilterDTO       `json:"filters"`
 	Mutations map[string]string `json:"mutations"` // e.g. {"distance": "distance + 10"}
 	Limit     int               `json:"limit"`
+	Offset    int               `json:"offset"`
 	Async     bool              `json:"async,omitempty"`
 }
 
@@ -973,7 +1004,7 @@ func parseComputeOp(expr string) (storage.ComputeOp, error) {
 	}
 
 	// 1. Check for single literal assignment (e.g. "0", "-5", "100.5") or direct field alias
-	if _, err := strconv.ParseFloat(expr, 32); err == nil {
+	if _, err := strconv.ParseFloat(expr, 64); err == nil {
 		return storage.OpAssign{Value: expr}, nil
 	}
 	if isValidIdentifier(expr) {
@@ -1016,21 +1047,31 @@ func parseComputeOp(expr string) (storage.ComputeOp, error) {
 	return nil, fmt.Errorf("unsupported or malformed expression %q", expr)
 }
 
-// parseVal converts a filter value to float32. An empty string is treated as
-// zero (filters that do not use ValueHigh leave it empty). A non-empty value
-// that parses as neither a date nor a number is a hard error so callers cannot
-// silently match/update unintended records.
-func parseVal(str string) (float32, error) {
+func parseFilterVal(str string) (v32 float32, v64 float64, vInt64 int64, vUint64 uint64, valType storage.AttrType, has64 bool, err error) {
 	if str == "" {
-		return 0, nil
+		return 0, 0, 0, 0, storage.AttrTypeFloat32, false, nil
 	}
 	if d, err := storage.ParseDate(str); err == nil {
-		return d, nil
+		return d, float64(d), int64(d), uint64(d), storage.AttrTypeFloat32, false, nil
 	}
-	if f, err := strconv.ParseFloat(str, 32); err == nil {
-		return float32(f), nil
+	if i, err := strconv.ParseInt(str, 10, 64); err == nil {
+		var u uint64
+		if i >= 0 {
+			u = uint64(i)
+		}
+		return float32(i), float64(i), i, u, storage.AttrTypeInt64, true, nil
 	}
-	return 0, fmt.Errorf("invalid numeric value %q", str)
+	if u, err := strconv.ParseUint(str, 10, 64); err == nil {
+		var i int64
+		if u <= math.MaxInt64 {
+			i = int64(u)
+		}
+		return float32(u), float64(u), i, u, storage.AttrTypeUint64, true, nil
+	}
+	if f, err := strconv.ParseFloat(str, 64); err == nil {
+		return float32(f), f, 0, 0, storage.AttrTypeFloat64, true, nil
+	}
+	return 0, 0, 0, 0, storage.AttrTypeFloat32, false, fmt.Errorf("invalid numeric value %q", str)
 }
 
 // buildFilters converts API filter DTOs into storage filter conditions,
@@ -1038,19 +1079,67 @@ func parseVal(str string) (float32, error) {
 func buildFilters(filters []FilterDTO) ([]storage.FilterCondition, error) {
 	out := make([]storage.FilterCondition, 0, len(filters))
 	for _, f := range filters {
-		value, err := parseVal(f.Value)
+		v32, v64, vInt64, vUint64, valType, has64, err := parseFilterVal(f.Value)
 		if err != nil {
 			return nil, fmt.Errorf("filter field %q: %w", f.Field, err)
 		}
-		valueHigh, err := parseVal(f.ValueHigh)
+		vh32, vh64, vhInt64, vhUint64, vhType, hasHigh64, err := parseFilterVal(f.ValueHigh)
 		if err != nil {
 			return nil, fmt.Errorf("filter field %q (value_high): %w", f.Field, err)
 		}
+		condType := valType
+		condHighType := vhType
+		hasHighType := false
+		if f.Operator == "BETWEEN" && f.ValueHigh != "" {
+			lowIsInt := valType == storage.AttrTypeInt64 || valType == storage.AttrTypeUint64
+			highIsInt := vhType == storage.AttrTypeInt64 || vhType == storage.AttrTypeUint64
+			if lowIsInt && highIsInt {
+				if valType != vhType {
+					if valType == storage.AttrTypeInt64 && vInt64 >= 0 {
+						vUint64 = uint64(vInt64)
+						condType = storage.AttrTypeUint64
+						condHighType = storage.AttrTypeUint64
+					} else if vhType == storage.AttrTypeInt64 && vhInt64 >= 0 {
+						vhUint64 = uint64(vhInt64)
+						condType = storage.AttrTypeUint64
+						condHighType = storage.AttrTypeUint64
+					} else if valType == storage.AttrTypeUint64 && vUint64 <= math.MaxInt64 {
+						vInt64 = int64(vUint64)
+						condType = storage.AttrTypeInt64
+						condHighType = storage.AttrTypeInt64
+					} else if vhType == storage.AttrTypeUint64 && vhUint64 <= math.MaxInt64 {
+						vhInt64 = int64(vhUint64)
+						condType = storage.AttrTypeInt64
+						condHighType = storage.AttrTypeInt64
+					} else {
+						condType = valType
+						condHighType = vhType
+						hasHighType = true
+					}
+				}
+			} else if valType == storage.AttrTypeFloat64 || vhType == storage.AttrTypeFloat64 || (lowIsInt != highIsInt) {
+				condType = storage.AttrTypeFloat64
+				condHighType = storage.AttrTypeFloat64
+				has64 = true
+			}
+		} else if condType == storage.AttrTypeFloat32 && vhType != storage.AttrTypeFloat32 {
+			condType = vhType
+		}
 		out = append(out, storage.FilterCondition{
-			Field:     f.Field,
-			Operator:  f.Operator,
-			Value:     value,
-			ValueHigh: valueHigh,
+			Field:           f.Field,
+			Operator:        f.Operator,
+			Value:           v32,
+			ValueHigh:       vh32,
+			Value64:         v64,
+			ValueHigh64:     vh64,
+			HasFloat64:      has64 || hasHigh64,
+			ValueInt64:      vInt64,
+			ValueHighInt64:  vhInt64,
+			ValueUint64:     vUint64,
+			ValueHighUint64: vhUint64,
+			ValType:         condType,
+			ValHighType:     condHighType,
+			HasHighType:     hasHighType,
 		})
 	}
 	return out, nil
@@ -1087,12 +1176,29 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		if req.Roles != nil {
 			roles = *req.Roles
 		}
-		if len(req.Props) > 0 {
+		if len(req.Attrs) > 0 {
+			name, err := db.SaveRecordTypedWithNode(effectiveName, opStatus, req.Attrs, coord, roles)
+			if err != nil {
+				if errors.Is(err, storage.ErrMissingRequiredField) ||
+					errors.Is(err, storage.ErrUnknownField) ||
+					errors.Is(err, storage.ErrInvalidFieldType) ||
+					errors.Is(err, storage.ErrSchemaMismatch) ||
+					errors.Is(err, storage.ErrRecordLocked) {
+					writeJSONError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			effectiveName = name
+		} else if len(req.Props) > 0 {
 			name, err := db.SaveRecordWithNode(effectiveName, opStatus, req.Props, coord, roles)
 			if err != nil {
 				if errors.Is(err, storage.ErrMissingRequiredField) ||
 					errors.Is(err, storage.ErrUnknownField) ||
-					errors.Is(err, storage.ErrInvalidFieldType) {
+					errors.Is(err, storage.ErrInvalidFieldType) ||
+					errors.Is(err, storage.ErrSchemaMismatch) ||
+					errors.Is(err, storage.ErrRecordLocked) {
 					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -1110,18 +1216,37 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		name, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
-		if err != nil {
-			if errors.Is(err, storage.ErrMissingRequiredField) ||
-				errors.Is(err, storage.ErrUnknownField) ||
-				errors.Is(err, storage.ErrInvalidFieldType) {
-				writeJSONError(w, http.StatusBadRequest, err.Error())
+		if len(req.Attrs) > 0 {
+			name, err := db.SaveRecordTypedWithIDAndOp(req.Name, opStatus, req.Attrs)
+			if err != nil {
+				if errors.Is(err, storage.ErrMissingRequiredField) ||
+					errors.Is(err, storage.ErrUnknownField) ||
+					errors.Is(err, storage.ErrInvalidFieldType) ||
+					errors.Is(err, storage.ErrSchemaMismatch) ||
+					errors.Is(err, storage.ErrRecordLocked) {
+					writeJSONError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
+			effectiveName = name
+		} else {
+			name, err := db.SaveRecordWithIDAndOp(req.Name, opStatus, req.Props)
+			if err != nil {
+				if errors.Is(err, storage.ErrMissingRequiredField) ||
+					errors.Is(err, storage.ErrUnknownField) ||
+					errors.Is(err, storage.ErrInvalidFieldType) ||
+					errors.Is(err, storage.ErrSchemaMismatch) ||
+					errors.Is(err, storage.ErrRecordLocked) {
+					writeJSONError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			effectiveName = name
 		}
-		effectiveName = name
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1210,41 +1335,45 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	// 1. Try Hot DB first
 	db, err := s.getModel(req.Model)
 	if err == nil {
-		_, op, gErr := db.GetRecordWithOperation(req.Name)
+		cr, gErr := db.GetRecordTypedWithCompute(req.Name, computations, req.Select...)
 		if gErr == nil {
-			var props map[string]float32
-			if len(computations) > 0 || len(req.Select) > 0 {
-				props, err = db.GetRecordWithCompute(req.Name, computations, req.Select...)
-			} else {
-				props, err = db.GetRecord(req.Name)
-			}
-			if err == nil {
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"success":   true,
-					"name":      req.Name,
-					"operation": op,
-					"props":     props,
-					"tier":      "hot",
-				})
-				return
-			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":   true,
+				"name":      req.Name,
+				"operation": cr.Operation,
+				"props":     cr.ToMap(),
+				"attrs":     cr.ExpandAttrs(),
+				"tier":      "hot",
+			})
+			return
+		}
+		// Only a missing record may fall through to cold tier. Any other hot
+		// failure keeps its own status instead of masquerading as 404.
+		if !errors.Is(gErr, storage.ErrRecordNotFound) {
+			writeJSONError(w, dispatchErrorStatus(gErr), gErr.Error())
+			return
 		}
 	}
 
-	// 2. Transparent Cold Storage Fallback
-	props, op, coldErr := s.GetRecordWithComputeTiered(req.Model, req.Name, computations, req.Select)
+	// 2. Transparent Cold Storage Fallback (not-found only)
+	cr, coldErr := s.GetColdRecordTyped(req.Model, req.Name, computations, req.Select)
 	if coldErr == nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":   true,
 			"name":      req.Name,
-			"operation": op,
-			"props":     props,
+			"operation": cr.Operation,
+			"props":     cr.ToMap(),
+			"attrs":     cr.ExpandAttrs(),
 			"tier":      "cold",
 		})
 		return
 	}
 
-	writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in model %q (hot or cold tiers)", req.Name, req.Model))
+	if errors.Is(coldErr, storage.ErrRecordNotFound) {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in model %q (hot or cold tiers)", req.Name, req.Model))
+		return
+	}
+	writeJSONError(w, dispatchErrorStatus(coldErr), coldErr.Error())
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -1305,7 +1434,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		AllowedOperations:    req.AllowedOperations,
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1361,6 +1490,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 					Filters:        filters,
 					Mutations:      mutations,
 					Limit:          req.Limit,
+					Offset:         req.Offset,
 				})
 				if err == nil {
 					log.Printf("[WORKER] Async batch update succeeded for model %q: %d records updated", req.Model, count)
@@ -1391,6 +1521,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		Filters:        filters,
 		Mutations:      mutations,
 		Limit:          req.Limit,
+		Offset:         req.Offset,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrUnknownField) ||
@@ -2009,7 +2140,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		records, specificProps, err := s.s3Cache.InspectPartition(ctx, sink, req.PartitionFile, req.Name, limit)
+		records, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, req.PartitionFile, req.Name, limit)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
 			return
@@ -2020,6 +2151,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 				"partition_file": req.PartitionFile,
 				"name":           req.Name,
 				"props":          specificProps,
+				"attrs":          specificAttrs,
 				"source":         "s3",
 			})
 			return
@@ -2050,7 +2182,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	defer pdb.Close()
 
 	if req.Name != "" {
-		props, err := pdb.GetRecord(req.Name)
+		cr, err := pdb.GetRecordTyped(req.Name)
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in partition", req.Name))
 			return
@@ -2059,7 +2191,8 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 			"success":        true,
 			"partition_file": cleanFilename,
 			"name":           req.Name,
-			"props":          props,
+			"props":          cr.ToMap(),
+			"attrs":          cr.ExpandAttrs(),
 		})
 		return
 	}
@@ -2071,12 +2204,13 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	}
 
 	type RecordDTO struct {
-		Name  string             `json:"name"`
-		Props map[string]float32 `json:"props"`
+		Name  string              `json:"name"`
+		Props map[string]float32  `json:"props"`
+		Attrs []storage.AttrEntry `json:"attrs,omitempty"`
 	}
 	out := make([]RecordDTO, len(records))
 	for i, r := range records {
-		out[i] = RecordDTO{Name: r.Name, Props: r.Props}
+		out[i] = RecordDTO{Name: r.Name, Props: r.Props, Attrs: r.Attrs}
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2298,7 +2432,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	records, specificProps, err := s.s3Cache.InspectPartition(ctx, sink, targetKey, req.Name, limit)
+	records, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, targetKey, req.Name, limit)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
 		return
@@ -2311,6 +2445,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 			"target":  targetKey,
 			"name":    req.Name,
 			"props":   specificProps,
+			"attrs":   specificAttrs,
 		})
 		return
 	}
@@ -2380,7 +2515,7 @@ func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc str
 	return sink
 }
 
-func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, error) {
+func (s *Server) fetchRecordTypedFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
 	var localFile string
 	if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
 		sink := s.buildS3SinkForEntry(entry, entry.PartitionFile)
@@ -2390,7 +2525,7 @@ func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name
 		var err error
 		localFile, err = s.s3Cache.EnsurePartition(ctx, sink, entry.PartitionFile)
 		if err != nil {
-			return nil, err
+			return storage.CompactRecord{}, err
 		}
 	} else {
 		localFile = filepath.Join(s.dataDir, "partitions", entry.PartitionFile)
@@ -2398,14 +2533,63 @@ func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name
 
 	pdb, err := storage.Open(localFile)
 	if err != nil {
-		return nil, err
+		return storage.CompactRecord{}, err
 	}
 	defer pdb.Close()
 
 	if len(computations) > 0 || len(selectFields) > 0 {
-		return pdb.GetRecordWithCompute(name, computations, selectFields...)
+		return pdb.GetRecordTypedWithCompute(name, computations, selectFields...)
 	}
-	return pdb.GetRecord(name)
+	return pdb.GetRecordTyped(name)
+}
+
+func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, error) {
+	cr, err := s.fetchRecordTypedFromCatalogEntry(entry, name, computations, selectFields)
+	if err != nil {
+		return nil, err
+	}
+	return cr.ToMap(), nil
+}
+
+// GetColdRecordTyped looks up a record only in the cold tier via the partition
+// catalog. A catalog hit whose fetch fails returns that failure (never a
+// masked "not found"); a catalog miss returns ErrRecordNotFound. It implements
+// wire.ColdTierBackend so wire callers whose own hot lookup already failed can
+// consult cold storage without repeating the hot read.
+func (s *Server) GetColdRecordTyped(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
+	if s.catalog != nil {
+		if entry, found := s.catalog.FindRecord(model, name); found {
+			return s.fetchRecordTypedFromCatalogEntry(entry, name, computations, selectFields)
+		}
+	}
+	return storage.CompactRecord{}, fmt.Errorf("record %q not found in model %q: %w", name, model, storage.ErrRecordNotFound)
+}
+
+// GetRecordTypedWithComputeTiered implements wire.TypedTieredBackend.
+func (s *Server) GetRecordTypedWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
+	// 1. Check Hot DB
+	db, err := s.getModel(model)
+	if err == nil {
+		var cr storage.CompactRecord
+		var hotErr error
+		if len(computations) > 0 || len(selectFields) > 0 {
+			cr, hotErr = db.GetRecordTypedWithCompute(name, computations, selectFields...)
+		} else {
+			cr, hotErr = db.GetRecordTyped(name)
+		}
+		if hotErr == nil {
+			return cr, nil
+		}
+		// Only a missing record may fall through to cold tier. Compute, IO,
+		// closed-DB and other failures keep their identity so callers never
+		// mistake them for "not found".
+		if !errors.Is(hotErr, storage.ErrRecordNotFound) {
+			return storage.CompactRecord{}, hotErr
+		}
+	}
+
+	// 2. Check Cold Tier via Partition Catalog
+	return s.GetColdRecordTyped(model, name, computations, selectFields)
 }
 
 // GetRecordTiered implements wire.TieredBackend.
@@ -2415,35 +2599,11 @@ func (s *Server) GetRecordTiered(model, name string) (map[string]float32, uint8,
 
 // GetRecordWithComputeTiered implements wire.TieredBackend.
 func (s *Server) GetRecordWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, uint8, error) {
-	// 1. Check Hot DB
-	db, err := s.getModel(model)
-	if err == nil {
-		if len(computations) > 0 || len(selectFields) > 0 {
-			props, cErr := db.GetRecordWithCompute(name, computations, selectFields...)
-			if cErr == nil {
-				_, op, _ := db.GetRecordWithOperation(name)
-				return props, op, nil
-			}
-		} else {
-			props, op, gErr := db.GetRecordWithOperation(name)
-			if gErr == nil {
-				return props, op, nil
-			}
-		}
+	cr, err := s.GetRecordTypedWithComputeTiered(model, name, computations, selectFields)
+	if err != nil {
+		return nil, 0, err
 	}
-
-	// 2. Check Cold Tier via Partition Catalog
-	if s.catalog != nil {
-		entry, found := s.catalog.FindRecord(model, name)
-		if found {
-			props, err := s.fetchRecordFromCatalogEntry(entry, name, computations, selectFields)
-			if err == nil {
-				return props, storage.OpStatusActive, nil
-			}
-		}
-	}
-
-	return nil, 0, fmt.Errorf("record %q not found in model %q", name, model)
+	return cr.ToMap(), cr.Operation, nil
 }
 
 // GetPartitionCatalog implements wire.PartitionBackend.
@@ -2483,18 +2643,19 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		records, props, err := s.s3Cache.InspectPartition(ctx, sink, fileOrLoc, recordName, limit)
+		records, props, attrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, fileOrLoc, recordName, limit)
 		if err != nil {
 			return wire.PartitionInspectWireResponse{}, err
 		}
 		var wireItems []wire.PartitionRecordWireItem
 		for _, r := range records {
-			wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props})
+			wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props, Attrs: r.Attrs})
 		}
 		return wire.PartitionInspectWireResponse{
 			PartitionFile: fileOrLoc,
 			RecordName:    recordName,
 			Props:         props,
+			Attrs:         attrs,
 			Records:       wireItems,
 		}, nil
 	}
@@ -2508,14 +2669,15 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	defer pdb.Close()
 
 	if recordName != "" {
-		props, err := pdb.GetRecord(recordName)
+		cr, err := pdb.GetRecordTyped(recordName)
 		if err != nil {
 			return wire.PartitionInspectWireResponse{}, err
 		}
 		return wire.PartitionInspectWireResponse{
 			PartitionFile: cleanFilename,
 			RecordName:    recordName,
-			Props:         props,
+			Props:         cr.ToMap(),
+			Attrs:         cr.ExpandAttrs(),
 		}, nil
 	}
 
@@ -2528,7 +2690,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	}
 	var wireItems []wire.PartitionRecordWireItem
 	for _, r := range recs {
-		wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props})
+		wireItems = append(wireItems, wire.PartitionRecordWireItem{Name: r.Name, Props: r.Props, Attrs: r.Attrs})
 	}
 	return wire.PartitionInspectWireResponse{
 		PartitionFile: cleanFilename,

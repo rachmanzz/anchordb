@@ -13,15 +13,17 @@ import (
 )
 
 type mockBackend struct {
-	mu        sync.Mutex
-	dataDir   string
-	models    map[string]*storage.AnchorDB
-	authToken string
+	mu            sync.Mutex
+	dataDir       string
+	models        map[string]*storage.AnchorDB
+	authToken     string
+	getModelCalls int64
 }
 
 func (m *mockBackend) GetModel(name string) (*storage.AnchorDB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.getModelCalls++
 	if db, ok := m.models[name]; ok {
 		return db, nil
 	}
@@ -51,6 +53,12 @@ func (m *mockBackend) CloseAll() {
 	for _, db := range m.models {
 		_ = db.Close()
 	}
+}
+
+// GetColdRecordTyped implements ColdTierBackend with an empty cold tier:
+// every cold-only lookup misses, mirroring a backend with no catalog.
+func (m *mockBackend) GetColdRecordTyped(model, name string, _ map[string]storage.ComputeOp, _ []string) (storage.CompactRecord, error) {
+	return storage.CompactRecord{}, fmt.Errorf("record %q not found in model %q: %w", name, model, storage.ErrRecordNotFound)
 }
 
 func TestWire_ServerAndClient_EndToEnd(t *testing.T) {

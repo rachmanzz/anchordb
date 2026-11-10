@@ -201,6 +201,14 @@ func (s *InternalScheduler) Jitter() time.Duration {
 	return time.Duration(s.jitterNs.Load())
 }
 
+// ValidateSchedule reports whether schedule can be registered. It applies the
+// same strict parsing as RegisterTask without registering anything, so server
+// startup can reject invalid schedules before subsystems start.
+func ValidateSchedule(schedule string) error {
+	_, err := parseScheduleConfig(schedule)
+	return err
+}
+
 // NormalizeSchedule converts convenient formats into standard specifications.
 //
 // Accepted inputs:

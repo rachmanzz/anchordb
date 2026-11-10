@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -393,7 +394,14 @@ func (c *Client) InspectPartitionRecord(ctx context.Context, partitionFile, reco
 	if err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: recordName, props: res.Props}, nil
+	attrs := res.Attrs
+	if len(attrs) == 0 && len(res.Props) > 0 {
+		attrs = make([]storage.AttrEntry, 0, len(res.Props))
+		for k, v := range res.Props {
+			attrs = append(attrs, storage.NewFloat32Attr(k, v))
+		}
+	}
+	return &EntityResult{Name: recordName, props: res.Props, attrs: attrs}, nil
 }
 
 // Attach locks the specified schema contract into the currently active model.
@@ -505,16 +513,6 @@ func (c *Client) SetRelation(name string, direction spatial.Point2D) error {
 // Operators & Date Helpers
 // -----------------------------------------------------------------------------
 
-// Divide creates an in-storage division operator (a / b).
-func Divide(fieldA, fieldB string) storage.ComputeOp {
-	return storage.OpDivide{FieldA: fieldA, FieldB: fieldB}
-}
-
-// Multiply creates an in-storage multiplication operator (a * b).
-func Multiply(fieldA, fieldB string) storage.ComputeOp {
-	return storage.OpMultiply{FieldA: fieldA, FieldB: fieldB}
-}
-
 // Add creates an in-storage addition operator (a + b).
 // Both fieldA and fieldB can be attribute names or stringified numeric literals (e.g. "10").
 func Add(fieldA, fieldB string) storage.ComputeOp {
@@ -524,6 +522,16 @@ func Add(fieldA, fieldB string) storage.ComputeOp {
 // AddConst creates an in-storage addition operator adding a numeric constant to an attribute (field + val).
 func AddConst(field string, val float32) storage.ComputeOp {
 	return storage.OpAdd{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
+}
+
+// AddInt creates an in-storage addition operator adding a 64-bit integer constant to an attribute (field + val).
+func AddInt(field string, val int64) storage.ComputeOp {
+	return storage.OpAdd{FieldA: field, FieldB: strconv.FormatInt(val, 10)}
+}
+
+// AddFloat64 creates an in-storage addition operator adding a 64-bit float constant to an attribute (field + val).
+func AddFloat64(field string, val float64) storage.ComputeOp {
+	return storage.OpAdd{FieldA: field, FieldB: strconv.FormatFloat(val, 'g', -1, 64)}
 }
 
 // Subtract creates an in-storage subtraction operator (a - b).
@@ -536,14 +544,44 @@ func SubtractConst(field string, val float32) storage.ComputeOp {
 	return storage.OpSubtract{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
 }
 
+// SubtractInt creates an in-storage subtraction operator subtracting a 64-bit integer constant from an attribute (field - val).
+func SubtractInt(field string, val int64) storage.ComputeOp {
+	return storage.OpSubtract{FieldA: field, FieldB: strconv.FormatInt(val, 10)}
+}
+
+// SubtractFloat64 creates an in-storage subtraction operator subtracting a 64-bit float constant from an attribute (field - val).
+func SubtractFloat64(field string, val float64) storage.ComputeOp {
+	return storage.OpSubtract{FieldA: field, FieldB: strconv.FormatFloat(val, 'g', -1, 64)}
+}
+
+// Multiply creates an in-storage multiplication operator (a * b).
+func Multiply(fieldA, fieldB string) storage.ComputeOp {
+	return storage.OpMultiply{FieldA: fieldA, FieldB: fieldB}
+}
+
 // MultiplyConst creates an in-storage multiplication operator multiplying an attribute by a numeric constant (field * val).
 func MultiplyConst(field string, val float32) storage.ComputeOp {
 	return storage.OpMultiply{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
 }
 
+// MultiplyFloat64 creates an in-storage multiplication operator multiplying an attribute by a 64-bit float constant (field * val).
+func MultiplyFloat64(field string, val float64) storage.ComputeOp {
+	return storage.OpMultiply{FieldA: field, FieldB: strconv.FormatFloat(val, 'g', -1, 64)}
+}
+
+// Divide creates an in-storage division operator (a / b).
+func Divide(fieldA, fieldB string) storage.ComputeOp {
+	return storage.OpDivide{FieldA: fieldA, FieldB: fieldB}
+}
+
 // DivideConst creates an in-storage division operator dividing an attribute by a numeric constant (field / val).
 func DivideConst(field string, val float32) storage.ComputeOp {
 	return storage.OpDivide{FieldA: field, FieldB: fmt.Sprintf("%g", val)}
+}
+
+// DivideFloat64 creates an in-storage division operator dividing an attribute by a 64-bit float constant (field / val).
+func DivideFloat64(field string, val float64) storage.ComputeOp {
+	return storage.OpDivide{FieldA: field, FieldB: strconv.FormatFloat(val, 'g', -1, 64)}
 }
 
 // Date converts a "YYYY-MM-DD" string to numeric Epoch Days.
@@ -583,6 +621,21 @@ func DaysBetween(fieldA, fieldB string) storage.ComputeOp {
 // Value creates an operator assigning a constant numeric value.
 func Value(val float32) storage.ComputeOp {
 	return storage.OpAssign{Value: fmt.Sprintf("%g", val)}
+}
+
+// ValueInt creates an operator assigning a 64-bit signed integer value.
+func ValueInt(val int64) storage.ComputeOp {
+	return storage.OpAssign{Value: strconv.FormatInt(val, 10)}
+}
+
+// ValueUint creates an operator assigning a 64-bit unsigned integer value.
+func ValueUint(val uint64) storage.ComputeOp {
+	return storage.OpAssign{Value: strconv.FormatUint(val, 10)}
+}
+
+// ValueFloat64 creates an operator assigning a 64-bit float value.
+func ValueFloat64(val float64) storage.ComputeOp {
+	return storage.OpAssign{Value: strconv.FormatFloat(val, 'g', -1, 64)}
 }
 
 // Assign creates an operator assigning a literal value or copying another field.
@@ -691,39 +744,113 @@ func (b *GetBuilder) Execute(ctx context.Context) (*EntityResult, error) {
 type EntityResult struct {
 	Name  string
 	props map[string]float32
+	attrs []storage.AttrEntry
 }
 
 // Get returns the numeric value of a field (stored or computed).
 func (r *EntityResult) Get(field string) float32 {
-	return r.props[field]
+	if r.props != nil {
+		if v, ok := r.props[field]; ok {
+			return v
+		}
+	}
+	for _, a := range r.attrs {
+		if a.Key == field {
+			return a.Value
+		}
+	}
+	return 0
 }
 
 // Has checks if a field is present in the returned result.
 func (r *EntityResult) Has(field string) bool {
-	_, ok := r.props[field]
-	return ok
+	if r.props != nil {
+		if _, ok := r.props[field]; ok {
+			return true
+		}
+	}
+	for _, a := range r.attrs {
+		if a.Key == field {
+			return true
+		}
+	}
+	return false
 }
 
 // All returns all stored and computed fields.
 func (r *EntityResult) All() map[string]float32 {
+	if len(r.props) == 0 && len(r.attrs) > 0 {
+		m := make(map[string]float32, len(r.attrs))
+		for _, a := range r.attrs {
+			m[a.Key] = a.Value
+		}
+		return m
+	}
 	return r.props
 }
 
 // Props returns all stored and computed fields.
 func (r *EntityResult) Props() map[string]float32 {
-	return r.props
+	return r.All()
+}
+
+// Attrs returns all typed attributes.
+func (r *EntityResult) Attrs() []storage.AttrEntry {
+	if len(r.attrs) == 0 && len(r.props) > 0 {
+		out := make([]storage.AttrEntry, 0, len(r.props))
+		for k, v := range r.props {
+			out = append(out, storage.NewFloat32Attr(k, v))
+		}
+		return out
+	}
+	return r.attrs
+}
+
+// GetTyped returns the exact AttrEntry for a field.
+func (r *EntityResult) GetTyped(field string) (storage.AttrEntry, bool) {
+	for _, a := range r.attrs {
+		if a.Key == field {
+			return a, true
+		}
+	}
+	if v, ok := r.props[field]; ok {
+		return storage.NewFloat32Attr(field, v), true
+	}
+	return storage.AttrEntry{}, false
+}
+
+// GetInt returns the exact int64 representation of a field.
+func (r *EntityResult) GetInt(field string) int64 {
+	if a, ok := r.GetTyped(field); ok {
+		return a.Int64()
+	}
+	return 0
+}
+
+// GetUint returns the exact uint64 representation of a field.
+func (r *EntityResult) GetUint(field string) uint64 {
+	if a, ok := r.GetTyped(field); ok {
+		return a.Uint64()
+	}
+	return 0
+}
+
+// GetFloat64 returns the exact float64 representation of a field.
+func (r *EntityResult) GetFloat64(field string) float64 {
+	if a, ok := r.GetTyped(field); ok {
+		return a.Float64()
+	}
+	return 0
 }
 
 // GetDate returns the field value formatted as a YYYY-MM-DD date string.
 func (r *EntityResult) GetDate(field string) string {
-	val := r.props[field]
-	return storage.FormatDate(val)
+	return storage.FormatDate(r.Get(field))
 }
 
 // GetTimestamp returns the field value formatted as a YYYY-MM-DD HH:MM:SS timestamp string.
 func (r *EntityResult) GetTimestamp(field string) string {
-	val := r.props[field]
-	return storage.FormatTimestamp(val)
+	return storage.FormatTimestamp(r.Get(field))
 }
 
 // List creates a query builder to list, filter, compute, and paginate multiple entities.
@@ -749,27 +876,155 @@ type ListBuilder struct {
 	offset       int
 }
 
-func toFloat32Value(v any) (float32, error) {
+func toFilterConditionValue(v any) (v32 float32, v64 float64, vInt64 int64, vUint64 uint64, valType storage.AttrType, has64 bool, err error) {
 	switch val := v.(type) {
 	case float32:
-		return val, nil
+		return val, float64(val), 0, 0, storage.AttrTypeFloat32, false, nil
 	case float64:
-		return float32(val), nil
+		return float32(val), val, 0, 0, storage.AttrTypeFloat64, true, nil
 	case int:
-		return float32(val), nil
+		i := int64(val)
+		var u uint64
+		if i >= 0 {
+			u = uint64(i)
+		}
+		return float32(i), float64(i), i, u, storage.AttrTypeInt64, true, nil
 	case int64:
-		return float32(val), nil
+		var u uint64
+		if val >= 0 {
+			u = uint64(val)
+		}
+		return float32(val), float64(val), val, u, storage.AttrTypeInt64, true, nil
+	case int32:
+		i := int64(val)
+		var u uint64
+		if i >= 0 {
+			u = uint64(i)
+		}
+		return float32(val), float64(val), i, u, storage.AttrTypeInt64, true, nil
+	case uint:
+		u := uint64(val)
+		var i int64
+		if u <= math.MaxInt64 {
+			i = int64(u)
+		}
+		return float32(u), float64(u), i, u, storage.AttrTypeUint64, true, nil
+	case uint64:
+		var i int64
+		if val <= math.MaxInt64 {
+			i = int64(val)
+		}
+		return float32(val), float64(val), i, val, storage.AttrTypeUint64, true, nil
+	case uint32:
+		u := uint64(val)
+		return float32(val), float64(val), int64(val), u, storage.AttrTypeUint64, true, nil
 	case string:
 		if d, err := storage.ParseDate(val); err == nil {
-			return d, nil
+			return d, float64(d), int64(d), uint64(d), storage.AttrTypeFloat32, false, nil
 		}
-		if f, err := strconv.ParseFloat(val, 32); err == nil {
-			return float32(f), nil
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			var u uint64
+			if i >= 0 {
+				u = uint64(i)
+			}
+			return float32(i), float64(i), i, u, storage.AttrTypeInt64, true, nil
 		}
-		return 0, fmt.Errorf("invalid numeric or date value %q", val)
+		if u, err := strconv.ParseUint(val, 10, 64); err == nil {
+			var i int64
+			if u <= math.MaxInt64 {
+				i = int64(u)
+			}
+			return float32(u), float64(u), i, u, storage.AttrTypeUint64, true, nil
+		}
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return float32(f), f, 0, 0, storage.AttrTypeFloat64, true, nil
+		}
+		return 0, 0, 0, 0, storage.AttrTypeFloat32, false, fmt.Errorf("invalid numeric or date value %q", val)
 	default:
-		return 0, fmt.Errorf("unsupported filter value type %T", v)
+		return 0, 0, 0, 0, storage.AttrTypeFloat32, false, fmt.Errorf("unsupported filter value type %T", v)
 	}
+}
+
+func toFilterCondition(field, op string, value any) (storage.FilterCondition, error) {
+	v32, v64, vInt64, vUint64, valType, has64, err := toFilterConditionValue(value)
+	if err != nil {
+		return storage.FilterCondition{}, err
+	}
+	return storage.FilterCondition{
+		Field:           field,
+		Operator:        op,
+		Value:           v32,
+		Value64:         v64,
+		HasFloat64:      has64,
+		ValueInt64:      vInt64,
+		ValueHighInt64:  vInt64,
+		ValueUint64:     vUint64,
+		ValueHighUint64: vUint64,
+		ValType:         valType,
+	}, nil
+}
+
+func toFilterBetweenCondition(field string, minVal, maxVal any) (storage.FilterCondition, error) {
+	low32, low64, lowInt64, lowUint64, lowType, hasLow64, err := toFilterConditionValue(minVal)
+	if err != nil {
+		return storage.FilterCondition{}, err
+	}
+	high32, high64, highInt64, highUint64, highType, hasHigh64, err := toFilterConditionValue(maxVal)
+	if err != nil {
+		return storage.FilterCondition{}, err
+	}
+	valType := lowType
+	valHighType := highType
+	hasHighType := false
+	lowIsInt := lowType == storage.AttrTypeInt64 || lowType == storage.AttrTypeUint64
+	highIsInt := highType == storage.AttrTypeInt64 || highType == storage.AttrTypeUint64
+	if lowIsInt && highIsInt {
+		if lowType != highType {
+			if lowType == storage.AttrTypeInt64 && lowInt64 >= 0 {
+				lowUint64 = uint64(lowInt64)
+				valType = storage.AttrTypeUint64
+				valHighType = storage.AttrTypeUint64
+			} else if highType == storage.AttrTypeInt64 && highInt64 >= 0 {
+				highUint64 = uint64(highInt64)
+				valType = storage.AttrTypeUint64
+				valHighType = storage.AttrTypeUint64
+			} else if lowType == storage.AttrTypeUint64 && lowUint64 <= math.MaxInt64 {
+				lowInt64 = int64(lowUint64)
+				valType = storage.AttrTypeInt64
+				valHighType = storage.AttrTypeInt64
+			} else if highType == storage.AttrTypeUint64 && highUint64 <= math.MaxInt64 {
+				highInt64 = int64(highUint64)
+				valType = storage.AttrTypeInt64
+				valHighType = storage.AttrTypeInt64
+			} else {
+				valType = lowType
+				valHighType = highType
+				hasHighType = true
+			}
+		}
+	} else if lowType == storage.AttrTypeFloat64 || highType == storage.AttrTypeFloat64 || (lowIsInt != highIsInt) {
+		valType = storage.AttrTypeFloat64
+		valHighType = storage.AttrTypeFloat64
+		hasLow64 = true
+	} else if valType == storage.AttrTypeFloat32 && highType != storage.AttrTypeFloat32 {
+		valType = highType
+	}
+	return storage.FilterCondition{
+		Field:           field,
+		Operator:        "BETWEEN",
+		Value:           low32,
+		ValueHigh:       high32,
+		Value64:         low64,
+		ValueHigh64:     high64,
+		HasFloat64:      hasLow64 || hasHigh64,
+		ValueInt64:      lowInt64,
+		ValueHighInt64:  highInt64,
+		ValueUint64:     lowUint64,
+		ValueHighUint64: highUint64,
+		ValType:         valType,
+		ValHighType:     valHighType,
+		HasHighType:     hasHighType,
+	}, nil
 }
 
 // Select specifies which columns/attributes to retrieve.
@@ -780,16 +1035,12 @@ func (b *ListBuilder) Select(fields ...string) *ListBuilder {
 
 // Where adds a filter condition (supports numbers or date strings).
 func (b *ListBuilder) Where(field, op string, value any) *ListBuilder {
-	converted, err := toFloat32Value(value)
+	cond, err := toFilterCondition(field, op, value)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	b.filters = append(b.filters, storage.FilterCondition{
-		Field:    field,
-		Operator: op,
-		Value:    converted,
-	})
+	b.filters = append(b.filters, cond)
 	return b
 }
 
@@ -810,22 +1061,12 @@ func (b *ListBuilder) WhereAfter(field string, value any) *ListBuilder {
 
 // Between matches records within range [minVal, maxVal].
 func (b *ListBuilder) Between(field string, minVal, maxVal any) *ListBuilder {
-	low, err := toFloat32Value(minVal)
+	cond, err := toFilterBetweenCondition(field, minVal, maxVal)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	high, err := toFloat32Value(maxVal)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	b.filters = append(b.filters, storage.FilterCondition{
-		Field:     field,
-		Operator:  "BETWEEN",
-		Value:     low,
-		ValueHigh: high,
-	})
+	b.filters = append(b.filters, cond)
 	return b
 }
 
@@ -921,16 +1162,12 @@ func (b *UpdateBuilder) In(names ...string) *UpdateBuilder {
 
 // Where adds a filter condition for update targets.
 func (b *UpdateBuilder) Where(field, op string, value any) *UpdateBuilder {
-	converted, err := toFloat32Value(value)
+	cond, err := toFilterCondition(field, op, value)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	b.filters = append(b.filters, storage.FilterCondition{
-		Field:    field,
-		Operator: op,
-		Value:    converted,
-	})
+	b.filters = append(b.filters, cond)
 	return b
 }
 
@@ -951,22 +1188,12 @@ func (b *UpdateBuilder) WhereAfter(field string, value any) *UpdateBuilder {
 
 // Between bounds update to records within [minVal, maxVal].
 func (b *UpdateBuilder) Between(field string, minVal, maxVal any) *UpdateBuilder {
-	low, err := toFloat32Value(minVal)
+	cond, err := toFilterBetweenCondition(field, minVal, maxVal)
 	if err != nil {
 		b.err = err
 		return b
 	}
-	high, err := toFloat32Value(maxVal)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	b.filters = append(b.filters, storage.FilterCondition{
-		Field:     field,
-		Operator:  "BETWEEN",
-		Value:     low,
-		ValueHigh: high,
-	})
+	b.filters = append(b.filters, cond)
 	return b
 }
 

@@ -2,6 +2,8 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
 	"testing"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
@@ -283,6 +285,106 @@ func TestWire_ListRequestPayload(t *testing.T) {
 	}
 }
 
+func TestWire_ListResponsePayload_Typed(t *testing.T) {
+	largeInt := int64(9007199254740993)
+	preciseFloat := 123456.789012345
+	largeUint := uint64(18446744073709551614)
+
+	resp := ListResponse{
+		TotalCount: 1,
+		HasMore:    false,
+		Items: []storage.EntityRecord{
+			{
+				Name:      "item_typed",
+				Operation: storage.OpStatusActive,
+				Props:     map[string]float32{"legacy": 10.5},
+				Attrs: []storage.AttrEntry{
+					storage.NewInt64Attr("big_id", largeInt),
+					storage.NewUint64Attr("huge_uint", largeUint),
+					storage.NewFloat64Attr("precise_f64", preciseFloat),
+					storage.NewFloat32Attr("legacy", 10.5),
+				},
+			},
+		},
+	}
+	respBytes := EncodeListResponse(resp)
+	dResp, err := DecodeListResponse(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeListResponse failed: %v", err)
+	}
+	if len(dResp.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(dResp.Items))
+	}
+	item := dResp.Items[0]
+	if len(item.Attrs) != 4 {
+		t.Fatalf("expected 4 attrs, got %d", len(item.Attrs))
+	}
+
+	var foundInt int64
+	var foundUint uint64
+	var foundFloat float64
+	for _, a := range item.Attrs {
+		switch a.Key {
+		case "big_id":
+			foundInt = a.Int64()
+		case "huge_uint":
+			foundUint = a.Uint64()
+		case "precise_f64":
+			foundFloat = a.Float64()
+		}
+	}
+	if foundInt != largeInt {
+		t.Fatalf("expected big_id %d, got %d", largeInt, foundInt)
+	}
+	if foundUint != largeUint {
+		t.Fatalf("expected huge_uint %d, got %d", largeUint, foundUint)
+	}
+	if foundFloat != preciseFloat {
+		t.Fatalf("expected precise_f64 %f, got %f", preciseFloat, foundFloat)
+	}
+	// Verify legacy Props map was also transparently populated
+	if item.Props["legacy"] != 10.5 {
+		t.Fatalf("expected legacy prop 10.5, got %v", item.Props["legacy"])
+	}
+}
+
+func TestWire_FilterCondition_64BitExact(t *testing.T) {
+	largeInt := int64(9007199254740993)
+	largeUint := uint64(18446744073709551614)
+
+	condInt := storage.FilterCondition{
+		Field:          "user_id",
+		Operator:       "=",
+		ValueInt64:     largeInt,
+		ValueHighInt64: largeInt,
+		ValType:        storage.AttrTypeInt64,
+	}
+	buf := appendFilterCondition(nil, condInt)
+	dCondInt, _, err := readFilterCondition(buf, 0)
+	if err != nil {
+		t.Fatalf("readFilterCondition failed: %v", err)
+	}
+	if dCondInt.ValType != storage.AttrTypeInt64 || dCondInt.ValueInt64 != largeInt || dCondInt.Operator != "=" {
+		t.Fatalf("unexpected decoded int filter: %+v", dCondInt)
+	}
+
+	condUint := storage.FilterCondition{
+		Field:           "tx_id",
+		Operator:        ">=",
+		ValueUint64:     largeUint,
+		ValueHighUint64: largeUint,
+		ValType:         storage.AttrTypeUint64,
+	}
+	bufUint := appendFilterCondition(nil, condUint)
+	dCondUint, _, err := readFilterCondition(bufUint, 0)
+	if err != nil {
+		t.Fatalf("readFilterCondition uint failed: %v", err)
+	}
+	if dCondUint.ValType != storage.AttrTypeUint64 || dCondUint.ValueUint64 != largeUint || dCondUint.Operator != ">=" {
+		t.Fatalf("unexpected decoded uint filter: %+v", dCondUint)
+	}
+}
+
 func TestWire_UpdateRequestPayload(t *testing.T) {
 	req := UpdateRequest{
 		Limit:          100,
@@ -430,4 +532,65 @@ func TestWire_EdgeWithDirectionPayload(t *testing.T) {
 	_ = src
 	_ = tgt
 	_ = w
+}
+
+func TestWire_DecodeListResponse_BoundsAndTypeSafety(t *testing.T) {
+	// 1. Reject oversized itemCount on 9-byte header without OOM
+	malformedHeader := make([]byte, 9)
+	binary.LittleEndian.PutUint32(malformedHeader[0:4], 1)
+	malformedHeader[4] = 0
+	binary.LittleEndian.PutUint32(malformedHeader[5:9], 0xFFFFFFFF)
+	if _, err := DecodeListResponse(malformedHeader); err == nil {
+		t.Fatalf("expected DecodeListResponse to reject oversized itemCount")
+	}
+
+	// 2. Reject invalid AttrType in typed list item
+	validResp := EncodeListResponse(ListResponse{
+		TotalCount: 1,
+		Items: []storage.EntityRecord{
+			{
+				Name:      "rec1",
+				Operation: storage.OpStatusActive,
+				Attrs:     []storage.AttrEntry{storage.NewInt64Attr("k", 123)},
+			},
+		},
+	})
+	corrupted := append([]byte(nil), validResp...)
+	// Offset: 9 (header) + 2+4 ("rec1") + 1 (op) + 2 (rawCount) + 2+1 ("k") = 21 -> attrType byte
+	corrupted[21] = 99
+	if _, err := DecodeListResponse(corrupted); err == nil {
+		t.Fatalf("expected DecodeListResponse to reject unknown AttrType 99")
+	}
+
+	// 3. Mixed BETWEEN filter condition roundtrip (Int64 low, Uint64 high)
+	listReq := ListRequest{
+		Limit: 10,
+		Filters: []storage.FilterCondition{
+			{
+				Field:           "val",
+				Operator:        "BETWEEN",
+				ValueInt64:      -50,
+				ValueHighUint64: math.MaxUint64,
+				ValType:         storage.AttrTypeInt64,
+				ValHighType:     storage.AttrTypeUint64,
+				HasHighType:     true,
+				HasFloat64:      true,
+			},
+		},
+	}
+	reqBytes := EncodeListRequest(listReq)
+	decodedReq, err := DecodeListRequest(reqBytes)
+	if err != nil {
+		t.Fatalf("DecodeListRequest failed: %v", err)
+	}
+	if len(decodedReq.Filters) != 1 {
+		t.Fatalf("expected 1 filter, got %d", len(decodedReq.Filters))
+	}
+	fc := decodedReq.Filters[0]
+	if !fc.HasHighType || fc.ValType != storage.AttrTypeInt64 || fc.ValHighType != storage.AttrTypeUint64 {
+		t.Fatalf("unexpected decoded mixed filter types: %+v", fc)
+	}
+	if fc.ValueInt64 != -50 || fc.ValueHighUint64 != math.MaxUint64 {
+		t.Fatalf("unexpected decoded mixed filter bounds: low=%d high=%d", fc.ValueInt64, fc.ValueHighUint64)
+	}
 }

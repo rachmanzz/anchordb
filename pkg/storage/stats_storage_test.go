@@ -180,3 +180,139 @@ func BenchmarkComputeStats_100k(b *testing.B) {
 		_, _ = db.ComputeStats("voltage")
 	}
 }
+
+func TestComputeStats_64BitPrecision(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "stats_64bit.anchordb")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	val1 := int64(5000000001) // Truncated in float32 (becomes 5000000000), preserved in float64
+	val2 := int64(5000000009)
+
+	_, _ = db.SaveRecordTyped("rec_1", []AttrEntry{NewInt64Attr("big_val", val1)})
+	_, _ = db.SaveRecordTyped("rec_2", []AttrEntry{NewInt64Attr("big_val", val2)})
+
+	stats, err := db.ComputeStats("big_val")
+	if err != nil {
+		t.Fatalf("ComputeStats failed: %v", err)
+	}
+	if stats.Count != 2 {
+		t.Fatalf("expected count=2, got %d", stats.Count)
+	}
+	if int64(stats.Min64) != val1 {
+		t.Errorf("expected Min64=%d, got %f", val1, stats.Min64)
+	}
+	if int64(stats.Max64) != val2 {
+		t.Errorf("expected Max64=%d, got %f", val2, stats.Max64)
+	}
+
+	// Verify float32 loss vs float64 precision
+	if float32(val1) == float32(val2) {
+		// Float32 collapsed the precision, but Min64/Max64 differentiated them
+		if stats.Min64 == stats.Max64 {
+			t.Errorf("expected Min64 != Max64, both got %f", stats.Min64)
+		}
+	}
+}
+
+func TestComputeStats_ExactIntegerExtremes(t *testing.T) {
+	openStatsDB := func(t *testing.T, name string) *AnchorDB {
+		t.Helper()
+		db, err := Open(filepath.Join(t.TempDir(), name+".anchordb"))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+
+	t.Run("uint64 above 2^53 stays exact", func(t *testing.T) {
+		db := openStatsDB(t, "stats_u64exact")
+		hi := uint64(math.MaxUint64)
+		lo := uint64(math.MaxUint64 - 1000)
+		if _, err := db.SaveRecordTyped("a", []AttrEntry{NewUint64Attr("big", hi)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		if _, err := db.SaveRecordTyped("b", []AttrEntry{NewUint64Attr("big", lo)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		stats, err := db.ComputeStats("big")
+		if err != nil {
+			t.Fatalf("ComputeStats failed: %v", err)
+		}
+		// Legacy float64 path collapses both values; the exact fields must not.
+		if stats.Min64 != stats.Max64 {
+			t.Errorf("precondition broken: expected legacy Min64==Max64 collapse, got %f vs %f", stats.Min64, stats.Max64)
+		}
+		if stats.MinType != AttrTypeUint64 || stats.MaxType != AttrTypeUint64 {
+			t.Fatalf("expected uint64 domain tags, got min=%v max=%v", stats.MinType, stats.MaxType)
+		}
+		if stats.MinUint != lo || stats.MaxUint != hi {
+			t.Fatalf("expected exact [%d, %d], got [%d, %d]", lo, hi, stats.MinUint, stats.MaxUint)
+		}
+	})
+
+	t.Run("int64 extremes stay exact", func(t *testing.T) {
+		db := openStatsDB(t, "stats_i64exact")
+		if _, err := db.SaveRecordTyped("a", []AttrEntry{NewInt64Attr("n", math.MinInt64)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		if _, err := db.SaveRecordTyped("b", []AttrEntry{NewInt64Attr("n", math.MinInt64+1000)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		stats, err := db.ComputeStats("n")
+		if err != nil {
+			t.Fatalf("ComputeStats failed: %v", err)
+		}
+		if stats.MinType != AttrTypeInt64 || stats.MaxType != AttrTypeInt64 {
+			t.Fatalf("expected int64 domain tags, got min=%v max=%v", stats.MinType, stats.MaxType)
+		}
+		if stats.MinInt != math.MinInt64 || stats.MaxInt != math.MinInt64+1000 {
+			t.Fatalf("expected exact [%d, %d], got [%d, %d]", int64(math.MinInt64), int64(math.MinInt64+1000), stats.MinInt, stats.MaxInt)
+		}
+	})
+
+	t.Run("mixed int64 and uint64 resolve exactly", func(t *testing.T) {
+		db := openStatsDB(t, "stats_mixed")
+		if _, err := db.SaveRecordTyped("a", []AttrEntry{NewInt64Attr("m", -5)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		if _, err := db.SaveRecordTyped("b", []AttrEntry{NewUint64Attr("m", 10)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		stats, err := db.ComputeStats("m")
+		if err != nil {
+			t.Fatalf("ComputeStats failed: %v", err)
+		}
+		if stats.MinType != AttrTypeInt64 || stats.MinInt != -5 {
+			t.Fatalf("expected overall min int64 -5, got type=%v val=%d", stats.MinType, stats.MinInt)
+		}
+		if stats.MaxType != AttrTypeUint64 || stats.MaxUint != 10 {
+			t.Fatalf("expected overall max uint64 10, got type=%v val=%d", stats.MaxType, stats.MaxUint)
+		}
+	})
+
+	t.Run("float field stays on float domain", func(t *testing.T) {
+		db := openStatsDB(t, "stats_float")
+		if _, err := db.SaveRecordTyped("a", []AttrEntry{NewFloat32Attr("f", 1.5)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		if _, err := db.SaveRecordTyped("b", []AttrEntry{NewFloat32Attr("f", 2.5)}); err != nil {
+			t.Fatalf("save failed: %v", err)
+		}
+		stats, err := db.ComputeStats("f")
+		if err != nil {
+			t.Fatalf("ComputeStats failed: %v", err)
+		}
+		if stats.MinType != AttrTypeFloat64 || stats.MaxType != AttrTypeFloat64 {
+			t.Fatalf("expected float64 domain tags, got min=%v max=%v", stats.MinType, stats.MaxType)
+		}
+		if stats.Min64 != 1.5 || stats.Max64 != 2.5 {
+			t.Fatalf("expected [1.5, 2.5], got [%f, %f]", stats.Min64, stats.Max64)
+		}
+	})
+}

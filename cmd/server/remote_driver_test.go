@@ -529,3 +529,97 @@ func TestServer_Math_StatsAndHaversine(t *testing.T) {
 		t.Fatalf("unexpected haversine distance: %+v", havResp)
 	}
 }
+
+func TestRemoteDriver_SaveTypedAndGetTyped(t *testing.T) {
+	s, dir := createTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	s.authToken = "secret-token-123"
+	ts := httptest.NewServer(s.Routes())
+	defer ts.Close()
+
+	ctx := context.Background()
+	client, err := driver.ConnectRemote(ts.URL,
+		driver.WithToken("secret-token-123"),
+		driver.WithModel("remote_typed"),
+	)
+	if err != nil {
+		t.Fatalf("ConnectRemote failed: %v", err)
+	}
+	defer client.Close()
+
+	largeInt := int64(9007199254740993)
+	largeUint := uint64(18446744073709551614)
+	preciseFloat := 123456.789012345
+
+	attrs := []storage.AttrEntry{
+		storage.NewInt64Attr("big_counter", largeInt),
+		storage.NewUint64Attr("big_uid", largeUint),
+		storage.NewFloat64Attr("precise_val", preciseFloat),
+		storage.NewFloat32Attr("level", 3.5),
+	}
+
+	name, err := client.SaveTyped("remote_item_1", attrs)
+	if err != nil {
+		t.Fatalf("SaveTyped failed: %v", err)
+	}
+	if name != "remote_item_1" {
+		t.Fatalf("expected name remote_item_1, got %q", name)
+	}
+
+	cr, err := client.GetTyped("remote_item_1")
+	if err != nil {
+		t.Fatalf("GetTyped failed: %v", err)
+	}
+	v, ok := cr.GetInt("big_counter")
+	if !ok || v != largeInt {
+		t.Fatalf("expected big_counter %d, got %d (ok=%v)", largeInt, v, ok)
+	}
+	u, ok := cr.GetUint("big_uid")
+	if !ok || u != largeUint {
+		t.Fatalf("expected big_uid %d, got %d (ok=%v)", largeUint, u, ok)
+	}
+	f, ok := cr.GetFloat64("precise_val")
+	if !ok || f != preciseFloat {
+		t.Fatalf("expected precise_val %f, got %f (ok=%v)", preciseFloat, f, ok)
+	}
+
+	// Test List and Where with 64-bit filter over remote HTTP
+	listRes, err := client.List().Where("big_counter", "=", largeInt).Execute(ctx)
+	if err != nil {
+		t.Fatalf("List with Where over HTTP failed: %v", err)
+	}
+	if len(listRes.Items) != 1 || listRes.Items[0].Name != "remote_item_1" {
+		t.Fatalf("unexpected remote list result: %+v", listRes)
+	}
+	if listRes.Items[0].GetInt("big_counter") != largeInt {
+		t.Fatalf("expected big_counter %d, got %d", largeInt, listRes.Items[0].GetInt("big_counter"))
+	}
+	if listRes.Items[0].GetFloat64("precise_val") != preciseFloat {
+		t.Fatalf("expected precise_val %f, got %f", preciseFloat, listRes.Items[0].GetFloat64("precise_val"))
+	}
+
+	// Test filtering uint64 attribute (> 2^53) over HTTP where strconv.ParseInt parses as Int64
+	largeUintWithinInt64 := uint64(9007199254740993)
+	_, err = client.SaveTyped("remote_item_2", []storage.AttrEntry{
+		storage.NewUint64Attr("big_uid", largeUintWithinInt64),
+	})
+	if err != nil {
+		t.Fatalf("SaveTyped remote_item_2 failed: %v", err)
+	}
+	uidListRes, err := client.List().Where("big_uid", "=", largeUintWithinInt64).Execute(ctx)
+	if err != nil {
+		t.Fatalf("List with uint64 Where over HTTP failed: %v", err)
+	}
+	if len(uidListRes.Items) != 1 || uidListRes.Items[0].Name != "remote_item_2" {
+		t.Fatalf("expected remote_item_2 for exact uint64 filter over HTTP, got %+v", uidListRes.Items)
+	}
+	// Test mixed BETWEEN bounds over HTTP
+	betweenRes, err := client.List().Between("big_uid", int64(-10), uint64(18446744073709551615)).Execute(ctx)
+	if err != nil {
+		t.Fatalf("List with mixed Between over HTTP failed: %v", err)
+	}
+	if len(betweenRes.Items) != 2 {
+		t.Fatalf("expected 2 items for mixed Between [-10, MaxUint64], got %d", len(betweenRes.Items))
+	}
+}

@@ -767,6 +767,12 @@ func TestRelationsAreValidatedAndUnknownRelationRejected(t *testing.T) {
 	if _, _, err := db.ExecuteGraphStepWithOptions([]string{"x"}, "custom", -1, OrderByCompositeDesc, 0.05); err == nil {
 		t.Fatal("negative TopK should fail")
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := db.Relation("custom"); exists {
+		t.Fatal("Relation after Close must report absent")
+	}
 }
 
 func TestOpenExclusivelyLocksDatabaseAcrossInstances(t *testing.T) {
@@ -1208,6 +1214,131 @@ func TestAutoSyncTrigger(t *testing.T) {
 
 	if !synced {
 		t.Fatalf("auto-sync did not re-map entities to zero-copy Raw within deadline")
+	}
+}
+
+func TestListRecordsWithPaging_TypedParity(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "typed_paging.adb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	largeInt := int64(9007199254740993)
+	preciseFloat := 123456.789012345
+
+	_, err = db.SaveRecordTyped("item1", []AttrEntry{
+		NewInt64Attr("big_id", largeInt),
+		NewFloat64Attr("weight", preciseFloat),
+		NewFloat32Attr("legacy", 42.5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.SaveRecordTyped("item2", []AttrEntry{
+		NewInt64Attr("big_id", largeInt+10),
+		NewFloat64Attr("weight", 200.0),
+		NewFloat32Attr("legacy", 10.0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Filter by exact large int64
+	results, hasMore, err := db.ListRecordsWithPaging(QueryOptions{
+		Filters: []FilterCondition{
+			{
+				Field:      "big_id",
+				Operator:   "=",
+				ValueInt64: largeInt,
+				ValType:    AttrTypeInt64,
+			},
+		},
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMore || len(results) != 1 || results[0].Name != "item1" {
+		t.Fatalf("unexpected results for exact big_id filter: %+v", results)
+	}
+	// Verify Attrs is populated
+	rec := results[0]
+	if len(rec.Attrs) != 3 {
+		t.Fatalf("expected 3 Attrs in EntityRecord, got %d", len(rec.Attrs))
+	}
+	var foundInt int64
+	var foundFloat float64
+	for _, a := range rec.Attrs {
+		if a.Key == "big_id" {
+			foundInt = a.Int64()
+		}
+		if a.Key == "weight" {
+			foundFloat = a.Float64()
+		}
+	}
+	if foundInt != largeInt {
+		t.Fatalf("expected big_id %d, got %d", largeInt, foundInt)
+	}
+	if foundFloat != preciseFloat {
+		t.Fatalf("expected weight %f, got %f", preciseFloat, foundFloat)
+	}
+
+	// 2. Computations with 64-bit precision
+	calcResults, _, err := db.ListRecordsWithPaging(QueryOptions{
+		Computations: map[string]ComputeOp{
+			"doubled_id": OpAdd{FieldA: "big_id", FieldB: "big_id"},
+		},
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calcResults) != 2 {
+		t.Fatalf("expected 2 calculated results, got %d", len(calcResults))
+	}
+	var item1Doubled int64
+	for _, r := range calcResults {
+		if r.Name == "item1" {
+			for _, a := range r.Attrs {
+				if a.Key == "doubled_id" {
+					item1Doubled = a.Int64()
+				}
+			}
+		}
+	}
+	if item1Doubled != largeInt*2 {
+		t.Fatalf("expected doubled_id %d, got %d", largeInt*2, item1Doubled)
+	}
+
+	// 3. Cross-integer comparison (Int64 filter vs Uint64 attribute > 2^53 and negative Int64 vs Uint64)
+	uEntry := NewUint64Attr("uid", uint64(largeInt))
+	condEq := FilterCondition{Field: "uid", Operator: "=", ValueInt64: largeInt, ValType: AttrTypeInt64}
+	if !condEq.MatchesAttr(uEntry) {
+		t.Fatalf("expected exact cross-integer match between Int64(%d) and Uint64(%d)", largeInt, uint64(largeInt))
+	}
+	condNeq := FilterCondition{Field: "uid", Operator: "=", ValueInt64: largeInt - 1, ValType: AttrTypeInt64}
+	if condNeq.MatchesAttr(uEntry) {
+		t.Fatalf("did not expect cross-integer match between Int64(%d) and Uint64(%d)", largeInt-1, uint64(largeInt))
+	}
+	condGtNeg := FilterCondition{Field: "uid", Operator: ">", ValueInt64: -10, ValType: AttrTypeInt64}
+	if !condGtNeg.MatchesAttr(uEntry) {
+		t.Fatalf("expected Uint64 attribute to be > negative Int64(-10)")
+	}
+	// Mixed BETWEEN with Int64(-10) and Uint64(MaxUint64)
+	maxUEntry := NewUint64Attr("uid", math.MaxUint64)
+	mixedCond := FilterCondition{
+		Field:           "uid",
+		Operator:        "BETWEEN",
+		ValueInt64:      -10,
+		ValueHighUint64: math.MaxUint64,
+		ValType:         AttrTypeInt64,
+		ValHighType:     AttrTypeUint64,
+		HasHighType:     true,
+	}
+	if !mixedCond.MatchesAttr(maxUEntry) {
+		t.Fatalf("expected MaxUint64 to match BETWEEN [-10, MaxUint64]")
 	}
 }
 

@@ -12,8 +12,14 @@ const (
 	MagicHeader = 0x48434E41 // Little-endian for "ANCH"
 	// DBVersion is the on-disk format version written by Sync.
 	// Version 3 appends an optional causal-edge section after the entity section.
-	// Version 4 introduces typed numeric attributes (int64, uint64, float32) with RawTypedFlag.
+	// Version 4 introduces typed numeric attributes (int64, uint64, float32, float64) with RawTypedFlag.
 	// Readers accept every version from 1..DBVersion, so v1/v2/v3 files remain openable.
+	//
+	// Version policy (guardrail): every on-disk format change MUST bump DBVersion
+	// and gate both the writer and the reader on it. Readers branch on the stored
+	// version when decoding versioned sections; Sync rewrites older files in full
+	// (never streams their entity section) and stamps the new header with DBVersion,
+	// so a file written by an older format can never be silently misread.
 	DBVersion = 4
 
 	// RawTypedFlag is set on the upper bit of attrCount in binary entity records to indicate typed attributes.
@@ -32,7 +38,7 @@ const (
 // Header represents the 64-byte file header of .anchordb
 type Header struct {
 	Magic        uint32  // "ANCH"
-	Version      uint32  // 1..DBVersion (3 = causal-edge section present)
+	Version      uint32  // 1..DBVersion (2 = entity section, 3 = causal-edge section, 4 = typed numeric attributes)
 	NodeCount    uint64  // Total nodes stored
 	GridCellsX   uint16  // 256
 	GridCellsY   uint16  // 256

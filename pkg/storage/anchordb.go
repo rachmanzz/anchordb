@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,6 +32,22 @@ var ErrDatabaseClosed = errors.New("anchordb: database is closed")
 
 // ErrRecordLocked indicates the record is in an in-flight partition operation.
 var ErrRecordLocked = errors.New("anchordb: record is locked for partitioning")
+
+// ErrIntegerOverflow is returned when exact int64/uint64 arithmetic produces a
+// result that cannot be represented in a 64-bit integer. Results are never
+// wrapped or silently converted to float64.
+var ErrIntegerOverflow = errors.New("anchordb: integer arithmetic overflow")
+
+// ErrRecordNotFound marks a missing (or tombstoned) record. Lookups wrap it
+// with %w so transports can distinguish "no such record" (cold-tier fallback
+// and 404 are allowed) from compute/IO/closed failures (which must propagate
+// with their own status and never masquerade as not-found).
+var ErrRecordNotFound = errors.New("anchordb: record not found")
+
+// ErrComputeFailed marks a failed in-storage computation (overflow, division
+// by zero, unknown field, custom-op error). Get/List/Update wrap it with %w so
+// transports can answer 422 instead of masking the failure as "not found".
+var ErrComputeFailed = errors.New("anchordb: compute failed")
 
 // OrderByMode defines the sorting strategy in AnchorDB
 type OrderByMode int
@@ -644,54 +662,7 @@ func (cr CompactRecord) MatchesFilter(f FilterCondition) bool {
 	if !exists {
 		return false
 	}
-	if f.HasFloat64 || attr.Type == AttrTypeFloat64 || attr.Type == AttrTypeInt64 || attr.Type == AttrTypeUint64 {
-		val := attr.Float64()
-		cmpVal := float64(f.Value)
-		if f.HasFloat64 {
-			cmpVal = f.Value64
-		}
-		cmpHigh := float64(f.ValueHigh)
-		if f.HasFloat64 {
-			cmpHigh = f.ValueHigh64
-		}
-		switch f.Operator {
-		case "=":
-			return val == cmpVal
-		case "!=":
-			return val != cmpVal
-		case ">":
-			return val > cmpVal
-		case ">=":
-			return val >= cmpVal
-		case "<":
-			return val < cmpVal
-		case "<=":
-			return val <= cmpVal
-		case "BETWEEN":
-			return val >= cmpVal && val <= cmpHigh
-		default:
-			return false
-		}
-	}
-	val := attr.Value
-	switch f.Operator {
-	case "=":
-		return val == f.Value
-	case "!=":
-		return val != f.Value
-	case ">":
-		return val > f.Value
-	case ">=":
-		return val >= f.Value
-	case "<":
-		return val < f.Value
-	case "<=":
-		return val <= f.Value
-	case "BETWEEN":
-		return val >= f.Value && val <= f.ValueHigh
-	default:
-		return false
-	}
+	return f.MatchesAttr(attr)
 }
 
 // AnchorDB is the computational spatial graph storage engine.
@@ -806,6 +777,11 @@ func (db *AnchorDB) SetRelation(name string, direction spatial.Point2D) error {
 func (db *AnchorDB) Relation(name string) (spatial.Point2D, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	// No error channel by design: after Close the only honest answer a bool
+	// lookup can give is "absent", consistent with rejecting reads elsewhere.
+	if db.closed {
+		return spatial.Point2D{}, false
+	}
 	direction, ok := db.relations[name]
 	return direction, ok
 }
@@ -900,45 +876,126 @@ func isFloatResultFloat32(valA AttrEntry, litA bool, valB AttrEntry, litB bool) 
 	return valA.Type == AttrTypeFloat32 && valB.Type == AttrTypeFloat32
 }
 
-func combineIntegerArithmeticTyped(outputField string, op byte, valA AttrEntry, litA bool, valB AttrEntry, litB bool) (AttrEntry, bool) {
+// combineIntegerArithmeticTyped performs exact integer arithmetic for +, - and *.
+// It returns handled=false when the operands are not both integers, so the caller
+// may use the floating-point path. When the operands are integers, the result is
+// either an exact int64/uint64 attribute or an error wrapping ErrIntegerOverflow.
+func combineIntegerArithmeticTyped(outputField string, op byte, valA AttrEntry, litA bool, valB AttrEntry, litB bool) (AttrEntry, bool, error) {
 	isIntA := valA.Type == AttrTypeInt64 || valA.Type == AttrTypeUint64
 	isIntB := valB.Type == AttrTypeInt64 || valB.Type == AttrTypeUint64
 	if !isIntA || !isIntB {
-		return AttrEntry{}, false
+		return AttrEntry{}, false, nil
 	}
-	if (valA.Type == AttrTypeUint64 && !litA) || (valB.Type == AttrTypeUint64 && !litB) || (valA.Type == AttrTypeUint64 && valB.Type == AttrTypeUint64) {
-		if (valA.Type == AttrTypeInt64 && valA.IntVal < 0) || (valB.Type == AttrTypeInt64 && valB.IntVal < 0) {
-			// Negative signed operand mixed with uint64 falls back to signed or float64
-			return AttrEntry{}, false
+	if op != '+' && op != '-' && op != '*' {
+		return AttrEntry{}, false, nil
+	}
+	preferUnsigned := (valA.Type == AttrTypeUint64 && !litA) || (valB.Type == AttrTypeUint64 && !litB) ||
+		(valA.Type == AttrTypeUint64 && valB.Type == AttrTypeUint64)
+
+	if valA.Type == AttrTypeInt64 && valB.Type == AttrTypeInt64 {
+		if res, ok := checkedInt64Op(op, valA.IntVal, valB.IntVal); ok {
+			return NewInt64Attr(outputField, res), true, nil
 		}
-		uA := valA.Uint64()
-		uB := valB.Uint64()
+		return exactIntegerResult(outputField, op, valA, valB, false)
+	}
+
+	negA := valA.Type == AttrTypeInt64 && valA.IntVal < 0
+	negB := valB.Type == AttrTypeInt64 && valB.IntVal < 0
+	if preferUnsigned && !negA && !negB {
+		uA, uB := valA.Uint64(), valB.Uint64()
 		switch op {
 		case '+':
-			return NewUint64Attr(outputField, uA+uB), true
+			if sum, carry := bits.Add64(uA, uB, 0); carry == 0 {
+				return NewUint64Attr(outputField, sum), true, nil
+			}
 		case '-':
 			if uA >= uB {
-				return NewUint64Attr(outputField, uA-uB), true
+				return NewUint64Attr(outputField, uA-uB), true, nil
 			}
-			return AttrEntry{}, false
 		case '*':
-			return NewUint64Attr(outputField, uA*uB), true
+			if hi, lo := bits.Mul64(uA, uB); hi == 0 {
+				return NewUint64Attr(outputField, lo), true, nil
+			}
 		}
 	}
-	iA := valA.Int64()
-	iB := valB.Int64()
-	switch op {
-	case '+':
-		return NewInt64Attr(outputField, iA+iB), true
-	case '-':
-		return NewInt64Attr(outputField, iA-iB), true
-	case '*':
-		return NewInt64Attr(outputField, iA*iB), true
-	}
-	return AttrEntry{}, false
+	return exactIntegerResult(outputField, op, valA, valB, preferUnsigned)
 }
 
-func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (AttrEntry, bool)) (AttrEntry, error) {
+// checkedInt64Op applies op to a and b and reports false on signed overflow.
+func checkedInt64Op(op byte, a, b int64) (int64, bool) {
+	switch op {
+	case '+':
+		s := a + b
+		return s, (a^s)&(b^s) >= 0
+	case '-':
+		d := a - b
+		return d, (a^b)&(a^d) >= 0
+	case '*':
+		if a == 0 || b == 0 {
+			return 0, true
+		}
+		if (a == -1 && b == math.MinInt64) || (b == -1 && a == math.MinInt64) {
+			return 0, false
+		}
+		p := a * b
+		return p, p/b == a
+	}
+	return 0, false
+}
+
+// exactIntegerResult computes op without overflow and picks a result type:
+// uint64 when preferUnsigned and the result is non-negative, otherwise int64.
+// Results outside both ranges return ErrIntegerOverflow.
+func exactIntegerResult(outputField string, op byte, valA, valB AttrEntry, preferUnsigned bool) (AttrEntry, bool, error) {
+	a := attrToBigInt(valA)
+	b := attrToBigInt(valB)
+	r := new(big.Int)
+	switch op {
+	case '+':
+		r.Add(a, b)
+	case '-':
+		r.Sub(a, b)
+	case '*':
+		r.Mul(a, b)
+	}
+	if preferUnsigned && r.Sign() >= 0 && r.IsUint64() {
+		return NewUint64Attr(outputField, r.Uint64()), true, nil
+	}
+	if r.IsInt64() {
+		return NewInt64Attr(outputField, r.Int64()), true, nil
+	}
+	return AttrEntry{}, true, fmt.Errorf("%w: %s %c %s = %s exceeds 64-bit integer range", ErrIntegerOverflow, a, op, b, r)
+}
+
+func attrToBigInt(a AttrEntry) *big.Int {
+	if a.Type == AttrTypeUint64 {
+		return new(big.Int).SetUint64(uint64(a.IntVal))
+	}
+	return big.NewInt(a.IntVal)
+}
+
+// attrMapToFloat32Props builds the legacy float32 property snapshot passed to custom ComputeOp implementations.
+func attrMapToFloat32Props(attrs map[string]AttrEntry) map[string]float32 {
+	props := make(map[string]float32, len(attrs))
+	for k, a := range attrs {
+		props[k] = a.Float32()
+	}
+	return props
+}
+
+// attrsToFloat32Props builds the legacy float32 property snapshot passed to custom ComputeOp implementations.
+func attrsToFloat32Props(attrs []AttrEntry) map[string]float32 {
+	props := make(map[string]float32, len(attrs))
+	for _, a := range attrs {
+		props[a.Key] = a.Float32()
+	}
+	return props
+}
+
+// applyComputeOpTyped evaluates op against a record. lookup resolves typed attributes;
+// snapshot supplies the full record as map[string]float32 for custom ComputeOp
+// implementations, which keep the legacy float32 Apply contract.
+func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (AttrEntry, bool), snapshot func() map[string]float32) (AttrEntry, error) {
 	switch o := op.(type) {
 	case OpDivide:
 		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
@@ -968,7 +1025,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if intRes, ok := combineIntegerArithmeticTyped(outputField, '*', valA, litA, valB, litB); ok {
+		intRes, ok, err := combineIntegerArithmeticTyped(outputField, '*', valA, litA, valB, litB)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if ok {
 			return intRes, nil
 		}
 		res := valA.Float64() * valB.Float64()
@@ -986,7 +1047,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if intRes, ok := combineIntegerArithmeticTyped(outputField, '+', valA, litA, valB, litB); ok {
+		intRes, ok, err := combineIntegerArithmeticTyped(outputField, '+', valA, litA, valB, litB)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if ok {
 			return intRes, nil
 		}
 		res := valA.Float64() + valB.Float64()
@@ -1004,7 +1069,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if intRes, ok := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB); ok {
+		intRes, ok, err := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if ok {
 			return intRes, nil
 		}
 		res := valA.Float64() - valB.Float64()
@@ -1019,7 +1088,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 			return AttrEntry{}, err
 		}
 		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
-			return NewInt64Attr(outputField, val.Int64()+int64(o.Days)), nil
+			res, ok := checkedInt64Op('+', val.Int64(), int64(o.Days))
+			if !ok {
+				return AttrEntry{}, fmt.Errorf("%w: %s + %d days exceeds int64 range", ErrIntegerOverflow, o.Field, int64(o.Days))
+			}
+			return NewInt64Attr(outputField, res), nil
 		}
 		res := val.Float64() + float64(o.Days)
 		if val.Type == AttrTypeFloat32 {
@@ -1033,7 +1106,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 			return AttrEntry{}, err
 		}
 		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
-			return NewInt64Attr(outputField, val.Int64()-int64(o.Days)), nil
+			res, ok := checkedInt64Op('-', val.Int64(), int64(o.Days))
+			if !ok {
+				return AttrEntry{}, fmt.Errorf("%w: %s - %d days exceeds int64 range", ErrIntegerOverflow, o.Field, int64(o.Days))
+			}
+			return NewInt64Attr(outputField, res), nil
 		}
 		res := val.Float64() - float64(o.Days)
 		if val.Type == AttrTypeFloat32 {
@@ -1050,7 +1127,11 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if intRes, ok := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB); ok {
+		intRes, ok, err := combineIntegerArithmeticTyped(outputField, '-', valA, litA, valB, litB)
+		if err != nil {
+			return AttrEntry{}, err
+		}
+		if ok {
 			return intRes, nil
 		}
 		res := valA.Float64() - valB.Float64()
@@ -1086,7 +1167,12 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		return val, nil
 
 	default:
-		props := make(map[string]float32)
+		var props map[string]float32
+		if snapshot != nil {
+			props = snapshot()
+		} else {
+			props = make(map[string]float32)
+		}
 		v, err := op.Apply(props)
 		if err != nil {
 			return AttrEntry{}, err
@@ -1257,13 +1343,179 @@ func (op OpAssign) Apply(props map[string]float32) (float32, error) {
 
 // FilterCondition defines a field comparison in Where clauses
 type FilterCondition struct {
-	Field       string
-	Operator    string  // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
-	Value       float32
-	ValueHigh   float32 // Used for "BETWEEN" range [Value, ValueHigh]
-	Value64     float64 // Optional exact 64-bit precision value
-	ValueHigh64 float64 // Optional exact 64-bit precision range
-	HasFloat64  bool
+	Field           string
+	Operator        string // "=", "!=", ">", ">=", "<", "<=", "BETWEEN"
+	Value           float32
+	ValueHigh       float32 // Used for "BETWEEN" range [Value, ValueHigh]
+	Value64         float64 // Optional exact 64-bit precision value
+	ValueHigh64     float64 // Optional exact 64-bit precision range
+	HasFloat64      bool
+	ValueInt64      int64
+	ValueHighInt64  int64
+	ValueUint64     uint64
+	ValueHighUint64 uint64
+	ValType         AttrType
+	ValHighType     AttrType
+	HasHighType     bool
+}
+
+func isIntAttrType(t AttrType) bool {
+	return t == AttrTypeInt64 || t == AttrTypeUint64
+}
+
+func compareExactIntegers(aType AttrType, aInt int64, aUint uint64, bType AttrType, bInt int64, bUint uint64) int {
+	if aType == AttrTypeInt64 && bType == AttrTypeInt64 {
+		if aInt < bInt {
+			return -1
+		}
+		if aInt > bInt {
+			return 1
+		}
+		return 0
+	}
+	if aType == AttrTypeUint64 && bType == AttrTypeUint64 {
+		if aUint < bUint {
+			return -1
+		}
+		if aUint > bUint {
+			return 1
+		}
+		return 0
+	}
+	if aType == AttrTypeInt64 && bType == AttrTypeUint64 {
+		if aInt < 0 {
+			return -1
+		}
+		au := uint64(aInt)
+		if au < bUint {
+			return -1
+		}
+		if au > bUint {
+			return 1
+		}
+		return 0
+	}
+	// aType == AttrTypeUint64 && bType == AttrTypeInt64
+	if bInt < 0 {
+		return 1
+	}
+	bu := uint64(bInt)
+	if aUint < bu {
+		return -1
+	}
+	if aUint > bu {
+		return 1
+	}
+	return 0
+}
+
+// MatchesAttr evaluates the filter condition against a typed AttrEntry with exact precision.
+func (f FilterCondition) MatchesAttr(attr AttrEntry) bool {
+	highType := f.ValType
+	if f.HasHighType {
+		highType = f.ValHighType
+	}
+
+	// 1. Exact 64-bit integer comparison (including cross-signedness int64 vs uint64):
+	if isIntAttrType(attr.Type) {
+		if f.Operator == "BETWEEN" {
+			if isIntAttrType(f.ValType) && isIntAttrType(highType) {
+				cmpLow := compareExactIntegers(attr.Type, attr.Int64(), attr.Uint64(), f.ValType, f.ValueInt64, f.ValueUint64)
+				cmpHigh := compareExactIntegers(attr.Type, attr.Int64(), attr.Uint64(), highType, f.ValueHighInt64, f.ValueHighUint64)
+				return cmpLow >= 0 && cmpHigh <= 0
+			}
+		} else if isIntAttrType(f.ValType) {
+			cmp := compareExactIntegers(attr.Type, attr.Int64(), attr.Uint64(), f.ValType, f.ValueInt64, f.ValueUint64)
+			switch f.Operator {
+			case "=":
+				return cmp == 0
+			case "!=":
+				return cmp != 0
+			case ">":
+				return cmp > 0
+			case ">=":
+				return cmp >= 0
+			case "<":
+				return cmp < 0
+			case "<=":
+				return cmp <= 0
+			default:
+				return false
+			}
+		}
+	}
+
+	// 2. 64-bit float / mixed comparison
+	if f.HasFloat64 || f.ValType != AttrTypeFloat32 || highType != AttrTypeFloat32 || attr.Type != AttrTypeFloat32 {
+		val := attr.Float64()
+		var cmpVal float64
+		switch f.ValType {
+		case AttrTypeInt64:
+			cmpVal = float64(f.ValueInt64)
+		case AttrTypeUint64:
+			cmpVal = float64(f.ValueUint64)
+		default:
+			if f.HasFloat64 {
+				cmpVal = f.Value64
+			} else {
+				cmpVal = float64(f.Value)
+			}
+		}
+
+		var cmpHigh float64
+		switch highType {
+		case AttrTypeInt64:
+			cmpHigh = float64(f.ValueHighInt64)
+		case AttrTypeUint64:
+			cmpHigh = float64(f.ValueHighUint64)
+		default:
+			if f.HasFloat64 {
+				cmpHigh = f.ValueHigh64
+			} else {
+				cmpHigh = float64(f.ValueHigh)
+			}
+		}
+
+		switch f.Operator {
+		case "=":
+			return val == cmpVal
+		case "!=":
+			return val != cmpVal
+		case ">":
+			return val > cmpVal
+		case ">=":
+			return val >= cmpVal
+		case "<":
+			return val < cmpVal
+		case "<=":
+			return val <= cmpVal
+		case "BETWEEN":
+			return val >= cmpVal && val <= cmpHigh
+		default:
+			return false
+		}
+	}
+
+	// 3. Fallback 32-bit float comparison
+	val := attr.Value
+	switch f.Operator {
+	case "=":
+		return val == f.Value
+	case "!=":
+		return val != f.Value
+	case ">":
+		return val > f.Value
+	case ">=":
+		return val >= f.Value
+	case "<":
+		return val < f.Value
+	case "<=":
+		return val <= f.Value
+	case "BETWEEN":
+		return val >= f.Value && val <= f.ValueHigh
+	default:
+		return false
+	}
 }
 
 // Matches evaluates the filter condition against the given property map.
@@ -1272,30 +1524,7 @@ func (f FilterCondition) Matches(props map[string]float32) bool {
 	if !exists {
 		return false
 	}
-	cmpVal := f.Value
-	cmpHigh := f.ValueHigh
-	if f.HasFloat64 {
-		cmpVal = float32(f.Value64)
-		cmpHigh = float32(f.ValueHigh64)
-	}
-	switch f.Operator {
-	case "=":
-		return val == cmpVal
-	case "!=":
-		return val != cmpVal
-	case ">":
-		return val > cmpVal
-	case ">=":
-		return val >= cmpVal
-	case "<":
-		return val < cmpVal
-	case "<=":
-		return val <= cmpVal
-	case "BETWEEN":
-		return val >= cmpVal && val <= cmpHigh
-	default:
-		return false
-	}
+	return f.MatchesAttr(NewFloat32Attr(f.Field, val))
 }
 
 // QueryOptions defines criteria for List queries with pagination, column selection, and operation filtering
@@ -2574,7 +2803,7 @@ func (db *AnchorDB) GetRecordTyped(name string) (CompactRecord, error) {
 
 	cr, exists := db.EntityStore[name]
 	if !exists || cr.Operation == OpStatusTombstone {
-		return CompactRecord{}, fmt.Errorf("record not found: %q", name)
+		return CompactRecord{}, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
 
 	return CompactRecord{
@@ -2595,7 +2824,7 @@ func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]f
 
 	cr, exists := db.EntityStore[name]
 	if !exists || cr.Operation == OpStatusTombstone {
-		return nil, fmt.Errorf("record not found: %q", name)
+		return nil, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
 
 	return cr.Project(selectFields), nil
@@ -2611,7 +2840,7 @@ func (db *AnchorDB) GetRecordWithOperation(name string, selectFields ...string) 
 
 	cr, exists := db.EntityStore[name]
 	if !exists || cr.Operation == OpStatusTombstone {
-		return nil, 0, fmt.Errorf("record not found: %q", name)
+		return nil, 0, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
 
 	return cr.Project(selectFields), cr.Operation, nil
@@ -2676,6 +2905,9 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 		a, ok := attrMap[key]
 		return a, ok
 	}
+	snapshot := func() map[string]float32 {
+		return attrMapToFloat32Props(attrMap)
+	}
 	compKeys := make([]string, 0, len(computations))
 	for k := range computations {
 		compKeys = append(compKeys, k)
@@ -2683,9 +2915,9 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 	slices.Sort(compKeys)
 	for _, outputField := range compKeys {
 		op := computations[outputField]
-		newAttr, err := applyComputeOpTyped(outputField, op, lookup)
+		newAttr, err := applyComputeOpTyped(outputField, op, lookup, snapshot)
 		if err != nil {
-			return CompactRecord{}, fmt.Errorf("calculation failed for field %q: %w", outputField, err)
+			return CompactRecord{}, fmt.Errorf("%w: calculation failed for field %q: %w", ErrComputeFailed, outputField, err)
 		}
 		if _, exists := attrMap[outputField]; !exists {
 			order = append(order, outputField)
@@ -2720,6 +2952,9 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, false, ErrDatabaseClosed
+	}
 
 	limit := opts.Limit
 	if limit <= 0 {
@@ -2786,27 +3021,48 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			}
 		}
 
-		props := cr.ToMap()
+		var finalAttrs []AttrEntry
+		var finalProps map[string]float32
 
-		// Apply in-storage computations
-		calcFailed := false
-		for outField, op := range opts.Computations {
-			computedVal, err := op.Apply(props)
-			if err != nil {
-				calcFailed = true
-				break
-			}
-			props[outField] = computedVal
-		}
-		if calcFailed {
-			continue
-		}
-
-		// Apply Where conditions if computations were present
 		if len(opts.Computations) > 0 {
+			attrs := cr.ExpandAttrs()
+			attrMap := make(map[string]AttrEntry, len(attrs)+len(opts.Computations))
+			order := make([]string, 0, len(attrs)+len(opts.Computations))
+			for _, a := range attrs {
+				if _, exists := attrMap[a.Key]; !exists {
+					order = append(order, a.Key)
+				}
+				attrMap[a.Key] = a
+			}
+			lookup := func(key string) (AttrEntry, bool) {
+				a, ok := attrMap[key]
+				return a, ok
+			}
+			snapshot := func() map[string]float32 {
+				return attrMapToFloat32Props(attrMap)
+			}
+			compKeys := make([]string, 0, len(opts.Computations))
+			for k := range opts.Computations {
+				compKeys = append(compKeys, k)
+			}
+			slices.Sort(compKeys)
+			for _, outField := range compKeys {
+				op := opts.Computations[outField]
+				newAttr, err := applyComputeOpTyped(outField, op, lookup, snapshot)
+				if err != nil {
+					return nil, false, fmt.Errorf("%w: compute %q for record %q failed: %w", ErrComputeFailed, outField, name, err)
+				}
+				if _, exists := attrMap[outField]; !exists {
+					order = append(order, outField)
+				}
+				attrMap[outField] = newAttr
+			}
+
+			// Apply Where conditions if computations were present
 			matches := true
 			for _, filter := range opts.Filters {
-				if !filter.Matches(props) {
+				attr, exists := attrMap[filter.Field]
+				if !exists || !filter.MatchesAttr(attr) {
 					matches = false
 					break
 				}
@@ -2814,26 +3070,70 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			if !matches {
 				continue
 			}
+
+			// Handle pagination Offset
+			if skipped < offset {
+				skipped++
+				continue
+			}
+
+			// Early Termination: Stop immediately when limit is reached! (Constant-time bound O(K))
+			if len(results) >= limit {
+				hasMore = true
+				break
+			}
+
+			if len(opts.Select) > 0 {
+				finalAttrs = make([]AttrEntry, 0, len(opts.Select))
+				finalProps = make(map[string]float32, len(opts.Select))
+				for _, f := range opts.Select {
+					if a, ok := attrMap[f]; ok {
+						finalAttrs = append(finalAttrs, a)
+						finalProps[f] = a.Float32()
+					}
+				}
+			} else {
+				finalAttrs = make([]AttrEntry, 0, len(order))
+				finalProps = make(map[string]float32, len(order))
+				for _, k := range order {
+					a := attrMap[k]
+					finalAttrs = append(finalAttrs, a)
+					finalProps[k] = a.Float32()
+				}
+			}
+		} else {
+			// Handle pagination Offset
+			if skipped < offset {
+				skipped++
+				continue
+			}
+
+			// Early Termination: Stop immediately when limit is reached! (Constant-time bound O(K))
+			if len(results) >= limit {
+				hasMore = true
+				break
+			}
+
+			if len(opts.Select) > 0 {
+				finalAttrs = make([]AttrEntry, 0, len(opts.Select))
+				finalProps = make(map[string]float32, len(opts.Select))
+				for _, f := range opts.Select {
+					if a, ok := cr.GetTyped(f); ok {
+						finalAttrs = append(finalAttrs, a)
+						finalProps[f] = a.Float32()
+					}
+				}
+			} else {
+				finalAttrs = cr.ExpandAttrs()
+				finalProps = cr.ToMap()
+			}
 		}
 
-		// Handle pagination Offset
-		if skipped < offset {
-			skipped++
-			continue
-		}
-
-		// Early Termination: Stop immediately when limit is reached! (Constant-time bound O(K))
-		if len(results) >= limit {
-			hasMore = true
-			break
-		}
-
-		// Project to selected columns
-		finalProps := projectProperties(props, opts.Select)
 		results = append(results, EntityRecord{
 			Name:      name,
 			Operation: cr.Operation,
 			Props:     finalProps,
+			Attrs:     finalAttrs,
 		})
 	}
 
@@ -2928,11 +3228,14 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 			lookup := func(key string) (AttrEntry, bool) {
 				return cr.GetTyped(key)
 			}
+			snapshot := func() map[string]float32 {
+				return attrsToFloat32Props(cr.ExpandAttrs())
+			}
 			pending := make([]AttrEntry, 0, len(opts.Mutations))
 			for field, op := range opts.Mutations {
-				newAttr, err := applyComputeOpTyped(field, op, lookup)
+				newAttr, err := applyComputeOpTyped(field, op, lookup, snapshot)
 				if err != nil {
-					return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
+					return updatedCount, fmt.Errorf("%w: update %q field %q: %w", ErrComputeFailed, name, field, err)
 				}
 				if schemaSpecs != nil {
 					newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
@@ -3003,11 +3306,14 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		lookup := func(key string) (AttrEntry, bool) {
 			return cr.GetTyped(key)
 		}
+		snapshot := func() map[string]float32 {
+			return attrsToFloat32Props(cr.ExpandAttrs())
+		}
 		pending := make([]AttrEntry, 0, len(opts.Mutations))
 		for field, op := range opts.Mutations {
-			newAttr, err := applyComputeOpTyped(field, op, lookup)
+			newAttr, err := applyComputeOpTyped(field, op, lookup, snapshot)
 			if err != nil {
-				return updatedCount, fmt.Errorf("update %q field %q: %w", name, field, err)
+				return updatedCount, fmt.Errorf("%w: update %q field %q: %w", ErrComputeFailed, name, field, err)
 			}
 			if schemaSpecs != nil {
 				newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
@@ -3901,6 +4207,9 @@ func (db *AnchorDB) ExecuteGraphStep(inputs []string, relation string, limitK in
 func (db *AnchorDB) CalculateDistance(wordA, wordB string) (float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
@@ -3924,6 +4233,9 @@ func (db *AnchorDB) CalculateDistance(wordA, wordB string) (float32, error) {
 func (db *AnchorDB) CalculateHaversineDistance(wordA, wordB string) (float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
@@ -3947,6 +4259,9 @@ func (db *AnchorDB) CalculateHaversineDistance(wordA, wordB string) (float32, er
 func (db *AnchorDB) CalculateCentroid(words []string) (spatial.Point2D, [4]float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return spatial.Point2D{}, [4]float32{}, ErrDatabaseClosed
+	}
 
 	if len(words) == 0 {
 		return spatial.Point2D{}, [4]float32{}, fmt.Errorf("empty word list")
@@ -3983,6 +4298,9 @@ func (db *AnchorDB) CalculateCentroid(words []string) (spatial.Point2D, [4]float
 func (db *AnchorDB) CalculateCosineSimilarity(wordA, wordB string) (float32, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
@@ -4148,15 +4466,30 @@ func (db *AnchorDB) FindNodesInRadius(center spatial.Point2D, radius float32, li
 }
 
 // StatsResult represents single-pass statistical aggregate calculations for a numeric field.
+//
+// Min/Max/Mean/Variance/StdDev/Min64/Max64 are float accumulations (Min64/Max64
+// are inexact for uint64 above 2^53) and are kept for backward compatibility.
+// The exact integer extremes below are meaningful only when Count > 0:
+// MinType/MaxType select the domain of the overall min/max — AttrTypeInt64 reads
+// MinInt/MaxInt, AttrTypeUint64 reads MinUint/MaxUint, anything else reads the
+// float64 Min64/Max64 path with its documented precision caveat.
 type StatsResult struct {
-	Field    string  `json:"field"`
-	Count    uint64  `json:"count"`
-	Sum      float64 `json:"sum"`
-	Min      float32 `json:"min"`
-	Max      float32 `json:"max"`
-	Mean     float64 `json:"mean"`
-	Variance float64 `json:"variance"`
-	StdDev   float64 `json:"std_dev"`
+	Field    string   `json:"field"`
+	Count    uint64   `json:"count"`
+	Sum      float64  `json:"sum"`
+	Min      float32  `json:"min"`
+	Max      float32  `json:"max"`
+	Min64    float64  `json:"min64"`
+	Max64    float64  `json:"max64"`
+	MinInt   int64    `json:"min_int"`
+	MaxInt   int64    `json:"max_int"`
+	MinUint  uint64   `json:"min_uint"`
+	MaxUint  uint64   `json:"max_uint"`
+	MinType  AttrType `json:"min_type"`
+	MaxType  AttrType `json:"max_type"`
+	Mean     float64  `json:"mean"`
+	Variance float64  `json:"variance"`
+	StdDev   float64  `json:"std_dev"`
 }
 
 // StatsOptions defines configuration and filters for single-pass in-storage statistical computations.
@@ -4171,6 +4504,53 @@ type StatsOptions struct {
 // for a numeric field across all active records using Welford's algorithm.
 func (db *AnchorDB) ComputeStats(field string) (StatsResult, error) {
 	return db.ComputeStatsWithOptions(StatsOptions{Field: field})
+}
+
+// cmpIntUint compares signed a against unsigned b exactly: any negative int64
+// sorts below every uint64, non-negative values compare in uint64 space.
+func cmpIntUint(a int64, b uint64) int {
+	if a < 0 {
+		return -1
+	}
+	ua := uint64(a)
+	switch {
+	case ua < b:
+		return -1
+	case ua > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// ratForStatsFloat returns the exact rational value of a finite float64, or nil
+// for NaN/Inf so non-finite floats can never win an exact extreme.
+func ratForStatsFloat(f float64) *big.Rat {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	return new(big.Rat).SetFloat64(f)
+}
+
+// resolveStatsExtreme picks the domain tag of the overall min (wantMin=true) or
+// max across the exact integer candidates and the float64 candidate. Integer
+// domains compare exactly against each other; a finite float candidate joins
+// via one exact rational comparison (never per record). Ties resolve to the
+// integer domain so the published extreme stays exact.
+func resolveStatsExtreme(haveInt bool, intCand int64, haveUint bool, uintCand uint64, floatCand float64, wantMin bool) AttrType {
+	intBeatsUint := haveInt && (!haveUint || (wantMin && cmpIntUint(intCand, uintCand) <= 0) || (!wantMin && cmpIntUint(intCand, uintCand) >= 0))
+	if intBeatsUint {
+		if r := ratForStatsFloat(floatCand); r == nil || (wantMin && new(big.Rat).SetInt64(intCand).Cmp(r) <= 0) || (!wantMin && new(big.Rat).SetInt64(intCand).Cmp(r) >= 0) {
+			return AttrTypeInt64
+		}
+		return AttrTypeFloat64
+	}
+	if haveUint {
+		if r := ratForStatsFloat(floatCand); r == nil || (wantMin && new(big.Rat).SetUint64(uintCand).Cmp(r) <= 0) || (!wantMin && new(big.Rat).SetUint64(uintCand).Cmp(r) >= 0) {
+			return AttrTypeUint64
+		}
+	}
+	return AttrTypeFloat64
 }
 
 // ComputeStatsWithOptions calculates single-pass statistical aggregates with custom filters using Welford's algorithm.
@@ -4194,6 +4574,17 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 	var sum float64
 	var minVal float32 = math.MaxFloat32
 	var maxVal float32 = -math.MaxFloat32
+	var minVal64 float64 = math.MaxFloat64
+	var maxVal64 float64 = -math.MaxFloat64
+	// Exact integer extremes: plain integer compares per record (no big.Int in
+	// the hot loop); cross-domain resolution happens once at the end.
+	// Float extremes for resolution track only float-typed values: the legacy
+	// float64 accumulators above round integer inputs (e.g. float64(MaxUint64)
+	// is 2^64), so they must never compete as "true" values against integers.
+	var seenInt, seenUint, seenFloat bool
+	var minI, maxI int64
+	var minU, maxU uint64
+	var minF, maxF float64
 	var m float64 // Mean accumulator
 	var s float64 // M2 sum-of-squares accumulator in Welford's algorithm
 
@@ -4237,8 +4628,48 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 		}
 
 		count++
+
+		// Track integer extremes exactly in their own domain.
+		switch attr.Type {
+		case AttrTypeInt64:
+			if !seenInt || attr.IntVal < minI {
+				minI = attr.IntVal
+			}
+			if !seenInt || attr.IntVal > maxI {
+				maxI = attr.IntVal
+			}
+			seenInt = true
+		case AttrTypeUint64:
+			u := uint64(attr.IntVal)
+			if !seenUint || u < minU {
+				minU = u
+			}
+			if !seenUint || u > maxU {
+				maxU = u
+			}
+			seenUint = true
+		}
+
 		val64 := attr.Float64()
 		sum += val64
+
+		switch attr.Type {
+		case AttrTypeFloat32, AttrTypeFloat64:
+			if !seenFloat || val64 < minF {
+				minF = val64
+			}
+			if !seenFloat || val64 > maxF {
+				maxF = val64
+			}
+			seenFloat = true
+		}
+
+		if val64 < minVal64 {
+			minVal64 = val64
+		}
+		if val64 > maxVal64 {
+			maxVal64 = val64
+		}
 
 		val32 := float32(val64)
 		if val32 < minVal {
@@ -4265,12 +4696,26 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 	}
 	stdDev := math.Sqrt(variance)
 
+	// Resolution sees only genuine float-typed values; an absent float domain
+	// presents as NaN so it can never win an extreme.
+	floatMin, floatMax := math.NaN(), math.NaN()
+	if seenFloat {
+		floatMin, floatMax = minF, maxF
+	}
 	return StatsResult{
 		Field:    opts.Field,
 		Count:    count,
 		Sum:      sum,
 		Min:      minVal,
 		Max:      maxVal,
+		Min64:    minVal64,
+		Max64:    maxVal64,
+		MinInt:   minI,
+		MaxInt:   maxI,
+		MinUint:  minU,
+		MaxUint:  maxU,
+		MinType:  resolveStatsExtreme(seenInt, minI, seenUint, minU, floatMin, true),
+		MaxType:  resolveStatsExtreme(seenInt, maxI, seenUint, maxU, floatMax, false),
 		Mean:     m,
 		Variance: variance,
 		StdDev:   stdDev,
@@ -4310,6 +4755,12 @@ func (db *AnchorDB) ExecuteGraphChainWithOptions(initialInputs []string, relatio
 // ExecuteGraphChainWithContext runs a chain while observing cancellation between
 // graph steps and during each step's traversal.
 func (db *AnchorDB) ExecuteGraphChainWithContext(ctx context.Context, initialInputs []string, relationChain []string, limitK int, beamWidth float32) ([]GraphQueryResult, error) {
+	db.mu.RLock()
+	closed := db.closed
+	db.mu.RUnlock()
+	if closed {
+		return nil, ErrDatabaseClosed
+	}
 	if limitK < 0 {
 		return nil, fmt.Errorf("limitK must not be negative")
 	}

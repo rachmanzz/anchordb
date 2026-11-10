@@ -14,8 +14,9 @@ import (
 
 // RecordDTO holds user-facing properties for a partition record.
 type RecordDTO struct {
-	Name  string             `json:"name"`
-	Props map[string]float32 `json:"props"`
+	Name  string              `json:"name"`
+	Props map[string]float32  `json:"props"`
+	Attrs []storage.AttrEntry `json:"attrs,omitempty"`
 }
 
 // S3PartitionCache manages a local disk cache for partition database files retrieved from S3.
@@ -75,25 +76,25 @@ func (c *S3PartitionCache) EnsurePartition(ctx context.Context, sink *S3Sink, ke
 	return targetPath, nil
 }
 
-// InspectPartition fetches (if needed), opens, and queries an S3 partition file.
-func (c *S3PartitionCache) InspectPartition(ctx context.Context, sink *S3Sink, keyOrFilename, recordName string, limit int) ([]RecordDTO, map[string]float32, error) {
+// InspectPartitionTyped fetches (if needed), opens, and queries an S3 partition file returning typed attributes.
+func (c *S3PartitionCache) InspectPartitionTyped(ctx context.Context, sink *S3Sink, keyOrFilename, recordName string, limit int) ([]RecordDTO, map[string]float32, []storage.AttrEntry, error) {
 	localPath, err := c.EnsurePartition(ctx, sink, keyOrFilename)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	pdb, err := storage.Open(localPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed opening cached partition %s: %w", localPath, err)
+		return nil, nil, nil, fmt.Errorf("failed opening cached partition %s: %w", localPath, err)
 	}
 	defer pdb.Close()
 
 	if recordName != "" {
-		props, err := pdb.GetRecord(recordName)
+		cr, err := pdb.GetRecordTyped(recordName)
 		if err != nil {
-			return nil, nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
+			return nil, nil, nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
 		}
-		return nil, props, nil
+		return nil, cr.ToMap(), cr.ExpandAttrs(), nil
 	}
 
 	if limit <= 0 || limit > 1000 {
@@ -102,7 +103,7 @@ func (c *S3PartitionCache) InspectPartition(ctx context.Context, sink *S3Sink, k
 
 	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed listing records in partition: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed listing records in partition: %w", err)
 	}
 
 	out := make([]RecordDTO, len(records))
@@ -110,8 +111,15 @@ func (c *S3PartitionCache) InspectPartition(ctx context.Context, sink *S3Sink, k
 		out[i] = RecordDTO{
 			Name:  r.Name,
 			Props: r.Props,
+			Attrs: r.Attrs,
 		}
 	}
 
-	return out, nil, nil
+	return out, nil, nil, nil
+}
+
+// InspectPartition fetches (if needed), opens, and queries an S3 partition file.
+func (c *S3PartitionCache) InspectPartition(ctx context.Context, sink *S3Sink, keyOrFilename, recordName string, limit int) ([]RecordDTO, map[string]float32, error) {
+	records, props, _, err := c.InspectPartitionTyped(ctx, sink, keyOrFilename, recordName, limit)
+	return records, props, err
 }

@@ -19,7 +19,7 @@ AnchorDB provides an immutable schema contract system called **Register Model** 
 
 ## 2. Supported Data Types & Modifiers
 
-A schema in AnchorDB is a dictionary mapping attribute names to normalized scalar type identifiers backed by `float32` property storage.
+A schema in AnchorDB is a dictionary mapping attribute names to normalized scalar type identifiers. Each stored attribute carries one of four physical numeric types: `float32`, `int64`, `uint64`, or `float64`.
 
 ### A. Required vs. Optional Syntax (`?` Suffix)
 
@@ -28,15 +28,18 @@ A schema in AnchorDB is a dictionary mapping attribute names to normalized scala
 
 ### B. Scalar Type Table
 
-| Type Identifier | Description | Required Example | Optional Example | Internal Representation |
-| :--- | :--- | :--- | :--- | :--- |
-| **`int`** | Exact integer number | `"age": "int"` | `"doors": "int?"` | Exact integer (IEEE 754 float32) |
-| **`float`** | Floating-point metric | `"speed": "float"` | `"weight": "float?"` | IEEE 754 float32 |
-| **`bool`** | Boolean flag (`0.0` or `1.0`) | `"active": "bool"` | `"verified": "bool?"` | Float scalar `1.0` (true) / `0.0` (false) |
-| **`date`** | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Integer days since Unix epoch (float32); dates before 1970 are negative |
+| Type Identifier | Aliases | Description | Required Example | Optional Example | Accepted Storage |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`int`** | `integer`, `int32`, `int64` | Signed integer | `"age": "int"` | `"doors": "int?"` | Exact `int64` via typed writes; integral `float32` via legacy writes |
+| **`uint`** | `uint32`, `uint64` | Unsigned integer | `"uid": "uint"` | `"seq": "uint?"` | Exact `uint64` via typed writes; non-negative integral `float32` via legacy writes |
+| **`float`** | `number` | Floating-point metric | `"speed": "float"` | `"weight": "float?"` | `float32` or `float64` as written |
+| **`float32`** | | Single-precision metric | `"temp": "float32"` | `"rssi": "float32?"` | `float32` (wider values are coerced) |
+| **`float64`** | | Double-precision metric | `"balance": "float64"` | `"lat": "float64?"` | `float64` (integer values are promoted) |
+| **`bool`** | `boolean` | Boolean flag (`0` or `1`) | `"active": "bool"` | `"verified": "bool?"` | `0` (false) / `1` (true) |
+| **`date`** | `datetime` | Calendar date (`YYYY-MM-DD`) | `"registered": "date"` | `"updated": "date?"` | Integer days since Unix epoch; dates before 1970 are negative |
 
 > [!NOTE]
-> **Design Boundary: Contiguous Scalar Float32 Properties**: Record attributes in AnchorDB are stored in contiguous `map[string]float32` structures (`CompactRecord`) to support zero-copy memory-mapped operations and sub-microsecond in-storage arithmetic. Non-numeric types (`string`) and array modifiers (`[]`) are rejected at schema parse time.
+> **Precision Boundary**: The legacy APIs (`Save`, `Get`, `map[string]float32`, and custom `ComputeOp.Apply`) expose values as `float32`, which is exact only for integers up to 16,777,216. Use the typed APIs (`SaveTyped`, `GetTyped`, `GetInt`, `GetUint`, `GetFloat64`, and the `*Int`/`*Float64` operators) when values must stay exact. In-storage integer arithmetic on `int64`/`uint64` attributes is exact and returns `ErrIntegerOverflow` instead of wrapping when a result exceeds the 64-bit range. Non-numeric types (`string`) and array modifiers (`[]`) are rejected at schema parse time.
 
 ---
 

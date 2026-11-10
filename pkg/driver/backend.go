@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,18 +35,20 @@ type PartitionMeta struct {
 
 // PartitionRecord represents an entity record inside an archived partition.
 type PartitionRecord struct {
-	Name  string             `json:"name"`
-	Props map[string]float32 `json:"props"`
+	Name  string              `json:"name"`
+	Props map[string]float32  `json:"props"`
+	Attrs []storage.AttrEntry `json:"attrs,omitempty"`
 }
 
 // PartitionInspectResult represents the response when inspecting an archived partition file.
 type PartitionInspectResult struct {
-	Success       bool               `json:"success"`
-	PartitionFile string             `json:"partition_file"`
-	Name          string             `json:"name,omitempty"`
-	Props         map[string]float32 `json:"props,omitempty"`
-	Records       []PartitionRecord  `json:"records,omitempty"`
-	Count         int                `json:"count,omitempty"`
+	Success       bool                `json:"success"`
+	PartitionFile string              `json:"partition_file"`
+	Name          string              `json:"name,omitempty"`
+	Props         map[string]float32  `json:"props,omitempty"`
+	Attrs         []storage.AttrEntry `json:"attrs,omitempty"`
+	Records       []PartitionRecord   `json:"records,omitempty"`
+	Count         int                 `json:"count,omitempty"`
 }
 
 // backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
@@ -131,21 +134,15 @@ func (b *localBackend) SaveBatch(ctx context.Context, _ string, records []storag
 	return b.db.SaveRecordsBatch(records)
 }
 
-func (b *localBackend) Get(ctx context.Context, _, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
+func (b *localBackend) Get(ctx context.Context, _ string, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var props map[string]float32
-	var err error
-	if len(computations) == 0 {
-		props, err = b.db.GetRecord(name, selectFields...)
-	} else {
-		props, err = b.db.GetRecordWithCompute(name, computations, selectFields...)
-	}
+	cr, err := b.db.GetRecordTypedWithCompute(name, computations, selectFields...)
 	if err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: name, props: props}, nil
+	return &EntityResult{Name: name, props: cr.ToMap(), attrs: cr.ExpandAttrs()}, nil
 }
 
 func (b *localBackend) List(ctx context.Context, _ string, opts storage.QueryOptions) (*PagedListResult, error) {
@@ -162,6 +159,7 @@ func (b *localBackend) List(ctx context.Context, _ string, opts storage.QueryOpt
 		items[i] = EntityResult{
 			Name:  r.Name,
 			props: r.Props,
+			attrs: r.Attrs,
 		}
 	}
 	return &PagedListResult{
@@ -318,7 +316,7 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 	defer pdb.Close()
 
 	if recordName != "" {
-		props, err := pdb.GetRecord(recordName)
+		cr, err := pdb.GetRecordTyped(recordName)
 		if err != nil {
 			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
 		}
@@ -326,7 +324,8 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 			Success:       true,
 			PartitionFile: cleanFilename,
 			Name:          recordName,
-			Props:         props,
+			Props:         cr.ToMap(),
+			Attrs:         cr.ExpandAttrs(),
 		}, nil
 	}
 
@@ -340,7 +339,7 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 
 	out := make([]PartitionRecord, len(records))
 	for i, r := range records {
-		out[i] = PartitionRecord{Name: r.Name, Props: r.Props}
+		out[i] = PartitionRecord{Name: r.Name, Props: r.Props, Attrs: r.Attrs}
 	}
 
 	return &PartitionInspectResult{
@@ -547,16 +546,11 @@ func (b *embeddedBackend) Get(ctx context.Context, model, name string, selectFie
 	if err != nil {
 		return nil, err
 	}
-	var props map[string]float32
-	if len(computations) == 0 {
-		props, err = db.GetRecord(name, selectFields...)
-	} else {
-		props, err = db.GetRecordWithCompute(name, computations, selectFields...)
-	}
+	cr, err := db.GetRecordTypedWithCompute(name, computations, selectFields...)
 	if err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: name, props: props}, nil
+	return &EntityResult{Name: name, props: cr.ToMap(), attrs: cr.ExpandAttrs()}, nil
 }
 
 func (b *embeddedBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
@@ -577,6 +571,7 @@ func (b *embeddedBackend) List(ctx context.Context, model string, opts storage.Q
 		items[i] = EntityResult{
 			Name:  r.Name,
 			props: r.Props,
+			attrs: r.Attrs,
 		}
 	}
 	return &PagedListResult{
@@ -822,7 +817,7 @@ func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, r
 	defer pdb.Close()
 
 	if recordName != "" {
-		props, err := pdb.GetRecord(recordName)
+		cr, err := pdb.GetRecordTyped(recordName)
 		if err != nil {
 			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
 		}
@@ -830,7 +825,8 @@ func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, r
 			Success:       true,
 			PartitionFile: cleanFilename,
 			Name:          recordName,
-			Props:         props,
+			Props:         cr.ToMap(),
+			Attrs:         cr.ExpandAttrs(),
 		}, nil
 	}
 
@@ -844,7 +840,7 @@ func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, r
 
 	out := make([]PartitionRecord, len(records))
 	for i, r := range records {
-		out[i] = PartitionRecord{Name: r.Name, Props: r.Props}
+		out[i] = PartitionRecord{Name: r.Name, Props: r.Props, Attrs: r.Attrs}
 	}
 
 	return &PartitionInspectResult{
@@ -1008,12 +1004,57 @@ func (b *remoteBackend) Save(ctx context.Context, model, name string, op *uint8,
 	return resp.Name, nil
 }
 
-func (b *remoteBackend) SaveTyped(_ context.Context, _, _ string, _ *uint8, _ []storage.AttrEntry) (string, error) {
-	return "", fmt.Errorf("SaveTyped is only supported in local/embedded mode in Phase 1")
+func (b *remoteBackend) SaveTyped(ctx context.Context, model, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
+	req := map[string]interface{}{
+		"model": model,
+		"name":  name,
+		"attrs": attrs,
+	}
+	if op != nil {
+		req["operation"] = *op
+	}
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Name    string `json:"name"`
+		Message string `json:"message"`
+	}
+	if err := b.doJSON(ctx, http.MethodPost, "/v1/save", req, &resp); err != nil {
+		return "", err
+	}
+	return resp.Name, nil
 }
 
-func (b *remoteBackend) GetTyped(_ context.Context, _, _ string) (storage.CompactRecord, error) {
-	return storage.CompactRecord{}, fmt.Errorf("GetTyped is only supported in local/embedded mode in Phase 1")
+func (b *remoteBackend) GetTyped(ctx context.Context, model, name string) (storage.CompactRecord, error) {
+	req := map[string]interface{}{
+		"model": model,
+		"name":  name,
+	}
+
+	var resp struct {
+		Success   bool                `json:"success"`
+		Name      string              `json:"name"`
+		Operation uint8               `json:"operation"`
+		Props     map[string]float32  `json:"props"`
+		Attrs     []storage.AttrEntry `json:"attrs"`
+	}
+	if err := b.doJSON(ctx, http.MethodPost, "/v1/get", req, &resp); err != nil {
+		return storage.CompactRecord{}, err
+	}
+	if len(resp.Attrs) > 0 {
+		return storage.CompactRecord{
+			Operation: resp.Operation,
+			Attrs:     resp.Attrs,
+		}, nil
+	}
+	attrs := make([]storage.AttrEntry, 0, len(resp.Props))
+	for k, v := range resp.Props {
+		attrs = append(attrs, storage.NewFloat32Attr(k, v))
+	}
+	return storage.CompactRecord{
+		Operation: resp.Operation,
+		Attrs:     attrs,
+	}, nil
 }
 
 func (b *remoteBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
@@ -1049,15 +1090,20 @@ func (b *remoteBackend) Get(ctx context.Context, model, name string, selectField
 	}
 
 	var resp struct {
-		Success   bool               `json:"success"`
-		Name      string             `json:"name"`
-		Operation uint8              `json:"operation"`
-		Props     map[string]float32 `json:"props"`
+		Success   bool                `json:"success"`
+		Name      string              `json:"name"`
+		Operation uint8               `json:"operation"`
+		Props     map[string]float32  `json:"props"`
+		Attrs     []storage.AttrEntry `json:"attrs"`
 	}
 	if err := b.doJSON(ctx, http.MethodPost, "/v1/get", req, &resp); err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: resp.Name, props: resp.Props}, nil
+	return &EntityResult{
+		Name:  resp.Name,
+		props: resp.Props,
+		attrs: resp.Attrs,
+	}, nil
 }
 
 func (b *remoteBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
@@ -1088,9 +1134,10 @@ func (b *remoteBackend) List(ctx context.Context, model string, opts storage.Que
 	var resp struct {
 		Success bool `json:"success"`
 		Items   []struct {
-			Name      string             `json:"name"`
-			Operation uint8              `json:"operation"`
-			Props     map[string]float32 `json:"props"`
+			Name      string              `json:"name"`
+			Operation uint8               `json:"operation"`
+			Props     map[string]float32  `json:"props"`
+			Attrs     []storage.AttrEntry `json:"attrs"`
 		} `json:"items"`
 		HasMore bool `json:"has_more"`
 		Count   int  `json:"count"`
@@ -1104,6 +1151,7 @@ func (b *remoteBackend) List(ctx context.Context, model string, opts storage.Que
 		items[i] = EntityResult{
 			Name:  r.Name,
 			props: r.Props,
+			attrs: r.Attrs,
 		}
 	}
 	return &PagedListResult{
@@ -1114,9 +1162,10 @@ func (b *remoteBackend) List(ctx context.Context, model string, opts storage.Que
 
 func (b *remoteBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
 	req := map[string]interface{}{
-		"model": model,
-		"in":    opts.TargetEntities,
-		"limit": opts.Limit,
+		"model":  model,
+		"in":     opts.TargetEntities,
+		"limit":  opts.Limit,
+		"offset": opts.Offset,
 	}
 	if len(opts.Filters) > 0 {
 		req["filters"] = serializeFilters(opts.Filters)
@@ -1354,12 +1403,13 @@ func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, rec
 	}
 
 	var resp struct {
-		Success       bool               `json:"success"`
-		PartitionFile string             `json:"partition_file"`
-		Name          string             `json:"name,omitempty"`
-		Props         map[string]float32 `json:"props,omitempty"`
-		Records       []PartitionRecord  `json:"records,omitempty"`
-		Count         int                `json:"count,omitempty"`
+		Success       bool                `json:"success"`
+		PartitionFile string              `json:"partition_file"`
+		Name          string              `json:"name,omitempty"`
+		Props         map[string]float32  `json:"props,omitempty"`
+		Attrs         []storage.AttrEntry `json:"attrs,omitempty"`
+		Records       []PartitionRecord   `json:"records,omitempty"`
+		Count         int                 `json:"count,omitempty"`
 	}
 	if err := b.doJSON(ctx, http.MethodPost, "/v1/partition/inspect", req, &resp); err != nil {
 		return nil, err
@@ -1369,6 +1419,7 @@ func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, rec
 		PartitionFile: resp.PartitionFile,
 		Name:          resp.Name,
 		Props:         resp.Props,
+		Attrs:         resp.Attrs,
 		Records:       resp.Records,
 		Count:         resp.Count,
 	}, nil
@@ -1455,8 +1506,12 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 	out := make([]map[string]string, len(filters))
 	for i, f := range filters {
 		valStr := fmt.Sprintf("%g", f.Value)
-		if f.HasFloat64 {
-			valStr = fmt.Sprintf("%.17g", f.Value64)
+		if f.ValType == storage.AttrTypeInt64 {
+			valStr = strconv.FormatInt(f.ValueInt64, 10)
+		} else if f.ValType == storage.AttrTypeUint64 {
+			valStr = strconv.FormatUint(f.ValueUint64, 10)
+		} else if f.HasFloat64 {
+			valStr = strconv.FormatFloat(f.Value64, 'g', -1, 64)
 		}
 		m := map[string]string{
 			"field":    f.Field,
@@ -1464,8 +1519,16 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 			"value":    valStr,
 		}
 		if f.Operator == "BETWEEN" {
-			if f.HasFloat64 {
-				m["value_high"] = fmt.Sprintf("%.17g", f.ValueHigh64)
+			highType := f.ValType
+			if f.HasHighType {
+				highType = f.ValHighType
+			}
+			if highType == storage.AttrTypeInt64 {
+				m["value_high"] = strconv.FormatInt(f.ValueHighInt64, 10)
+			} else if highType == storage.AttrTypeUint64 {
+				m["value_high"] = strconv.FormatUint(f.ValueHighUint64, 10)
+			} else if f.HasFloat64 {
+				m["value_high"] = strconv.FormatFloat(f.ValueHigh64, 'g', -1, 64)
 			} else {
 				m["value_high"] = fmt.Sprintf("%g", f.ValueHigh)
 			}
@@ -1642,10 +1705,10 @@ func (b *wireBackend) SaveBatch(ctx context.Context, model string, records []sto
 }
 
 func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
-	var props map[string]float32
+	var cr storage.CompactRecord
 	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		var err error
-		props, _, err = wc.GetWithOptions(wire.GetRequest{
+		cr, err = wc.GetWithOptionsTyped(wire.GetRequest{
 			Name:         name,
 			Select:       selectFields,
 			Computations: computations,
@@ -1657,7 +1720,8 @@ func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields 
 	}
 	return &EntityResult{
 		Name:  name,
-		props: props,
+		props: cr.ToMap(),
+		attrs: cr.ExpandAttrs(),
 	}, nil
 }
 
@@ -1686,6 +1750,7 @@ func (b *wireBackend) List(ctx context.Context, model string, opts storage.Query
 		items[i] = EntityResult{
 			Name:  r.Name,
 			props: r.Props,
+			attrs: r.Attrs,
 		}
 	}
 	return &PagedListResult{
@@ -1946,6 +2011,7 @@ func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recor
 			records[i] = PartitionRecord{
 				Name:  r.Name,
 				Props: r.Props,
+				Attrs: r.Attrs,
 			}
 		}
 		result = &PartitionInspectResult{
@@ -1953,6 +2019,7 @@ func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recor
 			PartitionFile: resp.PartitionFile,
 			Name:          resp.RecordName,
 			Props:         resp.Props,
+			Attrs:         resp.Attrs,
 			Records:       records,
 			Count:         len(records),
 		}

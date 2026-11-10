@@ -14,6 +14,21 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/system"
 )
 
+// wireErrorCode maps storage failures to wire error codes so a missing record
+// never shares a code with a failed computation or a closed database.
+func wireErrorCode(err error) uint16 {
+	switch {
+	case errors.Is(err, storage.ErrRecordNotFound):
+		return 404
+	case errors.Is(err, storage.ErrComputeFailed):
+		return 422
+	case errors.Is(err, storage.ErrDatabaseClosed):
+		return 503
+	default:
+		return 500
+	}
+}
+
 // Backend defines the storage interface wire.Server requires from AnchorDB.
 type Backend interface {
 	GetModel(name string) (*storage.AnchorDB, error)
@@ -25,6 +40,19 @@ type Backend interface {
 type TieredBackend interface {
 	GetRecordTiered(model, name string) (props map[string]float32, op uint8, err error)
 	GetRecordWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (props map[string]float32, op uint8, err error)
+}
+
+// TypedTieredBackend defines typed cold storage tiered fallback for wire queries.
+type TypedTieredBackend interface {
+	GetRecordTypedWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error)
+}
+
+// ColdTierBackend is an optional extension consulted only after the caller's
+// own hot lookup already failed with storage.ErrRecordNotFound. Backends
+// implementing it let callers skip the redundant second hot read that the
+// full tiered fallback would otherwise repeat before going cold.
+type ColdTierBackend interface {
+	GetColdRecordTyped(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error)
 }
 
 // PartitionBackend defines AnchorWire handler interfaces for catalog and direct inspection.
@@ -816,9 +844,30 @@ func (s *Server) handleConn(conn net.Conn) {
 					err = cErr
 				}
 			}
-			if err != nil {
-				// Fallback to Cold Storage Tier if supported by backend
-				if tb, ok := s.backend.(TieredBackend); ok {
+			if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+				// Fallback to Cold Storage Tier only for missing records; compute,
+				// IO and closed-DB failures keep their identity (and code).
+				// Prefer a cold-only lookup when the backend offers it: the hot
+				// read above already failed, so repeating it would be pure waste.
+				if cb, ok := s.backend.(ColdTierBackend); ok {
+					cr, coldErr := cb.GetColdRecordTyped(currentModel, getReq.Name, getReq.Computations, getReq.Select)
+					if coldErr == nil {
+						err = nil
+						op = cr.Operation
+						attrs = cr.ExpandAttrs()
+						isTyped = true
+						resp.Flags |= FlagColdTier
+					}
+				} else if ttb, ok := s.backend.(TypedTieredBackend); ok {
+					cr, coldErr := ttb.GetRecordTypedWithComputeTiered(currentModel, getReq.Name, getReq.Computations, getReq.Select)
+					if coldErr == nil {
+						err = nil
+						op = cr.Operation
+						attrs = cr.ExpandAttrs()
+						isTyped = true
+						resp.Flags |= FlagColdTier
+					}
+				} else if tb, ok := s.backend.(TieredBackend); ok {
 					var coldErr error
 					if len(getReq.Computations) > 0 || len(getReq.Select) > 0 {
 						props, op, coldErr = tb.GetRecordWithComputeTiered(currentModel, getReq.Name, getReq.Computations, getReq.Select)
@@ -834,7 +883,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(404, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				if isTyped {
@@ -939,7 +988,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			items, hasMore, err := db.ListRecordsWithPaging(opts)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeListResponse(ListResponse{
@@ -967,7 +1016,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			updatedCount, err := db.UpdateRecords(opts)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				if updatedCount > 0 {
 					system.RecordMutation(uint64(updatedCount))

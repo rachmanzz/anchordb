@@ -94,6 +94,7 @@ Avoid the following design anti-patterns when building on AnchorDB:
 | **Ingesting Unbounded Logs without Lifecycle Partitioning** | Causes memory-mapped files to grow indefinitely until filesystem exhaustion. | Enable automatic partitioning (`PartitionSchedule`) with retention cutoffs (`RetentionDays`) and cold storage offloading. |
 | **Bypassing Gateway Mode in Multi-Tenant Environments** | Exposing raw AnchorDB instances to untrusted networks without rate limiting, connection pooling, or session key validation. | Deploy AnchorDB behind `anchor-connector` with `ANCHORDB_GATEWAY_MODE=true` to enforce structured session pairing and proxy routing. |
 | **Using Heavyweight Client-Side Join Logic** | Fetching entire models over the network to manually compute barycenters, distances, or causal chains in client code. | Leverage native in-storage compute operators, ray-casting DDA beam searches, and server-side graph traversal primitives. |
+| **Running Under a Hard RAM Cap Without Sizing**<br>*(e.g. a 1 GiB cgroup holding millions of entities)* | AnchorDB grows its memory-mapped working set instead of shrinking caches, so the process is OOM-killed (exit 137) with no graceful degradation, while pending writes survive only via WAL replay. | Size the cap from measured bytes-per-entity, set `-memory-limit` (`ANCHORDB_MEMORY_LIMIT`, also honored via `GOMEMLIMIT`) well below the cgroup limit, split hot domains into separate models, and enable partitioning with retention cutoffs so files stay checkpointed. |
 
 ---
 

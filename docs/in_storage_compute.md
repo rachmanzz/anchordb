@@ -25,7 +25,7 @@ AnchorDB provides arithmetic and assignment operators defined in `pkg/storage` a
 
 ## 2. Date Mathematics
 
-Dates in AnchorDB are stored internally as IEEE 754 `float32` numbers representing **Epoch Days** (the number of days elapsed since January 1, 1970 UTC). This representation allows calendar arithmetic to be executed as fast, single-cycle floating point additions and subtractions.
+Dates in AnchorDB represent **Epoch Days** (whole days elapsed since January 1, 1970 UTC) in two physical forms. The legacy path (`driver.Date`/`MustDate`, `map[string]float32` APIs) stores them as IEEE 754 `float32`; the typed path (schema `date` type with typed writes) stores integer epoch days (`int64`, negative before 1970) with exact integer date arithmetic that returns `ErrIntegerOverflow` instead of wrapping. Both forms execute calendar arithmetic in storage; exactness requires the typed form (see the Precision Boundary in `docs/model_schema_specification.md`).
 
 > **Date Timezone & Precision**:
 > All date parsing (`ParseDate`) assumes UTC midnight (`00:00:00 UTC`) without timezone offset ambiguity. Epoch days represent whole integer days from the 1970-01-01 UTC epoch. When formatting via `FormatDate`, values are rounded to the nearest integer day (`math.Round`) before converting back to `"YYYY-MM-DD"`.
@@ -118,7 +118,7 @@ fmt.Printf("Updated %d records\n", updatedCount)
 ## 5. In-Storage Basic Statistics (Welford Single-Pass Algorithm)
 
 > [!NOTE]
-> Single-pass in-storage statistical computations (`ComputeStats`, `ComputeStatsWithOptions`, `StatsResult`, `StatsOptions`) are scheduled for the **next release**.
+> Single-pass in-storage statistical computations (`ComputeStats`, `ComputeStatsWithOptions`, `StatsResult`, `StatsOptions`) are implemented in `pkg/storage`. Exact integer extremes are published alongside the float accumulations via `MinInt`/`MaxInt`/`MinUint`/`MaxUint` with the `MinType`/`MaxType` domain tag (the legacy `Min64`/`Max64` remain for compatibility but are inexact for `uint64` above 2^53).
 
 When computing summary statistics across large datasets, naive algorithms that calculate variance using standard sum-of-squares formulas suffer from catastrophic numerical cancellation when the variance is small relative to the mean. Conversely, standard two-pass formulas require either traversing storage twice or materializing large slices in heap memory.
 
@@ -212,7 +212,7 @@ See the [AnchorWire guide](anchorwire.md) for a complete runnable program.
 
 ## 7. Design Boundaries & Limitations
 
-1. **Numeric Precision**: AnchorDB optimizes attribute storage as IEEE 754 single-precision floats (`float32`). It is tailored for telemetry, IoT, metrics, and spatial coordinates, rather than arbitrary-precision banking decimals.
+1. **Numeric Precision**: Record attributes use four physical numeric types (`float32`, `int64`, `uint64`, `float64`); the schema types are `int`, `uint`, `float`, `float32`, `float64`, `bool`, `date` (see `docs/model_schema_specification.md`). The legacy `float32` APIs are exact only for integers up to 16,777,216 — use the typed APIs and exact integer arithmetic (`ErrIntegerOverflow` on overflow) when values must stay exact. AnchorDB is tailored for telemetry, IoT, metrics, and spatial coordinates, rather than arbitrary-precision banking decimals.
 2. **Deterministic Binary Operations**: Supported operators are limited to arithmetic (`+`, `-`, `*`, `/`) and date offsets (`+days`, `-days`, `days_between`). AnchorDB intentionally avoids embedding a general-purpose programming language (e.g. Lua or JavaScript) in storage to maintain zero-GPU, sub-microsecond latency.
 3. **Strict Division-by-Zero Semantics**: Division operations strictly validate that the divisor is non-zero. If the divisor resolves to zero, the engine returns an error (`division by zero: <field> is 0`) and rolls back the active mutation or query pass, preserving mathematical and financial integrity.
 4. **Single-Pass Scalar Statistics**: `ComputeStats` computes 1st and 2nd central moments (mean, variance, standard deviation) along with min, max, count, and sum. Order statistics such as Median, Percentiles, or Mode are intentionally omitted because they require O(N log N) sorting or auxiliary histogram allocations, conflicting with AnchorDB's predictable streaming design.

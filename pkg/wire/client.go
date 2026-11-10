@@ -15,6 +15,14 @@ import (
 )
 
 // Client is an AnchorWire TCP client with optional adaptive memory pacing.
+//
+// A Client holds exactly one connection, and the server tracks one active
+// model per connection. Sequential SelectModel calls are safe. Concurrent use
+// of a single Client across different models is NOT supported: two goroutines
+// selecting different models on the same Client will steer each other's
+// requests to the wrong model. Use one Client (connection) per model for
+// concurrent multi-model workloads; the driver pool in pkg/driver already
+// follows this rule by giving each checkout exclusive ownership of its Client.
 type Client struct {
 	conn          net.Conn
 	reader        *bufio.Reader
@@ -272,7 +280,9 @@ func (c *Client) ModelName() string {
 	return c.model
 }
 
-// SelectModel changes the active model on this connection.
+// SelectModel changes the active model on this connection. It is safe for
+// sequential use. Do not call it concurrently with other operations on the
+// same Client for a different model; open a separate Client per model instead.
 func (c *Client) SelectModel(model string) error {
 	_, err := c.call(OpSelectModel, EncodeSelectModelPayload(model))
 	if err == nil {
@@ -453,7 +463,12 @@ func (c *Client) GetWithOptions(req GetRequest) (map[string]float32, uint8, erro
 
 // GetTyped retrieves an entity's typed attributes and operation lifecycle state.
 func (c *Client) GetTyped(name string) (storage.CompactRecord, error) {
-	resp, err := c.call(OpGet, EncodeGetRequest(GetRequest{Name: name}))
+	return c.GetWithOptionsTyped(GetRequest{Name: name})
+}
+
+// GetWithOptionsTyped retrieves an entity's typed attributes with optional projection and computations.
+func (c *Client) GetWithOptionsTyped(req GetRequest) (storage.CompactRecord, error) {
+	resp, err := c.call(OpGet, EncodeGetRequest(req))
 	if err != nil {
 		return storage.CompactRecord{}, err
 	}

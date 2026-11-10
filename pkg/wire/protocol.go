@@ -63,6 +63,12 @@ const (
 	OpDemoteToReplica   byte = 0x31
 	OpReplicationStream byte = 0x32
 
+	// Planned-but-unassigned (reserved — never reuse without a new opcode audit):
+	// 0x22 OpAggregate (in-storage statistics; see futures/statistical_analytics_engine.md).
+	// A spatial-query opcode is still TBD and MUST take a fresh slot: 0x18 is
+	// taken by OpGraph (an older proposal assigned it to OpSpatialQuery by
+	// mistake) and 0x30-0x32 are taken by replication.
+
 	// Responses
 	OpResponseOK    byte = 0x80
 	OpResponseError byte = 0x81
@@ -995,10 +1001,86 @@ func DecodeMemoryNegotiationResponse(data []byte) (MemoryNegotiationResponse, er
 
 // --- FILTER & COMPUTATION CODECS ---
 
-const filterFloat64Marker = "\x01"
+const (
+	filterFloat64Marker   = "\x01"
+	filterInt64Marker     = "\x02"
+	filterUint64Marker    = "\x03"
+	filterIntUint64Marker = "\x04"
+	filterUintInt64Marker = "\x05"
+)
 
 func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 	buf = appendString(buf, f.Field)
+	if f.HasHighType && f.ValHighType != f.ValType {
+		if f.ValType == storage.AttrTypeInt64 && f.ValHighType == storage.AttrTypeUint64 {
+			buf = appendString(buf, filterIntUint64Marker+f.Operator)
+			var valBytes [24]byte
+			v32 := f.Value
+			if v32 == 0 && f.ValueInt64 != 0 {
+				v32 = float32(f.ValueInt64)
+			}
+			vh32 := f.ValueHigh
+			if vh32 == 0 && f.ValueHighUint64 != 0 {
+				vh32 = float32(f.ValueHighUint64)
+			}
+			binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(v32))
+			binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
+			binary.LittleEndian.PutUint64(valBytes[8:16], uint64(f.ValueInt64))
+			binary.LittleEndian.PutUint64(valBytes[16:24], f.ValueHighUint64)
+			return append(buf, valBytes[:]...)
+		}
+		if f.ValType == storage.AttrTypeUint64 && f.ValHighType == storage.AttrTypeInt64 {
+			buf = appendString(buf, filterUintInt64Marker+f.Operator)
+			var valBytes [24]byte
+			v32 := f.Value
+			if v32 == 0 && f.ValueUint64 != 0 {
+				v32 = float32(f.ValueUint64)
+			}
+			vh32 := f.ValueHigh
+			if vh32 == 0 && f.ValueHighInt64 != 0 {
+				vh32 = float32(f.ValueHighInt64)
+			}
+			binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(v32))
+			binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
+			binary.LittleEndian.PutUint64(valBytes[8:16], f.ValueUint64)
+			binary.LittleEndian.PutUint64(valBytes[16:24], uint64(f.ValueHighInt64))
+			return append(buf, valBytes[:]...)
+		}
+	}
+	if f.ValType == storage.AttrTypeInt64 {
+		buf = appendString(buf, filterInt64Marker+f.Operator)
+		var valBytes [24]byte
+		v32 := f.Value
+		if v32 == 0 && f.ValueInt64 != 0 {
+			v32 = float32(f.ValueInt64)
+		}
+		vh32 := f.ValueHigh
+		if vh32 == 0 && f.ValueHighInt64 != 0 {
+			vh32 = float32(f.ValueHighInt64)
+		}
+		binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(v32))
+		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
+		binary.LittleEndian.PutUint64(valBytes[8:16], uint64(f.ValueInt64))
+		binary.LittleEndian.PutUint64(valBytes[16:24], uint64(f.ValueHighInt64))
+		return append(buf, valBytes[:]...)
+	}
+	if f.ValType == storage.AttrTypeUint64 {
+		buf = appendString(buf, filterUint64Marker+f.Operator)
+		var valBytes [24]byte
+		v32 := f.Value
+		if v32 == 0 && f.ValueUint64 != 0 {
+			v32 = float32(f.ValueUint64)
+		}
+		vh32 := f.ValueHigh
+		if vh32 == 0 && f.ValueHighUint64 != 0 {
+			vh32 = float32(f.ValueHighUint64)
+		}
+		binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(v32))
+		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
+		binary.LittleEndian.PutUint64(valBytes[8:16], f.ValueUint64)
+		binary.LittleEndian.PutUint64(valBytes[16:24], f.ValueHighUint64)
+		return append(buf, valBytes[:]...)
+	}
 	if f.HasFloat64 {
 		buf = appendString(buf, filterFloat64Marker+f.Operator)
 		var valBytes [24]byte
@@ -1032,24 +1114,120 @@ func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int,
 	if err != nil {
 		return storage.FilterCondition{}, offset, err
 	}
-	if len(op) > 0 && op[0] == filterFloat64Marker[0] {
-		op = op[1:]
-		if nextOffset+24 > len(data) {
-			return storage.FilterCondition{}, offset, errors.New("truncated 64-bit filter values")
+	if len(op) > 0 {
+		switch op[:1] {
+		case filterIntUint64Marker:
+			op = op[1:]
+			if nextOffset+24 > len(data) {
+				return storage.FilterCondition{}, offset, errors.New("truncated 64-bit mixed int/uint filter values")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+			valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+			valInt64 := int64(binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16]))
+			valHighUint64 := binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24])
+			return storage.FilterCondition{
+				Field:           field,
+				Operator:        op,
+				Value:           val,
+				ValueHigh:       valHigh,
+				Value64:         float64(valInt64),
+				ValueHigh64:     float64(valHighUint64),
+				HasFloat64:      true,
+				ValueInt64:      valInt64,
+				ValueHighUint64: valHighUint64,
+				ValType:         storage.AttrTypeInt64,
+				ValHighType:     storage.AttrTypeUint64,
+				HasHighType:     true,
+			}, nextOffset + 24, nil
+
+		case filterUintInt64Marker:
+			op = op[1:]
+			if nextOffset+24 > len(data) {
+				return storage.FilterCondition{}, offset, errors.New("truncated 64-bit mixed uint/int filter values")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+			valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+			valUint64 := binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16])
+			valHighInt64 := int64(binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24]))
+			return storage.FilterCondition{
+				Field:          field,
+				Operator:       op,
+				Value:          val,
+				ValueHigh:      valHigh,
+				Value64:        float64(valUint64),
+				ValueHigh64:    float64(valHighInt64),
+				HasFloat64:     true,
+				ValueUint64:    valUint64,
+				ValueHighInt64: valHighInt64,
+				ValType:        storage.AttrTypeUint64,
+				ValHighType:    storage.AttrTypeInt64,
+				HasHighType:    true,
+			}, nextOffset + 24, nil
+
+		case filterInt64Marker:
+			op = op[1:]
+			if nextOffset+24 > len(data) {
+				return storage.FilterCondition{}, offset, errors.New("truncated 64-bit int filter values")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+			valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+			valInt64 := int64(binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16]))
+			valHighInt64 := int64(binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24]))
+			return storage.FilterCondition{
+				Field:          field,
+				Operator:       op,
+				Value:          val,
+				ValueHigh:      valHigh,
+				Value64:        float64(valInt64),
+				ValueHigh64:    float64(valHighInt64),
+				HasFloat64:     true,
+				ValueInt64:     valInt64,
+				ValueHighInt64: valHighInt64,
+				ValType:        storage.AttrTypeInt64,
+			}, nextOffset + 24, nil
+
+		case filterUint64Marker:
+			op = op[1:]
+			if nextOffset+24 > len(data) {
+				return storage.FilterCondition{}, offset, errors.New("truncated 64-bit uint filter values")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+			valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+			valUint64 := binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16])
+			valHighUint64 := binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24])
+			return storage.FilterCondition{
+				Field:           field,
+				Operator:        op,
+				Value:           val,
+				ValueHigh:       valHigh,
+				Value64:         float64(valUint64),
+				ValueHigh64:     float64(valHighUint64),
+				HasFloat64:      true,
+				ValueUint64:     valUint64,
+				ValueHighUint64: valHighUint64,
+				ValType:         storage.AttrTypeUint64,
+			}, nextOffset + 24, nil
+
+		case filterFloat64Marker:
+			op = op[1:]
+			if nextOffset+24 > len(data) {
+				return storage.FilterCondition{}, offset, errors.New("truncated 64-bit filter values")
+			}
+			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
+			valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
+			val64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16]))
+			valHigh64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24]))
+			return storage.FilterCondition{
+				Field:       field,
+				Operator:    op,
+				Value:       val,
+				ValueHigh:   valHigh,
+				Value64:     val64,
+				ValueHigh64: valHigh64,
+				HasFloat64:  true,
+				ValType:     storage.AttrTypeFloat64,
+			}, nextOffset + 24, nil
 		}
-		val := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
-		valHigh := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset+4 : nextOffset+8]))
-		val64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+8 : nextOffset+16]))
-		valHigh64 := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset+16 : nextOffset+24]))
-		return storage.FilterCondition{
-			Field:       field,
-			Operator:    op,
-			Value:       val,
-			ValueHigh:   valHigh,
-			Value64:     val64,
-			ValueHigh64: valHigh64,
-			HasFloat64:  true,
-		}, nextOffset + 24, nil
 	}
 	if nextOffset+8 > len(data) {
 		return storage.FilterCondition{}, offset, errors.New("truncated filter values")
@@ -1061,6 +1239,7 @@ func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int,
 		Operator:  op,
 		Value:     val,
 		ValueHigh: valHigh,
+		ValType:   storage.AttrTypeFloat32,
 	}, nextOffset + 8, nil
 }
 
@@ -1362,14 +1541,49 @@ func EncodeListResponse(resp ListResponse) []byte {
 	for _, item := range resp.Items {
 		buf = appendString(buf, item.Name)
 		buf = append(buf, item.Operation)
-		var countBytes [2]byte
-		binary.LittleEndian.PutUint16(countBytes[:], uint16(len(item.Props)))
-		buf = append(buf, countBytes[:]...)
-		for k, v := range item.Props {
-			buf = appendString(buf, k)
-			var valBytes [4]byte
-			binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
-			buf = append(buf, valBytes[:]...)
+		if len(item.Attrs) > 0 {
+			attrSlice := item.Attrs
+			if len(attrSlice) > storage.MaxAttrCount {
+				attrSlice = attrSlice[:storage.MaxAttrCount]
+			}
+			var countBytes [2]byte
+			binary.LittleEndian.PutUint16(countBytes[:], storage.RawTypedFlag|uint16(len(attrSlice)))
+			buf = append(buf, countBytes[:]...)
+			for _, attr := range attrSlice {
+				buf = appendString(buf, attr.Key)
+				buf = append(buf, byte(attr.Type))
+				var valBytes [8]byte
+				switch attr.Type {
+				case storage.AttrTypeFloat64:
+					binary.LittleEndian.PutUint64(valBytes[:], math.Float64bits(attr.Float64()))
+				case storage.AttrTypeInt64:
+					binary.LittleEndian.PutUint64(valBytes[:], uint64(attr.Int64()))
+				case storage.AttrTypeUint64:
+					binary.LittleEndian.PutUint64(valBytes[:], attr.Uint64())
+				default:
+					binary.LittleEndian.PutUint32(valBytes[:4], math.Float32bits(attr.Value))
+				}
+				buf = append(buf, valBytes[:]...)
+			}
+		} else {
+			propCount := len(item.Props)
+			if propCount > storage.MaxAttrCount {
+				propCount = storage.MaxAttrCount
+			}
+			var countBytes [2]byte
+			binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
+			buf = append(buf, countBytes[:]...)
+			written := 0
+			for k, v := range item.Props {
+				if written >= propCount {
+					break
+				}
+				buf = appendString(buf, k)
+				var valBytes [4]byte
+				binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
+				buf = append(buf, valBytes[:]...)
+				written++
+			}
 		}
 	}
 	return buf
@@ -1387,6 +1601,11 @@ func DecodeListResponse(data []byte) (ListResponse, error) {
 	itemCount := int(binary.LittleEndian.Uint32(data[5:9]))
 	offset := 9
 
+	// Each item requires at least 5 bytes on the wire (2B name length + 1B op + 2B rawCount).
+	if itemCount < 0 || itemCount > (len(data)-offset)/5 {
+		return ListResponse{}, errors.New("truncated list response items")
+	}
+
 	resp.Items = make([]storage.EntityRecord, 0, itemCount)
 	for i := 0; i < itemCount; i++ {
 		name, nextOffset, err := readString(data, offset)
@@ -1397,28 +1616,92 @@ func DecodeListResponse(data []byte) (ListResponse, error) {
 			return ListResponse{}, errors.New("truncated item header")
 		}
 		op := data[nextOffset]
-		propCount := int(binary.LittleEndian.Uint16(data[nextOffset+1 : nextOffset+3]))
+		rawCount := binary.LittleEndian.Uint16(data[nextOffset+1 : nextOffset+3])
 		offset = nextOffset + 3
 
-		props := make(map[string]float32, propCount)
-		for p := 0; p < propCount; p++ {
-			k, nOffset, err := readString(data, offset)
-			if err != nil {
-				return ListResponse{}, err
+		if rawCount&storage.RawTypedFlag != 0 {
+			attrCount := int(rawCount & ^storage.RawTypedFlag)
+			if attrCount > storage.MaxAttrCount {
+				return ListResponse{}, errors.New("list item attribute count exceeds maximum allowed")
 			}
-			if nOffset+4 > len(data) {
+			// Each typed attribute requires at least 11 bytes (2B key length + 1B type + 8B value).
+			if len(data)-offset < attrCount*11 {
+				return ListResponse{}, errors.New("truncated typed property value")
+			}
+			attrs := make([]storage.AttrEntry, 0, attrCount)
+			props := make(map[string]float32, attrCount)
+			for p := 0; p < attrCount; p++ {
+				k, nOffset, err := readString(data, offset)
+				if err != nil {
+					return ListResponse{}, err
+				}
+				if nOffset+9 > len(data) {
+					return ListResponse{}, errors.New("truncated typed property value")
+				}
+				attrType := storage.AttrType(data[nOffset])
+				rawVal := binary.LittleEndian.Uint64(data[nOffset+1 : nOffset+9])
+				offset = nOffset + 9
+
+				var entry storage.AttrEntry
+				switch attrType {
+				case storage.AttrTypeFloat32:
+					f32 := math.Float32frombits(uint32(rawVal))
+					entry = storage.NewFloat32Attr(k, f32)
+					props[k] = f32
+				case storage.AttrTypeFloat64:
+					f64 := math.Float64frombits(rawVal)
+					entry = storage.NewFloat64Attr(k, f64)
+					props[k] = float32(f64)
+				case storage.AttrTypeInt64:
+					i64 := int64(rawVal)
+					entry = storage.NewInt64Attr(k, i64)
+					props[k] = float32(i64)
+				case storage.AttrTypeUint64:
+					u64 := rawVal
+					entry = storage.NewUint64Attr(k, u64)
+					props[k] = float32(u64)
+				default:
+					return ListResponse{}, fmt.Errorf("invalid attribute type %d", attrType)
+				}
+				attrs = append(attrs, entry)
+			}
+			resp.Items = append(resp.Items, storage.EntityRecord{
+				Name:      name,
+				Operation: op,
+				Props:     props,
+				Attrs:     attrs,
+			})
+		} else {
+			propCount := int(rawCount)
+			if propCount > storage.MaxAttrCount {
+				return ListResponse{}, errors.New("list item attribute count exceeds maximum allowed")
+			}
+			// Each untyped attribute requires at least 6 bytes (2B key length + 4B value).
+			if len(data)-offset < propCount*6 {
 				return ListResponse{}, errors.New("truncated property float value")
 			}
-			val := math.Float32frombits(binary.LittleEndian.Uint32(data[nOffset : nOffset+4]))
-			props[k] = val
-			offset = nOffset + 4
+			props := make(map[string]float32, propCount)
+			attrs := make([]storage.AttrEntry, 0, propCount)
+			for p := 0; p < propCount; p++ {
+				k, nOffset, err := readString(data, offset)
+				if err != nil {
+					return ListResponse{}, err
+				}
+				if nOffset+4 > len(data) {
+					return ListResponse{}, errors.New("truncated property float value")
+				}
+				val := math.Float32frombits(binary.LittleEndian.Uint32(data[nOffset : nOffset+4]))
+				props[k] = val
+				attrs = append(attrs, storage.NewFloat32Attr(k, val))
+				offset = nOffset + 4
+			}
+			resp.Items = append(resp.Items, storage.EntityRecord{
+				Name:      name,
+				Operation: op,
+				Props:     props,
+				Attrs:     attrs,
+			})
 		}
-
-		resp.Items = append(resp.Items, storage.EntityRecord{
-			Name:      name,
-			Operation: op,
-			Props:     props,
-		})
 	}
 
 	return resp, nil
@@ -1973,8 +2256,9 @@ type PartitionInspectWireRequest struct {
 
 // PartitionRecordWireItem holds a record in an inspected partition.
 type PartitionRecordWireItem struct {
-	Name  string             `json:"name"`
-	Props map[string]float32 `json:"props"`
+	Name  string              `json:"name"`
+	Props map[string]float32  `json:"props"`
+	Attrs []storage.AttrEntry `json:"attrs,omitempty"`
 }
 
 // PartitionInspectWireResponse represents result of OpPartitionInspect.
@@ -1982,6 +2266,7 @@ type PartitionInspectWireResponse struct {
 	PartitionFile string                    `json:"partition_file"`
 	RecordName    string                    `json:"record_name,omitempty"`
 	Props         map[string]float32        `json:"props,omitempty"`
+	Attrs         []storage.AttrEntry       `json:"attrs,omitempty"`
 	Records       []PartitionRecordWireItem `json:"records,omitempty"`
 }
 

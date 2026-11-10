@@ -211,8 +211,8 @@ func main() {
 	// 1. Declare Model Schema Contract
 	// AnchorDB enforces strict data contracts per model to prevent drift and corruption.
 	schema := driver.Schema{
-		"distance":  "float", // Required float32 metric
-		"duration":  "float", // Required float32 metric
+		"distance":  "float", // Required float metric
+		"duration":  "float", // Required float metric
 		"sensor_id": "int?",  // Optional integer attribute (trailing ?)
 		"is_active": "bool?", // Optional boolean flag
 	}
@@ -266,8 +266,8 @@ AnchorDB enforces strict schema immutability per model database to guarantee typ
 ```go
 // Define schema contract: required types and optional (?) fields
 sensorSchema := driver.Schema{
-	"voltage":    "float", // Required float32
-	"current":    "float", // Required float32
+	"voltage":    "float", // Required float
+	"current":    "float", // Required float
 	"status":     "int",   // Required integer
 	"is_active":  "bool?", // Optional boolean
 	"calibrated": "date?", // Optional calendar date (epoch day)
@@ -311,7 +311,7 @@ for _, item := range result.Items {
 
 ### 4. Date Arithmetic
 
-Date values are stored as float32 Epoch Days (days since Unix epoch).
+Date values are stored as Epoch Days (days since Unix epoch). The legacy `map[string]float32` API below stores them as `float32`; typed writes store them as exact `int64`.
 
 ```go
 // Store date
@@ -462,7 +462,7 @@ Settings can be specified through command-line flags or environment variables:
 AnchorDB is engineered for high throughput, sub-microsecond in-storage math, 2D spatial indexing, and directed causal reasoning. It is designed with clear architectural trade-offs:
 
 1. **Not a Relational SQL Database**: AnchorDB enforces the **One Model = One File** model. Each model maintains its own immutable schema contract, and there are no relational SQL tables, cross-model relational `JOIN` operations, or dynamic migrations.
-2. **Computational Property Storage**: Attribute values are stored as contiguous `float32` scalar primitives (`float`, `int`, `bool`, `date`). Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
+2. **Computational Property Storage**: Attribute values are flat numeric scalars stored as `float32`, `int64`, `uint64`, or `float64` (schema types `float`, `float32`, `float64`, `int`, `uint`, `bool`, `date`). The legacy `map[string]float32` APIs are exact only for integers up to 16,777,216; use the typed APIs (`SaveTyped`, `GetInt`, `GetUint`, `GetFloat64`) for exact 64-bit values. Integer arithmetic in storage returns `ErrIntegerOverflow` instead of wrapping. Complex nested document trees (arbitrary nested JSON hierarchies) are intentionally not supported to preserve zero-copy memory-mapped speed and predictable memory layouts.
 3. **Engine-Encapsulated Storage**: Direct access to `.anchordb` files is strictly unsupported. All reads and writes must pass through the Engine (AnchorWire server or embedded in-process engine) to guarantee WAL recovery, single-writer file locking (`flock`), lifecycle state tracking, and background synchronization.
 4. **Advisory Single-Writer Locking**: Each model file supports concurrent reads and serialized writes managed by the engine. Two separate processes cannot write directly to the same model file concurrently.
 5. **Geometry & Spherical Navigation**: 2D geofencing operates on planar coordinates. Great-circle distance calculation (`HaversineDistanceKM`) uses the mean spherical Earth radius (R = 6371.0 km), which is computationally efficient for high-frequency geofencing and proximity filtering without the latency overhead of ellipsoidal geodesic algorithms.

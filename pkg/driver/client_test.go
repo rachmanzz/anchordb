@@ -203,6 +203,12 @@ func TestDriver_PartitionInspection(t *testing.T) {
 	}
 	_, _ = pdb.SaveRecordWithIDAndOp("archive_sensor_1", storage.OpStatusActive, map[string]float32{"humidity": 45.0})
 	_, _ = pdb.SaveRecordWithIDAndOp("archive_sensor_2", storage.OpStatusActive, map[string]float32{"humidity": 55.0})
+	exactViews := int64(9007199254740993)
+	preciseScore := 98.76543210123
+	_, _ = pdb.SaveRecordTypedWithIDAndOp("archive_sensor_3", storage.OpStatusActive, []storage.AttrEntry{
+		storage.NewInt64Attr("views", exactViews),
+		storage.NewFloat64Attr("score", preciseScore),
+	})
 	_ = pdb.Sync()
 	_ = pdb.Close()
 
@@ -240,13 +246,32 @@ func TestDriver_PartitionInspection(t *testing.T) {
 		t.Errorf("expected humidity=55.0, got %f", rec.Get("humidity"))
 	}
 
-	// 4. InspectPartition listing records
+	// 4. InspectPartition single record with exact 64-bit attributes
+	res3, err := client.InspectPartition(ctx, "sensors_2026_05.anchordb", "archive_sensor_3", 0)
+	if err != nil {
+		t.Fatalf("InspectPartition typed record failed: %v", err)
+	}
+	if len(res3.Attrs) != 2 {
+		t.Fatalf("expected 2 Attrs in res3, got %d", len(res3.Attrs))
+	}
+	rec3, err := client.InspectPartitionRecord(ctx, "sensors_2026_05.anchordb", "archive_sensor_3")
+	if err != nil {
+		t.Fatalf("InspectPartitionRecord typed failed: %v", err)
+	}
+	if v := rec3.GetInt("views"); v != exactViews {
+		t.Fatalf("expected views %d, got %d", exactViews, v)
+	}
+	if f := rec3.GetFloat64("score"); f != preciseScore {
+		t.Fatalf("expected score %f, got %f", preciseScore, f)
+	}
+
+	// 5. InspectPartition listing records
 	listRes, err := client.InspectPartition(ctx, "sensors_2026_05.anchordb", "", 10)
 	if err != nil {
 		t.Fatalf("InspectPartition list failed: %v", err)
 	}
-	if len(listRes.Records) != 2 {
-		t.Errorf("expected 2 records in partition, got %d", len(listRes.Records))
+	if len(listRes.Records) != 3 {
+		t.Errorf("expected 3 records in partition, got %d", len(listRes.Records))
 	}
 }
 
@@ -390,5 +415,108 @@ func TestDriver_SaveAndGetTyped(t *testing.T) {
 	u, ok := cr.GetUint("uid")
 	if !ok || u != exactUID {
 		t.Fatalf("expected exact uid %d, got %d (ok=%v)", exactUID, u, ok)
+	}
+}
+
+func TestDriver_ListAndWhereTyped(t *testing.T) {
+	dataDir := t.TempDir()
+	client, err := OpenEmbedded(dataDir)
+	if err != nil {
+		t.Fatalf("OpenEmbedded failed: %v", err)
+	}
+	defer client.Close()
+
+	exactViews := int64(9007199254740993)
+	exactUID := uint64(18446744073709551614)
+	preciseFloat := 123456.789012345
+
+	attrs := []AttrEntry{
+		NewInt64Attr("views", exactViews),
+		NewUint64Attr("uid", exactUID),
+		NewFloat64Attr("score", preciseFloat),
+	}
+
+	_, err = client.SaveTyped("product_parity", attrs)
+	if err != nil {
+		t.Fatalf("SaveTyped failed: %v", err)
+	}
+
+	// 1. Where with exact int64 (> 2^53)
+	ctx := context.Background()
+	res, err := client.List().Where("views", "=", exactViews).Execute(ctx)
+	if err != nil {
+		t.Fatalf("List with Where failed: %v", err)
+	}
+	if len(res.Items) != 1 || res.Items[0].Name != "product_parity" {
+		t.Fatalf("unexpected items: %+v", res.Items)
+	}
+	item := res.Items[0]
+	if item.GetInt("views") != exactViews {
+		t.Fatalf("expected views %d, got %d", exactViews, item.GetInt("views"))
+	}
+	if item.GetUint("uid") != exactUID {
+		t.Fatalf("expected uid %d, got %d", exactUID, item.GetUint("uid"))
+	}
+	if item.GetFloat64("score") != preciseFloat {
+		t.Fatalf("expected score %f, got %f", preciseFloat, item.GetFloat64("score"))
+	}
+
+	// 2. Client Get typed getters
+	getRes, err := client.Get("product_parity").Execute(ctx)
+	if err != nil {
+		t.Fatalf("client.Get failed: %v", err)
+	}
+	if getRes.GetInt("views") != exactViews {
+		t.Fatalf("expected getRes views %d, got %d", exactViews, getRes.GetInt("views"))
+	}
+	if getRes.GetFloat64("score") != preciseFloat {
+		t.Fatalf("expected getRes score %f, got %f", preciseFloat, getRes.GetFloat64("score"))
+	}
+}
+
+func TestDriver_64BitOperators(t *testing.T) {
+	opAddInt := AddInt("count", 9007199254740993)
+	if opAdd, ok := opAddInt.(storage.OpAdd); !ok || opAdd.FieldB != "9007199254740993" {
+		t.Fatalf("unexpected AddInt op: %+v", opAddInt)
+	}
+
+	opSubInt := SubtractInt("count", 42)
+	if opSub, ok := opSubInt.(storage.OpSubtract); !ok || opSub.FieldB != "42" {
+		t.Fatalf("unexpected SubtractInt op: %+v", opSubInt)
+	}
+
+	opAddF64 := AddFloat64("score", 123.456789012345)
+	if opAdd, ok := opAddF64.(storage.OpAdd); !ok || opAdd.FieldB != "123.456789012345" {
+		t.Fatalf("unexpected AddFloat64 op: %+v", opAddF64)
+	}
+
+	opSubF64 := SubtractFloat64("score", 0.5)
+	if opSub, ok := opSubF64.(storage.OpSubtract); !ok || opSub.FieldB != "0.5" {
+		t.Fatalf("unexpected SubtractFloat64 op: %+v", opSubF64)
+	}
+
+	opMulF64 := MultiplyFloat64("score", 2.5)
+	if opMul, ok := opMulF64.(storage.OpMultiply); !ok || opMul.FieldB != "2.5" {
+		t.Fatalf("unexpected MultiplyFloat64 op: %+v", opMulF64)
+	}
+
+	opDivF64 := DivideFloat64("score", 2.0)
+	if opDiv, ok := opDivF64.(storage.OpDivide); !ok || opDiv.FieldB != "2" {
+		t.Fatalf("unexpected DivideFloat64 op: %+v", opDivF64)
+	}
+
+	opValInt := ValueInt(-9007199254740993)
+	if opAssign, ok := opValInt.(storage.OpAssign); !ok || opAssign.Value != "-9007199254740993" {
+		t.Fatalf("unexpected ValueInt op: %+v", opValInt)
+	}
+
+	opValUint := ValueUint(18446744073709551615)
+	if opAssign, ok := opValUint.(storage.OpAssign); !ok || opAssign.Value != "18446744073709551615" {
+		t.Fatalf("unexpected ValueUint op: %+v", opValUint)
+	}
+
+	opValF64 := ValueFloat64(123456.789012345)
+	if opAssign, ok := opValF64.(storage.OpAssign); !ok || opAssign.Value != "123456.789012345" {
+		t.Fatalf("unexpected ValueFloat64 op: %+v", opValF64)
 	}
 }

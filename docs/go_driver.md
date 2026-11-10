@@ -102,16 +102,16 @@ Schemas are defined using `driver.Schema` (a mapping of field names to type stri
 
 ```go
 schema := driver.Schema{
-    "voltage":     "float", // Required float32
-    "current":     "float", // Required float32
-    "status":      "int",   // Required integer
+    "voltage":     "float", // Required float (float32 or float64 as written)
+    "current":     "float", // Required float (float32 or float64 as written)
+    "status":      "int",   // Required integer (exact int64 via typed writes)
     "is_active":   "bool?", // Optional boolean (trailing ?)
-    "calibrated":  "date?", // Optional calendar date (epoch day)
+    "calibrated":  "date?", // Optional calendar date (integer epoch day via typed writes)
 }
 ```
 
 #### Supported Field Types & Modifiers:
-- **Primitives**: `int`, `float`, `bool`, `date` (YYYY-MM-DD epoch day)
+- **Primitives**: `int`, `uint`, `float`, `float32`, `float64`, `bool`, `date` (YYYY-MM-DD; integer epoch day via typed writes). `float` accepts `float32` or `float64` as written; legacy `float32`-only APIs stay exact only up to 16,777,216.
 - **Required (Default)**: Omission of `?` makes the field strictly mandatory during writes.
 - **Optional (`?`)**: Suffix `?` marks the field as optional.
 
@@ -347,6 +347,6 @@ Additionally, records pruned from the active database during partition archival 
 ## 13. Design Boundaries & Limitations
 
 1. **One Model = One File**: Each named model (`sensors`, `telemetry`) is an isolated binary file with its own lock and WAL. AnchorDB does not support cross-model relational JOINs.
-2. **Numeric Property Vectors**: Record attributes are optimized for computational floating-point metrics (`float32`) and Epoch Days dates (`MustDate("YYYY-MM-DD")`).
+2. **Numeric Property Vectors**: Record attributes use four physical numeric types (`float32`, `int64`, `uint64`, `float64`); Epoch Days dates use integer epoch days via typed writes (`MustDate("YYYY-MM-DD")` remains the legacy `float32` helper). Exactness requires the typed APIs (see the Precision Boundary in `docs/model_schema_specification.md`).
 3. **Engine-Only Invariant Access**: Never attempt to open, copy, or mutate an active `.anchordb` file outside the engine. Access data via `driver.ConnectWire(...)` or `driver.OpenEmbedded(...)`.
 
