@@ -503,3 +503,9 @@ See [Benchmark & Verification Guide](docs/benchmark_and_verification.md) for ind
 ## License
 
 AnchorDB is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+---
+
+## AI Assistance
+
+This product is built and maintained with AI assistance, developed carefully: every change passes automated checks (`gofmt`, `go vet`, `golangci-lint`) and the `go test -race` suite, and behavior is verified by tests rather than assumed. AI output can still be wrong, so please review the code and run the verification suite yourself before trusting it in production.
