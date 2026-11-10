@@ -177,8 +177,56 @@ filteredStats, err := db.ComputeStatsWithOptions(opts)
 ### 5.4 Performance Characteristics
 
 * **Time Complexity**: O(N) where N is the number of active entities in the model.
-* **Space Complexity**: O(1) auxiliary heap allocation. The accumulators (`count`, `sum`, `min`, `max`, `m`, `s`) reside on the stack.
-* **Benchmark Profile**: Evaluates 100,000 entities in ~7.8 ms with **0 B/op** and **0 allocs/op**, without spawning background goroutines or acquiring long-lived write locks.
+* **Space Complexity**: O(1) auxiliary heap allocation for the base aggregates. The accumulators (`count`, `sum`, `min`, `max`, `m`, `s`) reside on the stack.
+* **Benchmark Profile** (measured 2026-11-10, i7-1165G7, 100k entities): base stats ~15–20 ms/op; with P50+P90+P99 ~33–35 ms/op (≈3 extra selection passes) and one materialized value slice (~800 KB, ±25 growth allocs). Without requested percentiles the slice is never allocated.
+
+### 5.5 Percentiles (`StatsOptions.Percentiles`, `P50`/`P90`/`P99`)
+
+```go
+stats, err := db.ComputeStatsWithOptions(storage.StatsOptions{
+    Field: "temperature",
+    Percentiles: []float64{0.5, 0.9, 0.99}, // the only supported quantiles
+})
+fmt.Printf("P50: %.2f, P90: %.2f, P99: %.2f\n", stats.P50, stats.P90, stats.P99)
+```
+
+Quantiles resolve by Introselect (average O(N), worst case O(N log N)) under the locked nearest-rank definition `k = ceil(p*N)-1`. Only `0.5`, `0.9`, `0.99` are published; anything else (or values outside `[0, 1]`) is rejected before any O(N) work. NaN values are excluded from the percentile population (legacy `Sum`/`Mean` keep their existing NaN behavior). Unrequested quantiles stay zero and cost nothing. Selection runs in `float64` image space, which is order-faithful but cannot split integers that round to the same `float64` (same boundary as `Min64`).
+
+### 5.6 Histogram (`ComputeHistogram`, `HistogramResult`)
+
+```go
+h, err := db.ComputeHistogramWithOptions(storage.HistogramOptions{
+    Field: "temperature",
+    Bins:  20,
+    Filters: []storage.FilterCondition{
+        {Field: "status", Operator: "==", Value: 1.0},
+    },
+})
+// h.Bins has len == Bins, h.Edges has len == Bins+1, sum(h.Bins) == h.Count
+```
+
+Two passes: min/max comes from the same `ComputeStatsWithOptions` path (identical population semantics, including filters), then values are binned linearly over `[Min, Max]`. The maximum value always lands in the last bin and the last edge equals Max exactly; float dust is clamped to the edge bins, never dropped. NaN values are excluded from both bins and `Count`, so `sum(Bins) == Count` always holds. A single-valued (or otherwise degenerate) range collapses to one bin holding the full count.
+
+### 5.7 Anomaly Filters (`FilterZScore`, `FilterIQROutlier`)
+
+```go
+// |x-μ|/σ > 3 with μ/σ from the same active population
+outliers, err := db.FilterZScore("temperature", 3.0)
+
+// Outside [Q1 - 1.5·IQR, Q3 + 1.5·IQR], quartiles by nearest rank
+fenced, err := db.FilterIQROutlier("temperature", 1.5)
+```
+
+Both run two read-only passes (statistics first, selection second) and return `[]storage.EntityRecord` (`Name`, `Operation`, `Props`, `Attrs`). A zero σ (constant column) or zero IQR yields an empty result, never an error; an empty population yields an empty result. Tombstoned records never match. Invalid configs (negative threshold, `k <= 0`, NaN, empty field) are rejected up front.
+
+### 5.8 Graph Degree Statistics and PageRank (`pkg/storage/edges.go`)
+
+```go
+deg, err := db.GraphDegreeStats(5) // Top-5 hubs by in-degree
+pr, err := db.PageRank(0.85, 1e-9, 1000, 5)
+```
+
+`GraphDegreeStats` aggregates in/out-degree distribution over live edges (tombstoned slots skipped) in one O(V+E) pass: node/edge counts, average degree, population variance (Welford over sorted node order), and Top-N hubs ranked by in-degree (ties by node name). `PageRank` runs power iteration with the given damping factor: dangling nodes redistribute their rank evenly so scores always sum to 1, convergence is declared when the L1 delta drops below tolerance, and repeated runs are bit-identical. Scores below the iteration budget return the best effort with `Converged=false` rather than an error.
 
 ---
 

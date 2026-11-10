@@ -11,6 +11,178 @@ import (
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
 
+func seedCausalGraph(t *testing.T, name string) *AnchorDB {
+	t.Helper()
+	db, err := Open(filepath.Join(t.TempDir(), name+".anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	edges := [][4]interface{}{
+		{"a", "causes", "hub", 1.0},
+		{"b", "causes", "hub", 1.0},
+		{"c", "causes", "hub", 1.0},
+		{"hub", "causes", "d", 1.0},
+	}
+	for _, e := range edges {
+		if err := db.AddEdge(e[0].(string), e[1].(string), e[2].(string), float32(e[3].(float64))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db
+}
+
+func referencePageRank(t *testing.T, edges [][2]string) map[string]float64 {
+	t.Helper()
+	nodes := map[string]bool{}
+	out := map[string][]string{}
+	for _, e := range edges {
+		nodes[e[0]] = true
+		nodes[e[1]] = true
+		out[e[0]] = append(out[e[0]], e[1])
+	}
+	n := float64(len(nodes))
+	rank := map[string]float64{}
+	for node := range nodes {
+		rank[node] = 1 / n
+	}
+	for it := 0; it < 10000; it++ {
+		var dangling float64
+		for node := range nodes {
+			if len(out[node]) == 0 {
+				dangling += rank[node]
+			}
+		}
+		next := map[string]float64{}
+		delta := 0.0
+		for node := range nodes {
+			s := (1-0.85)/n + 0.85*dangling/n
+			for src, tgts := range out {
+				for _, tgt := range tgts {
+					if tgt == node {
+						s += 0.85 * rank[src] / float64(len(tgts))
+					}
+				}
+			}
+			next[node] = s
+			delta += math.Abs(s - rank[node])
+		}
+		rank = next
+		if delta < 1e-12 {
+			break
+		}
+	}
+	return rank
+}
+
+func TestGraphDegreeStats(t *testing.T) {
+	db := seedCausalGraph(t, "deg")
+	stats, err := db.GraphDegreeStats(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes != 5 || stats.Edges != 4 {
+		t.Fatalf("expected 5 nodes 4 edges, got %+v", stats)
+	}
+	if stats.AvgDegree != 1.6 {
+		t.Fatalf("expected avg degree 1.6, got %v", stats.AvgDegree)
+	}
+	if len(stats.TopHubs) != 2 || stats.TopHubs[0].Node != "hub" || stats.TopHubs[0].Degree != 3 {
+		t.Fatalf("expected hub/3 on top, got %+v", stats.TopHubs)
+	}
+	if _, err := db.GraphDegreeStats(-1); err == nil {
+		t.Fatal("expected error for negative topK")
+	}
+}
+
+func TestPageRank(t *testing.T) {
+	db := seedCausalGraph(t, "pr")
+	res, err := db.PageRank(0.85, 1e-9, 1000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Converged {
+		t.Fatal("expected convergence on small graph")
+	}
+	var sum float64
+	for _, s := range res.Scores {
+		sum += s
+	}
+	if math.Abs(sum-1) > 1e-9 {
+		t.Fatalf("scores must sum to 1, got %v", sum)
+	}
+	ref := referencePageRank(t, [][2]string{{"a", "hub"}, {"b", "hub"}, {"c", "hub"}, {"hub", "d"}})
+	for node, want := range ref {
+		if math.Abs(res.Scores[node]-want) > 1e-9 {
+			t.Fatalf("node %s: got %v want %v", node, res.Scores[node], want)
+		}
+	}
+	// d outranks hub: hub passes all its concentrated rank to d, and dangling
+	// d redistributes only a fraction — verified against the reference above.
+	if len(res.Top) != 2 || res.Top[0].Node != "d" || res.Top[1].Node != "hub" {
+		t.Fatalf("expected [d hub] on top, got %+v", res.Top)
+	}
+
+	// Determinism: repeated runs are bit-identical.
+	res2, err := db.PageRank(0.85, 1e-9, 1000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for node, s := range res.Scores {
+		if res2.Scores[node] != s {
+			t.Fatalf("non-deterministic score for %s: %v vs %v", node, s, res2.Scores[node])
+		}
+	}
+
+	// Invalid parameters.
+	for _, tc := range []struct {
+		d, tol float64
+		maxIt  int
+		topK   int
+	}{
+		{0, 1e-9, 100, 1}, {1, 1e-9, 100, 1}, {math.NaN(), 1e-9, 100, 1},
+		{0.85, 0, 100, 1}, {0.85, math.NaN(), 100, 1}, {0.85, 1e-9, 0, 1}, {0.85, 1e-9, 100, -1},
+	} {
+		if _, err := db.PageRank(tc.d, tc.tol, tc.maxIt, tc.topK); err == nil {
+			t.Fatalf("expected error for %+v", tc)
+		}
+	}
+
+	// Empty graph: vacuous success.
+	dbe, err := Open(filepath.Join(t.TempDir(), "pr_empty.anchordb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbe.Close()
+	re, err := dbe.PageRank(0.85, 1e-9, 100, 1)
+	if err != nil || !re.Converged || len(re.Scores) != 0 {
+		t.Fatalf("empty graph must converge vacuously, got %+v %v", re, err)
+	}
+
+	// Tombstoned edges are excluded.
+	if err := db.RemoveEdge("c", "causes", "hub"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := db.GraphDegreeStats(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Edges != 3 || stats.TopHubs[0].Degree != 2 {
+		t.Fatalf("tombstoned edge must not count, got %+v", stats)
+	}
+
+	// Closed database rejected.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PageRank(0.85, 1e-9, 100, 1); !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("expected ErrDatabaseClosed, got %v", err)
+	}
+	if _, err := db.GraphDegreeStats(1); !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("expected ErrDatabaseClosed, got %v", err)
+	}
+}
+
 func TestEdgeAddQueryReplaceRemove(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "edges.anchordb"))
 	if err != nil {

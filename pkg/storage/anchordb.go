@@ -4490,6 +4490,12 @@ type StatsResult struct {
 	Mean     float64  `json:"mean"`
 	Variance float64  `json:"variance"`
 	StdDev   float64  `json:"std_dev"`
+	// P50/P90/P99 hold the requested quantiles (float64, consistent with Mean).
+	// They are populated only when StatsOptions.Percentiles asks for them;
+	// zero values otherwise carry no meaning.
+	P50 float64 `json:"p50,omitempty"`
+	P90 float64 `json:"p90,omitempty"`
+	P99 float64 `json:"p99,omitempty"`
 }
 
 // StatsOptions defines configuration and filters for single-pass in-storage statistical computations.
@@ -4498,6 +4504,9 @@ type StatsOptions struct {
 	Filters              []FilterCondition
 	IncludeAllOperations bool
 	AllowedOperations    []uint8
+	// Percentiles lists quantiles to compute (e.g. {0.50, 0.90, 0.99}).
+	// Empty means legacy behavior: no value materialization, no extra allocs.
+	Percentiles []float64
 }
 
 // ComputeStats calculates single-pass statistical aggregates (Count, Sum, Min, Max, Mean, Variance, StdDev)
@@ -4553,11 +4562,403 @@ func resolveStatsExtreme(haveInt bool, intCand int64, haveUint bool, uintCand ui
 	return AttrTypeFloat64
 }
 
+// ilog2 returns floor(log2(n)) for n >= 1.
+func ilog2(n int) int {
+	l := 0
+	for n >>= 1; n > 0; n >>= 1 {
+		l++
+	}
+	return l
+}
+
+// insertionSortFloat64 sorts vals in place; used for tiny partitions.
+func insertionSortFloat64(vals []float64) {
+	for i := 1; i < len(vals); i++ {
+		for j := i; j > 0 && vals[j] < vals[j-1]; j-- {
+			vals[j], vals[j-1] = vals[j-1], vals[j]
+		}
+	}
+}
+
+// siftDownFloat64 restores the max-heap rooted at root within [lo, hi).
+func siftDownFloat64(vals []float64, lo, root, hi int) {
+	for {
+		child := lo + 2*(root-lo) + 1
+		if child >= hi {
+			return
+		}
+		if child+1 < hi && vals[child] < vals[child+1] {
+			child++
+		}
+		if vals[root] >= vals[child] {
+			return
+		}
+		vals[root], vals[child] = vals[child], vals[root]
+		root = child
+	}
+}
+
+// heapSortFloat64 sorts vals[lo:hi] in place; the introselect fallback that
+// caps worst-case selection at O(N log N).
+func heapSortFloat64(vals []float64, lo, hi int) {
+	for i := (lo+hi)/2 - 1; i >= lo; i-- {
+		siftDownFloat64(vals, lo, i, hi)
+		if i == lo {
+			break
+		}
+	}
+	for end := hi - 1; end > lo; end-- {
+		vals[lo], vals[end] = vals[end], vals[lo]
+		siftDownFloat64(vals, lo, lo, end)
+	}
+}
+
+// partitionLomuto partitions vals[lo:hi] around vals[lo]: elements strictly
+// less than the pivot precede it. Returns the pivot's final index.
+func partitionLomuto(vals []float64, lo, hi int) int {
+	pivot := vals[lo]
+	i := lo
+	for j := lo + 1; j < hi; j++ {
+		if vals[j] < pivot {
+			i++
+			vals[i], vals[j] = vals[j], vals[i]
+		}
+	}
+	vals[lo], vals[i] = vals[i], vals[lo]
+	return i
+}
+
+// medianOfThree moves the median of vals[a], vals[b], vals[c] to vals[a].
+func medianOfThree(vals []float64, a, b, c int) {
+	if vals[a] > vals[b] {
+		vals[a], vals[b] = vals[b], vals[a]
+	}
+	if vals[b] > vals[c] {
+		vals[b], vals[c] = vals[c], vals[b]
+	}
+	if vals[a] > vals[b] {
+		vals[a], vals[b] = vals[b], vals[a]
+	}
+}
+
+// selectKthFloat64 returns the k-th smallest element (0-based) of vals,
+// reordering vals in place. Preconditions: len(vals) > 0, 0 <= k < len(vals),
+// and no NaN elements (NaN breaks partitioning order). Introselect: quickselect
+// with median-of-three pivots, falling back to heapsort when the recursion
+// depth budget is exhausted, so worst case stays O(N log N).
+func selectKthFloat64(vals []float64, k int) float64 {
+	lo, hi := 0, len(vals)
+	depth := 2 * (ilog2(len(vals)) + 1)
+	for {
+		if hi-lo <= 12 {
+			insertionSortFloat64(vals[lo:hi])
+			return vals[k]
+		}
+		if depth == 0 {
+			heapSortFloat64(vals, lo, hi)
+			return vals[k]
+		}
+		depth--
+		mid := lo + (hi-lo)/2
+		medianOfThree(vals, lo, mid, hi-1)
+		p := partitionLomuto(vals, lo, hi)
+		if k == p {
+			return vals[k]
+		}
+		if k < p {
+			hi = p
+		} else {
+			lo = p + 1
+		}
+	}
+}
+
+// quantileRank locks the nearest-rank definition used by ComputeStats:
+// k = ceil(p*N)-1 clamped to [0,N-1]. One definition, verified against a
+// sort-based reference, never re-debated per caller.
+func quantileRank(p float64, n int) int {
+	k := int(math.Ceil(p*float64(n))) - 1
+	if k < 0 {
+		return 0
+	}
+	if k > n-1 {
+		return n - 1
+	}
+	return k
+}
+
+// validatePercentiles rejects unusable quantile requests before any O(N) work.
+func validatePercentiles(ps []float64) error {
+	for _, p := range ps {
+		if math.IsNaN(p) || p < 0 || p > 1 {
+			return fmt.Errorf("invalid percentile %v: must be within [0, 1]", p)
+		}
+		switch p {
+		case 0.5, 0.9, 0.99:
+		default:
+			return fmt.Errorf("unsupported percentile %v: published quantiles are 0.5, 0.9, 0.99", p)
+		}
+	}
+	return nil
+}
+
+// HistogramOptions mirrors the population semantics of StatsOptions for
+// ComputeHistogramWithOptions: the same records are binned.
+type HistogramOptions struct {
+	Field                string
+	Bins                 int
+	Filters              []FilterCondition
+	IncludeAllOperations bool
+	AllowedOperations    []uint8
+}
+
+// HistogramResult is a linear K-bin frequency distribution over [Min, Max].
+// Edges has len(Bins)+1 entries; the last edge equals Max exactly. Values
+// that would fall outside due to float64 rounding are clamped to the edge
+// bins, never dropped. NaN values are excluded from both bins and Count.
+type HistogramResult struct {
+	Field string    `json:"field"`
+	Count uint64    `json:"count"`
+	Bins  []uint32  `json:"bins"`
+	Edges []float64 `json:"edges"`
+}
+
+// ComputeHistogram builds a K-bin linear histogram for a numeric field.
+func (db *AnchorDB) ComputeHistogram(field string, bins int) (HistogramResult, error) {
+	return db.ComputeHistogramWithOptions(HistogramOptions{Field: field, Bins: bins})
+}
+
+// ComputeHistogramWithOptions builds a K-bin linear histogram with custom
+// population filters. Two passes: min/max via ComputeStatsWithOptions (exact
+// same population semantics), then binning. O(N) time, O(bins) memory.
+func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (HistogramResult, error) {
+	if opts.Field == "" {
+		return HistogramResult{}, fmt.Errorf("field must not be empty")
+	}
+	if opts.Bins < 1 {
+		return HistogramResult{Field: opts.Field}, fmt.Errorf("bins must be at least 1, got %d", opts.Bins)
+	}
+
+	// Pass 1: range from the shared stats path (same population semantics).
+	st, err := db.ComputeStatsWithOptions(StatsOptions{
+		Field:                opts.Field,
+		Filters:              opts.Filters,
+		IncludeAllOperations: opts.IncludeAllOperations,
+		AllowedOperations:    opts.AllowedOperations,
+	})
+	if err != nil {
+		return HistogramResult{Field: opts.Field}, err
+	}
+	if st.Count == 0 {
+		return HistogramResult{Field: opts.Field}, nil
+	}
+	lo, hi := st.Min64, st.Max64
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return HistogramResult{}, ErrDatabaseClosed
+	}
+
+	// Degenerate range (single value, or nothing binnable such as all-NaN):
+	// one bin holding the binned count, or empty when nothing binned.
+	if !(hi > lo) {
+		var n uint64
+		for i := 0; i < len(db.EntityOrder); i++ {
+			cr := db.EntityStore[db.EntityOrder[i]]
+			if !matchHistogramRecord(cr, opts) {
+				continue
+			}
+			if v, ok := cr.GetTyped(opts.Field); ok && !math.IsNaN(v.Float64()) {
+				n++
+			}
+		}
+		if n == 0 {
+			return HistogramResult{Field: opts.Field}, nil
+		}
+		return HistogramResult{Field: opts.Field, Count: n, Bins: []uint32{uint32(n)}, Edges: []float64{lo, hi}}, nil
+	}
+
+	width := (hi - lo) / float64(opts.Bins)
+	counts := make([]uint32, opts.Bins)
+	edges := make([]float64, opts.Bins+1)
+	for i := range edges {
+		edges[i] = lo + float64(i)*width
+	}
+	edges[opts.Bins] = hi // exact upper bound, not lo+bins*width rounding
+	var n uint64
+	for i := 0; i < len(db.EntityOrder); i++ {
+		cr := db.EntityStore[db.EntityOrder[i]]
+		if !matchHistogramRecord(cr, opts) {
+			continue
+		}
+		attr, ok := cr.GetTyped(opts.Field)
+		if !ok {
+			continue
+		}
+		v := attr.Float64()
+		if math.IsNaN(v) {
+			continue
+		}
+		idx := int((v - lo) / width)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= opts.Bins {
+			idx = opts.Bins - 1 // Max and float dust land in the last bin
+		}
+		counts[idx]++
+		n++
+	}
+	if n == 0 {
+		return HistogramResult{Field: opts.Field}, nil
+	}
+	return HistogramResult{Field: opts.Field, Count: n, Bins: counts, Edges: edges}, nil
+}
+
+// matchHistogramRecord mirrors the population filter of ComputeStatsWithOptions
+// (operation gate + attribute filters) so both passes bin the same records.
+func matchHistogramRecord(cr CompactRecord, opts HistogramOptions) bool {
+	if len(opts.AllowedOperations) > 0 {
+		matched := false
+		for _, allowed := range opts.AllowedOperations {
+			if cr.Operation == allowed {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	} else if !opts.IncludeAllOperations {
+		if cr.Operation != OpStatusActive {
+			return false
+		}
+	}
+	if len(opts.Filters) > 0 {
+		for _, f := range opts.Filters {
+			if !cr.MatchesFilter(f) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// FilterZScore returns active records whose field value is a z-score outlier:
+// |x-μ|/σ > threshold, with μ/σ computed from the same population in a first
+// pass. A zero σ (constant column) yields no outliers; an empty population
+// yields an empty result. NaN values never match.
+func (db *AnchorDB) FilterZScore(field string, threshold float64) ([]EntityRecord, error) {
+	if field == "" {
+		return nil, fmt.Errorf("field must not be empty")
+	}
+	if math.IsNaN(threshold) || threshold < 0 {
+		return nil, fmt.Errorf("invalid z-score threshold %v: must be non-negative", threshold)
+	}
+	st, err := db.ComputeStatsWithOptions(StatsOptions{Field: field})
+	if err != nil {
+		return nil, err
+	}
+	if st.Count == 0 || st.StdDev == 0 {
+		return nil, nil
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	var out []EntityRecord
+	for i := 0; i < len(db.EntityOrder); i++ {
+		name := db.EntityOrder[i]
+		cr := db.EntityStore[name]
+		if cr.Operation != OpStatusActive {
+			continue
+		}
+		attr, ok := cr.GetTyped(field)
+		if !ok {
+			continue
+		}
+		v := attr.Float64()
+		if math.IsNaN(v) {
+			continue
+		}
+		if math.Abs(v-st.Mean)/st.StdDev > threshold {
+			out = append(out, EntityRecord{Name: name, Operation: cr.Operation, Props: cr.ToMap(), Attrs: cr.ExpandAttrs()})
+		}
+	}
+	return out, nil
+}
+
+// FilterIQROutlier returns active records outside the Tukey fences built from
+// the same population: [Q1-k·IQR, Q3+k·IQR] with IQR = Q3-Q1. Quartiles use
+// the locked nearest-rank definition (quantileRank). A zero IQR yields no
+// outliers; an empty population yields an empty result.
+func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, error) {
+	if field == "" {
+		return nil, fmt.Errorf("field must not be empty")
+	}
+	if math.IsNaN(k) || k <= 0 {
+		return nil, fmt.Errorf("invalid IQR multiplier %v: must be positive", k)
+	}
+	st, err := db.ComputeStatsWithOptions(StatsOptions{Field: field})
+	if err != nil {
+		return nil, err
+	}
+	if st.Count == 0 {
+		return nil, nil
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	var vals []float64
+	var names []string
+	for i := 0; i < len(db.EntityOrder); i++ {
+		name := db.EntityOrder[i]
+		cr := db.EntityStore[name]
+		if cr.Operation != OpStatusActive {
+			continue
+		}
+		attr, ok := cr.GetTyped(field)
+		if !ok {
+			continue
+		}
+		if v := attr.Float64(); !math.IsNaN(v) {
+			vals = append(vals, v)
+			names = append(names, name)
+		}
+	}
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	q1 := selectKthFloat64(vals, quantileRank(0.25, len(vals)))
+	q3 := selectKthFloat64(vals, quantileRank(0.75, len(vals)))
+	iqr := q3 - q1
+	if iqr == 0 {
+		return nil, nil
+	}
+	lo, hi := q1-k*iqr, q3+k*iqr
+	var out []EntityRecord
+	for i, v := range vals {
+		if v < lo || v > hi {
+			cr := db.EntityStore[names[i]]
+			out = append(out, EntityRecord{Name: names[i], Operation: cr.Operation, Props: cr.ToMap(), Attrs: cr.ExpandAttrs()})
+		}
+	}
+	return out, nil
+}
+
 // ComputeStatsWithOptions calculates single-pass statistical aggregates with custom filters using Welford's algorithm.
 func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, error) {
 	if opts.Field == "" {
 		return StatsResult{}, fmt.Errorf("field must not be empty")
 	}
+	if err := validatePercentiles(opts.Percentiles); err != nil {
+		return StatsResult{Field: opts.Field}, err
+	}
+	wantPct := len(opts.Percentiles) > 0
 
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -4585,6 +4986,9 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 	var minI, maxI int64
 	var minU, maxU uint64
 	var minF, maxF float64
+	// Percentile values materialize only on request; without Percentiles this
+	// stays nil and the loop below allocates nothing extra.
+	var pctVals []float64
 	var m float64 // Mean accumulator
 	var s float64 // M2 sum-of-squares accumulator in Welford's algorithm
 
@@ -4653,6 +5057,12 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 		val64 := attr.Float64()
 		sum += val64
 
+		// NaN never enters the percentile population (it would break
+		// partitioning order); legacy sum/mean keep their existing behavior.
+		if wantPct && !math.IsNaN(val64) {
+			pctVals = append(pctVals, val64)
+		}
+
 		switch attr.Type {
 		case AttrTypeFloat32, AttrTypeFloat64:
 			if !seenFloat || val64 < minF {
@@ -4702,6 +5112,24 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 	if seenFloat {
 		floatMin, floatMax = minF, maxF
 	}
+
+	// Quantiles resolve in float64 image space (order-faithful: float64()
+	// is monotonic, so ranks match the true order; values rounding to the
+	// same float64 are indistinguishable by construction, like Min64).
+	var p50, p90, p99 float64
+	if wantPct && len(pctVals) > 0 {
+		for _, p := range opts.Percentiles {
+			q := selectKthFloat64(pctVals, quantileRank(p, len(pctVals)))
+			switch p {
+			case 0.5:
+				p50 = q
+			case 0.9:
+				p90 = q
+			case 0.99:
+				p99 = q
+			}
+		}
+	}
 	return StatsResult{
 		Field:    opts.Field,
 		Count:    count,
@@ -4716,6 +5144,9 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 		MaxUint:  maxU,
 		MinType:  resolveStatsExtreme(seenInt, minI, seenUint, minU, floatMin, true),
 		MaxType:  resolveStatsExtreme(seenInt, maxI, seenUint, maxU, floatMax, false),
+		P50:      p50,
+		P90:      p90,
+		P99:      p99,
 		Mean:     m,
 		Variance: variance,
 		StdDev:   stdDev,

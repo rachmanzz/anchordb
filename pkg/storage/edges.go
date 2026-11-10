@@ -208,6 +208,217 @@ func (db *AnchorDB) RemoveEdge(source, relation, target string) error {
 	return nil
 }
 
+// HubScore ranks one node by degree.
+type HubScore struct {
+	Node   string `json:"node"`
+	Degree int    `json:"degree"`
+}
+
+// GraphDegreeStats aggregates in/out-degree distribution over live edges.
+type GraphDegreeStats struct {
+	Nodes          uint64     `json:"nodes"`
+	Edges          uint64     `json:"edges"`
+	AvgDegree      float64    `json:"avg_degree"`
+	DegreeVariance float64    `json:"degree_variance"`
+	TopHubs        []HubScore `json:"top_hubs"`
+}
+
+// GraphDegreeStats computes in/out-degree distribution over live edges in one
+// O(V+E) pass. TopHubs ranks by in-degree (ties by node name, ascending) and
+// holds at most topK entries; topK <= 0 skips the ranking.
+func (db *AnchorDB) GraphDegreeStats(topK int) (GraphDegreeStats, error) {
+	if topK < 0 {
+		return GraphDegreeStats{}, fmt.Errorf("invalid topK %d: must be non-negative", topK)
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return GraphDegreeStats{}, ErrDatabaseClosed
+	}
+	nodes := make(map[string]bool)
+	inDeg := make(map[string]int)
+	outDeg := make(map[string]int)
+	var edgeCount uint64
+	for _, e := range db.edges {
+		if e.Source == "" {
+			continue // tombstoned slot
+		}
+		nodes[e.Source] = true
+		nodes[e.Target] = true
+		outDeg[e.Source]++
+		inDeg[e.Target]++
+		edgeCount++
+	}
+	// Welford over a sorted node order for determinism.
+	ordered := make([]string, 0, len(nodes))
+	for node := range nodes {
+		ordered = append(ordered, node)
+	}
+	sort.Strings(ordered)
+	var mean, acc float64
+	for i, node := range ordered {
+		d := float64(inDeg[node] + outDeg[node])
+		delta := d - mean
+		mean += delta / float64(i+1)
+		acc += delta * (d - mean)
+	}
+	stats := GraphDegreeStats{
+		Nodes:          uint64(len(nodes)),
+		Edges:          edgeCount,
+		AvgDegree:      mean,
+		DegreeVariance: 0,
+	}
+	if len(ordered) > 0 {
+		stats.DegreeVariance = acc / float64(len(ordered))
+	}
+	if topK > 0 {
+		hubs := make([]HubScore, 0, len(ordered))
+		for _, node := range ordered {
+			hubs = append(hubs, HubScore{Node: node, Degree: inDeg[node]})
+		}
+		sort.Slice(hubs, func(i, j int) bool {
+			if hubs[i].Degree != hubs[j].Degree {
+				return hubs[i].Degree > hubs[j].Degree
+			}
+			return hubs[i].Node < hubs[j].Node
+		})
+		if len(hubs) > topK {
+			hubs = hubs[:topK]
+		}
+		stats.TopHubs = hubs
+	}
+	return stats, nil
+}
+
+// NodeScore pairs a node with a computed score.
+type NodeScore struct {
+	Node  string  `json:"node"`
+	Score float64 `json:"score"`
+}
+
+// PageRankResult holds power-iteration PageRank over live edges.
+type PageRankResult struct {
+	Scores     map[string]float64 `json:"scores"`
+	Top        []NodeScore        `json:"top"`
+	Iterations int                `json:"iterations"`
+	Converged  bool               `json:"converged"`
+}
+
+// PageRank runs power iteration over live directed edges: each node starts at
+// 1/V and each iteration distributes rank along out-edges with the given
+// damping factor. Dangling nodes (no out-edges) redistribute their rank evenly
+// instead of leaking mass, so scores always sum to 1. Traversal follows sorted
+// node order and stored adjacency order, both fixed by DB state, so repeated
+// runs are bit-identical. O(iter·(V+E)) time, O(V+E) memory.
+func (db *AnchorDB) PageRank(damping, tolerance float64, maxIter, topK int) (PageRankResult, error) {
+	if math.IsNaN(damping) || damping <= 0 || damping >= 1 {
+		return PageRankResult{}, fmt.Errorf("invalid damping %v: must be within (0, 1)", damping)
+	}
+	if math.IsNaN(tolerance) || tolerance <= 0 {
+		return PageRankResult{}, fmt.Errorf("invalid tolerance %v: must be positive", tolerance)
+	}
+	if maxIter < 1 {
+		return PageRankResult{}, fmt.Errorf("invalid maxIter %d: must be at least 1", maxIter)
+	}
+	if topK < 0 {
+		return PageRankResult{}, fmt.Errorf("invalid topK %d: must be non-negative", topK)
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return PageRankResult{}, ErrDatabaseClosed
+	}
+	nodes := make(map[string]bool)
+	outDeg := make(map[string]int)
+	type link struct{ from, to string }
+	var links []link
+	for _, e := range db.edges {
+		if e.Source == "" {
+			continue // tombstoned slot
+		}
+		nodes[e.Source] = true
+		nodes[e.Target] = true
+		outDeg[e.Source]++
+		links = append(links, link{from: e.Source, to: e.Target})
+	}
+	ordered := make([]string, 0, len(nodes))
+	for node := range nodes {
+		ordered = append(ordered, node)
+	}
+	sort.Strings(ordered)
+	v := len(ordered)
+	if v == 0 {
+		return PageRankResult{Scores: map[string]float64{}, Converged: true}, nil
+	}
+	index := make(map[string]int, v)
+	for i, node := range ordered {
+		index[node] = i
+	}
+	inNbrs := make([][]int, v)
+	outCount := make([]int, v)
+	for _, l := range links {
+		fi, ti := index[l.from], index[l.to]
+		inNbrs[ti] = append(inNbrs[ti], fi)
+		outCount[fi]++
+	}
+	rank := make([]float64, v)
+	for i := range rank {
+		rank[i] = 1 / float64(v)
+	}
+	next := make([]float64, v)
+	base := (1 - damping) / float64(v)
+	iterations, converged := 0, false
+	for it := 1; it <= maxIter; it++ {
+		iterations = it
+		var dangling float64
+		for i := 0; i < v; i++ {
+			if outCount[i] == 0 {
+				dangling += rank[i]
+			}
+		}
+		share := base + damping*dangling/float64(v)
+		for j := range next {
+			next[j] = share
+		}
+		for j := 0; j < v; j++ {
+			for _, fi := range inNbrs[j] {
+				next[j] += damping * rank[fi] / float64(outCount[fi])
+			}
+		}
+		var delta float64
+		for j := 0; j < v; j++ {
+			delta += math.Abs(next[j] - rank[j])
+			rank[j] = next[j]
+		}
+		if delta < tolerance {
+			converged = true
+			break
+		}
+	}
+	scores := make(map[string]float64, v)
+	for i, node := range ordered {
+		scores[node] = rank[i]
+	}
+	res := PageRankResult{Scores: scores, Iterations: iterations, Converged: converged}
+	if topK > 0 {
+		top := make([]NodeScore, 0, v)
+		for node, s := range scores {
+			top = append(top, NodeScore{Node: node, Score: s})
+		}
+		sort.Slice(top, func(i, j int) bool {
+			if top[i].Score != top[j].Score {
+				return top[i].Score > top[j].Score
+			}
+			return top[i].Node < top[j].Node
+		})
+		if len(top) > topK {
+			top = top[:topK]
+		}
+		res.Top = top
+	}
+	return res, nil
+}
+
 // findEdge returns the index of a live edge or -1. Caller must hold db.mu.
 func (db *AnchorDB) findEdge(source, relation, target string) int {
 	if db.edgeIndex != nil {
