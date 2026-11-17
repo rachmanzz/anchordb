@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-17
+
+### Added
+- Typed numeric storage (`int64`, `uint64`, `float64`) with mixed arithmetic support and wire protocol encoding.
+- In-storage analytics operations (percentiles, histograms, z-score, and PageRank).
+- Zero-copy lookup paths and phase 3 layout optimization benchmarks.
+
+### Changed
+- Honest error semantics and exact statistics extremes reporting across storage, wire, server, and scheduler.
+- Disclosed AI-assisted development in `README.md`.
+
+### Fixed
+- Hardened durability, concurrency, numeric precision, security, partitioning, spatial indexing, worker lifecycle, and error propagation across storage, wire, server, driver, and scheduler (`roasted` `v8`–`v21`).
+
 ## [0.1.3] - 2026-10-20
 
 ### Added
