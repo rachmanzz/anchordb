@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -198,6 +200,57 @@ type S3Sink struct {
 	AllowInsecureHTTP bool
 }
 
+var cgnatCIDR = func() *net.IPNet {
+	_, netCIDR, _ := net.ParseCIDR("100.64.0.0/10")
+	return netCIDR
+}()
+
+// IsBlockedS3IP reports whether ip belongs to a non-public range (loopback,
+// private, link-local, multicast, unspecified, or CGNAT 100.64.0.0/10).
+func IsBlockedS3IP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() ||
+		(cgnatCIDR != nil && cgnatCIDR.Contains(ip))
+}
+
+// NewS3HTTPClient builds an HTTP client for S3 transfers with HTTP redirects
+// disabled, ResponseHeaderTimeout bounded (without cutting off long streaming
+// uploads), and socket-level SSRF IP blocking when allowPrivate is false.
+func NewS3HTTPClient(allowPrivate bool) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	if !allowPrivate {
+		dialer.Control = func(_ string, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+			ip := net.ParseIP(strings.Trim(host, "[]"))
+			if IsBlockedS3IP(ip) {
+				return fmt.Errorf("S3Sink: connection to non-public address %q refused", host)
+			}
+			return nil
+		}
+	}
+	transport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("S3Sink: HTTP redirects are disallowed")
+		},
+	}
+}
+
 // NewS3Sink creates an S3-compatible partition sink.
 func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 	return &S3Sink{
@@ -207,11 +260,11 @@ func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 		Region:     "us-east-1",
 		AccessKey:  accessKey,
 		SecretKey:  secretKey,
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: NewS3HTTPClient(true),
 	}
 }
 
-var defaultS3HTTPClient = &http.Client{Timeout: 30 * time.Second}
+var defaultS3HTTPClient = NewS3HTTPClient(true)
 
 func (s *S3Sink) httpClient() *http.Client {
 	if s.HTTPClient != nil {
@@ -225,8 +278,13 @@ func (s *S3Sink) Name() string {
 	return fmt.Sprintf("S3 (%s/%s/%s)", s.Endpoint, s.Bucket, s.Prefix)
 }
 
+// ErrS3ObjectNotFound indicates the requested object key does not exist (HTTP 404).
+var ErrS3ObjectNotFound = errors.New("S3Sink: object not found")
+
 // SavePartitionFromFile streams the local partition file into the S3 bucket.
-// If a companion "<srcPath>.schema" sidecar exists, it is uploaded alongside the archive.
+// The main archive is uploaded first; if successful and a companion "<srcPath>.schema"
+// sidecar exists, it is uploaded afterwards so a failed main upload never strands
+// an orphaned schema object.
 func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
@@ -236,6 +294,10 @@ func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error)
 	fi, err := src.Stat()
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: stat source partition %s: %w", srcPath, err)
+	}
+	targetLoc, err := s.put(filename, src, fi.Size())
+	if err != nil {
+		return "", err
 	}
 	if schemaSrc, sErr := os.Open(srcPath + ".schema"); sErr == nil {
 		defer schemaSrc.Close()
@@ -249,7 +311,7 @@ func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error)
 	} else if !os.IsNotExist(sErr) {
 		return "", fmt.Errorf("S3Sink: open source schema sidecar %s.schema: %w", srcPath, sErr)
 	}
-	return s.put(filename, src, fi.Size())
+	return targetLoc, nil
 }
 
 // SavePartition uploads raw bytes as an object to the S3 bucket.
@@ -375,13 +437,27 @@ func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath str
 		return fmt.Errorf("S3Sink: refusing to send credentials over plaintext http endpoint %q", s.Endpoint)
 	}
 
-	// Clean key
+	// Clean key and reject path traversal segments before constructing the URL.
 	key := keyOrFilename
 	if strings.HasPrefix(key, "s3://") {
 		prefix := fmt.Sprintf("s3://%s/", s.Bucket)
+		if !strings.HasPrefix(key, prefix) {
+			return fmt.Errorf("S3Sink: key %q does not match bucket %q", keyOrFilename, s.Bucket)
+		}
 		key = strings.TrimPrefix(key, prefix)
 	}
+	if strings.Contains(key, "\\") {
+		return fmt.Errorf("S3Sink: invalid key %q", keyOrFilename)
+	}
 	key = strings.TrimPrefix(key, "/")
+	if key == "" {
+		return errors.New("S3Sink: object key or filename cannot be empty")
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("S3Sink: invalid path segment in key %q", keyOrFilename)
+		}
+	}
 	if !strings.Contains(key, "/") && s.Prefix != "" {
 		key = path.Join(strings.Trim(s.Prefix, "/"), key)
 	}
@@ -406,6 +482,10 @@ func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath str
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%w: HTTP 404: %s", ErrS3ObjectNotFound, string(snippet))
+	}
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("S3Sink: download returned HTTP %d: %s", resp.StatusCode, string(snippet))

@@ -393,17 +393,17 @@ func (c *Client) Sync() error {
 
 // ListPartitions queries the engine to retrieve metadata on archived partition files.
 func (c *Client) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
-	return c.backend.ListPartitions(ctx)
+	return c.backend.ListPartitions(ctx, c.model)
 }
 
 // InspectPartition inspects an archived partition file through the engine runtime without exposing raw file descriptors.
 func (c *Client) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
-	return c.backend.InspectPartition(ctx, partitionFile, recordName, limit)
+	return c.backend.InspectPartition(ctx, c.model, partitionFile, recordName, limit)
 }
 
 // InspectPartitionRecord retrieves a single record from an archived partition file through the engine.
 func (c *Client) InspectPartitionRecord(ctx context.Context, partitionFile, recordName string) (*EntityResult, error) {
-	res, err := c.backend.InspectPartition(ctx, partitionFile, recordName, 0)
+	res, err := c.backend.InspectPartition(ctx, c.model, partitionFile, recordName, 0)
 	if err != nil {
 		return nil, err
 	}

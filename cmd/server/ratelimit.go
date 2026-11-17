@@ -54,8 +54,8 @@ func (rl *rateLimiter) allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Sweep idle buckets at most once a minute, or proactively when reaching capacity.
-	if now.Sub(rl.lastSweep) > time.Minute || len(rl.buckets) >= maxRateLimiterBuckets {
+	// Sweep idle buckets periodically; the LRU eviction loop below handles maxRateLimiterBuckets in O(1).
+	if now.Sub(rl.lastSweep) > time.Minute {
 		rl.sweepLocked(now)
 		rl.lastSweep = now
 	}
@@ -127,14 +127,14 @@ func (rl *rateLimiter) sweepLocked(now time.Time) {
 	}
 }
 
-// rateLimitMiddleware enforces the limiter, if configured. Health and metrics
-// endpoints are exempt so probes and scrapers keep working under load.
+// rateLimitMiddleware enforces the limiter, if configured. Health probes remain
+// exempt so liveness/readiness checks keep working under load.
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	if s.limiter == nil {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}

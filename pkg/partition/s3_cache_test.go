@@ -3,10 +3,12 @@ package partition
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -201,6 +203,10 @@ func TestS3PartitionCache_CancelOneWaiterAndActiveTTLRefresh(t *testing.T) {
 	var gets atomic.Int32
 	gate := make(chan struct{})
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".schema") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		n := gets.Add(1)
 		if n == 1 {
 			<-gate
@@ -364,5 +370,144 @@ func TestExecutePartition_PreservesSchemaAndHasMore(t *testing.T) {
 	recs, hasMore, err := partDB.ListRecordsWithPaging(storage.QueryOptions{Limit: 2})
 	if err != nil || len(recs) != 2 || !hasMore {
 		t.Fatalf("expected len=2 and hasMore=true, got len=%d hasMore=%v err=%v", len(recs), hasMore, err)
+	}
+}
+
+func TestS3Sink_AndCache_SchemaSidecarOrderFetchAndEviction(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "src_schema.anchordb")
+	db, err := storage.OpenWithOptions(dbPath, storage.Options{WAL: storage.WALOptions{SyncMode: storage.SyncNone}})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	if err := db.AttachSchema(storage.ModelSchema{"k": "int", "score": "float"}); err != nil {
+		_ = db.Close()
+		t.Fatalf("AttachSchema: %v", err)
+	}
+	if _, err := db.SaveRecordTyped("r1", []storage.AttrEntry{
+		storage.NewInt64Attr("k", 42),
+		storage.NewFloat64Attr("score", 9.5),
+	}); err != nil {
+		_ = db.Close()
+		t.Fatalf("SaveRecordTyped: %v", err)
+	}
+	if err := db.Sync(); err != nil {
+		_ = db.Close()
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var mu sync.Mutex
+	objects := make(map[string][]byte)
+	var putOrder []string
+	var failSchemaGet atomic.Bool
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/b/")
+		switch r.Method {
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			objects[key] = body
+			putOrder = append(putOrder, key)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if strings.HasSuffix(key, ".schema") && failSchemaGet.Load() {
+				http.Error(w, "upstream error", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			data, ok := objects[key]
+			mu.Unlock()
+			if !ok {
+				http.Error(w, "NotFound", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		default:
+			http.Error(w, "unsupported", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	sink := &S3Sink{Endpoint: srv.URL, Bucket: "b", Prefix: "pfx", HTTPClient: srv.Client()}
+	if _, err := sink.SavePartitionFromFile("p_schema.anchordb", dbPath); err != nil {
+		t.Fatalf("SavePartitionFromFile: %v", err)
+	}
+	if len(putOrder) != 2 || putOrder[0] != "pfx/p_schema.anchordb" || putOrder[1] != "pfx/p_schema.anchordb.schema" {
+		t.Fatalf("expected main archive uploaded before .schema sidecar, got putOrder=%v", putOrder)
+	}
+
+	// Main upload failure must not upload an orphaned .schema object.
+	var orphanPuts []string
+	failMainSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/b/")
+		orphanPuts = append(orphanPuts, key)
+		http.Error(w, "fail main", http.StatusInternalServerError)
+	}))
+	defer failMainSrv.Close()
+	failSink := &S3Sink{Endpoint: failMainSrv.URL, Bucket: "b", Prefix: "pfx", HTTPClient: failMainSrv.Client()}
+	if _, err := failSink.SavePartitionFromFile("fail_main.anchordb", dbPath); err == nil {
+		t.Fatal("expected SavePartitionFromFile to fail when main upload returns 500")
+	}
+	if len(orphanPuts) != 1 || orphanPuts[0] != "pfx/fail_main.anchordb" {
+		t.Fatalf("expected only main archive PUT attempted on failure, got %v", orphanPuts)
+	}
+
+	// Transient sidecar GET failure must fail EnsurePartition and roll back the local archive file.
+	cacheDir := filepath.Join(dir, "cache")
+	cache, err := NewS3PartitionCacheWithOptions(cacheDir, S3CacheOptions{MaxBytes: 1024 * 1024})
+	if err != nil {
+		t.Fatalf("NewS3PartitionCacheWithOptions: %v", err)
+	}
+	defer func() { _ = cache.Close() }()
+
+	failSchemaGet.Store(true)
+	if _, err := cache.EnsurePartition(context.Background(), sink, "p_schema.anchordb"); err == nil {
+		t.Fatal("expected EnsurePartition error on 500 .schema sidecar fetch")
+	}
+	failSchemaGet.Store(false)
+
+	cachedPath, err := cache.EnsurePartition(context.Background(), sink, "p_schema.anchordb")
+	if err != nil {
+		t.Fatalf("EnsurePartition: %v", err)
+	}
+	opened, err := storage.OpenWithOptions(cachedPath, storage.Options{WAL: storage.WALOptions{SyncMode: storage.SyncNone}})
+	if err != nil {
+		t.Fatalf("Open cached partition: %v", err)
+	}
+	gotSchema, hasSchema := opened.GetSchema()
+	_ = opened.Close()
+	if !hasSchema || gotSchema["k"] != "int" || gotSchema["score"] != "float" {
+		t.Fatalf("expected cached S3 partition to preserve schema, got hasSchema=%v schema=%v", hasSchema, gotSchema)
+	}
+
+	// Legacy partition without .schema (404) must succeed, and evicting p_schema must remove its .schema file.
+	legacyBytes := buildTestPartitionBytes(t, "legacy_rec", 3.14)
+	mu.Lock()
+	objects["pfx/p_legacy.anchordb"] = legacyBytes
+	mu.Unlock()
+	if _, err := cache.EnsurePartition(context.Background(), sink, "p_legacy.anchordb"); err != nil {
+		t.Fatalf("EnsurePartition legacy 404 .schema: %v", err)
+	}
+	cache.mu.Lock()
+	cache.maxBytes = 1
+	cache.mu.Unlock()
+	if _, err := cache.EnsurePartition(context.Background(), sink, "p_legacy.anchordb"); err != nil {
+		t.Fatalf("EnsurePartition trigger eviction: %v", err)
+	}
+	// Eviction removes p_schema files once EnsurePartition runs for a new key.
+	mu.Lock()
+	objects["pfx/p_trigger.anchordb"] = legacyBytes
+	mu.Unlock()
+	if _, err := cache.EnsurePartition(context.Background(), sink, "p_trigger.anchordb"); err != nil {
+		t.Fatalf("EnsurePartition p_trigger: %v", err)
+	}
+	if _, statErr := os.Stat(cachedPath + ".schema"); !os.IsNotExist(statErr) {
+		t.Fatalf("expected evicted .schema sidecar %s.schema removed, statErr=%v", cachedPath, statErr)
 	}
 }

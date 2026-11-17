@@ -215,12 +215,13 @@ const DefaultMemoryCheckStride uint64 = 5000
 // MemoryMonitor tracks memory headroom asynchronously using a configurable stride counter
 // and background sampling, eliminating lock and syscall overhead on high-throughput hot paths.
 type MemoryMonitor struct {
-	current atomic.Pointer[MemoryHeadroom]
-	counter atomic.Uint64
-	stride  uint64
-	trigger chan struct{}
-	stop    chan struct{}
-	done    chan struct{}
+	current  atomic.Pointer[MemoryHeadroom]
+	counter  atomic.Uint64
+	stride   uint64
+	trigger  chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewMemoryMonitor creates and starts a MemoryMonitor.
@@ -309,13 +310,10 @@ func (m *MemoryMonitor) Stop() {
 	if m == nil {
 		return
 	}
-	select {
-	case <-m.stop:
-		// already stopped
-	default:
+	m.stopOnce.Do(func() {
 		close(m.stop)
-		<-m.done
-	}
+	})
+	<-m.done
 }
 
 // Stride returns the configured stride for this monitor.

@@ -88,7 +88,10 @@ func WithSyncInterval(d time.Duration) Option {
 	}
 }
 
-// WithWorkerConcurrency sets the concurrency limit for the embedded worker pool.
+// WithWorkerConcurrency is retained for API compatibility as a no-op; embedded
+// mode executes operations synchronously in-process.
+//
+// Deprecated: Embedded mode no longer runs a background worker pool.
 func WithWorkerConcurrency(n int) Option {
 	return func(c *clientConfig) {
 		if n > 0 {

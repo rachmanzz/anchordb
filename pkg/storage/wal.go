@@ -1000,6 +1000,9 @@ func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncompl
 		}
 		payload := scratch[:payloadLen]
 		if _, err := io.ReadFull(reader, payload); err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				return count, lastValidOffset, fmt.Errorf("read wal payload at %d: %w", frameOffset, err)
+			}
 			if truncateIncomplete {
 				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
 					return count, lastValidOffset, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, terr)
@@ -1270,6 +1273,9 @@ func (w *WALManager) Repair() (*WALRepairResult, error) {
 		return nil, err
 	}
 	_, validEnd, scanErr := w.scanWALLocked(nil, false)
+	if scanErr != nil && !errors.Is(scanErr, ErrWALCorrupt) {
+		return nil, scanErr
+	}
 
 	res := &WALRepairResult{Path: w.path, ValidBytes: validEnd}
 	if validEnd >= size {

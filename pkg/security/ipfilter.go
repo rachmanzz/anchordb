@@ -193,33 +193,30 @@ func (f *IPFilter) ExtractClientIP(r *http.Request) net.IP {
 	// configured with NewIPFilterWithTrustedProxies.
 	remoteIP := remoteAddrIP(r.RemoteAddr)
 	if f.isTrustedProxy(remoteIP) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
-			chain := make([]net.IP, 0, len(parts))
-			valid := true
-			for _, part := range parts {
-				ip := net.ParseIP(strings.TrimSpace(part))
-				if ip == nil {
-					valid = false
-					break
+		xffVals := r.Header.Values("X-Forwarded-For")
+		if len(xffVals) > 0 {
+			combined := strings.Join(xffVals, ",")
+			if strings.TrimSpace(combined) != "" {
+				parts := strings.Split(combined, ",")
+				var lastTrusted net.IP
+				for i := len(parts) - 1; i >= 0; i-- {
+					ip := net.ParseIP(strings.TrimSpace(parts[i]))
+					if ip == nil {
+						// Malformed hop before reaching an untrusted client IP: fail closed
+						// rather than promoting the trusted proxy remoteIP or falling back
+						// to X-Real-IP.
+						return nil
+					}
+					if !f.isTrustedProxy(ip) {
+						return ip
+					}
+					lastTrusted = ip
 				}
-				chain = append(chain, ip)
-			}
-			if valid && len(chain) > 0 {
-				// Proxies commonly append the peer they received the request from.
-				// Walk right-to-left, discarding trusted proxies; the first untrusted
-				// address is the client and cannot be overridden by a forged left side.
-				peer := remoteIP
-				for i := len(chain) - 1; i >= 0 && f.isTrustedProxy(peer); i-- {
-					peer = chain[i]
+				if lastTrusted != nil {
+					return lastTrusted
 				}
-				return peer
+				return nil
 			}
-			// X-Forwarded-For was present but malformed. Do NOT fall back to other
-			// client-supplied headers (e.g. X-Real-IP): that lets a client bypass
-			// the whitelist and rate limiter by sending a garbage XFF alongside a
-			// spoofed X-Real-IP. Treat the peer as the client instead.
-			return remoteIP
 		}
 	}
 

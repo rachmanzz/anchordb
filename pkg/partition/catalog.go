@@ -114,10 +114,11 @@ func (c *Catalog) rebuildIndexesLocked() {
 }
 
 func (c *Catalog) indexEntry(e *CatalogEntry) {
-	// Deduplicate by ID/PartitionFile so re-registration replaces rather than duplicates.
+	// Deduplicate by (Model, ID/PartitionFile) so re-registration replaces within
+	// the same model without overwriting another model's manifest entry.
 	replaced := false
 	for i, existing := range c.entries {
-		if (e.ID != "" && existing.ID == e.ID) || (e.PartitionFile != "" && existing.PartitionFile == e.PartitionFile) {
+		if existing.Model == e.Model && ((e.ID != "" && existing.ID == e.ID) || (e.PartitionFile != "" && existing.PartitionFile == e.PartitionFile)) {
 			c.entries[i] = e
 			replaced = true
 			break

@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -41,6 +40,7 @@ type JoinConfig struct {
 	AuthToken           string
 	ClusterID           string
 	OTKSecret           string
+	SessionTTL          time.Duration
 	CommitmentStore     *CommitmentStore
 	CommitmentStorePath string
 }
@@ -66,6 +66,7 @@ type JoinManager struct {
 	pairingExpiry    time.Time
 	allowedNets      []*net.IPNet
 	sessionSecret    []byte
+	sessionTTL       time.Duration
 	staticToken      string
 	clusterID        string
 	otkSecret        []byte
@@ -89,6 +90,9 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 	}
 	if cfg.PairingTimeout <= 0 {
 		cfg.PairingTimeout = 120 * time.Second
+	}
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = 24 * time.Hour
 	}
 	explicitJoinMode := cfg.JoinMode != ""
 	if cfg.JoinMode == "" {
@@ -158,6 +162,7 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 		joinMode:         cfg.JoinMode,
 		explicitJoinMode: explicitJoinMode,
 		sessionSecret:    sessionSecretBytes,
+		sessionTTL:       cfg.SessionTTL,
 		staticToken:      cfg.AuthToken,
 		clusterID:        cfg.ClusterID,
 		otkSecret:        otkSecretBytes,
@@ -355,33 +360,66 @@ func (jm *JoinManager) ValidateAndBurnOTK(tokenString string) (role, clusterID s
 	return role, clusterID, epoch, nil
 }
 
+// RequiresAuth reports whether JoinManager requires explicit authentication on new connections.
+func (jm *JoinManager) RequiresAuth() bool {
+	if jm == nil {
+		return false
+	}
+	return jm.gatewayMode || jm.staticToken != "" || (jm.explicitJoinMode && (jm.joinMode == "pairing" || jm.joinMode == "otk"))
+}
+
+// HasStaticToken reports whether JoinManager has an explicit static auth token configured.
+func (jm *JoinManager) HasStaticToken() bool {
+	if jm == nil {
+		return false
+	}
+	return jm.staticToken != ""
+}
+
 // GenerateSessionKey generates a signed session key for nodeID.
 func (jm *JoinManager) GenerateSessionKey(nodeID string) string {
+	key, err := jm.GenerateSessionKeyWithError(nodeID)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+// GenerateSessionKeyWithError generates a signed, expiring session key for nodeID.
+func (jm *JoinManager) GenerateSessionKeyWithError(nodeID string) (string, error) {
 	if nodeID == "" {
 		nodeID = "anchor-connector"
 	}
 	randBytes := make([]byte, 16)
 	if _, err := rand.Read(randBytes); err != nil {
-		// Fallback to high-resolution timestamp if entropy pool fails
-		binary.LittleEndian.PutUint64(randBytes[:8], uint64(time.Now().UnixNano()))
+		return "", fmt.Errorf("wire: failed generating session key entropy: %w", err)
 	}
 	randHex := hex.EncodeToString(randBytes)
+	ttl := jm.sessionTTL
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	expUnix := time.Now().Add(ttl).Unix()
 
-	payload := fmt.Sprintf("SESS.%s.%s.%s", jm.clusterID, nodeID, randHex)
+	payload := fmt.Sprintf("SESS.%s.%s.%s_%d", jm.clusterID, nodeID, randHex, expUnix)
 	mac := hmac.New(sha256.New, jm.sessionSecret)
 	mac.Write([]byte(payload))
 	sig := hex.EncodeToString(mac.Sum(nil))[:32]
 
-	return fmt.Sprintf("%s.%s", payload, sig)
+	return fmt.Sprintf("%s.%s", payload, sig), nil
 }
 
-// ValidateSessionKey verifies that the session key carries a valid HMAC signature.
+// ValidateSessionKey verifies that the session key carries a valid HMAC signature,
+// belongs to this cluster, and has not expired.
 func (jm *JoinManager) ValidateSessionKey(key string) (nodeID string, err error) {
 	if jm == nil {
 		return "", ErrInvalidSessionKey
 	}
 	parts := strings.Split(key, ".")
 	if len(parts) != 5 || parts[0] != "SESS" {
+		return "", ErrInvalidSessionKey
+	}
+	if parts[1] != jm.clusterID {
 		return "", ErrInvalidSessionKey
 	}
 	payload := fmt.Sprintf("SESS.%s.%s.%s", parts[1], parts[2], parts[3])
@@ -392,6 +430,15 @@ func (jm *JoinManager) ValidateSessionKey(key string) (nodeID string, err error)
 	actualSig := hex.EncodeToString(mac.Sum(nil))[:32]
 
 	if !hmac.Equal([]byte(expectedSig), []byte(actualSig)) {
+		return "", ErrInvalidSessionKey
+	}
+
+	idx := strings.LastIndexByte(parts[3], '_')
+	if idx <= 0 || idx >= len(parts[3])-1 {
+		return "", ErrInvalidSessionKey
+	}
+	expUnix, parseErr := strconv.ParseInt(parts[3][idx+1:], 10, 64)
+	if parseErr != nil || time.Now().Unix() > expUnix {
 		return "", ErrInvalidSessionKey
 	}
 	return parts[2], nil
@@ -439,38 +486,56 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 			}
 		}
 
-		// Lock pairing after successful initial handshake
-		jm.pairingActive = false
-		jm.mu.Unlock()
-
-		sessKey := jm.GenerateSessionKey(req.NodeID)
+		sessKey, sErr := jm.GenerateSessionKeyWithError(req.NodeID)
+		if sErr != nil {
+			jm.mu.Unlock()
+			return "", 500, sErr
+		}
 		if req.HasCommitment {
-			if cs := jm.CommitmentStore(); cs != nil {
+			if cs := jm.commitmentStore; cs != nil {
 				if rErr := cs.RegisterInitial(req.NodeID, req.InitialCommitment); rErr != nil {
+					jm.mu.Unlock()
 					return "", 500, fmt.Errorf("failed registering initial commitment: %w", rErr)
 				}
 			}
 		}
+		// Lock pairing only after initial commitment registration succeeds.
+		jm.pairingActive = false
+		jm.mu.Unlock()
 		return sessKey, 0, nil
 
 	case AuthTypeOTK:
+		if strings.TrimSpace(req.NodeID) == "" {
+			return "", ErrCodeMalformedPayload, errors.New("otk auth requires node_id")
+		}
 		_, _, _, err := jm.ValidateAndBurnOTK(req.Credential)
 		if err != nil {
 			return "", ErrCodeOTKExpiredOrBurned, ErrOTKExpiredOrBurned
 		}
-		sessKey := jm.GenerateSessionKey(req.NodeID)
-		if req.HasCommitment {
-			if cs := jm.CommitmentStore(); cs != nil {
-				if rErr := cs.RegisterInitial(req.NodeID, req.InitialCommitment); rErr != nil {
+		if cs := jm.CommitmentStore(); cs != nil {
+			if req.HasCommitment {
+				if rErr := cs.RegisterInitialNew(req.NodeID, req.InitialCommitment); rErr != nil {
+					if errors.Is(rErr, ErrNodeAlreadyRegistered) {
+						return "", ErrCodeUnauthorized, rErr
+					}
 					return "", 500, fmt.Errorf("failed registering initial commitment: %w", rErr)
 				}
+			} else if cs.HasNode(req.NodeID) {
+				return "", ErrCodeUnauthorized, fmt.Errorf("%w: %q", ErrNodeAlreadyRegistered, req.NodeID)
 			}
+		}
+		sessKey, sErr := jm.GenerateSessionKeyWithError(req.NodeID)
+		if sErr != nil {
+			return "", 500, sErr
 		}
 		return sessKey, 0, nil
 
 	case AuthTypeSession:
-		_, err := jm.ValidateSessionKey(req.Credential)
+		nodeID, err := jm.ValidateSessionKey(req.Credential)
 		if err != nil {
+			return "", ErrCodeInvalidSession, ErrInvalidSessionKey
+		}
+		if req.NodeID != "" && nodeID != req.NodeID {
 			return "", ErrCodeInvalidSession, ErrInvalidSessionKey
 		}
 		// Valid session key from earlier pairing/OTK

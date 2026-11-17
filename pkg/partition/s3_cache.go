@@ -75,6 +75,7 @@ type S3PartitionCache struct {
 	maxOpenHandles int
 	totalBytes     int64
 	entries        map[string]*cacheEntry
+	pendingPins    map[string]int
 
 	flightMu sync.Mutex
 	flights  map[string]*flightCall
@@ -173,6 +174,7 @@ func removePartitionFiles(path string) {
 		return
 	}
 	_ = os.Remove(path)
+	_ = os.Remove(path + ".schema")
 	_ = os.Remove(path + ".wal")
 	_ = os.Remove(path + ".lock")
 }
@@ -220,6 +222,12 @@ func (c *S3PartitionCache) ensurePartitionPinned(ctx context.Context, sink *S3Si
 		c.mu.Unlock()
 		return entry, path, nil
 	}
+	if pin {
+		if c.pendingPins == nil {
+			c.pendingPins = make(map[string]int)
+		}
+		c.pendingPins[cacheKey]++
+	}
 	c.mu.Unlock()
 
 	_, sfErr := c.doSingleFlight(ctx, cacheKey, func(fetchCtx context.Context) (string, error) {
@@ -252,6 +260,10 @@ func (c *S3PartitionCache) ensurePartitionPinned(ctx context.Context, sink *S3Si
 		if err := sink.FetchPartition(fetchCtx, keyOrFilename, targetPath); err != nil {
 			removePartitionFiles(targetPath)
 			return "", fmt.Errorf("failed fetching partition from s3: %w", err)
+		}
+		if schemaErr := sink.FetchPartition(fetchCtx, keyOrFilename+".schema", targetPath+".schema"); schemaErr != nil && !errors.Is(schemaErr, ErrS3ObjectNotFound) {
+			removePartitionFiles(targetPath)
+			return "", fmt.Errorf("failed fetching partition schema sidecar from s3: %w", schemaErr)
 		}
 
 		fi, err := os.Stat(targetPath)
@@ -310,10 +322,26 @@ func (c *S3PartitionCache) ensurePartitionPinned(ctx context.Context, sink *S3Si
 		return targetPath, nil
 	})
 	if sfErr != nil {
+		if pin {
+			c.mu.Lock()
+			if c.pendingPins[cacheKey] > 1 {
+				c.pendingPins[cacheKey]--
+			} else {
+				delete(c.pendingPins, cacheKey)
+			}
+			c.mu.Unlock()
+		}
 		return nil, "", sfErr
 	}
 
 	c.mu.Lock()
+	if pin {
+		if c.pendingPins[cacheKey] > 1 {
+			c.pendingPins[cacheKey]--
+		} else {
+			delete(c.pendingPins, cacheKey)
+		}
+	}
 	entry, ok := c.entries[cacheKey]
 	if !ok {
 		c.mu.Unlock()
@@ -381,7 +409,7 @@ func (c *S3PartitionCache) evictLocked(keepKey string) []*cacheHandle {
 	}
 	candidates := make([]*cacheEntry, 0, len(c.entries))
 	for k, e := range c.entries {
-		if k == keepKey || e.refs > 0 {
+		if k == keepKey || e.refs > 0 || c.pendingPins[k] > 0 {
 			continue
 		}
 		candidates = append(candidates, e)
@@ -464,53 +492,71 @@ func (c *S3PartitionCache) acquireHandle(ctx context.Context, sink *S3Sink, keyO
 	}
 	c.mu.Unlock()
 
-	entry.openMu.Lock()
-	c.mu.Lock()
-	h = entry.handle
-	currentPath := entry.path
-	if h != nil {
-		h.refs++
+	for {
+		entry.openMu.Lock()
+		c.mu.Lock()
+		h = entry.handle
+		currentPath := entry.path
+		openGen := entry.gen
+		if h != nil {
+			h.refs++
+			c.mu.Unlock()
+			entry.openMu.Unlock()
+			return entry, h, nil
+		}
+		c.mu.Unlock()
+
+		if currentPath != "" {
+			localPath = currentPath
+		}
+		if _, statErr := os.Stat(localPath); statErr != nil {
+			entry.openMu.Unlock()
+			c.releasePin(entry)
+			return nil, nil, fmt.Errorf("cached partition missing %s: %w", localPath, statErr)
+		}
+
+		opened, openErr := storage.OpenWithOptions(localPath, storage.Options{
+			WAL: storage.WALOptions{SyncMode: storage.SyncNone},
+		})
+		if openErr != nil {
+			entry.openMu.Unlock()
+			c.releasePin(entry)
+			return nil, nil, fmt.Errorf("failed opening cached partition %s: %w", localPath, openErr)
+		}
+
+		c.mu.Lock()
+		if entry.gen != openGen || entry.path != localPath {
+			// A concurrent TTL refresh rotated entry.path/gen; discard stale handle and retry.
+			c.mu.Unlock()
+			entry.openMu.Unlock()
+			_ = opened.Close()
+			continue
+		}
+		if entry.handle != nil {
+			entry.handle.refs++
+			existing := entry.handle
+			c.mu.Unlock()
+			entry.openMu.Unlock()
+			_ = opened.Close()
+			return entry, existing, nil
+		}
+		h = &cacheHandle{
+			db:   opened,
+			path: localPath,
+			refs: 1,
+		}
+		entry.handle = h
+		toClose := c.trimOpenHandlesLocked(entry.key)
 		c.mu.Unlock()
 		entry.openMu.Unlock()
+
+		for _, stale := range toClose {
+			if stale.db != nil {
+				_ = stale.db.Close()
+			}
+		}
 		return entry, h, nil
 	}
-	c.mu.Unlock()
-
-	if currentPath != "" {
-		localPath = currentPath
-	}
-	if _, statErr := os.Stat(localPath); statErr != nil {
-		entry.openMu.Unlock()
-		c.releasePin(entry)
-		return nil, nil, fmt.Errorf("cached partition missing %s: %w", localPath, statErr)
-	}
-
-	opened, openErr := storage.OpenWithOptions(localPath, storage.Options{
-		WAL: storage.WALOptions{SyncMode: storage.SyncNone},
-	})
-	if openErr != nil {
-		entry.openMu.Unlock()
-		c.releasePin(entry)
-		return nil, nil, fmt.Errorf("failed opening cached partition %s: %w", localPath, openErr)
-	}
-
-	h = &cacheHandle{
-		db:   opened,
-		path: localPath,
-		refs: 1,
-	}
-	c.mu.Lock()
-	entry.handle = h
-	toClose := c.trimOpenHandlesLocked(entry.key)
-	c.mu.Unlock()
-	entry.openMu.Unlock()
-
-	for _, stale := range toClose {
-		if stale.db != nil {
-			_ = stale.db.Close()
-		}
-	}
-	return entry, h, nil
 }
 
 func (c *S3PartitionCache) releasePin(entry *cacheEntry) {

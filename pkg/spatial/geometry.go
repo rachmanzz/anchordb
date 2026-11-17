@@ -157,12 +157,18 @@ func (poly Polygon2D) Perimeter() float32 {
 }
 
 // WithinRadius tests if point p is within a circular radius from center.
-// Eliminates math.Sqrt by comparing squared Euclidean distances.
+// Uses float64 intermediates to prevent float32 squaring overflow/underflow.
 func WithinRadius(p, center Point2D, radius float32) bool {
-	if radius <= 0 {
+	if radius <= 0 || math.IsNaN(float64(radius)) {
 		return false
 	}
-	return p.DistanceSq(center) <= radius*radius
+	dx := float64(p.X) - float64(center.X)
+	dy := float64(p.Y) - float64(center.Y)
+	if math.IsNaN(dx) || math.IsNaN(dy) {
+		return false
+	}
+	r := float64(radius)
+	return dx*dx+dy*dy <= r*r
 }
 
 // EarthRadiusKM is the standard spherical Earth mean radius in kilometers (WGS84 spherical approx).

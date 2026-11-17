@@ -3,6 +3,7 @@ package driver
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,13 +18,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
 	"github.com/rachmanzz/anchordb/pkg/wire"
-	"github.com/rachmanzz/anchordb/pkg/worker"
 )
 
 // PartitionMeta represents metadata for an archived partition file.
@@ -75,8 +76,8 @@ type backend interface {
 	Close() error
 	DB() *storage.AnchorDB
 	IsRemote() bool
-	ListPartitions(ctx context.Context) ([]PartitionMeta, error)
-	InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error)
+	ListPartitions(ctx context.Context, model string) ([]PartitionMeta, error)
+	InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error)
 	Attach(ctx context.Context, model string, schema storage.ModelSchema) error
 	GetSchema(ctx context.Context, model string) (storage.ModelSchema, error)
 	ResetModel(ctx context.Context, model string, confirm bool) error
@@ -99,8 +100,27 @@ func newLocalBackend(filePath string) (*localBackend, error) {
 	return &localBackend{filePath: filePath, db: db}, nil
 }
 
-func (b *localBackend) Save(ctx context.Context, _, name string, op *uint8, props map[string]float32) (string, error) {
+func (b *localBackend) defaultModel() string {
+	base := strings.TrimSuffix(filepath.Base(b.filePath), ".anchordb")
+	if base == "" || base == "." || base == "/" {
+		return "default"
+	}
+	return base
+}
+
+func (b *localBackend) checkModel(model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "default" || model == b.defaultModel() {
+		return nil
+	}
+	return fmt.Errorf("local single-file backend only supports model %q (got %q); open a directory in embedded mode for multi-model isolation", b.defaultModel(), model)
+}
+
+func (b *localBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
 	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := b.checkModel(model); err != nil {
 		return "", err
 	}
 	opStatus := storage.OpStatusActive
@@ -110,8 +130,11 @@ func (b *localBackend) Save(ctx context.Context, _, name string, op *uint8, prop
 	return b.db.SaveRecordWithIDAndOp(name, opStatus, props)
 }
 
-func (b *localBackend) SaveTyped(ctx context.Context, _, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
+func (b *localBackend) SaveTyped(ctx context.Context, model, name string, op *uint8, attrs []storage.AttrEntry) (string, error) {
 	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := b.checkModel(model); err != nil {
 		return "", err
 	}
 	opStatus := storage.OpStatusActive
@@ -121,22 +144,31 @@ func (b *localBackend) SaveTyped(ctx context.Context, _, name string, op *uint8,
 	return b.db.SaveRecordTypedWithIDAndOp(name, opStatus, attrs)
 }
 
-func (b *localBackend) GetTyped(ctx context.Context, _, name string) (storage.CompactRecord, error) {
+func (b *localBackend) GetTyped(ctx context.Context, model, name string) (storage.CompactRecord, error) {
 	if err := ctx.Err(); err != nil {
+		return storage.CompactRecord{}, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return storage.CompactRecord{}, err
 	}
 	return b.db.GetRecordTyped(name)
 }
 
-func (b *localBackend) SaveBatch(ctx context.Context, _ string, records []storage.BatchRecordItem) ([]string, error) {
+func (b *localBackend) SaveBatch(ctx context.Context, model string, records []storage.BatchRecordItem) ([]string, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	return b.db.SaveRecordsBatch(records)
 }
 
-func (b *localBackend) Get(ctx context.Context, _ string, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
+func (b *localBackend) Get(ctx context.Context, model string, name string, selectFields []string, computations map[string]storage.ComputeOp) (*EntityResult, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	cr, err := b.db.GetRecordTypedWithCompute(name, computations, selectFields...)
@@ -146,8 +178,11 @@ func (b *localBackend) Get(ctx context.Context, _ string, name string, selectFie
 	return &EntityResult{Name: name, props: cr.ToMap(), attrs: cr.ExpandAttrs()}, nil
 }
 
-func (b *localBackend) List(ctx context.Context, _ string, opts storage.QueryOptions) (*PagedListResult, error) {
+func (b *localBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	opts.Context = ctx
@@ -169,16 +204,22 @@ func (b *localBackend) List(ctx context.Context, _ string, opts storage.QueryOpt
 	}, nil
 }
 
-func (b *localBackend) Update(ctx context.Context, _ string, opts storage.UpdateOptions) (int, error) {
+func (b *localBackend) Update(ctx context.Context, model string, opts storage.UpdateOptions) (int, error) {
 	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return 0, err
 	}
 	opts.Context = ctx
 	return b.db.UpdateRecords(opts)
 }
 
-func (b *localBackend) Graph(ctx context.Context, _ string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
+func (b *localBackend) Graph(ctx context.Context, model string, inputs []string, relation string, limitK int, orderMode storage.OrderByMode, beamWidth float32) (*GraphResponse, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	results, anchor, err := b.db.ExecuteGraphStepWithContext(ctx, inputs, relation, limitK, orderMode, beamWidth)
@@ -188,8 +229,11 @@ func (b *localBackend) Graph(ctx context.Context, _ string, inputs []string, rel
 	return &GraphResponse{Anchor: anchor, Results: results}, nil
 }
 
-func (b *localBackend) GraphChain(ctx context.Context, _ string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
+func (b *localBackend) GraphChain(ctx context.Context, model string, inputs []string, relations []string, limitK int, beamWidth float32) (*ChainResponse, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	steps, err := b.db.ExecuteGraphChainWithContext(ctx, inputs, relations, limitK, beamWidth)
@@ -206,8 +250,11 @@ func (b *localBackend) GraphChain(ctx context.Context, _ string, inputs []string
 	}, nil
 }
 
-func (b *localBackend) Edge(ctx context.Context, _, action, source, relation, target string, weight float32) error {
+func (b *localBackend) Edge(ctx context.Context, model, action, source, relation, target string, weight float32) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.checkModel(model); err != nil {
 		return err
 	}
 	switch strings.ToLower(action) {
@@ -218,8 +265,11 @@ func (b *localBackend) Edge(ctx context.Context, _, action, source, relation, ta
 	}
 }
 
-func (b *localBackend) Causal(ctx context.Context, _ string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
+func (b *localBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	if len(relations) > 0 {
@@ -228,39 +278,60 @@ func (b *localBackend) Causal(ctx context.Context, _ string, seeds []string, rel
 	return b.db.ExecuteCausalStep(ctx, seeds, relation, limitK)
 }
 
-func (b *localBackend) Distance(_ context.Context, _, wordA, wordB string) (float32, error) {
+func (b *localBackend) Distance(_ context.Context, model, wordA, wordB string) (float32, error) {
+	if err := b.checkModel(model); err != nil {
+		return 0, err
+	}
 	return b.db.CalculateDistance(wordA, wordB)
 }
 
-func (b *localBackend) Centroid(_ context.Context, _ string, words []string) (CentroidResult, error) {
+func (b *localBackend) Centroid(_ context.Context, model string, words []string) (CentroidResult, error) {
+	if err := b.checkModel(model); err != nil {
+		return CentroidResult{}, err
+	}
 	coord, roles, err := b.db.CalculateCentroid(words)
 	return CentroidResult{Coord: coord, Roles: roles}, err
 }
 
-func (b *localBackend) CosineSimilarity(_ context.Context, _, wordA, wordB string) (float32, error) {
+func (b *localBackend) CosineSimilarity(_ context.Context, model, wordA, wordB string) (float32, error) {
+	if err := b.checkModel(model); err != nil {
+		return 0, err
+	}
 	return b.db.CalculateCosineSimilarity(wordA, wordB)
 }
 
-func (b *localBackend) Nearest(_ context.Context, _, word string, limitK int) ([]storage.GraphQueryResult, error) {
+func (b *localBackend) Nearest(_ context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
+	if err := b.checkModel(model); err != nil {
+		return nil, err
+	}
 	return b.db.FindNearestNeighbors(word, limitK)
 }
 
-func (b *localBackend) AppendNode(ctx context.Context, _, word string, coord spatial.Point2D, roles [4]float32) error {
+func (b *localBackend) AppendNode(ctx context.Context, model, word string, coord spatial.Point2D, roles [4]float32) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.checkModel(model); err != nil {
 		return err
 	}
 	_, err := b.db.AppendNode(word, coord, roles, 1)
 	return err
 }
 
-func (b *localBackend) SetRelation(ctx context.Context, _, name string, direction spatial.Point2D) error {
+func (b *localBackend) SetRelation(ctx context.Context, model, name string, direction spatial.Point2D) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.checkModel(model); err != nil {
 		return err
 	}
 	return b.db.SetRelation(name, direction)
 }
 
-func (b *localBackend) Sync(_ context.Context, _ string) error {
+func (b *localBackend) Sync(_ context.Context, model string) error {
+	if err := b.checkModel(model); err != nil {
+		return err
+	}
 	return b.db.Sync()
 }
 
@@ -305,7 +376,10 @@ func listPartitionsInDir(partDir string) ([]PartitionMeta, error) {
 	return out, nil
 }
 
-func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
+func (b *localBackend) ListPartitions(_ context.Context, model string) ([]PartitionMeta, error) {
+	if err := b.checkModel(model); err != nil {
+		return nil, err
+	}
 	return listPartitionsInDir(filepath.Join(filepath.Dir(b.filePath), "partitions"))
 }
 
@@ -363,19 +437,28 @@ func inspectPartitionFile(ctx context.Context, baseDir, partitionFile, recordNam
 	}, nil
 }
 
-func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *localBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	if err := b.checkModel(model); err != nil {
+		return nil, err
+	}
 	return inspectPartitionFile(ctx, filepath.Dir(b.filePath), partitionFile, recordName, limit)
 }
 
-func (b *localBackend) Attach(ctx context.Context, _ string, schema storage.ModelSchema) error {
+func (b *localBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.checkModel(model); err != nil {
 		return err
 	}
 	return b.db.AttachSchema(schema)
 }
 
-func (b *localBackend) GetSchema(ctx context.Context, _ string) (storage.ModelSchema, error) {
+func (b *localBackend) GetSchema(ctx context.Context, model string) (storage.ModelSchema, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
 	s, ok := b.db.GetSchema()
@@ -385,8 +468,11 @@ func (b *localBackend) GetSchema(ctx context.Context, _ string) (storage.ModelSc
 	return s, nil
 }
 
-func (b *localBackend) ResetModel(ctx context.Context, _ string, confirm bool) error {
+func (b *localBackend) ResetModel(ctx context.Context, model string, confirm bool) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.checkModel(model); err != nil {
 		return err
 	}
 	if !confirm {
@@ -400,14 +486,17 @@ func (b *localBackend) ResetModel(ctx context.Context, _ string, confirm bool) e
 // -----------------------------------------------------------------------------
 
 type embeddedBackend struct {
-	mu         sync.RWMutex
-	dataDir    string
-	cfg        clientConfig
-	models     map[string]*storage.AnchorDB
-	modelOrder []string
-	workerPool *worker.Pool
-	scheduler  *scheduler.InternalScheduler
-	closed     bool
+	mu            sync.RWMutex
+	dataDir       string
+	cfg           clientConfig
+	models        map[string]*storage.AnchorDB
+	modelPins     map[string]*atomic.Int64
+	modelDraining map[string]chan struct{}
+	lruMu         sync.Mutex
+	modelLRU      *list.List
+	modelElems    map[string]*list.Element
+	scheduler     *scheduler.InternalScheduler
+	closed        bool
 }
 
 type embeddedSyncTask struct {
@@ -432,17 +521,13 @@ func newEmbeddedBackend(dataDir string, cfg clientConfig) (*embeddedBackend, err
 	}
 
 	b := &embeddedBackend{
-		dataDir: dataDir,
-		cfg:     cfg,
-		models:  make(map[string]*storage.AnchorDB),
-	}
-
-	if cfg.workerConcurrency > 0 {
-		pool := worker.NewPool(worker.Config{
-			Concurrency: cfg.workerConcurrency,
-		})
-		pool.Start()
-		b.workerPool = pool
+		dataDir:       dataDir,
+		cfg:           cfg,
+		models:        make(map[string]*storage.AnchorDB),
+		modelPins:     make(map[string]*atomic.Int64),
+		modelDraining: make(map[string]chan struct{}),
+		modelLRU:      list.New(),
+		modelElems:    make(map[string]*list.Element),
 	}
 
 	if cfg.enableScheduler || cfg.syncInterval > 0 {
@@ -458,76 +543,236 @@ func newEmbeddedBackend(dataDir string, cfg clientConfig) (*embeddedBackend, err
 	}
 
 	if cfg.model != "" {
-		if _, err := b.getDB(cfg.model); err != nil {
+		if _, release, err := b.acquireDB(cfg.model); err != nil {
 			_ = b.Close()
 			return nil, err
+		} else {
+			release()
 		}
 	}
 
 	return b, nil
 }
 
-func (b *embeddedBackend) getDB(model string) (*storage.AnchorDB, error) {
-	if model == "" {
-		model = "default"
+func makeEmbeddedRelease(pin *atomic.Int64) func() {
+	if pin == nil {
+		return func() {}
 	}
-	cleanModel := filepath.Base(model)
-	if cleanModel == "." || cleanModel == "/" || cleanModel == ".." {
-		cleanModel = "default"
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			pin.Add(-1)
+		})
+	}
+}
+
+func (b *embeddedBackend) touchModelOrder(modelName string) {
+	b.lruMu.Lock()
+	defer b.lruMu.Unlock()
+	if b.modelLRU == nil {
+		b.modelLRU = list.New()
+	}
+	if b.modelElems == nil {
+		b.modelElems = make(map[string]*list.Element)
+	}
+	if elem, ok := b.modelElems[modelName]; ok {
+		b.modelLRU.MoveToFront(elem)
+		return
+	}
+	b.modelElems[modelName] = b.modelLRU.PushFront(modelName)
+}
+
+func (b *embeddedBackend) ensurePinLocked(modelName string) *atomic.Int64 {
+	if b.modelPins == nil {
+		b.modelPins = make(map[string]*atomic.Int64)
+	}
+	pin, ok := b.modelPins[modelName]
+	if !ok {
+		pin = &atomic.Int64{}
+		b.modelPins[modelName] = pin
+	}
+	return pin
+}
+
+func (b *embeddedBackend) pickIdleVictimLocked(skip map[string]bool) (string, *storage.AnchorDB) {
+	b.lruMu.Lock()
+	if b.modelLRU != nil {
+		for elem := b.modelLRU.Back(); elem != nil; elem = elem.Prev() {
+			candidate, _ := elem.Value.(string)
+			if skip[candidate] {
+				continue
+			}
+			vdb, ok := b.models[candidate]
+			if !ok {
+				continue
+			}
+			if pin := b.modelPins[candidate]; pin != nil && pin.Load() > 0 {
+				continue
+			}
+			b.modelLRU.Remove(elem)
+			delete(b.modelElems, candidate)
+			b.lruMu.Unlock()
+			return candidate, vdb
+		}
+	}
+	b.lruMu.Unlock()
+	return "", nil
+}
+
+func (b *embeddedBackend) evictIdleModelWithUnlockLocked(skip map[string]bool) (bool, error) {
+	victim, vdb := b.pickIdleVictimLocked(skip)
+	if victim == "" || vdb == nil {
+		return false, nil
+	}
+	delete(b.models, victim)
+	delete(b.modelPins, victim)
+	if b.modelDraining == nil {
+		b.modelDraining = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	b.modelDraining[victim] = done
+	b.mu.Unlock()
+
+	if syncErr := vdb.Sync(); syncErr != nil {
+		b.mu.Lock()
+		delete(b.modelDraining, victim)
+		close(done)
+		if !b.closed && b.models[victim] == nil {
+			b.models[victim] = vdb
+			b.ensurePinLocked(victim)
+			b.touchModelOrder(victim)
+		}
+		skip[victim] = true
+		return true, fmt.Errorf("failed syncing evicted embedded model %q: %w", victim, syncErr)
+	}
+
+	closeErr := vdb.Close()
+	b.mu.Lock()
+	delete(b.modelDraining, victim)
+	close(done)
+	if closeErr != nil {
+		return true, fmt.Errorf("failed closing evicted embedded model %q: %w", victim, closeErr)
+	}
+	return true, nil
+}
+
+func validateEmbeddedModelName(model string) (string, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "default", nil
+	}
+	if len(model) > 64 {
+		return "", fmt.Errorf("invalid model name %q: exceeds 64 characters", model)
+	}
+	if filepath.Base(model) != model || strings.Contains(model, "..") || strings.Contains(model, "/") || strings.Contains(model, "\\") {
+		return "", fmt.Errorf("invalid model name %q: path separators are not allowed", model)
+	}
+	for _, ch := range model {
+		if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') && ch != '_' && ch != '-' {
+			return "", fmt.Errorf("invalid character %q in model name %q", ch, model)
+		}
+	}
+	return model, nil
+}
+
+func (b *embeddedBackend) acquireDB(model string) (*storage.AnchorDB, func(), error) {
+	return b.acquireDBInternal(model, true)
+}
+
+func (b *embeddedBackend) acquireDBInternal(model string, pinned bool) (*storage.AnchorDB, func(), error) {
+	cleanModel, err := validateEmbeddedModelName(model)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	b.mu.RLock()
+	if b.closed {
+		b.mu.RUnlock()
+		return nil, nil, fmt.Errorf("embedded engine is closed")
+	}
 	db, ok := b.models[cleanModel]
-	closed := b.closed
+	var pin *atomic.Int64
+	if ok && pinned {
+		pin = b.modelPins[cleanModel]
+		if pin != nil {
+			pin.Add(1)
+		}
+	}
 	b.mu.RUnlock()
 
-	if closed {
-		return nil, fmt.Errorf("embedded engine is closed")
-	}
-	if ok {
-		return db, nil
+	if ok && (!pinned || pin != nil) {
+		b.touchModelOrder(cleanModel)
+		if !pinned {
+			return db, func() {}, nil
+		}
+		return db, makeEmbeddedRelease(pin), nil
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.closed {
-		return nil, fmt.Errorf("embedded engine is closed")
-	}
-	if db, ok := b.models[cleanModel]; ok {
-		return db, nil
-	}
+	skip := make(map[string]bool)
+	for {
+		if b.closed {
+			return nil, nil, fmt.Errorf("embedded engine is closed")
+		}
+		if waitCh, draining := b.modelDraining[cleanModel]; draining {
+			b.mu.Unlock()
+			<-waitCh
+			b.mu.Lock()
+			continue
+		}
+		if db, ok := b.models[cleanModel]; ok {
+			pin := b.ensurePinLocked(cleanModel)
+			if pinned {
+				pin.Add(1)
+			}
+			b.touchModelOrder(cleanModel)
+			if !pinned {
+				return db, func() {}, nil
+			}
+			return db, makeEmbeddedRelease(pin), nil
+		}
 
-	const maxEmbeddedModels = 500
-	if len(b.models) >= maxEmbeddedModels && len(b.modelOrder) > 0 {
-		victim := b.modelOrder[0]
-		b.modelOrder = b.modelOrder[1:]
-		if vdb, exists := b.models[victim]; exists {
-			delete(b.models, victim)
-			if err := errors.Join(vdb.Sync(), vdb.Close()); err != nil {
-				return nil, fmt.Errorf("failed evicting embedded model %q: %w", victim, err)
+		const maxEmbeddedModels = 500
+		if len(b.models) >= maxEmbeddedModels {
+			evicted, evErr := b.evictIdleModelWithUnlockLocked(skip)
+			if evErr != nil {
+				return nil, nil, evErr
+			}
+			if evicted {
+				continue
 			}
 		}
+		break
 	}
 
 	filePath := filepath.Join(b.dataDir, cleanModel+".anchordb")
 	newDB, err := storage.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open embedded model %q at %s: %w", cleanModel, filePath, err)
+		return nil, nil, fmt.Errorf("failed to open embedded model %q at %s: %w", cleanModel, filePath, err)
 	}
 	b.models[cleanModel] = newDB
-	b.modelOrder = append(b.modelOrder, cleanModel)
-	return newDB, nil
+	pin = b.ensurePinLocked(cleanModel)
+	if pinned {
+		pin.Add(1)
+	}
+	b.touchModelOrder(cleanModel)
+	if !pinned {
+		return newDB, func() {}, nil
+	}
+	return newDB, makeEmbeddedRelease(pin), nil
 }
 
 func (b *embeddedBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	opStatus := storage.OpStatusActive
 	if op != nil {
 		opStatus = *op
@@ -539,10 +784,11 @@ func (b *embeddedBackend) SaveTyped(ctx context.Context, model, name string, op 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 	opStatus := storage.OpStatusActive
 	if op != nil {
 		opStatus = *op
@@ -554,10 +800,11 @@ func (b *embeddedBackend) GetTyped(ctx context.Context, model, name string) (sto
 	if err := ctx.Err(); err != nil {
 		return storage.CompactRecord{}, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return storage.CompactRecord{}, err
 	}
+	defer release()
 	return db.GetRecordTyped(name)
 }
 
@@ -565,10 +812,11 @@ func (b *embeddedBackend) SaveBatch(ctx context.Context, model string, records [
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return db.SaveRecordsBatch(records)
 }
 
@@ -576,10 +824,11 @@ func (b *embeddedBackend) Get(ctx context.Context, model, name string, selectFie
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	cr, err := db.GetRecordTypedWithCompute(name, computations, selectFields...)
 	if err != nil {
 		return nil, err
@@ -591,10 +840,11 @@ func (b *embeddedBackend) List(ctx context.Context, model string, opts storage.Q
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	opts.Context = ctx
 	records, hasMore, err := db.ListRecordsWithPaging(opts)
 	if err != nil {
@@ -618,10 +868,11 @@ func (b *embeddedBackend) Update(ctx context.Context, model string, opts storage
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return 0, err
 	}
+	defer release()
 	opts.Context = ctx
 	return db.UpdateRecords(opts)
 }
@@ -630,10 +881,11 @@ func (b *embeddedBackend) Graph(ctx context.Context, model string, inputs []stri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	results, anchor, err := db.ExecuteGraphStepWithContext(ctx, inputs, relation, limitK, orderMode, beamWidth)
 	if err != nil {
 		return nil, err
@@ -645,10 +897,11 @@ func (b *embeddedBackend) GraphChain(ctx context.Context, model string, inputs [
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	steps, err := db.ExecuteGraphChainWithContext(ctx, inputs, relations, limitK, beamWidth)
 	if err != nil {
 		return nil, err
@@ -667,10 +920,11 @@ func (b *embeddedBackend) Edge(ctx context.Context, model, action, source, relat
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return err
 	}
+	defer release()
 	switch strings.ToLower(action) {
 	case "remove", "delete", "unlink":
 		return db.RemoveEdge(source, relation, target)
@@ -683,10 +937,11 @@ func (b *embeddedBackend) Causal(ctx context.Context, model string, seeds []stri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if len(relations) > 0 {
 		return db.ExecuteCausalChain(ctx, seeds, relations, limitK)
 	}
@@ -694,35 +949,39 @@ func (b *embeddedBackend) Causal(ctx context.Context, model string, seeds []stri
 }
 
 func (b *embeddedBackend) Distance(_ context.Context, model, wordA, wordB string) (float32, error) {
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return 0, err
 	}
+	defer release()
 	return db.CalculateDistance(wordA, wordB)
 }
 
 func (b *embeddedBackend) Centroid(_ context.Context, model string, words []string) (CentroidResult, error) {
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return CentroidResult{}, err
 	}
+	defer release()
 	coord, roles, err := db.CalculateCentroid(words)
 	return CentroidResult{Coord: coord, Roles: roles}, err
 }
 
 func (b *embeddedBackend) CosineSimilarity(_ context.Context, model, wordA, wordB string) (float32, error) {
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return 0, err
 	}
+	defer release()
 	return db.CalculateCosineSimilarity(wordA, wordB)
 }
 
 func (b *embeddedBackend) Nearest(_ context.Context, model, word string, limitK int) ([]storage.GraphQueryResult, error) {
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return db.FindNearestNeighbors(word, limitK)
 }
 
@@ -730,10 +989,11 @@ func (b *embeddedBackend) AppendNode(ctx context.Context, model, word string, co
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return err
 	}
+	defer release()
 	_, err = db.AppendNode(word, coord, roles, 1)
 	return err
 }
@@ -742,66 +1002,89 @@ func (b *embeddedBackend) SetRelation(ctx context.Context, model, name string, d
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return db.SetRelation(name, direction)
 }
 
 func (b *embeddedBackend) Sync(_ context.Context, model string) error {
 	if model != "" && model != "all" {
-		db, err := b.getDB(model)
+		db, release, err := b.acquireDB(model)
 		if err != nil {
 			return err
 		}
+		defer release()
 		return db.Sync()
 	}
 	b.mu.RLock()
-	dbs := make([]*storage.AnchorDB, 0, len(b.models))
-	for _, db := range b.models {
-		dbs = append(dbs, db)
+	names := make([]string, 0, len(b.models))
+	for name := range b.models {
+		names = append(names, name)
 	}
 	b.mu.RUnlock()
 
 	var syncErrs []error
-	for _, db := range dbs {
+	for _, name := range names {
+		db, release, err := b.acquireDB(name)
+		if err != nil {
+			syncErrs = append(syncErrs, err)
+			continue
+		}
 		if err := db.Sync(); err != nil {
 			syncErrs = append(syncErrs, err)
 		}
+		release()
 	}
 	return errors.Join(syncErrs...)
 }
 
 func (b *embeddedBackend) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
+		b.mu.Unlock()
 		return nil
 	}
 	b.closed = true
+	sched := b.scheduler
+	b.mu.Unlock()
+
+	if sched != nil {
+		sched.Stop()
+	}
+
+	b.mu.Lock()
+	for len(b.modelDraining) > 0 {
+		var waitCh chan struct{}
+		for _, ch := range b.modelDraining {
+			waitCh = ch
+			break
+		}
+		b.mu.Unlock()
+		<-waitCh
+		b.mu.Lock()
+	}
+	defer b.mu.Unlock()
 
 	var closeErrs []error
-	if b.scheduler != nil {
-		b.scheduler.Stop()
-	}
-	if b.workerPool != nil {
-		if err := b.workerPool.Shutdown(); err != nil {
-			closeErrs = append(closeErrs, err)
-		}
-	}
-
 	for _, db := range b.models {
 		if err := db.Close(); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 	}
 	b.models = make(map[string]*storage.AnchorDB)
+	b.modelPins = make(map[string]*atomic.Int64)
+	b.lruMu.Lock()
+	b.modelLRU = nil
+	b.modelElems = nil
+	b.lruMu.Unlock()
 	return errors.Join(closeErrs...)
 }
 
 func (b *embeddedBackend) DB() *storage.AnchorDB {
-	db, err := b.getDB(b.cfg.model)
+	db, _, err := b.acquireDBInternal(b.cfg.model, false)
 	if err != nil {
 		return nil
 	}
@@ -812,11 +1095,11 @@ func (b *embeddedBackend) IsRemote() bool {
 	return false
 }
 
-func (b *embeddedBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
+func (b *embeddedBackend) ListPartitions(_ context.Context, _ string) ([]PartitionMeta, error) {
 	return listPartitionsInDir(filepath.Join(b.dataDir, "partitions"))
 }
 
-func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *embeddedBackend) InspectPartition(ctx context.Context, _, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
 	return inspectPartitionFile(ctx, b.dataDir, partitionFile, recordName, limit)
 }
 
@@ -824,10 +1107,11 @@ func (b *embeddedBackend) Attach(ctx context.Context, model string, schema stora
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return db.AttachSchema(schema)
 }
 
@@ -835,10 +1119,11 @@ func (b *embeddedBackend) GetSchema(ctx context.Context, model string) (storage.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	s, ok := db.GetSchema()
 	if !ok {
 		return nil, fmt.Errorf("no schema attached to model %q", model)
@@ -853,10 +1138,11 @@ func (b *embeddedBackend) ResetModel(ctx context.Context, model string, confirm 
 	if !confirm {
 		return fmt.Errorf("confirm must be true to reset model schema")
 	}
-	db, err := b.getDB(model)
+	db, release, err := b.acquireDB(model)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return db.ResetSchema()
 }
 
@@ -941,6 +1227,24 @@ func (b *remoteBackend) doJSON(ctx context.Context, method, endpoint string, req
 			return fmt.Errorf("engine error (status %d): %s", resp.StatusCode, errResp.Error)
 		}
 		return fmt.Errorf("engine returned HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	if len(bodyBytes) > 0 {
+		var statusEnvelope struct {
+			Success *bool  `json:"success"`
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if jsonErr := json.Unmarshal(bodyBytes, &statusEnvelope); jsonErr == nil && statusEnvelope.Success != nil && !*statusEnvelope.Success {
+			msg := statusEnvelope.Error
+			if msg == "" {
+				msg = statusEnvelope.Message
+			}
+			if msg == "" {
+				msg = "request failed (success=false)"
+			}
+			return fmt.Errorf("engine error (status %d): %s", resp.StatusCode, msg)
+		}
 	}
 
 	if respPayload != nil && len(bodyBytes) > 0 {
@@ -1349,7 +1653,7 @@ func (b *remoteBackend) IsRemote() bool {
 	return true
 }
 
-func (b *remoteBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+func (b *remoteBackend) ListPartitions(ctx context.Context, _ string) ([]PartitionMeta, error) {
 	var resp struct {
 		Success    bool            `json:"success"`
 		Partitions []PartitionMeta `json:"partitions"`
@@ -1360,7 +1664,7 @@ func (b *remoteBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, er
 	return resp.Partitions, nil
 }
 
-func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *remoteBackend) InspectPartition(ctx context.Context, _, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
 	req := map[string]interface{}{
 		"partition_file": partitionFile,
 	}
@@ -1611,6 +1915,14 @@ func (b *wireBackend) acquire(ctx context.Context) (*wire.Client, error) {
 
 	select {
 	case wc := <-b.idle:
+		b.mu.Lock()
+		closed := b.closed
+		b.mu.Unlock()
+		if closed {
+			_ = wc.Close()
+			<-b.sem
+			return nil, errors.New("wire client closed")
+		}
 		return wc, nil
 	case <-b.closeChan:
 		<-b.sem
@@ -1677,13 +1989,24 @@ func (b *wireBackend) withClient(ctx context.Context, model string, fn func(wc *
 		b.release(wc, healthy)
 	}()
 
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = wc.Close()
+	})
+	defer stopCancel()
+
 	if model != "" && model != wc.ModelName() {
 		if err := wc.SelectModel(model); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			healthy = isHealthyWireResult(err)
 			return err
 		}
 	}
 	err = fn(wc)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	healthy = isHealthyWireResult(err)
 	return err
 }
@@ -1975,6 +2298,18 @@ func (b *wireBackend) Close() error {
 	}
 	b.closed = true
 	close(b.closeChan)
+	for {
+		select {
+		case wc := <-b.idle:
+			if wc != nil {
+				delete(b.clients, wc)
+				_ = wc.Close()
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
 	toClose := make([]*wire.Client, 0, len(b.clients))
 	for wc := range b.clients {
 		toClose = append(toClose, wc)
@@ -2006,11 +2341,13 @@ func (b *wireBackend) defaultModel() string {
 	return "default"
 }
 
-func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
+func (b *wireBackend) ListPartitions(ctx context.Context, model string) ([]PartitionMeta, error) {
 	var out []PartitionMeta
-	model := b.defaultModel()
+	if model == "" {
+		model = b.defaultModel()
+	}
 	err := b.withClient(ctx, model, func(wc *wire.Client) error {
-		items, err := wc.PartitionCatalog(b.cfg.model)
+		items, err := wc.PartitionCatalog(model)
 		if err != nil {
 			return err
 		}
@@ -2030,9 +2367,12 @@ func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, erro
 	return out, nil
 }
 
-func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *wireBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
 	var result *PartitionInspectResult
-	err := b.withClient(ctx, b.defaultModel(), func(wc *wire.Client) error {
+	if model == "" {
+		model = b.defaultModel()
+	}
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		resp, err := wc.PartitionInspect(wire.PartitionInspectWireRequest{
 			PartitionFile: partitionFile,
 			RecordName:    recordName,
@@ -2057,6 +2397,7 @@ func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recor
 			Attrs:         resp.Attrs,
 			Records:       records,
 			Count:         len(records),
+			HasMore:       resp.HasMore,
 		}
 		return nil
 	})

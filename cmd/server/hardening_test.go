@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -314,5 +315,71 @@ func TestServer_HandleGetMaxBytes413AndAllModelNames(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413 RequestEntityTooLarge for oversized /v1/get, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServer_PartitionRunAndWorkerCancelMaxBytes413(t *testing.T) {
+	s, dir := createFastTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	handler := s.Routes()
+	pad := bytes.Repeat([]byte("x"), maxRequestBodyBytes+1024)
+	for _, tc := range []struct {
+		path string
+		body []byte
+	}{
+		{"/v1/partition/run", append(append([]byte(`{"model":"`), pad...), []byte(`"}`)...)},
+		{"/v1/worker/cancel", append(append([]byte(`{"job_id":"`), pad...), []byte(`"}`)...)},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(tc.body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("%s oversized body = %d, want 413: %s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestServer_ModelLRUPreservesHotModelOnRLockHit(t *testing.T) {
+	s, dir := createFastTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	for _, name := range []string{"m1", "m2", "m3"} {
+		if _, err := s.getModel(name); err != nil {
+			t.Fatalf("getModel(%s): %v", name, err)
+		}
+	}
+
+	// Concurrent RLock cache hits on m1 must promote m1 to MRU without races,
+	// so m2 (coldest remaining) is evicted before m1.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				if _, err := s.getModel("m1"); err != nil {
+					t.Errorf("concurrent getModel(m1): %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	s.mu.Lock()
+	evicted := s.evictIdleModelWithUnlockLocked(make(map[string]bool))
+	_, hasM1 := s.models["m1"]
+	_, hasM2 := s.models["m2"]
+	s.mu.Unlock()
+
+	if !evicted {
+		t.Fatal("expected evictIdleModelWithUnlockLocked to evict one model")
+	}
+	if !hasM1 {
+		t.Fatal("expected frequently hit model m1 to stay cached under LRU")
+	}
+	if hasM2 {
+		t.Fatal("expected least-recently-used model m2 to be evicted instead of m1")
 	}
 }

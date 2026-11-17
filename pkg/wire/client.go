@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -45,6 +46,7 @@ type ClientConfig struct {
 	Timeout       time.Duration
 	TargetRecords uint32
 	EnablePacing  bool
+	TLSConfig     *tls.Config
 }
 
 // ClientOption configures a wire Client.
@@ -79,7 +81,18 @@ func WithClientAdaptivePacing(targetRecords uint32) ClientOption {
 	}
 }
 
-// Connect opens a TCP connection to an AnchorWire daemon.
+// WithClientTLS configures TLS for the AnchorWire client connection.
+func WithClientTLS(cfg *tls.Config) ClientOption {
+	return func(c *ClientConfig) {
+		if cfg != nil {
+			c.TLSConfig = cfg.Clone()
+		} else {
+			c.TLSConfig = nil
+		}
+	}
+}
+
+// Connect opens a TCP (or TLS if configured) connection to an AnchorWire daemon.
 func Connect(addr string, opts ...ClientOption) (*Client, error) {
 	cfg := ClientConfig{
 		Model:   "default",
@@ -90,7 +103,17 @@ func Connect(addr string, opts ...ClientOption) (*Client, error) {
 	}
 
 	dialer := net.Dialer{Timeout: cfg.Timeout}
-	conn, err := dialer.Dial("tcp", addr)
+	var conn net.Conn
+	var err error
+	if cfg.TLSConfig != nil {
+		tlsDialer := tls.Dialer{
+			NetDialer: &dialer,
+			Config:    cfg.TLSConfig.Clone(),
+		}
+		conn, err = tlsDialer.Dial("tcp", addr)
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial wire server at %s: %w", addr, err)
 	}
@@ -164,15 +187,22 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 	}
 
 	if err := WriteFrame(c.writer, req); err != nil {
+		_ = c.Close()
 		return Frame{}, fmt.Errorf("failed to send frame: %w", err)
 	}
 	if err := c.writer.Flush(); err != nil {
+		_ = c.Close()
 		return Frame{}, fmt.Errorf("failed to flush frame: %w", err)
 	}
 
 	resp, err := ReadFrame(c.reader)
 	if err != nil {
+		_ = c.Close()
 		return Frame{}, fmt.Errorf("failed to read response frame: %w", err)
+	}
+	if resp.Seq != seq {
+		_ = c.Close()
+		return Frame{}, fmt.Errorf("wire response sequence mismatch: got %d, want %d", resp.Seq, seq)
 	}
 
 	if resp.Flags&FlagMemoryPressure != 0 {
@@ -230,12 +260,14 @@ func (c *Client) AuthStructured(req AuthRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(resp.Payload) > 0 && resp.Payload[0] == StructuredRespMagic {
-		if len(resp.Payload) > 1 && resp.Payload[1] == SubCodeRotationStaged {
+	if len(resp.Payload) > 0 {
+		switch resp.Payload[0] {
+		case StructuredRotationRespMagic:
 			_, msg, dErr := DecodeRotationStagedResponse(resp.Payload)
 			return msg, dErr
+		case StructuredRespMagic:
+			return DecodeAuthResponse(resp.Payload)
 		}
-		return DecodeAuthResponse(resp.Payload)
 	}
 	return "", nil
 }

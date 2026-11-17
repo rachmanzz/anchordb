@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -368,13 +369,13 @@ func (p *Pool) checkMemory() error {
 	if limit <= 0 {
 		limit = debug.SetMemoryLimit(-1)
 	}
-	if limit <= 0 {
+	if limit <= 0 || limit == math.MaxInt64 {
 		return nil // unlimited
 	}
 
 	usage, _ := processMemoryUsage()
 	thresh := float64(limit) * p.cfg.MemoryThreshold
-	if int64(usage) >= int64(thresh) {
+	if float64(usage) >= thresh {
 		return ErrMemoryFull
 	}
 	return nil
@@ -1093,6 +1094,13 @@ func (p *Pool) Shutdown() error {
 			log.Println("[WORKER] Shutdown finished after forced signal (some tasks may be truncated).")
 			return nil
 		case <-time.After(p.cfg.ShutdownTimeout):
+			// Drain any unconsumed queued tasks left in closed taskCh so pending
+			// counters and cancellation callbacks stay consistent.
+			for job := range taskCh {
+				p.canceled.Add(1)
+				p.decPending()
+				p.reportCanceled(job.task)
+			}
 			p.stopped.Store(true)
 			p.forced.Store(true)
 			log.Println("[WORKER] Shutdown exceeded timeout; a task ignored cancellation. Pool marked forcibly stopped.")

@@ -197,6 +197,74 @@ func TestDriver_WirePoolDiscardsBrokenConnAndRetainsProtocolErrorConn(t *testing
 	}
 }
 
+type wirePartitionTestBackend struct {
+	*wireTestBackend
+}
+
+func (m *wirePartitionTestBackend) GetPartitionCatalog(_ string) ([]wire.PartitionCatalogItemDTO, error) {
+	return nil, nil
+}
+
+func (m *wirePartitionTestBackend) InspectPartition(fileOrLoc, _ string, limit int) (wire.PartitionInspectWireResponse, error) {
+	all := []wire.PartitionRecordWireItem{
+		{Name: "r1"},
+		{Name: "r2"},
+		{Name: "r3"},
+	}
+	hasMore := false
+	if limit > 0 && limit < len(all) {
+		hasMore = true
+		all = all[:limit]
+	}
+	return wire.PartitionInspectWireResponse{
+		PartitionFile: fileOrLoc,
+		Records:       all,
+		HasMore:       hasMore,
+	}, nil
+}
+
+func TestWireBackend_InspectPartitionHasMore(t *testing.T) {
+	backend := &wirePartitionTestBackend{
+		wireTestBackend: &wireTestBackend{
+			dataDir: t.TempDir(),
+			models:  make(map[string]*storage.AnchorDB),
+		},
+	}
+	defer backend.Close()
+
+	srv := wire.NewServer(backend)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	go func() {
+		_ = srv.Serve(l)
+	}()
+
+	client, err := ConnectWire(fmt.Sprintf("wire://%s", l.Addr().String()))
+	if err != nil {
+		t.Fatalf("ConnectWire: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	res, err := client.InspectPartition(context.Background(), "part1.anchordb", "", 2)
+	if err != nil {
+		t.Fatalf("InspectPartition: %v", err)
+	}
+	if len(res.Records) != 2 || !res.HasMore {
+		t.Fatalf("expected len=2 and HasMore=true over wire, got len=%d HasMore=%v", len(res.Records), res.HasMore)
+	}
+
+	resAll, err := client.InspectPartition(context.Background(), "part1.anchordb", "", 5)
+	if err != nil {
+		t.Fatalf("InspectPartition all: %v", err)
+	}
+	if len(resAll.Records) != 3 || resAll.HasMore {
+		t.Fatalf("expected len=3 and HasMore=false over wire, got len=%d HasMore=%v", len(resAll.Records), resAll.HasMore)
+	}
+}
+
 func TestConnectWire_RejectsInvalidQueryParams(t *testing.T) {
 	for _, dsn := range []string{
 		"wire://127.0.0.1:7448?target=notanumber",

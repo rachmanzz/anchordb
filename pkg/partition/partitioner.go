@@ -44,6 +44,7 @@ type PartitionResult struct {
 	RecordNames    []string  `json:"record_names,omitempty"`
 	MinDate        float32   `json:"min_date,omitempty"`
 	MaxDate        float32   `json:"max_date,omitempty"`
+	HasMore        bool      `json:"has_more,omitempty"`
 }
 
 // ExecutePartition archives historical records older than RetentionDays into an isolated partition file
@@ -65,13 +66,15 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	cutoffDays := nowDays - policy.RetentionDays
 	cutoffDateStr := storage.FormatDate(cutoffDays)
 
+	const maxPartitionBatch = 1000000
 	// Select and transition candidates while holding the same database write
 	// lock. This prevents a save/update from slipping between the archive
 	// snapshot and the SafeDelete state change.
-	records, err := db.LockPartitionRecords(policy.DateField, cutoffDays, 1000000)
+	records, err := db.LockPartitionRecords(policy.DateField, cutoffDays, maxPartitionBatch)
 	if err != nil {
 		return nil, fmt.Errorf("failed locking partition records: %w", err)
 	}
+	hasMore := len(records) == maxPartitionBatch
 
 	if len(records) == 0 {
 		return &PartitionResult{
@@ -166,6 +169,11 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		return nil, rollback(fmt.Errorf("failed saving to sink %s: %w", policy.Sink.Name(), err))
 	}
 
+	registeredFilename := partitionFilename
+	if _, isS3 := policy.Sink.(*S3Sink); !isS3 && targetLoc != "" {
+		registeredFilename = filepath.Base(targetLoc)
+	}
+
 	// Phase B: Register durable catalog entry BEFORE mutating/pruning hot DB so
 	// cold-tier lookups can never miss already-pruned records across crash windows.
 	if policy.Catalog != nil {
@@ -181,10 +189,14 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 				AccessKey: s3Sink.AccessKey,
 			}
 		}
+		entryID := registeredFilename
+		if policy.ModelName != "" {
+			entryID = policy.ModelName + "/" + registeredFilename
+		}
 		if regErr := policy.Catalog.RegisterPartition(&CatalogEntry{
-			ID:             partitionFilename,
+			ID:             entryID,
 			Model:          policy.ModelName,
-			PartitionFile:  partitionFilename,
+			PartitionFile:  registeredFilename,
 			TargetLocation: targetLoc,
 			SinkType:       sinkType,
 			RecordCount:    len(records),
@@ -201,11 +213,11 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	if policy.PruneHotDB {
-		// Transition to Tombstone (2) and sweep
+		// Transition to Tombstone (2) and sweep only the newly archived records.
 		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusTombstone); err != nil {
 			return nil, fmt.Errorf("partition saved to %s but failed to mark source records for deletion: %w", targetLoc, err)
 		}
-		if _, err := db.CollectTombstones(len(archivedNames)); err != nil {
+		if _, err := db.CollectNamedTombstones(archivedNames); err != nil {
 			return nil, fmt.Errorf("partition saved to %s but failed to collect archived records: %w", targetLoc, err)
 		}
 		if err := db.Sync(); err != nil { // Compacts active database file on disk!
@@ -225,9 +237,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		CutoffDate:     cutoffDateStr,
 		ExecutionTime:  t0,
 		DurationMs:     time.Since(t0).Seconds() * 1000,
-		PartitionFile:  partitionFilename,
+		PartitionFile:  registeredFilename,
 		RecordNames:    archivedNames,
 		MinDate:        minDate,
 		MaxDate:        maxDate,
+		HasMore:        hasMore,
 	}, nil
 }

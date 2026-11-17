@@ -23,6 +23,9 @@ const (
 	StructuredAuthMagic byte = 0xAA
 	// StructuredRespMagic is the leading byte identifying structured handshake response frames.
 	StructuredRespMagic byte = 0xAB
+	// StructuredRotationRespMagic is the leading byte identifying rotation-staged response frames.
+	// Using a distinct magic byte prevents collision between buf[1] subcode and AuthResponse length.
+	StructuredRotationRespMagic byte = 0xAC
 
 	// SubCodeRotationStaged indicates that NextCommitment was successfully staged to disk.
 	SubCodeRotationStaged byte = 0x01
@@ -252,7 +255,7 @@ func EncodeRotationStagedResponse(msg string) []byte {
 		msgBytes = msgBytes[:math.MaxUint16]
 	}
 	buf := make([]byte, 1+1+2+len(msgBytes))
-	buf[0] = StructuredRespMagic
+	buf[0] = StructuredRotationRespMagic
 	buf[1] = SubCodeRotationStaged
 	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(msgBytes)))
 	copy(buf[4:], msgBytes)
@@ -264,8 +267,8 @@ func DecodeRotationStagedResponse(payload []byte) (byte, string, error) {
 	if len(payload) < 4 {
 		return 0, "", ErrMalformedAuthResponse
 	}
-	if payload[0] != StructuredRespMagic {
-		return 0, "", errors.New("wire: auth response is not a structured response")
+	if payload[0] != StructuredRotationRespMagic {
+		return 0, "", errors.New("wire: auth response is not a structured rotation response")
 	}
 	subCode := payload[1]
 	msgLen := int(binary.LittleEndian.Uint16(payload[2:4]))

@@ -27,6 +27,9 @@ const (
 
 	// MaxPayloadSize caps incoming frames at 64 MiB to guard against untrusted allocations
 	MaxPayloadSize = 64 << 20
+	// MaxPreAuthPayloadSize caps unauthenticated handshake/ping frames at 64 KiB
+	// to prevent unauthenticated peers from forcing large heap allocations.
+	MaxPreAuthPayloadSize uint32 = 64 << 10
 )
 
 // OpCodes
@@ -106,8 +109,14 @@ type Frame struct {
 	Payload []byte
 }
 
-// ReadFrame decodes a Frame from an io.Reader.
+// ReadFrame decodes a Frame from an io.Reader up to MaxPayloadSize.
 func ReadFrame(r io.Reader) (Frame, error) {
+	return ReadFrameMax(r, MaxPayloadSize)
+}
+
+// ReadFrameMax decodes a Frame from an io.Reader, rejecting declared payload
+// lengths above maxPayload before allocating a payload buffer.
+func ReadFrameMax(r io.Reader, maxPayload uint32) (Frame, error) {
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return Frame{}, err
@@ -126,8 +135,11 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
 	expectedChecksum := binary.LittleEndian.Uint32(hdr[12:16])
 
-	if payloadLen > MaxPayloadSize {
-		return Frame{}, fmt.Errorf("payload length %d exceeds max allowed %d", payloadLen, MaxPayloadSize)
+	if maxPayload == 0 || maxPayload > MaxPayloadSize {
+		maxPayload = MaxPayloadSize
+	}
+	if payloadLen > maxPayload {
+		return Frame{}, fmt.Errorf("payload length %d exceeds max allowed %d", payloadLen, maxPayload)
 	}
 
 	payload := make([]byte, payloadLen)
@@ -2400,6 +2412,7 @@ type PartitionInspectWireResponse struct {
 	Props         map[string]float32        `json:"props,omitempty"`
 	Attrs         []storage.AttrEntry       `json:"attrs,omitempty"`
 	Records       []PartitionRecordWireItem `json:"records,omitempty"`
+	HasMore       bool                      `json:"has_more,omitempty"`
 }
 
 // EncodePartitionInspectRequest encodes request for OpPartitionInspect.

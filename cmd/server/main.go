@@ -2,6 +2,7 @@
 package main
 
 import (
+	"container/list"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -91,22 +92,30 @@ type ServerConfig struct {
 
 // Server holds active AnchorDB database instances and background subsystems
 type Server struct {
-	mu          sync.RWMutex
-	dataDir     string
-	authToken   string
-	port        string
-	wirePort    string
-	wireServer  *wire.Server
-	models      map[string]*storage.AnchorDB
-	modelOrder  []string
-	scheduler   *scheduler.InternalScheduler
-	cronEnabled bool
-	worker      *worker.Pool
-	ipFilter    *security.IPFilter
-	startTime   time.Time
+	mu            sync.RWMutex
+	dataDir       string
+	authToken     string
+	port          string
+	wirePort      string
+	wireServer    *wire.Server
+	models        map[string]*storage.AnchorDB
+	modelPins     map[string]*atomic.Int64
+	modelDraining map[string]chan struct{}
+	lruMu         sync.Mutex
+	modelLRU      *list.List
+	modelElems    map[string]*list.Element
+	scheduler     *scheduler.InternalScheduler
+	cronEnabled   bool
+	worker        *worker.Pool
+	ipFilter      *security.IPFilter
+	startTime     time.Time
 
 	dbOptions storage.Options
 	limiter   *rateLimiter
+
+	memStatsMu     sync.Mutex
+	memStatsCached runtime.MemStats
+	memStatsAt     time.Time
 
 	// Gateway & Cluster Join state
 	gatewayMode bool
@@ -226,6 +235,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		s3DefaultAccessKey: cfg.S3DefaultAccessKey,
 		s3DefaultSecretKey: cfg.S3DefaultSecretKey,
 		models:             make(map[string]*storage.AnchorDB),
+		modelPins:          make(map[string]*atomic.Int64),
+		modelDraining:      make(map[string]chan struct{}),
 		scheduler:          sched,
 		cronEnabled:        cfg.CronEnabled,
 		worker:             workerPool,
@@ -303,8 +314,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/v1/model/schema", s.authMiddleware(s.handleModelSchema))
 	mux.HandleFunc("/v1/model/reset", s.authMiddleware(s.handleModelReset))
 	// recoverMiddleware is outermost so a panic in any layer yields a clean 500
-	// instead of dropping the connection with a stack trace.
-	return recoverMiddleware(s.rateLimitMiddleware(s.ipFilter.Middleware(mux)))
+	// instead of dropping the connection with a stack trace. ipFilter runs outside
+	// rateLimitMiddleware so disallowed IPs are rejected before touching rate-limit buckets.
+	return recoverMiddleware(s.ipFilter.Middleware(s.rateLimitMiddleware(mux)))
 }
 
 // recoverMiddleware catches panics from downstream handlers, logs them, and
@@ -404,8 +416,7 @@ func validateS3Endpoint(endpoint string, allowPrivate bool) error {
 		return fmt.Errorf("cannot resolve s3_endpoint host %q", host)
 	}
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if partition.IsBlockedS3IP(ip) {
 			return fmt.Errorf("s3_endpoint %q resolves to a private/loopback address; refusing (set ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT=true to allow)", host)
 		}
 	}
@@ -520,10 +531,20 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		s.opCancel()
 	}
 
-	// 4. Flush every model. Close only when nothing can still be using them.
+	// 4. Flush every model. Seal registry first and wait for any in-flight evictions.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closed = true // seal the registry: no model may be opened after this point
+	for len(s.modelDraining) > 0 {
+		var waitCh chan struct{}
+		for _, ch := range s.modelDraining {
+			waitCh = ch
+			break
+		}
+		s.mu.Unlock()
+		<-waitCh
+		s.mu.Lock()
+	}
+	defer s.mu.Unlock()
 	for name, db := range s.models {
 		if err := db.Sync(); err != nil {
 			errs = append(errs, fmt.Errorf("sync model %s: %w", name, err))
@@ -533,7 +554,14 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 				errs = append(errs, fmt.Errorf("close model %s: %w", name, err))
 			}
 			delete(s.models, name)
+			delete(s.modelPins, name)
 		}
+	}
+	if safeToClose {
+		s.lruMu.Lock()
+		s.modelLRU = nil
+		s.modelElems = nil
+		s.lruMu.Unlock()
 	}
 	if !safeToClose {
 		if s.dbOptions.WAL.SyncMode == storage.SyncAlways {
@@ -562,6 +590,12 @@ func (s *Server) WireServer() *wire.Server {
 // GetModel implements wire.Backend.
 func (s *Server) GetModel(name string) (*storage.AnchorDB, error) {
 	return s.getModel(name)
+}
+
+// AcquireModel implements wire.LeaseBackend, pinning the model handle until
+// release is invoked so LRU eviction cannot Close/Munmap it while in flight.
+func (s *Server) AcquireModel(name string) (*storage.AnchorDB, func(), error) {
+	return s.acquireModel(name)
 }
 
 // Authenticate implements wire.Backend.
@@ -634,10 +668,11 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 				if err := taskCtx.Err(); err != nil {
 					return err
 				}
-				db, err := t.server.getModel(modelName)
+				db, release, err := t.server.acquireModel(modelName)
 				if err != nil {
 					return err
 				}
+				defer release()
 				partRes, err := partition.ExecutePartition(db, partition.PartitionPolicy{
 					ModelName:     modelName,
 					DateField:     "date",
@@ -697,19 +732,26 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 		"periodic_disk_sync",
 		func(taskCtx context.Context) error {
 			t.server.mu.RLock()
-			var dbs []*storage.AnchorDB
-			for _, d := range t.server.models {
-				dbs = append(dbs, d)
+			names := make([]string, 0, len(t.server.models))
+			for name := range t.server.models {
+				names = append(names, name)
 			}
 			t.server.mu.RUnlock()
 
 			var synced int
 			var purged int
 			var syncErrs []error
-			for _, d := range dbs {
+			for _, name := range names {
 				if err := taskCtx.Err(); err != nil {
 					syncErrs = append(syncErrs, err)
 					break
+				}
+				d, release, err := t.server.acquireExistingModel(name)
+				if err != nil {
+					if !errors.Is(err, errModelNotFound) && !errors.Is(err, ErrServerClosed) {
+						syncErrs = append(syncErrs, err)
+					}
+					continue
 				}
 				collected, err := d.CollectTombstones(5000)
 				purged += collected
@@ -721,6 +763,7 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 				} else {
 					synced++
 				}
+				release()
 			}
 			if purged > 0 || synced > 0 {
 				log.Printf("[WORKER] Periodic background sync succeeded: %d models synced to disk, %d tombstones collected", synced, purged)
@@ -783,69 +826,167 @@ func isValidIdentifier(token string) bool {
 
 var errModelNotFound = errors.New("model does not exist")
 
-func (s *Server) touchModelOrderLocked(modelName string) {
-	for i, m := range s.modelOrder {
-		if m == modelName {
-			copy(s.modelOrder[i:], s.modelOrder[i+1:])
-			s.modelOrder[len(s.modelOrder)-1] = modelName
-			return
-		}
+func (s *Server) touchModelOrder(modelName string) {
+	s.lruMu.Lock()
+	defer s.lruMu.Unlock()
+	if s.modelLRU == nil {
+		s.modelLRU = list.New()
 	}
-	s.modelOrder = append(s.modelOrder, modelName)
+	if s.modelElems == nil {
+		s.modelElems = make(map[string]*list.Element)
+	}
+	if elem, ok := s.modelElems[modelName]; ok {
+		s.modelLRU.MoveToFront(elem)
+		return
+	}
+	s.modelElems[modelName] = s.modelLRU.PushFront(modelName)
 }
 
-func (s *Server) evictLRUModelLocked() bool {
-	evict := func(victim string, vdb *storage.AnchorDB) {
-		delete(s.models, victim)
-		if err := vdb.Sync(); err != nil {
-			log.Printf("[WARN] Failed to sync evicted LRU model %q: %v", victim, err)
-		}
-		if err := vdb.Close(); err != nil {
-			log.Printf("[WARN] Failed to close evicted LRU model %q: %v", victim, err)
-		}
+func makeLeaseRelease(pin *atomic.Int64) func() {
+	if pin == nil {
+		return func() {}
 	}
-	for len(s.modelOrder) > 0 {
-		victim := s.modelOrder[0]
-		s.modelOrder = s.modelOrder[1:]
-		if vdb, ok := s.models[victim]; ok {
-			evict(victim, vdb)
-			return true
-		}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			pin.Add(-1)
+		})
 	}
-	// Defensive fallback if s.modelOrder drifted out of sync with s.models.
-	if len(s.models) > 0 {
-		var victim string
-		for k := range s.models {
-			if victim == "" || k < victim {
-				victim = k
+}
+
+func (s *Server) ensureModelPinLocked(modelName string) *atomic.Int64 {
+	if s.modelPins == nil {
+		s.modelPins = make(map[string]*atomic.Int64)
+	}
+	pin, ok := s.modelPins[modelName]
+	if !ok {
+		pin = &atomic.Int64{}
+		s.modelPins[modelName] = pin
+	}
+	return pin
+}
+
+func (s *Server) pickIdleVictimLocked(skip map[string]bool) (string, *storage.AnchorDB) {
+	s.lruMu.Lock()
+	if s.modelLRU != nil {
+		for elem := s.modelLRU.Back(); elem != nil; elem = elem.Prev() {
+			candidate, _ := elem.Value.(string)
+			if skip[candidate] {
+				continue
 			}
-		}
-		if vdb, ok := s.models[victim]; ok {
-			evict(victim, vdb)
-			return true
+			vdb, ok := s.models[candidate]
+			if !ok {
+				continue
+			}
+			if pin := s.modelPins[candidate]; pin != nil && pin.Load() > 0 {
+				continue
+			}
+			s.modelLRU.Remove(elem)
+			delete(s.modelElems, candidate)
+			s.lruMu.Unlock()
+			return candidate, vdb
 		}
 	}
-	return false
+	s.lruMu.Unlock()
+
+	// Defensive fallback if modelLRU drifted out of sync with s.models.
+	var victim string
+	for k := range s.models {
+		if skip[k] {
+			continue
+		}
+		if pin := s.modelPins[k]; pin != nil && pin.Load() > 0 {
+			continue
+		}
+		if victim == "" || k < victim {
+			victim = k
+		}
+	}
+	if victim == "" {
+		return "", nil
+	}
+	return victim, s.models[victim]
 }
 
-// getExistingModel opens a model only if already loaded or present on disk,
-// avoiding empty file creation and cache exhaustion on read-only lookups.
-func (s *Server) getExistingModel(modelName string) (*storage.AnchorDB, error) {
+// evictIdleModelWithUnlockLocked selects one idle (unpinned) LRU model, removes it
+// from the active registry, and runs Sync+Close outside s.mu so other requests are
+// not stalled during disk flush. Caller must hold s.mu.Lock() and continues holding
+// s.mu.Lock() upon return.
+func (s *Server) evictIdleModelWithUnlockLocked(skip map[string]bool) bool {
+	victim, vdb := s.pickIdleVictimLocked(skip)
+	if victim == "" || vdb == nil {
+		return false
+	}
+
+	delete(s.models, victim)
+	delete(s.modelPins, victim)
+	if s.modelDraining == nil {
+		s.modelDraining = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	s.modelDraining[victim] = done
+	s.mu.Unlock()
+
+	syncErr := vdb.Sync()
+	if syncErr != nil {
+		log.Printf("[WARN] Failed to sync evicted LRU model %q (keeping handle open): %v", victim, syncErr)
+		s.mu.Lock()
+		delete(s.modelDraining, victim)
+		close(done)
+		if !s.closed && s.models[victim] == nil {
+			s.models[victim] = vdb
+			s.ensureModelPinLocked(victim)
+			s.touchModelOrder(victim)
+		}
+		skip[victim] = true
+		return true
+	}
+
+	if err := vdb.Close(); err != nil {
+		log.Printf("[WARN] Failed to close evicted LRU model %q: %v", victim, err)
+	}
+
+	s.mu.Lock()
+	delete(s.modelDraining, victim)
+	close(done)
+	return true
+}
+
+func (s *Server) acquireExistingModel(modelName string) (*storage.AnchorDB, func(), error) {
+	return s.acquireExistingModelInternal(modelName, true)
+}
+
+func (s *Server) acquireExistingModelInternal(modelName string, pinned bool) (*storage.AnchorDB, func(), error) {
 	cleanName, err := sanitizeModelName(modelName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, nil, ErrServerClosed
+	}
 	db, exists := s.models[cleanName]
+	var pin *atomic.Int64
+	if exists && pinned {
+		pin = s.modelPins[cleanName]
+		if pin != nil {
+			pin.Add(1)
+		}
+	}
 	s.mu.RUnlock()
-	if exists {
-		return db, nil
+	if exists && (!pinned || pin != nil) {
+		s.touchModelOrder(cleanName)
+		if !pinned {
+			return db, func() {}, nil
+		}
+		return db, makeLeaseRelease(pin), nil
 	}
 	dbPath := filepath.Join(s.dataDir, cleanName+".anchordb")
 	if _, statErr := os.Stat(dbPath); errors.Is(statErr, os.ErrNotExist) {
-		return nil, errModelNotFound
+		return nil, nil, errModelNotFound
 	}
-	return s.getModel(cleanName)
+	return s.acquireModelInternal(cleanName, pinned)
 }
 
 func closePartitionDB(pdb *storage.AnchorDB, label string) {
@@ -887,42 +1028,80 @@ func (s *Server) allModelNames() []string {
 	return names
 }
 
+func (s *Server) acquireModel(modelName string) (*storage.AnchorDB, func(), error) {
+	return s.acquireModelInternal(modelName, true)
+}
+
 // getModel retrieves or dynamically opens an AnchorDB instance ("One DB = One Model")
 func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
+	db, _, err := s.acquireModelInternal(modelName, false)
+	return db, err
+}
+
+func (s *Server) acquireModelInternal(modelName string, pinned bool) (*storage.AnchorDB, func(), error) {
 	cleanName, err := sanitizeModelName(modelName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	modelName = cleanName
 
 	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, nil, ErrServerClosed
+	}
 	db, exists := s.models[modelName]
+	var pin *atomic.Int64
+	if exists && pinned {
+		pin = s.modelPins[modelName]
+		if pin != nil {
+			pin.Add(1)
+		}
+	}
 	s.mu.RUnlock()
-	if exists {
-		return db, nil
+	if exists && (!pinned || pin != nil) {
+		s.touchModelOrder(modelName)
+		if !pinned {
+			return db, func() {}, nil
+		}
+		return db, makeLeaseRelease(pin), nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// After Shutdown closed every model the registry is sealed: a late handler
-	// must not open a new DB that would never be Synced/Closed (L11).
-	if s.closed {
-		return nil, ErrServerClosed
-	}
-
-	// Double check
-	if db, exists := s.models[modelName]; exists {
-		s.touchModelOrderLocked(modelName)
-		return db, nil
-	}
-
-	// Evict least-recently-used model when reaching maxLoadedModels cap.
-	const maxLoadedModels = 500
-	for len(s.models) >= maxLoadedModels {
-		if !s.evictLRUModelLocked() {
-			break
+	skip := make(map[string]bool)
+	for {
+		// After Shutdown closed every model the registry is sealed: a late handler
+		// must not open a new DB that would never be Synced/Closed (L11).
+		if s.closed {
+			return nil, nil, ErrServerClosed
 		}
+		if waitCh, draining := s.modelDraining[modelName]; draining {
+			s.mu.Unlock()
+			<-waitCh
+			s.mu.Lock()
+			continue
+		}
+		if db, exists := s.models[modelName]; exists {
+			pin := s.ensureModelPinLocked(modelName)
+			if pinned {
+				pin.Add(1)
+			}
+			s.touchModelOrder(modelName)
+			if !pinned {
+				return db, func() {}, nil
+			}
+			return db, makeLeaseRelease(pin), nil
+		}
+
+		const maxLoadedModels = 500
+		if len(s.models) >= maxLoadedModels {
+			if s.evictIdleModelWithUnlockLocked(skip) {
+				continue
+			}
+		}
+		break
 	}
 
 	dbPath := filepath.Join(s.dataDir, modelName+".anchordb")
@@ -933,18 +1112,25 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 		log.Printf("[ERROR] Failed to open model %q at %s: %v", modelName, dbPath, err)
 		switch {
 		case errors.Is(err, storage.ErrWALCorrupt):
-			return nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrWALCorrupt)
+			return nil, nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrWALCorrupt)
 		case errors.Is(err, storage.ErrDatabaseClosed):
-			return nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrDatabaseClosed)
+			return nil, nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrDatabaseClosed)
 		default:
-			return nil, fmt.Errorf("failed to open model %q", modelName)
+			return nil, nil, fmt.Errorf("failed to open model %q", modelName)
 		}
 	}
 
 	s.models[modelName] = newDB
-	s.touchModelOrderLocked(modelName)
+	pin = s.ensureModelPinLocked(modelName)
+	if pinned {
+		pin.Add(1)
+	}
+	s.touchModelOrder(modelName)
 	log.Printf("[INFO] Model %q loaded from disk: %s", modelName, dbPath)
-	return newDB, nil
+	if !pinned {
+		return newDB, func() {}, nil
+	}
+	return newDB, makeLeaseRelease(pin), nil
 }
 
 // isAuthorized reports whether the request carries a valid bearer token. When no
@@ -1015,8 +1201,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	var memSample runtime.MemStats
-	runtime.ReadMemStats(&memSample)
+	memSample := s.readMemStatsCached()
 
 	resp := map[string]interface{}{
 		"status":         status,
@@ -1040,16 +1225,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+const memStatsCacheTTL = 2 * time.Second
+
+func (s *Server) readMemStatsCached() runtime.MemStats {
+	s.memStatsMu.Lock()
+	defer s.memStatsMu.Unlock()
+	if !s.memStatsAt.IsZero() && time.Since(s.memStatsAt) < memStatsCacheTTL {
+		return s.memStatsCached
+	}
+	var sample runtime.MemStats
+	runtime.ReadMemStats(&sample)
+	s.memStatsCached = sample
+	s.memStatsAt = time.Now()
+	return sample
+}
+
 // handleMetrics exposes dependency-free Prometheus text-format metrics for
-// scraping. It is intentionally unauthenticated, like /health, so that standard
-// scrapers work; put it behind your reverse proxy if that is not acceptable.
+// scraping using a cached MemStats snapshot to avoid STW pauses on scrape floods.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	models := len(s.models)
 	s.mu.RUnlock()
 
-	var memSample runtime.MemStats
-	runtime.ReadMemStats(&memSample)
+	memSample := s.readMemStatsCached()
 	mem := system.GetMemoryStatsFrom(memSample)
 	ws := s.worker.StatsFromMemStats(memSample)
 
@@ -1345,11 +1543,12 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	opStatus := storage.OpStatusActive
 	if req.Operation != nil {
@@ -1381,7 +1580,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			effectiveName = name
-		} else if len(req.Props) > 0 {
+		} else {
 			name, err := db.SaveRecordWithNode(effectiveName, opStatus, req.Props, coord, roles)
 			if err != nil {
 				if errors.Is(err, storage.ErrMissingRequiredField) ||
@@ -1396,14 +1595,6 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			effectiveName = name
-		} else {
-			if effectiveName == "" {
-				effectiveName = uuid.NewString()
-			}
-			if _, err := db.AppendNode(effectiveName, coord, roles, uint16(opStatus)); err != nil {
-				writeJSONError(w, dispatchErrorStatus(err), err.Error())
-				return
-			}
 		}
 	} else {
 		if len(req.Attrs) > 0 {
@@ -1460,11 +1651,12 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	names, err := db.SaveRecordsBatch(req.Records)
 	if err != nil {
@@ -1521,13 +1713,14 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Try Hot DB first (read-only lookup avoids creating empty models on disk)
-	db, err := s.getExistingModel(req.Model)
+	db, release, err := s.acquireExistingModel(req.Model)
 	if err != nil && !errors.Is(err, errModelNotFound) {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 	if err == nil {
 		cr, gErr := db.GetRecordTypedWithCompute(req.Name, computations, req.Select...)
+		release()
 		if gErr == nil {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"success":   true,
@@ -1581,11 +1774,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	computations := make(map[string]storage.ComputeOp)
 	for outField, expr := range req.Computations {
@@ -1650,12 +1844,6 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
-	if err != nil {
-		writeJSONError(w, dispatchErrorStatus(err), err.Error())
-		return
-	}
-
 	mutations := make(map[string]storage.ComputeOp)
 	for field, expr := range req.Mutations {
 		op, err := parseComputeOp(expr)
@@ -1674,12 +1862,21 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
 	if isAsync {
+		if _, err := sanitizeModelName(req.Model); err != nil {
+			writeJSONError(w, dispatchErrorStatus(err), err.Error())
+			return
+		}
 		jobID := uuid.New().String()
 		err := s.worker.DispatchAsync(
 			s.asyncBaseContext(),
 			"update_"+req.Model,
 			func(taskCtx context.Context) error {
-				count, err := db.UpdateRecords(storage.UpdateOptions{
+				asyncDB, asyncRelease, err := s.acquireModel(req.Model)
+				if err != nil {
+					return err
+				}
+				defer asyncRelease()
+				count, err := asyncDB.UpdateRecords(storage.UpdateOptions{
 					Context:        taskCtx,
 					TargetEntities: req.In,
 					Filters:        filters,
@@ -1710,6 +1907,13 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	db, release, err := s.acquireModel(req.Model)
+	if err != nil {
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
+		return
+	}
+	defer release()
 
 	count, err := db.UpdateRecords(storage.UpdateOptions{
 		TargetEntities: req.In,
@@ -1744,11 +1948,12 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	limit := req.LimitK
 	if limit <= 0 {
@@ -1804,11 +2009,12 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	switch strings.ToLower(strings.TrimSpace(req.Action)) {
 	case "", "add", "link":
@@ -1851,11 +2057,12 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	limit := req.LimitK
 	if limit <= 0 {
@@ -1889,11 +2096,12 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(req.Model)
+	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	switch strings.ToLower(strings.TrimSpace(req.Op)) {
 	case "distance":
@@ -1998,19 +2206,31 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost, http.MethodGet) {
 		return
 	}
+	var syncReq struct {
+		Model string `json:"model"`
+		Async bool   `json:"async"`
+	}
+	if r.Method == http.MethodPost {
+		if !decodeJSONBody(w, r, &syncReq, true) {
+			return
+		}
+	}
 	modelName := r.URL.Query().Get("model")
+	if modelName == "" {
+		modelName = strings.TrimSpace(syncReq.Model)
+	}
 	if modelName == "" {
 		modelName = "default"
 	}
 
-	db, err := s.getModel(modelName)
-	if err != nil {
-		writeJSONError(w, dispatchErrorStatus(err), err.Error())
-		return
-	}
+	isAsync := r.URL.Query().Get("async") == "true" || syncReq.Async
 
 	// If async requested, offload to worker pool and return immediately
-	if r.URL.Query().Get("async") == "true" {
+	if isAsync {
+		if _, err := sanitizeModelName(modelName); err != nil {
+			writeJSONError(w, dispatchErrorStatus(err), err.Error())
+			return
+		}
 		jobID := uuid.New().String()
 		err := s.worker.DispatchAsync(
 			s.asyncBaseContext(),
@@ -2019,7 +2239,12 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				if err := taskCtx.Err(); err != nil {
 					return err
 				}
-				return db.Sync()
+				asyncDB, asyncRelease, err := s.acquireModel(modelName)
+				if err != nil {
+					return err
+				}
+				defer asyncRelease()
+				return asyncDB.Sync()
 			},
 			worker.WithID(jobID),
 			worker.WithModel(modelName),
@@ -2039,6 +2264,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	db, release, err := s.acquireModel(modelName)
+	if err != nil {
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
+		return
+	}
+	defer release()
 
 	if err := db.Sync(); err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
@@ -2073,8 +2305,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req PartitionRunRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
+	if !decodeJSONBody(w, r, &req, true) {
 		return
 	}
 
@@ -2095,7 +2326,8 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	var sink partition.PartitionSink
 	if strings.ToLower(req.SinkType) == "s3" {
-		if err := validateS3Endpoint(req.S3Endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+		allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
+		if err := validateS3Endpoint(req.S3Endpoint, allowPrivate); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -2110,6 +2342,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		}
 		s3sink := partition.NewS3Sink(endpoint, bucket, prefix, req.S3AccessKey, req.S3SecretKey)
 		s3sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+		s3sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 		sink = s3sink
 	} else {
 		targetDir := req.TargetPath
@@ -2176,7 +2409,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 						errs = append(errs, err)
 						break
 					}
-					db, err := s.getModel(m)
+					db, release, err := s.acquireModel(m)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
@@ -2190,6 +2423,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 						PruneHotDB:    prune,
 						Catalog:       s.catalog,
 					})
+					release()
 					if err != nil {
 						errs = append(errs, fmt.Errorf("partition %s: %w", m, err))
 						continue
@@ -2227,7 +2461,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	// 2. Synchronous execution
 	var results []*partition.PartitionResult
 	for _, m := range targetModels {
-		db, err := s.getModel(m)
+		db, release, err := s.acquireModel(m)
 		if err != nil {
 			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("Partition failed opening model %s: %s", m, err.Error()))
 			return
@@ -2241,6 +2475,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			PruneHotDB:    prune,
 			Catalog:       s.catalog,
 		})
+		release()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Partition failed for model %s: %s", m, err.Error()))
 			return
@@ -2508,7 +2743,8 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 	if endpoint == "" {
 		endpoint = s.s3DefaultEndpoint
 	}
-	if err := validateS3Endpoint(endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+	allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
+	if err := validateS3Endpoint(endpoint, allowPrivate); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
 		return
 	}
@@ -2542,6 +2778,7 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 		sink.Region = s.s3DefaultRegion
 	}
 	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -2600,7 +2837,8 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	if endpoint == "" {
 		endpoint = s.s3DefaultEndpoint
 	}
-	if err := validateS3Endpoint(endpoint, getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)); err != nil {
+	allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
+	if err := validateS3Endpoint(endpoint, allowPrivate); err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
 		return
 	}
@@ -2634,6 +2872,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 		sink.Region = s.s3DefaultRegion
 	}
 	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 
 	limit := req.Limit
 	if limit <= 0 || limit > 100 {
@@ -2724,6 +2963,7 @@ func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc str
 	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
 	sink.Region = region
 	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	sink.HTTPClient = partition.NewS3HTTPClient(getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false))
 	return sink
 }
 
@@ -2748,14 +2988,6 @@ func (s *Server) fetchRecordTypedFromCatalogEntry(entry *partition.CatalogEntry,
 	return pdb.GetRecordTyped(name)
 }
 
-func (s *Server) fetchRecordFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (map[string]float32, error) {
-	cr, err := s.fetchRecordTypedFromCatalogEntry(entry, name, computations, selectFields)
-	if err != nil {
-		return nil, err
-	}
-	return cr.ToMap(), nil
-}
-
 // GetColdRecordTyped looks up a record only in the cold tier via the partition
 // catalog. A catalog hit whose fetch fails returns that failure (never a
 // masked "not found"); a catalog miss returns ErrRecordNotFound. It implements
@@ -2773,7 +3005,7 @@ func (s *Server) GetColdRecordTyped(model, name string, computations map[string]
 // GetRecordTypedWithComputeTiered implements wire.TypedTieredBackend.
 func (s *Server) GetRecordTypedWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
 	// 1. Check Hot DB
-	db, err := s.getModel(model)
+	db, release, err := s.acquireModel(model)
 	if err != nil {
 		return storage.CompactRecord{}, err
 	}
@@ -2784,6 +3016,7 @@ func (s *Server) GetRecordTypedWithComputeTiered(model, name string, computation
 	} else {
 		cr, hotErr = db.GetRecordTyped(name)
 	}
+	release()
 	if hotErr == nil {
 		return cr, nil
 	}
@@ -2849,7 +3082,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		records, props, attrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, fileOrLoc, recordName, limit)
+		records, hasMore, props, attrs, err := s.s3Cache.InspectPartitionTypedWithHasMore(ctx, sink, fileOrLoc, recordName, limit)
 		if err != nil {
 			return wire.PartitionInspectWireResponse{}, err
 		}
@@ -2863,6 +3096,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 			Props:         props,
 			Attrs:         attrs,
 			Records:       wireItems,
+			HasMore:       hasMore,
 		}, nil
 	}
 
@@ -2890,7 +3124,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	if limit <= 0 || limit > 1000 {
 		limit = 50
 	}
-	recs, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	recs, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
 	if err != nil {
 		return wire.PartitionInspectWireResponse{}, err
 	}
@@ -2901,6 +3135,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	return wire.PartitionInspectWireResponse{
 		PartitionFile: cleanFilename,
 		Records:       wireItems,
+		HasMore:       hasMore,
 	}, nil
 }
 
@@ -3028,30 +3263,35 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 						errs = append(errs, err)
 						break
 					}
-					db, err := s.getModel(m)
+					db, release, err := s.acquireModel(m)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
 					}
-					if !pendingSync[m] {
-						purged, err := db.CollectTombstones(maxBatch)
-						if err != nil {
-							errs = append(errs, fmt.Errorf("collect %s: %w", m, err))
-							continue
+					err = func() error {
+						defer release()
+						if !pendingSync[m] {
+							purged, err := db.CollectTombstones(maxBatch)
+							if err != nil {
+								return fmt.Errorf("collect %s: %w", m, err)
+							}
+							total += purged
+							if purged == 0 {
+								completedModels[m] = true
+								return nil
+							}
+							pendingSync[m] = true
 						}
-						total += purged
-						if purged == 0 {
-							completedModels[m] = true
-							continue
+						if err := db.Sync(); err != nil {
+							return fmt.Errorf("sync %s: %w", m, err)
 						}
-						pendingSync[m] = true
+						pendingSync[m] = false
+						completedModels[m] = true
+						return nil
+					}()
+					if err != nil {
+						errs = append(errs, err)
 					}
-					if err := db.Sync(); err != nil {
-						errs = append(errs, fmt.Errorf("sync %s: %w", m, err))
-						continue
-					}
-					pendingSync[m] = false
-					completedModels[m] = true
 				}
 				if total > 0 {
 					log.Printf("[WORKER] Async collector sweep succeeded: %d tombstones purged", total)
@@ -3080,22 +3320,25 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 
 	totalPurged := 0
 	for _, m := range targetModels {
-		db, err := s.getModel(m)
+		db, release, err := s.acquireModel(m)
 		if err != nil {
 			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("collector failed opening model %s: %s", m, err.Error()))
 			return
 		}
 		purged, err := db.CollectTombstones(maxBatch)
 		if err != nil {
+			release()
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("collector failed for model %s: %s", m, err.Error()))
 			return
 		}
 		if purged > 0 {
 			if err := db.Sync(); err != nil {
+				release()
 				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("collector failed to sync model %s: %v", m, err))
 				return
 			}
 		}
+		release()
 		totalPurged += purged
 	}
 
@@ -3120,8 +3363,7 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req WorkerCancelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
+	if !decodeJSONBody(w, r, &req, true) {
 		return
 	}
 
@@ -3188,11 +3430,12 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, err := s.getModel(modelName)
+	db, release, err := s.acquireModel(modelName)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	if err := db.AttachSchema(req.Schema); err != nil {
 		if errors.Is(err, storage.ErrSchemaMismatch) {
@@ -3227,7 +3470,7 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 	if modelName == "" {
 		modelName = "default"
 	}
-	db, err := s.getExistingModel(modelName)
+	db, release, err := s.acquireExistingModel(modelName)
 	if err != nil {
 		if errors.Is(err, errModelNotFound) {
 			w.Header().Set("Content-Type", "application/json")
@@ -3242,6 +3485,7 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	schema, ok := db.GetSchema()
 	if !ok {
@@ -3286,11 +3530,12 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 		modelName = "default"
 	}
 
-	db, err := s.getModel(modelName)
+	db, release, err := s.acquireModel(modelName)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	defer release()
 
 	if err := db.ResetSchema(); err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
@@ -3434,51 +3679,22 @@ func main() {
 
 	flag.Parse()
 
-	// Resolve Gateway & Cluster Join Parameters
-	gatewayMode := *flagGatewayMode
-	if !gatewayMode || !flagPassed("gateway-mode") {
-		gatewayMode = getEnvBool("ANCHORDB_GATEWAY_MODE", false)
+	// Resolve Gateway & Cluster Join Parameters (Flag > ENV > Default)
+	gatewayMode := resolveBoolFlag("gateway-mode", *flagGatewayMode, "ANCHORDB_GATEWAY_MODE", false)
+	joinMode := resolveStringFlag("join-mode", *flagJoinMode, "ANCHORDB_JOIN_MODE", "pairing")
+
+	pairingTimeout, err := resolveDurationFlag("pairing-timeout", *flagPairingTimeout, "ANCHORDB_PAIRING_TIMEOUT", 120*time.Second, false)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid pairing-timeout configuration: %v", err)
 	}
 
-	joinMode := *flagJoinMode
-	if joinMode == "" || !flagPassed("join-mode") {
-		joinMode = getEnv("ANCHORDB_JOIN_MODE", "pairing")
-	}
-
-	pairingTimeout := 120 * time.Second
-	pairingTimeoutStr := *flagPairingTimeout
-	if pairingTimeoutStr == "" || !flagPassed("pairing-timeout") {
-		pairingTimeoutStr = getEnv("ANCHORDB_PAIRING_TIMEOUT", "120s")
-	}
-	if d, perr := time.ParseDuration(pairingTimeoutStr); perr == nil && d > 0 {
-		pairingTimeout = d
-	}
-
-	pairingCIDR := *flagPairingCIDR
-	if pairingCIDR == "" || !flagPassed("pairing-cidr") {
-		pairingCIDR = getEnv("ANCHORDB_PAIRING_ALLOWED_CIDR", "")
-	}
-
-	sessionSecret := *flagSessionSecret
-	if sessionSecret == "" || !flagPassed("session-secret") {
-		sessionSecret = getEnv("ANCHORDB_SESSION_SECRET", "")
-	}
+	pairingCIDR := resolveStringFlag("pairing-cidr", *flagPairingCIDR, "ANCHORDB_PAIRING_ALLOWED_CIDR", "")
+	sessionSecret := resolveStringFlag("session-secret", *flagSessionSecret, "ANCHORDB_SESSION_SECRET", "")
 
 	// Resolve Core Parameters with precedence: Flag > ENV > Default
-	portStr := *flagPort
-	if portStr == "" {
-		portStr = getEnv("ANCHORDB_PORT", "7447")
-	}
-
-	wirePortStr := *flagWirePort
-	if wirePortStr == "" {
-		wirePortStr = getEnv("ANCHORDB_WIRE_PORT", "7448")
-	}
-
-	dataDir := *flagDataDir
-	if dataDir == "" {
-		dataDir = getEnv("ANCHORDB_DATA_DIR", "")
-	}
+	portStr := resolveStringFlag("port", *flagPort, "ANCHORDB_PORT", "7447")
+	wirePortStr := resolveStringFlag("wire-port", *flagWirePort, "ANCHORDB_WIRE_PORT", "7448")
+	dataDir := resolveStringFlag("data-dir", *flagDataDir, "ANCHORDB_DATA_DIR", "")
 	if dataDir == "" {
 		dataDir = "/data"
 		if _, err := os.Stat(dataDir); os.IsNotExist(err) {
@@ -3486,10 +3702,7 @@ func main() {
 		}
 	}
 
-	authToken := *flagToken
-	if authToken == "" {
-		authToken = getEnv("ANCHORDB_AUTH_TOKEN", "")
-	}
+	authToken := resolveStringFlag("auth-token", *flagToken, "ANCHORDB_AUTH_TOKEN", "")
 	if *flagToken != "" {
 		log.Printf("[WARN] Auth token provided via CLI flag; its value is visible in `ps`/cmdline. Use ANCHORDB_AUTH_TOKEN instead.")
 	}
@@ -3502,63 +3715,39 @@ func main() {
 	}
 
 	memLimitStr := *flagMemLimit
-	if memLimitStr == "" {
+	if !flagPassed("memory-limit") && !flagPassed("mem-limit") && !flagPassed("m") {
 		memLimitStr = getEnv("ANCHORDB_MEMORY_LIMIT", "")
 	}
 
-	ipWhitelist := *flagIPWhitelist
-	if ipWhitelist == "" {
-		ipWhitelist = getEnv("ANCHORDB_IP_WHITELIST", "")
-	}
-
-	trustProxy := *flagTrustProxy
-	if !trustProxy {
-		trustProxy = getEnvBool("ANCHORDB_TRUST_PROXY", false)
-	}
+	ipWhitelist := resolveStringFlag("ip-whitelist", *flagIPWhitelist, "ANCHORDB_IP_WHITELIST", "")
+	trustProxy := resolveBoolFlag("trust-proxy", *flagTrustProxy, "ANCHORDB_TRUST_PROXY", false)
 
 	// Resolve Cron Parameters
-	cronEnabled := *flagCronEnabled
-	if !cronEnabled || !flagPassed("cron-enabled") {
-		cronEnabled = getEnvBool("ANCHORDB_CRON_ENABLED", true)
-	}
-
-	partitionSched := *flagPartitionSchedule
-	if partitionSched == "" {
-		partitionSched = getEnv("ANCHORDB_PARTITION_SCHEDULE", "23:00")
-	}
+	cronEnabled := resolveBoolFlag("cron-enabled", *flagCronEnabled, "ANCHORDB_CRON_ENABLED", true)
+	partitionSched := resolveStringFlag("partition-schedule", *flagPartitionSchedule, "ANCHORDB_PARTITION_SCHEDULE", "23:00")
 
 	retentionDays := float32(*flagRetentionDays)
-	if retentionDays <= 0 {
+	if !flagPassed("retention-days") {
 		retentionDays = float32(getEnvFloat("ANCHORDB_PARTITION_RETENTION_DAYS", 180))
 	}
 
-	syncInterval := *flagSyncInterval
-	if syncInterval == "" {
-		syncInterval = getEnv("ANCHORDB_SYNC_INTERVAL", "5m")
+	syncInterval := resolveStringFlag("sync-interval", *flagSyncInterval, "ANCHORDB_SYNC_INTERVAL", "5m")
+
+	cronTaskTimeout, err := resolveDurationFlag("cron-task-timeout", *flagCronTaskTimeout, "ANCHORDB_CRON_TASK_TIMEOUT", 0, true)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid cron-task-timeout configuration: %v", err)
 	}
 
-	var cronTaskTimeout time.Duration
-	if cronTaskTimeoutStr := getEnv("ANCHORDB_CRON_TASK_TIMEOUT", *flagCronTaskTimeout); cronTaskTimeoutStr != "" {
-		if d, err := time.ParseDuration(cronTaskTimeoutStr); err == nil {
-			cronTaskTimeout = d
-		}
-	}
-
-	var cronJitter time.Duration
-	if cronJitterStr := getEnv("ANCHORDB_CRON_JITTER", *flagCronJitter); cronJitterStr != "" {
-		if d, err := time.ParseDuration(cronJitterStr); err == nil {
-			cronJitter = d
-		}
+	cronJitter, err := resolveDurationFlag("cron-jitter", *flagCronJitter, "ANCHORDB_CRON_JITTER", 0, true)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid cron-jitter configuration: %v", err)
 	}
 
 	// Resolve Worker Parameters
-	workerEnabled := *flagWorkerEnabled
-	if !workerEnabled || !flagPassed("worker-enabled") {
-		workerEnabled = getEnvBool("ANCHORDB_WORKER_ENABLED", true)
-	}
+	workerEnabled := resolveBoolFlag("worker-enabled", *flagWorkerEnabled, "ANCHORDB_WORKER_ENABLED", true)
 
 	workerConcurrency := *flagWorkerConcurrency
-	if workerConcurrency <= 0 {
+	if !flagPassed("worker-concurrency") {
 		workerConcurrency = getEnvInt("ANCHORDB_WORKER_CONCURRENCY", runtime.NumCPU()*2)
 		if workerConcurrency < 2 {
 			workerConcurrency = 2
@@ -3566,17 +3755,14 @@ func main() {
 	}
 
 	workerQueueSize := *flagWorkerQueueSize
-	if workerQueueSize <= 0 {
+	if !flagPassed("worker-queue-size") {
 		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
 	}
 
-	workerEnforceMemory := *flagWorkerEnforceMemory
-	if !workerEnforceMemory || !flagPassed("worker-enforce-memory") {
-		workerEnforceMemory = getEnvBool("ANCHORDB_WORKER_ENFORCE_MEMORY", false)
-	}
+	workerEnforceMemory := resolveBoolFlag("worker-enforce-memory", *flagWorkerEnforceMemory, "ANCHORDB_WORKER_ENFORCE_MEMORY", false)
 
 	workerMemoryThreshold := *flagWorkerMemoryThreshold
-	if workerMemoryThreshold <= 0 || !flagPassed("worker-memory-threshold") {
+	if !flagPassed("worker-memory-threshold") {
 		workerMemoryThreshold = getEnvFloat("ANCHORDB_WORKER_MEMORY_THRESHOLD", 0.85)
 	}
 
@@ -3589,13 +3775,9 @@ func main() {
 	// Single global shutdown budget (L7). Phases get a share so the sum stays
 	// within it: HTTP 1/3, scheduler 1/6, worker up to 2x(1/6) = 1/3, leaving
 	// ~1/6 for the final per-model Sync.
-	shutdownTimeout := 25 * time.Second
-	if s := getEnv("ANCHORDB_SHUTDOWN_TIMEOUT", *flagShutdownTimeout); s != "" {
-		if d, perr := time.ParseDuration(s); perr == nil && d > 0 {
-			shutdownTimeout = d
-		} else {
-			log.Printf("[WARN] Invalid shutdown-timeout %q; using default %v", s, shutdownTimeout)
-		}
+	shutdownTimeout, err := resolveDurationFlag("shutdown-timeout", *flagShutdownTimeout, "ANCHORDB_SHUTDOWN_TIMEOUT", 25*time.Second, false)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid shutdown-timeout configuration: %v", err)
 	}
 
 	// Resolve WAL durability options (Flag > ENV > Default).
@@ -3610,7 +3792,7 @@ func main() {
 		rateLimit = getEnvFloat("ANCHORDB_RATE_LIMIT", 0)
 	}
 	rateLimitBurst := *flagRateLimitBurst
-	if rateLimitBurst <= 0 {
+	if !flagPassed("rate-limit-burst") {
 		rateLimitBurst = getEnvInt("ANCHORDB_RATE_LIMIT_BURST", 0)
 	}
 
@@ -3742,12 +3924,61 @@ func main() {
 	}
 }
 
-func flagPassed(name string) bool {
+func flagPassedIn(fs *flag.FlagSet, name string) bool {
 	found := false
-	flag.Visit(func(f *flag.Flag) {
+	fs.Visit(func(f *flag.Flag) {
 		if f.Name == name {
 			found = true
 		}
 	})
 	return found
+}
+
+func flagPassed(name string) bool {
+	return flagPassedIn(flag.CommandLine, name)
+}
+
+func resolveBoolFlagIn(fs *flag.FlagSet, name string, flagVal bool, envKey string, defaultVal bool) bool {
+	if flagPassedIn(fs, name) {
+		return flagVal
+	}
+	return getEnvBool(envKey, defaultVal)
+}
+
+func resolveBoolFlag(name string, flagVal bool, envKey string, defaultVal bool) bool {
+	return resolveBoolFlagIn(flag.CommandLine, name, flagVal, envKey, defaultVal)
+}
+
+func resolveStringFlagIn(fs *flag.FlagSet, name string, flagVal string, envKey string, defaultVal string) string {
+	if flagPassedIn(fs, name) {
+		return flagVal
+	}
+	return getEnv(envKey, defaultVal)
+}
+
+func resolveStringFlag(name string, flagVal string, envKey string, defaultVal string) string {
+	return resolveStringFlagIn(flag.CommandLine, name, flagVal, envKey, defaultVal)
+}
+
+func resolveDurationFlagIn(fs *flag.FlagSet, name string, flagVal string, envKey string, defaultVal time.Duration, allowZero bool) (time.Duration, error) {
+	raw := resolveStringFlagIn(fs, name, flagVal, envKey, "")
+	if strings.TrimSpace(raw) == "" {
+		return defaultVal, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q for %s/%s: %w", raw, name, envKey, err)
+	}
+	if allowZero {
+		if d < 0 {
+			return 0, fmt.Errorf("negative duration %q for %s/%s", raw, name, envKey)
+		}
+	} else if d <= 0 {
+		return 0, fmt.Errorf("non-positive duration %q for %s/%s", raw, name, envKey)
+	}
+	return d, nil
+}
+
+func resolveDurationFlag(name string, flagVal string, envKey string, defaultVal time.Duration, allowZero bool) (time.Duration, error) {
+	return resolveDurationFlagIn(flag.CommandLine, name, flagVal, envKey, defaultVal, allowZero)
 }

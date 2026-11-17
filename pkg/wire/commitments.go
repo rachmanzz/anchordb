@@ -172,6 +172,38 @@ func (cs *CommitmentStore) persistWithRestoreLocked(nodeID string, hadPrev bool,
 	return nil
 }
 
+// ErrNodeAlreadyRegistered is returned when attempting initial enrollment for an already-registered node.
+var ErrNodeAlreadyRegistered = errors.New("wire: node already registered")
+
+// HasNode reports whether nodeID already has a commitment record.
+func (cs *CommitmentStore) HasNode(nodeID string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	_, exists := cs.records[nodeID]
+	return exists
+}
+
+// RegisterInitialNew registers an initial commitment only if nodeID is not already registered.
+func (cs *CommitmentStore) RegisterInitialNew(nodeID string, commitment [32]byte) error {
+	if nodeID == "" {
+		return errors.New("wire: node id cannot be empty")
+	}
+
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if _, exists := cs.records[nodeID]; exists {
+		return fmt.Errorf("%w: %q", ErrNodeAlreadyRegistered, nodeID)
+	}
+	cs.records[nodeID] = &CommitmentRecord{
+		NodeID:            nodeID,
+		CurrentCommitment: commitment,
+		State:             StateActive,
+		LastRotatedAt:     time.Now().UnixNano(),
+	}
+	return cs.persistWithRestoreLocked(nodeID, false, CommitmentRecord{})
+}
+
 // RegisterInitial registers an initial commitment for a newly paired or enrolled node.
 func (cs *CommitmentStore) RegisterInitial(nodeID string, commitment [32]byte) error {
 	if nodeID == "" {

@@ -1752,6 +1752,21 @@ func (db *AnchorDB) markEntityDirtyLocked(name string) {
 	}
 }
 
+func (db *AnchorDB) detachRecordToHeapLocked(cr CompactRecord) CompactRecord {
+	if cr.Raw == nil {
+		return cr
+	}
+	expanded := cr.expandAttrs()
+	attrs := make([]AttrEntry, len(expanded))
+	for i, a := range expanded {
+		a.Key = db.internAttr(a.Key)
+		attrs[i] = a
+	}
+	cr.Attrs = attrs
+	cr.Raw = nil
+	return cr
+}
+
 // TriggerAutoSync requests an asynchronous background Sync to flush pending records
 // and remap in-memory entities to disk (zero-copy mmap), reclaiming heap memory.
 func (db *AnchorDB) TriggerAutoSync() bool {
@@ -2087,8 +2102,11 @@ func (db *AnchorDB) reconcileInterruptedOperationsLocked() (int, error) {
 	for _, name := range db.EntityOrder {
 		cr, exists := db.EntityStore[name]
 		if exists && cr.Operation == OpStatusSafeDelete {
+			cr = db.detachRecordToHeapLocked(cr)
 			cr.Operation = OpStatusRetry
 			db.EntityStore[name] = cr
+			db.syncedEntitiesModified = true
+			db.markEntityDirtyLocked(name)
 			if db.wal != nil {
 				if err := db.wal.WriteSave(name, cr); err != nil {
 					clear(db.partitionLocks)
@@ -2228,6 +2246,9 @@ func (db *AnchorDB) buildIndex() error {
 			return fmt.Errorf("corrupt file: truncated node record %d", i)
 		}
 		DecodeRecord(db.mmapData[offset:offset+RecordSize], &rec)
+		if rec.ID == 0 {
+			continue
+		}
 
 		// String lookup
 		if uint64(rec.WordOffset)+uint64(rec.WordLen) > db.Header.EntityOffset-db.Header.StringOffset {
@@ -2467,6 +2488,11 @@ entityLoop:
 		log.Printf("[STORAGE] ERROR: mmap entity corruption detected at entity %d (offset=%d) during remap; retaining unmapped in-memory state", corruptEntity, offset)
 	} else {
 		db.entitySectionEnd = int(db.Header.EntityOffset) + offset
+	}
+	for name := range db.dirtyDuringSync {
+		if cr, exists := db.EntityStore[name]; exists && cr.Raw != nil {
+			db.EntityStore[name] = db.detachRecordToHeapLocked(cr)
+		}
 	}
 	db.dirtyDuringSync = nil
 	db.isSyncing = false
@@ -3565,6 +3591,7 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error
 		if db.partitionLocks[name] || status == OpStatusSafeDelete && cr.Operation == OpStatusSafeDelete {
 			return 0, fmt.Errorf("%w: use partition locking APIs to change this state for %q", ErrRecordLocked, name)
 		}
+		cr = db.detachRecordToHeapLocked(cr)
 		cr.Operation = status
 		updates = append(updates, statusUpdate{name: name, cr: cr})
 	}
@@ -3614,6 +3641,7 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 		if !exists || cr.Operation != OpStatusSafeDelete || !db.partitionLocks[name] {
 			continue
 		}
+		cr = db.detachRecordToHeapLocked(cr)
 		cr.Operation = status
 		updates = append(updates, completionUpdate{name: name, cr: cr})
 	}
@@ -3671,13 +3699,13 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 		if len(records) >= limit {
 			break
 		}
+		updated := db.detachRecordToHeapLocked(cr)
 		records = append(records, EntityRecord{
 			Name:      name,
 			Operation: cr.Operation,
 			Props:     cr.ToMap(),
-			Attrs:     slices.Clone(cr.expandAttrs()),
+			Attrs:     slices.Clone(updated.Attrs),
 		})
-		updated := cr
 		updated.Operation = OpStatusSafeDelete
 		lockedCRs = append(lockedCRs, updated)
 	}
@@ -3725,7 +3753,37 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) (int, error) {
 			}
 		}
 	}
+	return db.purgeTombstonesLocked(toPurge)
+}
 
+// CollectNamedTombstones purges only the named entities currently marked with
+// OpStatusTombstone (2), preventing pre-existing tombstones from consuming the batch budget.
+func (db *AnchorDB) CollectNamedTombstones(names []string) (int, error) {
+	if len(names) == 0 {
+		return 0, nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
+
+	seen := make(map[string]struct{}, len(names))
+	var toPurge []string
+	for _, name := range names {
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		if cr, exists := db.EntityStore[name]; exists && cr.Operation == OpStatusTombstone {
+			toPurge = append(toPurge, name)
+		}
+	}
+	return db.purgeTombstonesLocked(toPurge)
+}
+
+func (db *AnchorDB) purgeTombstonesLocked(toPurge []string) (int, error) {
 	if len(toPurge) == 0 {
 		return 0, nil
 	}
@@ -3932,6 +3990,7 @@ func (db *AnchorDB) Sync() error {
 			db.mu.Lock()
 			db.isSyncing = false
 			db.dirtyDuringSync = nil
+			db.reapplyDeletesLocked()
 			db.mu.Unlock()
 		}
 	}()

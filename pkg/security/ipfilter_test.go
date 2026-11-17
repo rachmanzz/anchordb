@@ -126,19 +126,44 @@ func TestIPFilter_TrustedProxyWalksForwardedChainFromRight(t *testing.T) {
 }
 
 // A malformed X-Forwarded-For must not cause a fallback to the client-supplied
-// X-Real-IP header, which would let a client spoof its address to bypass both
-// the whitelist and the rate limiter.
+// X-Real-IP header or promote the trusted proxy's remoteIP, which would let a
+// client spoof its address to bypass both the whitelist and the rate limiter.
 func TestIPFilter_MalformedXFFDoesNotFallBackToXRealIP(t *testing.T) {
-	filter, err := NewIPFilter("10.0.0.5", true)
+	filter, err := NewIPFilter("127.0.0.1, 10.0.0.5", true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Rightmost untrusted IP is still extracted despite forged left-hand garbage.
 	request := httptest.NewRequest("GET", "/", nil)
 	request.RemoteAddr = "127.0.0.1:8080" // trusted local proxy
-	request.Header.Set("X-Forwarded-For", "not-an-ip, 10.0.0.5")
+	request.Header.Set("X-Forwarded-For", "not-an-ip, 203.0.113.9")
 	request.Header.Set("X-Real-IP", "10.0.0.5")
-	if got := filter.ExtractClientIP(request); got == nil || !got.Equal(net.ParseIP("127.0.0.1")) {
-		t.Fatalf("malformed XFF must not fall back to X-Real-IP; got %v", got)
+	if got := filter.ExtractClientIP(request); got == nil || !got.Equal(net.ParseIP("203.0.113.9")) {
+		t.Fatalf("expected rightmost untrusted IP 203.0.113.9, got %v", got)
+	}
+	if filter.IsAllowed(filter.ExtractClientIP(request)) {
+		t.Fatal("203.0.113.9 must be rejected by whitelist even when proxy is 127.0.0.1")
+	}
+
+	// Malformed rightmost hop fails closed (nil) and does not fall back to X-Real-IP or 127.0.0.1.
+	badReq := httptest.NewRequest("GET", "/", nil)
+	badReq.RemoteAddr = "127.0.0.1:8080"
+	badReq.Header.Set("X-Forwarded-For", "10.0.0.5, not-an-ip")
+	badReq.Header.Set("X-Real-IP", "10.0.0.5")
+	if got := filter.ExtractClientIP(badReq); got != nil {
+		t.Fatalf("expected nil on malformed rightmost XFF hop, got %v", got)
+	}
+	if filter.IsAllowed(filter.ExtractClientIP(badReq)) {
+		t.Fatal("malformed rightmost XFF must fail closed")
+	}
+
+	// Multi-header X-Forwarded-For values are combined in order.
+	multiReq := httptest.NewRequest("GET", "/", nil)
+	multiReq.RemoteAddr = "127.0.0.1:8080"
+	multiReq.Header.Add("X-Forwarded-For", "not-an-ip")
+	multiReq.Header.Add("X-Forwarded-For", "203.0.113.9")
+	if got := filter.ExtractClientIP(multiReq); got == nil || !got.Equal(net.ParseIP("203.0.113.9")) {
+		t.Fatalf("expected 203.0.113.9 from multi-header XFF, got %v", got)
 	}
 }
 
