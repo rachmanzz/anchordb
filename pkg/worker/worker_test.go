@@ -84,3 +84,34 @@ func TestWorkerPoolDisabled(t *testing.T) {
 
 	_ = pool.Shutdown()
 }
+
+func TestWorkerPool_FallbackCounterAndSyncCtxAdmission(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+	pool := NewPool(cfg)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ran := false
+	err := pool.Dispatch(canceledCtx, "canceled_sync", func(_ context.Context) error {
+		ran = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || ran {
+		t.Fatalf("expected Dispatch on canceled ctx to fail before sync execution (ran=%v, err=%v)", ran, err)
+	}
+
+	if err := pool.Dispatch(context.Background(), "fallback_sync", func(_ context.Context) error {
+		return errors.New("primary failed")
+	}, WithFallback(func(_ context.Context, _ error) error {
+		return nil
+	})); err != nil {
+		t.Fatalf("expected sync fallback dispatch nil, got %v", err)
+	}
+
+	stats := pool.Stats()
+	if stats.FallbackSuccesses != 1 || stats.Failed != 1 || stats.Completed != 1 {
+		t.Fatalf("expected FallbackSuccesses=1 Failed=1 Completed=1, got %+v", stats)
+	}
+}

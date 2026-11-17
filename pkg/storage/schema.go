@@ -325,19 +325,6 @@ func validateAttrEntry(attr AttrEntry, spec FieldSpec) error {
 		if attr.Value != 0.0 && attr.Value != 1.0 {
 			return fmt.Errorf("%w: field %q expects boolean (0.0 or 1.0), got %v", ErrInvalidFieldType, attr.Key, attr.Value)
 		}
-	case "float":
-		if attr.Type == AttrTypeFloat64 {
-			f64 := attr.Float64()
-			if math.IsNaN(f64) || math.IsInf(f64, 0) {
-				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, f64)
-			}
-			return nil
-		}
-		if attr.Type == AttrTypeFloat32 {
-			if math.IsNaN(float64(attr.Value)) || math.IsInf(float64(attr.Value), 0) {
-				return fmt.Errorf("%w: field %q requires finite value, got %v", ErrInvalidFieldType, attr.Key, attr.Value)
-			}
-		}
 	case "float32":
 		if attr.Type == AttrTypeFloat32 {
 			if math.IsNaN(float64(attr.Value)) || math.IsInf(float64(attr.Value), 0) {
@@ -346,7 +333,7 @@ func validateAttrEntry(attr AttrEntry, spec FieldSpec) error {
 			return nil
 		}
 		return fmt.Errorf("%w: field %q expects float32 value, got type %d", ErrInvalidFieldType, attr.Key, attr.Type)
-	case "float64":
+	case "float", "float64":
 		if attr.Type == AttrTypeFloat64 {
 			f64 := attr.Float64()
 			if math.IsNaN(f64) || math.IsInf(f64, 0) {
@@ -360,7 +347,7 @@ func validateAttrEntry(attr AttrEntry, spec FieldSpec) error {
 			}
 			return nil
 		}
-		return fmt.Errorf("%w: field %q expects float64 value, got type %d", ErrInvalidFieldType, attr.Key, attr.Type)
+		return fmt.Errorf("%w: field %q expects %s value, got type %d", ErrInvalidFieldType, attr.Key, spec.BaseType, attr.Type)
 	default:
 		return fmt.Errorf("%w: field %q has unsupported base type %q", ErrInvalidFieldType, attr.Key, spec.BaseType)
 	}

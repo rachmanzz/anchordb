@@ -46,7 +46,10 @@ func benchInStorageCompute() {
 	const n = 5_000_000
 	t0 := time.Now()
 	for i := 0; i < n; i++ {
-		_, _ = op.Apply(props)
+		if _, err := op.Apply(props); err != nil {
+			fmt.Fprintf(os.Stderr, "OpDivide failed at iteration %d: %v\n", i, err)
+			os.Exit(1)
+		}
 	}
 	dur := time.Since(t0)
 	nsPerOp := float64(dur.Nanoseconds()) / float64(n)
@@ -144,7 +147,10 @@ func benchCausalChain() {
 		{"svc_4", "disrupts", "app_inventory", 0.89},
 	}
 	for _, e := range edges {
-		_ = db.AddEdge(e.s, e.r, e.t, e.w)
+		if err := db.AddEdge(e.s, e.r, e.t, e.w); err != nil {
+			fmt.Fprintf(os.Stderr, "AddEdge %s->%s failed: %v\n", e.s, e.t, err)
+			os.Exit(1)
+		}
 	}
 
 	ctx := context.Background()
@@ -154,7 +160,10 @@ func benchCausalChain() {
 	const n = 200_000
 	t0 := time.Now()
 	for i := 0; i < n; i++ {
-		_, _ = db.ExecuteCausalChain(ctx, seeds, relations, 5)
+		if _, err := db.ExecuteCausalChain(ctx, seeds, relations, 5); err != nil {
+			fmt.Fprintf(os.Stderr, "ExecuteCausalChain failed at iteration %d: %v\n", i, err)
+			os.Exit(1)
+		}
 	}
 	dur := time.Since(t0)
 	nsPerOp := float64(dur.Nanoseconds()) / float64(n)
@@ -197,8 +206,14 @@ func benchEmbeddedEngineIO() {
 			X: float32(math.Cos(float64(angle))) * 0.5,
 			Y: float32(math.Sin(float64(angle))) * 0.5,
 		}
-		_, _ = db.SaveRecordWithIDAndOp(name, storage.OpStatusActive, props)
-		_, _ = db.AppendNode(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1)
+		if _, err := db.SaveRecordWithIDAndOp(name, storage.OpStatusActive, props); err != nil {
+			fmt.Fprintf(os.Stderr, "SaveRecordWithIDAndOp %s failed: %v\n", name, err)
+			os.Exit(1)
+		}
+		if _, err := db.AppendNode(name, coord, [4]float32{0.5, 0.5, 0.5, 0.5}, 1); err != nil {
+			fmt.Fprintf(os.Stderr, "AppendNode %s failed: %v\n", name, err)
+			os.Exit(1)
+		}
 	}
 	writeDur := time.Since(t0)
 
@@ -206,7 +221,10 @@ func benchEmbeddedEngineIO() {
 	tRead := time.Now()
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("node_%d", i)
-		_, _ = db.GetRecord(name)
+		if _, err := db.GetRecord(name); err != nil {
+			fmt.Fprintf(os.Stderr, "GetRecord %s failed: %v\n", name, err)
+			os.Exit(1)
+		}
 	}
 	readDur := time.Since(tRead)
 
@@ -242,7 +260,10 @@ func benchSchemaValidation() {
 	const n = 2_000_000
 	t0 := time.Now()
 	for i := 0; i < n; i++ {
-		_ = schema.ValidateProps(props)
+		if err := schema.ValidateProps(props); err != nil {
+			fmt.Fprintf(os.Stderr, "ValidateProps failed at iteration %d: %v\n", i, err)
+			os.Exit(1)
+		}
 	}
 	dur := time.Since(t0)
 	nsPerOp := float64(dur.Nanoseconds()) / float64(n)

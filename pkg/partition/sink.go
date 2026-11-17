@@ -56,6 +56,7 @@ func (s *LocalDiskSink) Name() string {
 }
 
 // SavePartitionFromFile copies the partition file from srcPath into the sink.
+// If a companion "<srcPath>.schema" sidecar exists, it is published alongside the archive.
 func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string, error) {
 	if filename == "" || filepath.Base(filename) != filename || filename == "." || filename == ".." {
 		return "", fmt.Errorf("invalid partition filename %q", filename)
@@ -65,7 +66,19 @@ func (s *LocalDiskSink) SavePartitionFromFile(filename, srcPath string) (string,
 		return "", fmt.Errorf("failed opening source partition %s: %w", srcPath, err)
 	}
 	defer src.Close()
-	return s.savePartition(filename, src)
+	targetPath, err := s.savePartition(filename, src)
+	if err != nil {
+		return "", err
+	}
+	if schemaSrc, sErr := os.Open(srcPath + ".schema"); sErr == nil {
+		defer schemaSrc.Close()
+		if _, err := s.savePartition(filepath.Base(targetPath)+".schema", schemaSrc); err != nil {
+			return "", fmt.Errorf("failed saving partition schema sidecar: %w", err)
+		}
+	} else if !os.IsNotExist(sErr) {
+		return "", fmt.Errorf("failed opening source schema sidecar %s.schema: %w", srcPath, sErr)
+	}
+	return targetPath, nil
 }
 
 func (s *LocalDiskSink) savePartition(filename string, src io.Reader) (string, error) {
@@ -198,12 +211,22 @@ func NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey string) *S3Sink {
 	}
 }
 
+var defaultS3HTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+func (s *S3Sink) httpClient() *http.Client {
+	if s.HTTPClient != nil {
+		return s.HTTPClient
+	}
+	return defaultS3HTTPClient
+}
+
 // Name returns the descriptive name of the S3 sink.
 func (s *S3Sink) Name() string {
 	return fmt.Sprintf("S3 (%s/%s/%s)", s.Endpoint, s.Bucket, s.Prefix)
 }
 
 // SavePartitionFromFile streams the local partition file into the S3 bucket.
+// If a companion "<srcPath>.schema" sidecar exists, it is uploaded alongside the archive.
 func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
@@ -214,12 +237,39 @@ func (s *S3Sink) SavePartitionFromFile(filename, srcPath string) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: stat source partition %s: %w", srcPath, err)
 	}
+	if schemaSrc, sErr := os.Open(srcPath + ".schema"); sErr == nil {
+		defer schemaSrc.Close()
+		sfi, stErr := schemaSrc.Stat()
+		if stErr != nil {
+			return "", fmt.Errorf("S3Sink: stat source schema sidecar %s.schema: %w", srcPath, stErr)
+		}
+		if _, err := s.put(filename+".schema", schemaSrc, sfi.Size()); err != nil {
+			return "", fmt.Errorf("S3Sink: upload schema sidecar: %w", err)
+		}
+	} else if !os.IsNotExist(sErr) {
+		return "", fmt.Errorf("S3Sink: open source schema sidecar %s.schema: %w", srcPath, sErr)
+	}
 	return s.put(filename, src, fi.Size())
 }
 
 // SavePartition uploads raw bytes as an object to the S3 bucket.
 func (s *S3Sink) SavePartition(filename string, data []byte) (string, error) {
 	return s.put(filename, bytes.NewReader(data), int64(len(data)))
+}
+
+func (s *S3Sink) signIfConfigured(req *http.Request, payloadHex string) error {
+	if s.AccessKey == "" && s.SecretKey == "" {
+		return nil
+	}
+	if s.AccessKey == "" || s.SecretKey == "" {
+		return errors.New("S3Sink: both access key and secret key are required when credentials are configured")
+	}
+	region := s.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	signS3Request(req, payloadHex, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+	return nil
 }
 
 // put uploads an object whose bytes come from body. body must be seekable so the
@@ -263,30 +313,20 @@ func (s *S3Sink) put(filename string, body io.ReadSeeker, size int64) (string, e
 	}
 	payloadHex := hex.EncodeToString(hasher.Sum(nil))
 
-	req, err := http.NewRequest(http.MethodPut, baseURL.String(), body)
+	uploadCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(uploadCtx, http.MethodPut, baseURL.String(), body)
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: failed creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = size
 
-	if s.AccessKey != "" {
-		if s.SecretKey == "" {
-			return "", fmt.Errorf("S3Sink: secret key cannot be empty when access key is set")
-		}
-		region := s.Region
-		if region == "" {
-			region = "us-east-1"
-		}
-		signS3Request(req, payloadHex, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+	if err := s.signIfConfigured(req, payloadHex); err != nil {
+		return "", err
 	}
 
-	client := s.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-
-	resp, err := client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("S3Sink: upload to %s failed: %w", req.URL, err)
 	}
@@ -308,8 +348,10 @@ type S3ObjectInfo struct {
 }
 
 type listBucketResult struct {
-	XMLName  xml.Name       `xml:"ListBucketResult"`
-	Contents []S3ObjectInfo `xml:"Contents"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	NextContinuationToken string         `xml:"NextContinuationToken"`
+	Contents              []S3ObjectInfo `xml:"Contents"`
 }
 
 // FetchPartition downloads an object from S3 using SigV4 authentication and atomically writes it to destPath.
@@ -354,23 +396,11 @@ func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath str
 	}
 
 	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	if s.AccessKey != "" {
-		if s.SecretKey == "" {
-			return errors.New("S3Sink: secret key cannot be empty when access key is set")
-		}
-		region := s.Region
-		if region == "" {
-			region = "us-east-1"
-		}
-		signS3Request(req, emptySHA256, s.AccessKey, s.SecretKey, region, time.Now().UTC())
+	if err := s.signIfConfigured(req, emptySHA256); err != nil {
+		return err
 	}
 
-	client := s.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-
-	resp, err := client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("S3Sink: download from %s failed: %w", req.URL, err)
 	}
@@ -436,62 +466,62 @@ func (s *S3Sink) ListPartitions(ctx context.Context) ([]S3ObjectInfo, error) {
 	baseURL.Path = bucketPath
 	baseURL.RawPath = ""
 
-	q := url.Values{}
-	q.Set("list-type", "2")
 	cleanPrefix := strings.Trim(s.Prefix, "/")
-	if cleanPrefix != "" {
-		q.Set("prefix", cleanPrefix)
-	}
-	baseURL.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("S3Sink: create list request: %w", err)
-	}
-
 	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	if s.AccessKey != "" {
-		if s.SecretKey == "" {
-			return nil, errors.New("S3Sink: secret key cannot be empty when access key is set")
-		}
-		region := s.Region
-		if region == "" {
-			region = "us-east-1"
-		}
-		signS3Request(req, emptySHA256, s.AccessKey, s.SecretKey, region, time.Now().UTC())
-	}
-
-	client := s.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("S3Sink: list request to %s failed: %w", req.URL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("S3Sink: list returned HTTP %d: %s", resp.StatusCode, string(snippet))
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("S3Sink: read list response: %w", err)
-	}
-
-	var res listBucketResult
-	if err := xml.Unmarshal(bodyBytes, &res); err != nil {
-		return nil, fmt.Errorf("S3Sink: parse XML list response: %w", err)
-	}
-
+	client := s.httpClient()
 	var partitions []S3ObjectInfo
-	for _, item := range res.Contents {
-		if strings.HasSuffix(item.Key, ".anchordb") {
-			partitions = append(partitions, item)
+	continuationToken := ""
+
+	for {
+		pageURL := *baseURL
+		q := url.Values{}
+		q.Set("list-type", "2")
+		if cleanPrefix != "" {
+			q.Set("prefix", cleanPrefix)
 		}
+		if continuationToken != "" {
+			q.Set("continuation-token", continuationToken)
+		}
+		pageURL.RawQuery = q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("S3Sink: create list request: %w", err)
+		}
+		if err := s.signIfConfigured(req, emptySHA256); err != nil {
+			return nil, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("S3Sink: list request to %s failed: %w", req.URL, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("S3Sink: list returned HTTP %d: %s", resp.StatusCode, string(snippet))
+		}
+
+		var res listBucketResult
+		decErr := xml.NewDecoder(resp.Body).Decode(&res)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			return nil, fmt.Errorf("S3Sink: parse XML list response: %w", decErr)
+		}
+
+		for _, item := range res.Contents {
+			if strings.HasSuffix(item.Key, ".anchordb") {
+				partitions = append(partitions, item)
+			}
+		}
+
+		if !res.IsTruncated {
+			break
+		}
+		if res.NextContinuationToken == "" {
+			return nil, errors.New("S3Sink: list response truncated without NextContinuationToken")
+		}
+		continuationToken = res.NextContinuationToken
 	}
 
 	return partitions, nil

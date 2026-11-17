@@ -808,3 +808,55 @@ func TestComputeStats_ExactIntegerExtremes(t *testing.T) {
 		}
 	})
 }
+
+func TestFilterIQROutlier_UnsortedPreservesRecordIdentity(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "iqr_unsorted.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{WAL: WALOptions{SyncMode: SyncNone}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Unsorted input where in-place selectKthFloat64 heavily permutes vals.
+	// Sorted values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 1000]
+	// Q1 = 3, Q3 = 8, IQR = 5, hi = 8 + 1.5*5 = 15.5 -> only "outlier_high" (1000) and "outlier_low" (-500) match.
+	entries := []struct {
+		name string
+		val  float64
+	}{
+		{"n8", 8},
+		{"outlier_high", 1000},
+		{"n3", 3},
+		{"n9", 9},
+		{"n1", 1},
+		{"outlier_low", -500},
+		{"n6", 6},
+		{"n2", 2},
+		{"n7", 7},
+		{"n4", 4},
+		{"n5", 5},
+	}
+	for _, e := range entries {
+		if _, err := db.SaveRecordTyped(e.name, []AttrEntry{NewFloat64Attr("v", e.val)}); err != nil {
+			t.Fatalf("save %s: %v", e.name, err)
+		}
+	}
+
+	got, err := db.FilterIQROutlier("v", 1.5)
+	if err != nil {
+		t.Fatalf("FilterIQROutlier failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 outliers, got %d: %+v", len(got), got)
+	}
+	gotByName := make(map[string]float64, len(got))
+	for _, r := range got {
+		if len(r.Attrs) != 1 {
+			t.Fatalf("expected 1 attr on %s, got %d", r.Name, len(r.Attrs))
+		}
+		gotByName[r.Name] = r.Attrs[0].Float64()
+	}
+	if gotByName["outlier_high"] != 1000 || gotByName["outlier_low"] != -500 {
+		t.Fatalf("unexpected outlier identity mapping: %+v", gotByName)
+	}
+}

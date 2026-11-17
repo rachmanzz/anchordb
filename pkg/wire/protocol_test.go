@@ -594,3 +594,62 @@ func TestWire_DecodeListResponse_BoundsAndTypeSafety(t *testing.T) {
 		t.Fatalf("unexpected decoded mixed filter bounds: low=%d high=%d", fc.ValueInt64, fc.ValueHighUint64)
 	}
 }
+
+func TestWire_DecoderRejectsInflatedCounts(t *testing.T) {
+	// SaveBatch with count = math.MaxUint32 in a 4-byte payload.
+	var batchHdr [4]byte
+	binary.LittleEndian.PutUint32(batchHdr[:], math.MaxUint32)
+	if _, err := DecodeSaveBatchPayload(batchHdr[:]); err == nil {
+		t.Fatalf("expected DecodeSaveBatchPayload to reject inflated count")
+	}
+
+	// CausalResult with count = math.MaxUint32.
+	if _, err := DecodeCausalResultPayload(batchHdr[:]); err == nil {
+		t.Fatalf("expected DecodeCausalResultPayload to reject inflated count")
+	}
+
+	// GraphResponse with resultCount = math.MaxUint32.
+	var graphHdr [12]byte
+	binary.LittleEndian.PutUint32(graphHdr[8:12], math.MaxUint32)
+	if _, err := DecodeGraphResponsePayload(graphHdr[:]); err == nil {
+		t.Fatalf("expected DecodeGraphResponsePayload to reject inflated count")
+	}
+
+	// MathResponse with neighborCount = math.MaxUint32.
+	var mathHdr [32]byte
+	binary.LittleEndian.PutUint32(mathHdr[28:32], math.MaxUint32)
+	if _, err := DecodeMathResponse(mathHdr[:]); err == nil {
+		t.Fatalf("expected DecodeMathResponse to reject inflated count")
+	}
+
+	// GetResult with inflated attrCount.
+	var getHdr [3]byte
+	getHdr[0] = storage.OpStatusActive
+	binary.LittleEndian.PutUint16(getHdr[1:3], 5000|storage.RawTypedFlag)
+	if _, _, err := DecodeGetResultPayload(getHdr[:]); err == nil {
+		t.Fatalf("expected DecodeGetResultPayload to reject inflated attrCount")
+	}
+
+	// Unknown edge action string encodes 0xFF and must be rejected on decode.
+	badActionEdge := EncodeEdgePayload("delete", "a", "r", "b", 1.0)
+	if _, _, _, _, _, _, err := DecodeEdgePayloadWithDirection(badActionEdge); err == nil {
+		t.Fatalf("expected DecodeEdgePayloadWithDirection to reject unknown action encoded from 'delete'")
+	}
+
+	// DecodeGetRequest / DecodeListRequest / DecodeUpdateRequest reject truncated trailing count headers.
+	getTrunc := append(EncodeGetPayload("rec1"), 0x01)
+	if _, err := DecodeGetRequest(getTrunc); err == nil {
+		t.Fatalf("expected DecodeGetRequest to reject truncated select count")
+	}
+	listBase := EncodeListRequest(ListRequest{Limit: 10})
+	if _, err := DecodeListRequest(listBase[:len(listBase)-1]); err == nil {
+		t.Fatalf("expected DecodeListRequest to reject truncated compute count")
+	}
+	if _, err := DecodeListRequest(append(listBase, 0x01)); err == nil {
+		t.Fatalf("expected DecodeListRequest to reject trailing unparsed bytes")
+	}
+	updBase := EncodeUpdateRequest(UpdateRequest{Limit: 5})
+	if _, err := DecodeUpdateRequest(updBase[:len(updBase)-1]); err == nil {
+		t.Fatalf("expected DecodeUpdateRequest to reject truncated mutation count")
+	}
+}

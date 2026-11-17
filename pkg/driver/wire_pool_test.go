@@ -134,3 +134,78 @@ func TestDriver_WireConnectionPool(t *testing.T) {
 		t.Fatalf("failed to save with pool=4 client: %v", err)
 	}
 }
+
+func TestDriver_WirePoolDiscardsBrokenConnAndRetainsProtocolErrorConn(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend := &wireTestBackend{
+		dataDir: tmpDir,
+		models:  make(map[string]*storage.AnchorDB),
+	}
+	defer backend.Close()
+
+	srv := wire.NewServer(backend)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+	go func() { _ = srv.Serve(l) }()
+	defer func() { _ = srv.Close() }()
+
+	client, err := ConnectWire("wire://"+l.Addr().String(), WithPoolSize(1))
+	if err != nil {
+		t.Fatalf("ConnectWire: %v", err)
+	}
+	defer client.Close()
+
+	wb := client.backend.(*wireBackend)
+
+	// 1. Protocol error (WireError, e.g., missing record) keeps the healthy connection in pool.
+	if _, err := client.Get("does_not_exist").Execute(context.Background()); err == nil {
+		t.Fatalf("expected error on missing record")
+	}
+	if len(wb.idle) != 1 {
+		t.Fatalf("expected protocol error to return healthy conn to idle pool, got len=%d", len(wb.idle))
+	}
+
+	// 2. Simulate transport error by closing the single underlying connection, then invoking a call.
+	wb.mu.Lock()
+	var onlyConn *wire.Client
+	for wc := range wb.clients {
+		onlyConn = wc
+	}
+	wb.mu.Unlock()
+	if onlyConn == nil {
+		t.Fatalf("expected 1 tracked wire client")
+	}
+	_ = onlyConn.Close()
+
+	if err := client.Save("fails_on_closed", map[string]float32{"x": 1}); err == nil {
+		t.Fatalf("expected Save on closed conn to fail")
+	}
+
+	// The broken connection must be discarded (not left in idle), and the next call must redial cleanly.
+	if err := client.Save("recovers_after_redial", map[string]float32{"x": 99}); err != nil {
+		t.Fatalf("expected pool to redial after discarding broken conn, got: %v", err)
+	}
+	res, err := client.Get("recovers_after_redial").Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Get after redial: %v", err)
+	}
+	if res.Get("x") != 99 {
+		t.Fatalf("expected x=99 after redial, got %v", res.Get("x"))
+	}
+}
+
+func TestConnectWire_RejectsInvalidQueryParams(t *testing.T) {
+	for _, dsn := range []string{
+		"wire://127.0.0.1:7448?target=notanumber",
+		"wire://127.0.0.1:7448?pool=0",
+		"wire://127.0.0.1:7448?pool=abc",
+		"wire://127.0.0.1:7448?pacing=maybe",
+	} {
+		if _, err := ConnectWire(dsn); err == nil {
+			t.Fatalf("expected ConnectWire(%q) to fail on invalid query param", dsn)
+		}
+	}
+}

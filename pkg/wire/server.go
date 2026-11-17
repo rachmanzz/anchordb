@@ -1,13 +1,16 @@
 package wire
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -76,19 +79,31 @@ type edgeJob struct {
 	done  chan struct{}
 }
 
+const (
+	defaultWireMaxConns     = 1024
+	defaultWireReadTimeout  = 60 * time.Second
+	defaultWireWriteTimeout = 30 * time.Second
+	defaultWireCloseTimeout = 5 * time.Second
+)
+
 // Server is the AnchorWire binary TCP protocol daemon.
 type Server struct {
-	backend     Backend
-	joinManager *JoinManager
-	gatewayMode bool
-	l           net.Listener
-	mu          sync.Mutex
-	conns       map[net.Conn]struct{}
-	closed      bool
-	wg          sync.WaitGroup
-	saveJobs    chan *saveJob
-	edgeJobs    chan *edgeJob
-	stopChan    chan struct{}
+	backend           Backend
+	joinManager       *JoinManager
+	gatewayMode       bool
+	l                 net.Listener
+	mu                sync.Mutex
+	conns             map[net.Conn]struct{}
+	connSem           chan struct{}
+	readTimeout       time.Duration
+	writeTimeout      time.Duration
+	closed            bool
+	wg                sync.WaitGroup
+	saveJobs          chan *saveJob
+	edgeJobs          chan *edgeJob
+	stopChan          chan struct{}
+	saveCommitterDone chan struct{}
+	edgeCommitterDone chan struct{}
 }
 
 // NewServer constructs an AnchorWire server instance.
@@ -103,18 +118,41 @@ func NewServerWithJoinManager(backend Backend, jm *JoinManager) *Server {
 		gatewayMode = jm.IsGatewayMode()
 	}
 	s := &Server{
-		backend:     backend,
-		joinManager: jm,
-		gatewayMode: gatewayMode,
-		conns:       make(map[net.Conn]struct{}),
-		saveJobs:    make(chan *saveJob, 2048),
-		edgeJobs:    make(chan *edgeJob, 2048),
-		stopChan:    make(chan struct{}),
+		backend:           backend,
+		joinManager:       jm,
+		gatewayMode:       gatewayMode,
+		conns:             make(map[net.Conn]struct{}),
+		connSem:           make(chan struct{}, defaultWireMaxConns),
+		readTimeout:       defaultWireReadTimeout,
+		writeTimeout:      defaultWireWriteTimeout,
+		saveJobs:          make(chan *saveJob, 2048),
+		edgeJobs:          make(chan *edgeJob, 2048),
+		stopChan:          make(chan struct{}),
+		saveCommitterDone: make(chan struct{}),
+		edgeCommitterDone: make(chan struct{}),
 	}
 	s.wg.Add(2)
 	go s.runGroupCommitter()
 	go s.runEdgeGroupCommitter()
 	return s
+}
+
+// SetTimeouts configures per-frame read and write socket deadlines for new connections.
+func (s *Server) SetTimeouts(readTimeout, writeTimeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readTimeout = readTimeout
+	s.writeTimeout = writeTimeout
+}
+
+// SetMaxConnections updates the maximum concurrent TCP connections accepted by Serve.
+func (s *Server) SetMaxConnections(maxConns int) {
+	if maxConns <= 0 {
+		maxConns = defaultWireMaxConns
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connSem = make(chan struct{}, maxConns)
 }
 
 // SetJoinManager assigns the JoinManager.
@@ -155,16 +193,35 @@ func (s *Server) Serve(l net.Listener) error {
 			s.mu.Unlock()
 			return nil
 		}
+		sem := s.connSem
+		readTimeout := s.readTimeout
+		writeTimeout := s.writeTimeout
+		select {
+		case sem <- struct{}{}:
+		default:
+			// Connection limit reached; reject immediately so goroutines stay bounded.
+			_ = conn.Close()
+			s.mu.Unlock()
+			continue
+		}
 		s.conns[conn] = struct{}{}
 		s.wg.Add(1)
 		s.mu.Unlock()
 
-		go s.handleConn(conn)
+		go func(c net.Conn, slot chan struct{}, rt, wt time.Duration) {
+			defer func() { <-slot }()
+			s.handleConn(c, rt, wt)
+		}(conn, sem, readTimeout, writeTimeout)
 	}
 }
 
-// Close gracefully terminates the server and closes all active connections.
+// Close gracefully terminates the server and closes all active connections within the default timeout.
 func (s *Server) Close() error {
+	return s.CloseWithTimeout(defaultWireCloseTimeout)
+}
+
+// CloseWithTimeout terminates the server and waits up to timeout for active handlers to finish.
+func (s *Server) CloseWithTimeout(timeout time.Duration) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -182,7 +239,22 @@ func (s *Server) Close() error {
 	jm := s.joinManager
 	s.mu.Unlock()
 
-	s.wg.Wait()
+	if timeout <= 0 {
+		s.wg.Wait()
+	} else {
+		done := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(done)
+		}()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			err = errors.Join(err, fmt.Errorf("wire server close timed out after %v", timeout))
+		}
+	}
 
 	if jm != nil {
 		if jmErr := jm.Close(); jmErr != nil && err == nil {
@@ -193,22 +265,35 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) runGroupCommitter() {
+	defer close(s.saveCommitterDone)
 	defer s.wg.Done()
 	const maxBatch = 128
 
+	drainClosing := func() {
+		for {
+			select {
+			case j := <-s.saveJobs:
+				j.err = errors.New("server closing")
+				close(j.done)
+			default:
+				return
+			}
+		}
+	}
+
 	for {
+		select {
+		case <-s.stopChan:
+			drainClosing()
+			return
+		default:
+		}
+
 		var firstJob *saveJob
 		select {
 		case <-s.stopChan:
-			for {
-				select {
-				case j := <-s.saveJobs:
-					j.err = errors.New("server closing")
-					close(j.done)
-				default:
-					return
-				}
-			}
+			drainClosing()
+			return
 		case firstJob = <-s.saveJobs:
 		}
 
@@ -216,6 +301,8 @@ func (s *Server) runGroupCommitter() {
 	drain:
 		for len(batch) < maxBatch {
 			select {
+			case <-s.stopChan:
+				break drain
 			case j := <-s.saveJobs:
 				batch = append(batch, j)
 			default:
@@ -224,6 +311,44 @@ func (s *Server) runGroupCommitter() {
 		}
 
 		s.processSaveBatch(batch)
+	}
+}
+
+func saveSingleGroupJob(db *storage.AnchorDB, j *saveJob) {
+	opStatus := j.item.Operation
+	if opStatus == 0 {
+		opStatus = storage.OpStatusActive
+	}
+	if len(j.item.Attrs) > 0 {
+		if j.item.Coord != nil || j.item.Roles != nil {
+			coord := spatial.Point2D{}
+			if j.item.Coord != nil {
+				coord = *j.item.Coord
+			}
+			var roles [4]float32
+			if j.item.Roles != nil {
+				roles = *j.item.Roles
+			}
+			j.savedName, j.err = db.SaveRecordTypedWithNode(j.item.Name, opStatus, j.item.Attrs, coord, roles)
+		} else {
+			j.savedName, j.err = db.SaveRecordTypedWithIDAndOp(j.item.Name, opStatus, j.item.Attrs)
+		}
+	} else if j.item.Coord != nil || j.item.Roles != nil {
+		coord := spatial.Point2D{}
+		if j.item.Coord != nil {
+			coord = *j.item.Coord
+		}
+		var roles [4]float32
+		if j.item.Roles != nil {
+			roles = *j.item.Roles
+		}
+		j.savedName, j.err = db.SaveRecordWithNode(j.item.Name, opStatus, j.item.Props, coord, roles)
+	} else {
+		j.savedName, j.err = db.SaveRecordWithIDAndOp(j.item.Name, opStatus, j.item.Props)
+	}
+	close(j.done)
+	if j.err == nil {
+		system.RecordMutation(1)
 	}
 }
 
@@ -262,47 +387,7 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 		}
 
 		if len(jobs) == 1 {
-			j := jobs[0]
-			opStatus := j.item.Operation
-			if opStatus == 0 {
-				opStatus = storage.OpStatusActive
-			}
-			if len(j.item.Attrs) > 0 {
-				if j.item.Coord != nil || j.item.Roles != nil {
-					coord := spatial.Point2D{}
-					if j.item.Coord != nil {
-						coord = *j.item.Coord
-					}
-					var roles [4]float32
-					if j.item.Roles != nil {
-						roles = *j.item.Roles
-					}
-					j.savedName, j.err = db.SaveRecordTypedWithNode(j.item.Name, opStatus, j.item.Attrs, coord, roles)
-				} else {
-					j.savedName, j.err = db.SaveRecordTypedWithIDAndOp(j.item.Name, opStatus, j.item.Attrs)
-				}
-			} else if j.item.Coord != nil || j.item.Roles != nil {
-				coord := spatial.Point2D{}
-				if j.item.Coord != nil {
-					coord = *j.item.Coord
-				}
-				var roles [4]float32
-				if j.item.Roles != nil {
-					roles = *j.item.Roles
-				}
-				if len(j.item.Props) > 0 {
-					j.savedName, j.err = db.SaveRecordWithNode(j.item.Name, opStatus, j.item.Props, coord, roles)
-				} else {
-					j.savedName = j.item.Name
-					_, j.err = db.AppendNode(j.savedName, coord, roles, 1)
-				}
-			} else {
-				j.savedName, j.err = db.SaveRecordWithIDAndOp(j.item.Name, opStatus, j.item.Props)
-			}
-			close(j.done)
-			if j.err == nil {
-				system.RecordMutation(1)
-			}
+			saveSingleGroupJob(db, jobs[0])
 			continue
 		}
 
@@ -313,47 +398,15 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 
 		names, bErr := db.SaveRecordsBatch(items)
 		if bErr != nil {
+			if errors.Is(bErr, storage.ErrDatabaseClosed) {
+				for _, j := range jobs {
+					j.err = bErr
+					close(j.done)
+				}
+				continue
+			}
 			for _, j := range jobs {
-				opStatus := j.item.Operation
-				if opStatus == 0 {
-					opStatus = storage.OpStatusActive
-				}
-				if len(j.item.Attrs) > 0 {
-					if j.item.Coord != nil || j.item.Roles != nil {
-						coord := spatial.Point2D{}
-						if j.item.Coord != nil {
-							coord = *j.item.Coord
-						}
-						var roles [4]float32
-						if j.item.Roles != nil {
-							roles = *j.item.Roles
-						}
-						j.savedName, j.err = db.SaveRecordTypedWithNode(j.item.Name, opStatus, j.item.Attrs, coord, roles)
-					} else {
-						j.savedName, j.err = db.SaveRecordTypedWithIDAndOp(j.item.Name, opStatus, j.item.Attrs)
-					}
-				} else if j.item.Coord != nil || j.item.Roles != nil {
-					coord := spatial.Point2D{}
-					if j.item.Coord != nil {
-						coord = *j.item.Coord
-					}
-					var roles [4]float32
-					if j.item.Roles != nil {
-						roles = *j.item.Roles
-					}
-					if len(j.item.Props) > 0 {
-						j.savedName, j.err = db.SaveRecordWithNode(j.item.Name, opStatus, j.item.Props, coord, roles)
-					} else {
-						j.savedName = j.item.Name
-						_, j.err = db.AppendNode(j.savedName, coord, roles, 1)
-					}
-				} else {
-					j.savedName, j.err = db.SaveRecordWithIDAndOp(j.item.Name, opStatus, j.item.Props)
-				}
-				close(j.done)
-				if j.err == nil {
-					system.RecordMutation(1)
-				}
+				saveSingleGroupJob(db, j)
 			}
 		} else {
 			for i, j := range jobs {
@@ -366,22 +419,35 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 }
 
 func (s *Server) runEdgeGroupCommitter() {
+	defer close(s.edgeCommitterDone)
 	defer s.wg.Done()
 	const maxBatch = 128
 
+	drainClosing := func() {
+		for {
+			select {
+			case j := <-s.edgeJobs:
+				j.err = errors.New("server closing")
+				close(j.done)
+			default:
+				return
+			}
+		}
+	}
+
 	for {
+		select {
+		case <-s.stopChan:
+			drainClosing()
+			return
+		default:
+		}
+
 		var firstJob *edgeJob
 		select {
 		case <-s.stopChan:
-			for {
-				select {
-				case j := <-s.edgeJobs:
-					j.err = errors.New("server closing")
-					close(j.done)
-				default:
-					return
-				}
-			}
+			drainClosing()
+			return
 		case firstJob = <-s.edgeJobs:
 		}
 
@@ -389,6 +455,8 @@ func (s *Server) runEdgeGroupCommitter() {
 	drain:
 		for len(batch) < maxBatch {
 			select {
+			case <-s.stopChan:
+				break drain
 			case j := <-s.edgeJobs:
 				batch = append(batch, j)
 			default:
@@ -437,6 +505,13 @@ func (s *Server) processEdgeBatch(batch []*edgeJob) {
 
 		bErr := db.AddEdgesBatch(items)
 		if bErr != nil {
+			if errors.Is(bErr, storage.ErrDatabaseClosed) {
+				for _, j := range jobs {
+					j.err = bErr
+					close(j.done)
+				}
+				continue
+			}
 			for _, j := range jobs {
 				j.err = db.AddEdge(j.item.Source, j.item.Relation, j.item.Target, j.item.Weight)
 				close(j.done)
@@ -460,29 +535,65 @@ func (s *Server) removeConn(conn net.Conn) {
 	s.wg.Done()
 }
 
-func (s *Server) handleConn(conn net.Conn) {
+func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Duration) {
 	defer func() {
 		_ = conn.Close()
 		s.removeConn(conn)
 	}()
 
+	connCtx, cancelConn := context.WithCancel(context.Background())
+	defer cancelConn()
+	go func() {
+		select {
+		case <-s.stopChan:
+			cancelConn()
+		case <-connCtx.Done():
+		}
+	}()
+
+	br := bufio.NewReaderSize(conn, 16*1024)
+	bw := bufio.NewWriterSize(conn, 16*1024)
+	writeResp := func(f Frame) error {
+		if writeTimeout > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		}
+		if err := WriteFrame(bw, f); err != nil {
+			return err
+		}
+		return bw.Flush()
+	}
+
 	currentModel := "default"
 	authenticated := !s.gatewayMode && !s.backend.RequiresAuth()
 	var authenticatedNodeID string
 	var stagedPendingConfirm bool
+	var stagedCommitment [32]byte
 
 	for {
-		req, err := ReadFrame(conn)
+		if readTimeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		}
+		req, err := ReadFrame(br)
 		if err != nil {
 			return
 		}
 
-		// Piggyback Pruning: confirm operational state upon receiving the first operational frame after reauth
+		// Piggyback Pruning: confirm operational state upon receiving the first operational frame after reauth.
 		if stagedPendingConfirm && req.OpCode != OpAuth {
-			if s.joinManager != nil && s.joinManager.CommitmentStore() != nil {
-				_ = s.joinManager.CommitmentStore().ConfirmOperational(authenticatedNodeID)
+			if cs := s.joinManager.CommitmentStore(); cs != nil {
+				if cErr := cs.ConfirmOperationalExpected(authenticatedNodeID, stagedCommitment); cErr != nil {
+					_ = writeResp(Frame{
+						Magic:   Magic,
+						Version: Version,
+						Seq:     req.Seq,
+						OpCode:  OpResponseError,
+						Payload: EncodeErrorPayload(500, cErr.Error()),
+					})
+					return
+				}
 			}
 			stagedPendingConfirm = false
+			stagedCommitment = [32]byte{}
 		}
 
 		resp := Frame{
@@ -495,7 +606,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		if req.OpCode == OpPing {
 			resp.OpCode = OpPong
 			resp.Payload = []byte("PONG")
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -509,7 +620,9 @@ func (s *Server) handleConn(conn net.Conn) {
 				if dErr != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(400, "invalid structured auth payload")
-					_ = WriteFrame(conn, resp)
+					if wErr := writeResp(resp); wErr != nil {
+						return
+					}
 					continue
 				}
 
@@ -518,7 +631,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					if aErr != nil {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(errCode, aErr.Error())
-						_ = WriteFrame(conn, resp)
+						_ = writeResp(resp)
 						return
 					}
 					authenticated = true
@@ -526,6 +639,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					if authReq.Type == AuthTypeStagedReauth {
 						authenticatedNodeID = authReq.NodeID
 						stagedPendingConfirm = true
+						stagedCommitment = authReq.NextCommitment
 						resp.Payload = EncodeRotationStagedResponse("Commitment staged successfully")
 					} else if sessKey != "" {
 						resp.Payload = EncodeAuthResponse(sessKey)
@@ -533,19 +647,24 @@ func (s *Server) handleConn(conn net.Conn) {
 						resp.Payload = EncodeOKPayload("authenticated")
 					}
 				} else {
-					// Fallback when joinManager is nil: evaluate static token
-					if authReq.Type == AuthTypeStatic && s.backend.Authenticate(authReq.Credential) {
+					if authReq.Type != AuthTypeStatic {
+						resp.OpCode = OpResponseError
+						resp.Payload = EncodeErrorPayload(501, "structured auth mode requires JoinManager")
+						_ = writeResp(resp)
+						return
+					}
+					if s.backend.Authenticate(authReq.Credential) {
 						authenticated = true
 						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeAuthResponse("SESS.default." + authReq.NodeID + ".static")
+						resp.Payload = EncodeOKPayload("authenticated")
 					} else {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(ErrCodeUnauthorized, "unauthorized: invalid credentials")
-						_ = WriteFrame(conn, resp)
+						_ = writeResp(resp)
 						return
 					}
 				}
-				if err := WriteFrame(conn, resp); err != nil {
+				if err := writeResp(resp); err != nil {
 					return
 				}
 				continue
@@ -555,7 +674,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			if s.gatewayMode {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(ErrCodeUnauthorized, "unauthorized: direct client access disabled in gateway mode; connection must route through anchor-connector")
-				_ = WriteFrame(conn, resp)
+				_ = writeResp(resp)
 				return
 			}
 
@@ -563,7 +682,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			if dErr != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, "invalid auth payload")
-				_ = WriteFrame(conn, resp)
+				if wErr := writeResp(resp); wErr != nil {
+					return
+				}
 				continue
 			}
 			if s.backend.Authenticate(token) {
@@ -573,10 +694,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			} else {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(401, "unauthorized: invalid token")
-				_ = WriteFrame(conn, resp)
+				_ = writeResp(resp)
 				return
 			}
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -586,7 +707,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		if !authenticated {
 			resp.OpCode = OpResponseError
 			resp.Payload = EncodeErrorPayload(401, "authentication required: send OpAuth first")
-			_ = WriteFrame(conn, resp)
+			_ = writeResp(resp)
 			return
 		}
 
@@ -601,7 +722,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload("model selected: " + currentModel)
 			}
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -613,7 +734,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			if dErr != nil {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(400, "invalid memory negotiation request: "+dErr.Error())
-				_ = WriteFrame(conn, resp)
+				if wErr := writeResp(resp); wErr != nil {
+					return
+				}
 				continue
 			}
 
@@ -659,7 +782,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				AllocatedBatchSize: allocatedBatch,
 				ReleaseIntervalMs:  releaseIntervalMs,
 			})
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -691,7 +814,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					}
 				}
 			}
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -725,7 +848,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					}
 				}
 			}
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -736,7 +859,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			resp.OpCode = OpResponseError
 			resp.Payload = EncodeErrorPayload(500, fmt.Sprintf("failed to get model %q: %v", currentModel, err))
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
 			continue
@@ -760,20 +883,28 @@ func (s *Server) handleConn(conn net.Conn) {
 
 			select {
 			case s.saveJobs <- job:
-				<-job.done
-				if job.err != nil {
-					if strings.Contains(job.err.Error(), "admission control") {
-						resp.OpCode = OpResponseError
-						resp.Payload = EncodeErrorPayload(507, job.err.Error())
+				select {
+				case <-job.done:
+					if job.err != nil {
+						if strings.Contains(job.err.Error(), "admission control") {
+							resp.OpCode = OpResponseError
+							resp.Payload = EncodeErrorPayload(507, job.err.Error())
+						} else {
+							resp.OpCode = OpResponseError
+							resp.Payload = EncodeErrorPayload(wireErrorCode(job.err), job.err.Error())
+						}
 					} else {
-						resp.OpCode = OpResponseError
-						resp.Payload = EncodeErrorPayload(500, job.err.Error())
+						resp.OpCode = OpResponseOK
+						resp.Payload = EncodeOKPayload(job.savedName)
 					}
-				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload(job.savedName)
+				case <-s.saveCommitterDone:
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(503, "server stopping")
 				}
 			case <-s.stopChan:
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(503, "server stopping")
+			case <-s.saveCommitterDone:
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(503, "server stopping")
 			}
@@ -806,7 +937,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			names, err := db.SaveRecordsBatch(items)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				system.RecordMutation(uint64(len(items)))
 				resp.OpCode = OpResponseOK
@@ -845,10 +976,9 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 			}
 			if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
-				// Fallback to Cold Storage Tier only for missing records; compute,
-				// IO and closed-DB failures keep their identity (and code).
-				// Prefer a cold-only lookup when the backend offers it: the hot
-				// read above already failed, so repeating it would be pure waste.
+				// Fallback to Cold Storage Tier only for missing records; preserve
+				// real non-not-found cold errors (I/O, closed DB, compute, S3)
+				// instead of masking them as 404.
 				if cb, ok := s.backend.(ColdTierBackend); ok {
 					cr, coldErr := cb.GetColdRecordTyped(currentModel, getReq.Name, getReq.Computations, getReq.Select)
 					if coldErr == nil {
@@ -857,6 +987,8 @@ func (s *Server) handleConn(conn net.Conn) {
 						attrs = cr.ExpandAttrs()
 						isTyped = true
 						resp.Flags |= FlagColdTier
+					} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+						err = coldErr
 					}
 				} else if ttb, ok := s.backend.(TypedTieredBackend); ok {
 					cr, coldErr := ttb.GetRecordTypedWithComputeTiered(currentModel, getReq.Name, getReq.Computations, getReq.Select)
@@ -866,6 +998,8 @@ func (s *Server) handleConn(conn net.Conn) {
 						attrs = cr.ExpandAttrs()
 						isTyped = true
 						resp.Flags |= FlagColdTier
+					} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+						err = coldErr
 					}
 				} else if tb, ok := s.backend.(TieredBackend); ok {
 					var coldErr error
@@ -878,6 +1012,8 @@ func (s *Server) handleConn(conn net.Conn) {
 						err = nil
 						isTyped = false
 						resp.Flags |= FlagColdTier
+					} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+						err = coldErr
 					}
 				}
 			}
@@ -928,15 +1064,25 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 				select {
 				case s.edgeJobs <- job:
-					<-job.done
-					err = job.err
+					select {
+					case <-job.done:
+						err = job.err
+					case <-s.edgeCommitterDone:
+						err = errors.New("server stopping")
+					}
 				case <-s.stopChan:
+					err = errors.New("server stopping")
+				case <-s.edgeCommitterDone:
 					err = errors.New("server stopping")
 				}
 			}
 			if err != nil {
+				code := wireErrorCode(err)
+				if code == 500 {
+					code = 400
+				}
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(400, err.Error())
+				resp.Payload = EncodeErrorPayload(code, err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", db.EdgeCount()))
@@ -949,10 +1095,30 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
 			}
-			results, err := db.ExecuteCausalStep(context.Background(), seeds, rel, limitK)
+			results, err := db.ExecuteCausalStep(connCtx, seeds, rel, limitK)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
+			} else {
+				resp.OpCode = OpResponseOK
+				resp.Payload = EncodeCausalResultPayload(results)
+			}
+
+		case OpCausalChain:
+			seeds, relations, limitK, dErr := DecodeCausalChainPayload(req.Payload)
+			if dErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(400, dErr.Error())
+				break
+			}
+			results, err := db.ExecuteCausalChain(connCtx, seeds, relations, limitK)
+			if err != nil {
+				code := wireErrorCode(err)
+				if code == 500 {
+					code = 400
+				}
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(code, err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeCausalResultPayload(results)
@@ -961,7 +1127,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		case OpSync:
 			if err := db.Sync(); err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload("synced")
@@ -975,7 +1141,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				break
 			}
 			opts := storage.QueryOptions{
-				Context:              context.Background(),
+				Context:              connCtx,
 				Limit:                listReq.Limit,
 				Offset:               listReq.Offset,
 				IncludeAllOperations: listReq.IncludeAllOperations,
@@ -1006,7 +1172,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				break
 			}
 			opts := storage.UpdateOptions{
-				Context:        context.Background(),
+				Context:        connCtx,
 				Limit:          upReq.Limit,
 				Offset:         upReq.Offset,
 				TargetEntities: upReq.TargetEntities,
@@ -1035,7 +1201,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			results, anchor, err := db.ExecuteGraphStepWithOptions(gReq.Inputs, gReq.Relation, gReq.LimitK, storage.OrderByMode(gReq.OrderMode), gReq.BeamWidth)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
@@ -1054,7 +1220,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			results, err := db.ExecuteGraphChainWithOptions(cReq.Inputs, cReq.RelationChain, cReq.LimitK, cReq.BeamWidth)
 			if err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
@@ -1088,8 +1254,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			if !ok {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(404, "no schema attached to model")
+			} else if data, mErr := json.Marshal(ms); mErr != nil {
+				resp.OpCode = OpResponseError
+				resp.Payload = EncodeErrorPayload(500, fmt.Sprintf("failed to marshal schema: %v", mErr))
 			} else {
-				data, _ := json.Marshal(ms)
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeGetSchemaPayload(string(data))
 			}
@@ -1101,6 +1269,13 @@ func (s *Server) handleConn(conn net.Conn) {
 				resp.Payload = EncodeErrorPayload(400, dErr.Error())
 				break
 			}
+			mathErrCode := func(err error) uint16 {
+				code := wireErrorCode(err)
+				if code == 500 {
+					return 404
+				}
+				return code
+			}
 			switch mReq.Op {
 			case "distance":
 				if len(mReq.Words) < 2 {
@@ -1111,7 +1286,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				dist, err := db.CalculateDistance(mReq.Words[0], mReq.Words[1])
 				if err != nil {
 					resp.OpCode = OpResponseError
-					resp.Payload = EncodeErrorPayload(404, err.Error())
+					resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
 				} else {
 					resp.OpCode = OpResponseOK
 					resp.Payload = EncodeMathResponse(MathResponse{Value: dist})
@@ -1120,7 +1295,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				coord, roles, err := db.CalculateCentroid(mReq.Words)
 				if err != nil {
 					resp.OpCode = OpResponseError
-					resp.Payload = EncodeErrorPayload(404, err.Error())
+					resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
 				} else {
 					resp.OpCode = OpResponseOK
 					resp.Payload = EncodeMathResponse(MathResponse{Coord: coord, Roles: roles})
@@ -1134,7 +1309,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				sim, err := db.CalculateCosineSimilarity(mReq.Words[0], mReq.Words[1])
 				if err != nil {
 					resp.OpCode = OpResponseError
-					resp.Payload = EncodeErrorPayload(404, err.Error())
+					resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
 				} else {
 					resp.OpCode = OpResponseOK
 					resp.Payload = EncodeMathResponse(MathResponse{Value: sim})
@@ -1148,7 +1323,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				neighbors, err := db.FindNearestNeighbors(mReq.Words[0], mReq.LimitK)
 				if err != nil {
 					resp.OpCode = OpResponseError
-					resp.Payload = EncodeErrorPayload(404, err.Error())
+					resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
 				} else {
 					resp.OpCode = OpResponseOK
 					resp.Payload = EncodeMathResponse(MathResponse{Neighbors: neighbors})
@@ -1172,7 +1347,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			if err := db.ResetSchema(); err != nil {
 				resp.OpCode = OpResponseError
-				resp.Payload = EncodeErrorPayload(500, err.Error())
+				resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 			} else {
 				resp.OpCode = OpResponseOK
 				resp.Payload = EncodeOKPayload("schema reset")
@@ -1184,9 +1359,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		if (req.Flags & FlagOneway) == 0 {
-			if err := WriteFrame(conn, resp); err != nil {
+			if err := writeResp(resp); err != nil {
 				return
 			}
+		} else if resp.OpCode == OpResponseError {
+			code, msg, _ := DecodeErrorPayload(resp.Payload)
+			log.Printf("[WIRE] Oneway op 0x%02X failed on model %q (code %d): %s", req.OpCode, currentModel, code, msg)
 		}
 	}
 }

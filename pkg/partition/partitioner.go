@@ -117,34 +117,46 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	defer os.RemoveAll(tempDir)
 
 	tempDBPath := filepath.Join(tempDir, partitionFilename)
-	partDB, err := storage.Open(tempDBPath)
+	partDB, err := storage.OpenWithOptions(tempDBPath, storage.Options{
+		WAL: storage.WALOptions{SyncMode: storage.SyncNone},
+	})
 	if err != nil {
 		return nil, rollback(fmt.Errorf("failed creating partition database: %w", err))
 	}
-
-	for _, r := range records {
-		var saveErr error
-		if len(r.Attrs) > 0 {
-			_, saveErr = partDB.SaveRecordTyped(r.Name, r.Attrs)
-		} else {
-			saveErr = partDB.SaveRecord(r.Name, r.Props)
-		}
-		if saveErr != nil {
+	if schema, hasSchema := db.GetSchema(); hasSchema {
+		if sErr := partDB.AttachSchema(schema); sErr != nil {
 			_ = partDB.Close()
-			return nil, rollback(fmt.Errorf("failed adding record %q to partition: %w", r.Name, saveErr))
+			return nil, rollback(fmt.Errorf("failed attaching schema to partition database: %w", sErr))
 		}
+	}
+
+	batchItems := make([]storage.BatchRecordItem, len(records))
+	for i, r := range records {
+		batchItems[i] = storage.BatchRecordItem{
+			Name:      r.Name,
+			Operation: storage.OpStatusActive,
+			Props:     r.Props,
+			Attrs:     r.Attrs,
+		}
+	}
+	if _, saveErr := partDB.SaveRecordsBatch(batchItems); saveErr != nil {
+		_ = partDB.Close()
+		return nil, rollback(fmt.Errorf("failed writing batch records to partition: %w", saveErr))
 	}
 
 	if err := partDB.Sync(); err != nil {
 		_ = partDB.Close()
 		return nil, rollback(fmt.Errorf("failed syncing partition database: %w", err))
 	}
-	_ = partDB.Close()
-
-	var tempFileSize int64
-	if fi, err := os.Stat(tempDBPath); err == nil {
-		tempFileSize = fi.Size()
+	if err := partDB.Close(); err != nil {
+		return nil, rollback(fmt.Errorf("failed closing partition database: %w", err))
 	}
+
+	fi, err := os.Stat(tempDBPath)
+	if err != nil {
+		return nil, rollback(fmt.Errorf("failed stating partition archive: %w", err))
+	}
+	tempFileSize := fi.Size()
 
 	// 5. Hand the partition file straight to the sink. Streaming from disk means
 	//    a large archive is never buffered entirely in memory (OOM risk). The
@@ -154,7 +166,40 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		return nil, rollback(fmt.Errorf("failed saving to sink %s: %w", policy.Sink.Name(), err))
 	}
 
-	// Phase B: Archival succeeded!
+	// Phase B: Register durable catalog entry BEFORE mutating/pruning hot DB so
+	// cold-tier lookups can never miss already-pruned records across crash windows.
+	if policy.Catalog != nil {
+		sinkType := "local"
+		var s3Meta *CatalogS3Metadata
+		if s3Sink, isS3 := policy.Sink.(*S3Sink); isS3 {
+			sinkType = "s3"
+			s3Meta = &CatalogS3Metadata{
+				Endpoint:  s3Sink.Endpoint,
+				Bucket:    s3Sink.Bucket,
+				Prefix:    s3Sink.Prefix,
+				Region:    s3Sink.Region,
+				AccessKey: s3Sink.AccessKey,
+			}
+		}
+		if regErr := policy.Catalog.RegisterPartition(&CatalogEntry{
+			ID:             partitionFilename,
+			Model:          policy.ModelName,
+			PartitionFile:  partitionFilename,
+			TargetLocation: targetLoc,
+			SinkType:       sinkType,
+			RecordCount:    len(records),
+			CutoffDate:     cutoffDateStr,
+			MinDate:        minDate,
+			MaxDate:        maxDate,
+			RecordNames:    archivedNames,
+			CreatedAt:      t0,
+			SizeBytes:      tempFileSize,
+			S3Metadata:     s3Meta,
+		}); regErr != nil {
+			return nil, rollback(fmt.Errorf("partition saved to %s but failed to register in catalog: %w", targetLoc, regErr))
+		}
+	}
+
 	if policy.PruneHotDB {
 		// Transition to Tombstone (2) and sweep
 		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusTombstone); err != nil {
@@ -171,36 +216,6 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 		if _, err := db.CompletePartitionRecords(archivedNames, storage.OpStatusActive); err != nil {
 			return nil, fmt.Errorf("partition saved to %s but failed to restore source records: %w", targetLoc, err)
 		}
-	}
-
-	if policy.Catalog != nil {
-		sinkType := "local"
-		var s3Meta *CatalogS3Metadata
-		if s3Sink, isS3 := policy.Sink.(*S3Sink); isS3 {
-			sinkType = "s3"
-			s3Meta = &CatalogS3Metadata{
-				Endpoint:  s3Sink.Endpoint,
-				Bucket:    s3Sink.Bucket,
-				Prefix:    s3Sink.Prefix,
-				Region:    s3Sink.Region,
-				AccessKey: s3Sink.AccessKey,
-			}
-		}
-		_ = policy.Catalog.RegisterPartition(&CatalogEntry{
-			ID:             partitionFilename,
-			Model:          policy.ModelName,
-			PartitionFile:  partitionFilename,
-			TargetLocation: targetLoc,
-			SinkType:       sinkType,
-			RecordCount:    len(records),
-			CutoffDate:     cutoffDateStr,
-			MinDate:        minDate,
-			MaxDate:        maxDate,
-			RecordNames:    archivedNames,
-			CreatedAt:      t0,
-			SizeBytes:      tempFileSize,
-			S3Metadata:     s3Meta,
-		})
 	}
 
 	return &PartitionResult{

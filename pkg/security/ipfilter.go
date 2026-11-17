@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -290,7 +291,9 @@ func (l *FilteredListener) Accept() (net.Conn, error) {
 		}
 		remoteIP := remoteAddrIP(conn.RemoteAddr().String())
 		if !l.filter.IsAllowed(remoteIP) {
-			_ = conn.Close()
+			if closeErr := conn.Close(); closeErr != nil {
+				log.Printf("[SECURITY] Error closing rejected connection from %s: %v", remoteIP, closeErr)
+			}
 			continue
 		}
 		return conn, nil

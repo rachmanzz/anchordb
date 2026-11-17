@@ -24,11 +24,13 @@ import (
 // concurrent multi-model workloads; the driver pool in pkg/driver already
 // follows this rule by giving each checkout exclusive ownership of its Client.
 type Client struct {
+	connMu        sync.Mutex
 	conn          net.Conn
 	reader        *bufio.Reader
 	writer        *bufio.Writer
 	mu            sync.Mutex
 	seq           atomic.Uint32
+	modelMu       sync.RWMutex
 	model         string
 	timeout       time.Duration
 	negoMu        sync.RWMutex
@@ -117,17 +119,34 @@ func Connect(addr string, opts ...ClientOption) (*Client, error) {
 
 	if cfg.EnablePacing {
 		c.pacingEnabled = true
-		_, _ = c.NegotiateMemory(cfg.TargetRecords, 512, 1000)
+		if _, err := c.NegotiateMemory(cfg.TargetRecords, 512, 1000); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("wire negotiate memory failed: %w", err)
+		}
 	}
 
 	return c, nil
+}
+
+// WireError represents a protocol-level error response returned by the AnchorWire server.
+// Unlike transport or framing errors, the underlying TCP stream remains synchronized.
+type WireError struct {
+	Code    uint16
+	Message string
+}
+
+func (e *WireError) Error() string {
+	return fmt.Sprintf("wire error (code %d): %s", e.Code, e.Message)
 }
 
 func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.conn == nil {
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil {
 		return Frame{}, errors.New("wire client closed")
 	}
 
@@ -141,7 +160,7 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 	}
 
 	if c.timeout > 0 {
-		_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
+		_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	}
 
 	if err := WriteFrame(c.writer, req); err != nil {
@@ -169,17 +188,24 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 			c.negotiation.Status = MemoryStatusHold
 		}
 		c.negoMu.Unlock()
-	} else if c.negotiation != nil && c.negotiation.Status == MemoryStatusHold {
+	} else {
 		c.negoMu.Lock()
-		c.negotiation.Status = MemoryStatusGranted
-		c.negotiation.AllocatedBatchSize = 1000
-		c.negotiation.ReleaseIntervalMs = 0
+		if c.negotiation != nil && c.negotiation.Status == MemoryStatusHold {
+			c.negotiation.Status = MemoryStatusGranted
+			if c.negotiation.AllocatedBatchSize == 0 {
+				c.negotiation.AllocatedBatchSize = 1000
+			}
+			c.negotiation.ReleaseIntervalMs = 0
+		}
 		c.negoMu.Unlock()
 	}
 
 	if resp.OpCode == OpResponseError {
-		code, msg, _ := DecodeErrorPayload(resp.Payload)
-		return resp, fmt.Errorf("wire error (code %d): %s", code, msg)
+		code, msg, decErr := DecodeErrorPayload(resp.Payload)
+		if decErr != nil {
+			return resp, &WireError{Code: 0, Message: fmt.Sprintf("malformed wire error payload: %v", decErr)}
+		}
+		return resp, &WireError{Code: code, Message: msg}
 	}
 
 	return resp, nil
@@ -275,8 +301,8 @@ func (c *Client) AuthStagedReauth(nodeID string, currentValidator [32]byte, next
 
 // ModelName returns the currently active model name.
 func (c *Client) ModelName() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.modelMu.RLock()
+	defer c.modelMu.RUnlock()
 	return c.model
 }
 
@@ -286,9 +312,9 @@ func (c *Client) ModelName() string {
 func (c *Client) SelectModel(model string) error {
 	_, err := c.call(OpSelectModel, EncodeSelectModelPayload(model))
 	if err == nil {
-		c.mu.Lock()
+		c.modelMu.Lock()
 		c.model = model
-		c.mu.Unlock()
+		c.modelMu.Unlock()
 	}
 	return err
 }
@@ -405,10 +431,10 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 						continue
 					}
-					return allNames, err
+					return allNames, fmt.Errorf("partial batch save failed (%d/%d committed): %w", len(allNames), len(records), err)
 				}
 				if err != nil {
-					return allNames, err
+					return allNames, fmt.Errorf("partial batch save failed (%d/%d committed): %w", len(allNames), len(records), err)
 				}
 				for _, r := range chunk {
 					allNames = append(allNames, r.Name)
@@ -495,6 +521,15 @@ func (c *Client) SetRelation(name string, direction spatial.Point2D) error {
 // Causal executes a causal step traversal over graph edges.
 func (c *Client) Causal(seeds []string, relation string, limitK int) ([]storage.CausalResult, error) {
 	resp, err := c.call(OpCausal, EncodeCausalPayload(seeds, relation, limitK))
+	if err != nil {
+		return nil, err
+	}
+	return DecodeCausalResultPayload(resp.Payload)
+}
+
+// CausalChain executes a multi-hop causal chain query in a single round-trip.
+func (c *Client) CausalChain(seeds []string, relations []string, limitK int) ([]storage.CausalResult, error) {
+	resp, err := c.call(OpCausalChain, EncodeCausalChainPayload(seeds, relations, limitK))
 	if err != nil {
 		return nil, err
 	}
@@ -599,14 +634,15 @@ func (c *Client) PartitionInspect(req PartitionInspectWireRequest) (PartitionIns
 	return DecodePartitionInspectResponse(resp.Payload)
 }
 
-// Close closes the underlying TCP connection.
+// Close closes the underlying TCP connection immediately so any in-flight
+// ReadFrame unblocks without waiting for the request timeout.
 func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil
-		return err
+	c.connMu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.connMu.Unlock()
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }

@@ -53,6 +53,7 @@ const (
 	OpGetSchema    byte = 0x1B
 	OpMath         byte = 0x1C
 	OpResetModel   byte = 0x1D
+	OpCausalChain  byte = 0x1E
 
 	// Cold Storage & Tiered Partition Extensions
 	OpPartitionCatalog byte = 0x20
@@ -207,17 +208,30 @@ func readString(data []byte, offset int) (string, int, error) {
 	return s, offset, nil
 }
 
+func validateWireCount(count, remaining, minElemBytes int, label string) error {
+	if count < 0 || remaining < 0 || count > remaining/minElemBytes {
+		return fmt.Errorf("truncated %s: count %d exceeds remaining %d bytes", label, count, remaining)
+	}
+	return nil
+}
+
 // EncodeAuthPayload encodes auth token
 func EncodeAuthPayload(token string) []byte {
 	return appendString(nil, token)
 }
 
-// DecodeAuthPayload decodes auth token, transparently supporting structured auth requests.
+// DecodeAuthPayload decodes legacy static string auth tokens.
+// Structured auth payloads are handled via DecodeStructuredAuth; non-static
+// or commitment-bearing structured payloads are rejected to avoid stripping
+// handshake semantics.
 func DecodeAuthPayload(data []byte) (string, error) {
 	if len(data) > 0 && data[0] == StructuredAuthMagic {
 		req, err := DecodeStructuredAuth(data)
 		if err != nil {
 			return "", err
+		}
+		if req.Type != AuthTypeStatic || req.HasCommitment || req.NodeID != "" {
+			return "", ErrMalformedAuthRequest
 		}
 		return req.Credential, nil
 	}
@@ -325,6 +339,13 @@ func DecodeSavePayload(data []byte) (storage.BatchRecordItem, error) {
 
 	isTyped := (rawCount & storage.RawTypedFlag) != 0
 	attrCount := int(rawCount & ^storage.RawTypedFlag)
+	minAttrBytes := 6
+	if isTyped {
+		minAttrBytes = 7
+	}
+	if err := validateWireCount(attrCount, len(data)-offset, minAttrBytes, "save attributes"); err != nil {
+		return storage.BatchRecordItem{}, err
+	}
 
 	props := make(map[string]float32, attrCount)
 	var attrs []storage.AttrEntry
@@ -444,6 +465,9 @@ func DecodeSaveBatchPayload(data []byte) ([]storage.BatchRecordItem, error) {
 	}
 	count := int(binary.LittleEndian.Uint32(data[0:4]))
 	offset := 4
+	if err := validateWireCount(count, len(data)-offset, 7, "save batch records"); err != nil {
+		return nil, err
+	}
 
 	records := make([]storage.BatchRecordItem, 0, count)
 	for i := 0; i < count; i++ {
@@ -494,6 +518,43 @@ func EncodeGetRequest(req GetRequest) []byte {
 	return buf
 }
 
+func readOptionalComputeOps(data []byte, offset int, label string) (map[string]storage.ComputeOp, int, error) {
+	if offset == len(data) {
+		return nil, offset, nil
+	}
+	if offset+2 > len(data) {
+		return nil, offset, fmt.Errorf("truncated %s count", label)
+	}
+	count := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	if err := validateWireCount(count, len(data)-offset, 3, label); err != nil {
+		return nil, offset, err
+	}
+	if count == 0 {
+		if offset != len(data) {
+			return nil, offset, fmt.Errorf("trailing unparsed bytes after %s", label)
+		}
+		return nil, offset, nil
+	}
+	ops := make(map[string]storage.ComputeOp, count)
+	for i := 0; i < count; i++ {
+		outField, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, offset, err
+		}
+		op, nextOffset, err := readComputeOp(data, nextOffset)
+		if err != nil {
+			return nil, offset, err
+		}
+		ops[outField] = op
+		offset = nextOffset
+	}
+	if offset != len(data) {
+		return nil, offset, fmt.Errorf("trailing unparsed bytes after %s", label)
+	}
+	return ops, offset, nil
+}
+
 // DecodeGetRequest deserializes GetRequest from OpGet.
 func DecodeGetRequest(data []byte) (GetRequest, error) {
 	name, offset, err := readString(data, 0)
@@ -501,9 +562,15 @@ func DecodeGetRequest(data []byte) (GetRequest, error) {
 		return GetRequest{}, err
 	}
 	req := GetRequest{Name: name}
-	if offset+2 <= len(data) {
+	if offset < len(data) {
+		if offset+2 > len(data) {
+			return req, errors.New("truncated select count")
+		}
 		selectCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
+		if err := validateWireCount(selectCount, len(data)-offset, 2, "get select fields"); err != nil {
+			return req, err
+		}
 		for i := 0; i < selectCount; i++ {
 			s, nextOffset, err := readString(data, offset)
 			if err != nil {
@@ -513,25 +580,11 @@ func DecodeGetRequest(data []byte) (GetRequest, error) {
 			offset = nextOffset
 		}
 	}
-	if offset+2 <= len(data) {
-		compCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if compCount > 0 {
-			req.Computations = make(map[string]storage.ComputeOp, compCount)
-			for i := 0; i < compCount; i++ {
-				outField, nextOffset, err := readString(data, offset)
-				if err != nil {
-					return req, err
-				}
-				op, nextOffset, err := readComputeOp(data, nextOffset)
-				if err != nil {
-					return req, err
-				}
-				req.Computations[outField] = op
-				offset = nextOffset
-			}
-		}
+	ops, _, err := readOptionalComputeOps(data, offset, "compute operations")
+	if err != nil {
+		return req, err
 	}
+	req.Computations = ops
 	return req, nil
 }
 
@@ -680,6 +733,13 @@ func DecodeGetResultTypedPayload(data []byte) (uint8, []storage.AttrEntry, error
 	isTyped := (rawCount & storage.RawTypedFlag) != 0
 	attrCount := int(rawCount & ^storage.RawTypedFlag)
 	offset := 3
+	minAttrBytes := 6
+	if isTyped {
+		minAttrBytes = 7
+	}
+	if err := validateWireCount(attrCount, len(data)-offset, minAttrBytes, "get result attributes"); err != nil {
+		return 0, nil, err
+	}
 
 	attrs := make([]storage.AttrEntry, 0, attrCount)
 	if isTyped {
@@ -746,15 +806,18 @@ func DecodeGetResultTypedPayload(data []byte) (uint8, []storage.AttrEntry, error
 }
 
 // EncodeEdgePayloadWithDirection serializes edge mutation or relation vector configuration for OpEdge.
+// Unknown action strings encode byte 0xFF so decoders reject them instead of coercing to "add".
 func EncodeEdgePayloadWithDirection(action, source, relation, target string, weight float32, direction *spatial.Point2D) []byte {
 	var actByte byte
 	switch action {
+	case "add":
+		actByte = 0
 	case "remove":
 		actByte = 1
 	case "set_relation":
 		actByte = 2
 	default:
-		actByte = 0
+		actByte = 0xFF
 	}
 	buf := []byte{actByte}
 	buf = appendString(buf, source)
@@ -783,12 +846,14 @@ func DecodeEdgePayloadWithDirection(data []byte) (action, source, relation, targ
 		return "", "", "", "", 0, nil, errors.New("truncated edge payload")
 	}
 	switch data[0] {
+	case 0:
+		action = "add"
 	case 1:
 		action = "remove"
 	case 2:
 		action = "set_relation"
 	default:
-		action = "add"
+		return "", "", "", "", 0, nil, fmt.Errorf("unknown edge action code: %d", data[0])
 	}
 	offset := 1
 	source, offset, err = readString(data, offset)
@@ -808,7 +873,10 @@ func DecodeEdgePayloadWithDirection(data []byte) (action, source, relation, targ
 	}
 	weight = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	offset += 4
-	if offset+8 <= len(data) {
+	if rem := len(data) - offset; rem > 0 {
+		if rem < 8 {
+			return "", "", "", "", 0, nil, errors.New("truncated edge direction vector")
+		}
 		dx := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
 		dy := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
 		direction = &spatial.Point2D{X: dx, Y: dy}
@@ -844,6 +912,9 @@ func DecodeCausalPayload(data []byte) (seeds []string, relation string, limitK i
 	}
 	seedCount := int(binary.LittleEndian.Uint16(data[0:2]))
 	offset := 2
+	if err := validateWireCount(seedCount, len(data)-offset, 2, "causal seeds"); err != nil {
+		return nil, "", 0, err
+	}
 
 	seeds = make([]string, 0, seedCount)
 	for i := 0; i < seedCount; i++ {
@@ -863,6 +934,69 @@ func DecodeCausalPayload(data []byte) (seeds []string, relation string, limitK i
 	}
 	limitK = int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	return seeds, relation, limitK, nil
+}
+
+// EncodeCausalChainPayload serializes multi-hop causal chain query input.
+func EncodeCausalChainPayload(seeds []string, relations []string, limitK int) []byte {
+	var buf []byte
+	var b [2]byte
+	binary.LittleEndian.PutUint16(b[:], uint16(len(seeds)))
+	buf = append(buf, b[:]...)
+	for _, s := range seeds {
+		buf = appendString(buf, s)
+	}
+	binary.LittleEndian.PutUint16(b[:], uint16(len(relations)))
+	buf = append(buf, b[:]...)
+	for _, rel := range relations {
+		buf = appendString(buf, rel)
+	}
+	var kb [4]byte
+	binary.LittleEndian.PutUint32(kb[:], uint32(limitK))
+	buf = append(buf, kb[:]...)
+	return buf
+}
+
+// DecodeCausalChainPayload deserializes multi-hop causal chain query input.
+func DecodeCausalChainPayload(data []byte) (seeds []string, relations []string, limitK int, err error) {
+	if len(data) < 2 {
+		return nil, nil, 0, errors.New("truncated causal chain seeds")
+	}
+	seedCount := int(binary.LittleEndian.Uint16(data[0:2]))
+	offset := 2
+	if err := validateWireCount(seedCount, len(data)-offset, 2, "causal chain seeds"); err != nil {
+		return nil, nil, 0, err
+	}
+	seeds = make([]string, 0, seedCount)
+	for i := 0; i < seedCount; i++ {
+		s, nextOffset, sErr := readString(data, offset)
+		if sErr != nil {
+			return nil, nil, 0, sErr
+		}
+		offset = nextOffset
+		seeds = append(seeds, s)
+	}
+	if offset+2 > len(data) {
+		return nil, nil, 0, errors.New("truncated causal chain relations count")
+	}
+	relCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	if err := validateWireCount(relCount, len(data)-offset, 2, "causal chain relations"); err != nil {
+		return nil, nil, 0, err
+	}
+	relations = make([]string, 0, relCount)
+	for i := 0; i < relCount; i++ {
+		rel, nextOffset, rErr := readString(data, offset)
+		if rErr != nil {
+			return nil, nil, 0, rErr
+		}
+		offset = nextOffset
+		relations = append(relations, rel)
+	}
+	if offset+4 > len(data) {
+		return nil, nil, 0, errors.New("truncated causal chain limitK")
+	}
+	limitK = int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	return seeds, relations, limitK, nil
 }
 
 // EncodeCausalResultPayload serializes causal results
@@ -887,6 +1021,9 @@ func DecodeCausalResultPayload(data []byte) ([]storage.CausalResult, error) {
 	}
 	count := int(binary.LittleEndian.Uint32(data[0:4]))
 	offset := 4
+	if err := validateWireCount(count, len(data)-offset, 6, "causal results"); err != nil {
+		return nil, err
+	}
 
 	results := make([]storage.CausalResult, 0, count)
 	for i := 0; i < count; i++ {
@@ -1481,6 +1618,9 @@ func DecodeListRequest(data []byte) (ListRequest, error) {
 	}
 	selectCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 	offset += 2
+	if err := validateWireCount(selectCount, len(data)-offset, 2, "list select fields"); err != nil {
+		return ListRequest{}, err
+	}
 	for i := 0; i < selectCount; i++ {
 		s, nextOffset, err := readString(data, offset)
 		if err != nil {
@@ -1504,25 +1644,11 @@ func DecodeListRequest(data []byte) (ListRequest, error) {
 		offset = nextOffset
 	}
 
-	if offset+2 <= len(data) {
-		compCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if compCount > 0 {
-			req.Computations = make(map[string]storage.ComputeOp, compCount)
-			for i := 0; i < compCount; i++ {
-				outField, nextOffset, err := readString(data, offset)
-				if err != nil {
-					return ListRequest{}, err
-				}
-				op, nextOffset, err := readComputeOp(data, nextOffset)
-				if err != nil {
-					return ListRequest{}, err
-				}
-				req.Computations[outField] = op
-				offset = nextOffset
-			}
-		}
+	ops, _, err := readOptionalComputeOps(data, offset, "compute operations")
+	if err != nil {
+		return ListRequest{}, err
 	}
+	req.Computations = ops
 
 	return req, nil
 }
@@ -1554,6 +1680,8 @@ func EncodeListResponse(resp ListResponse) []byte {
 				buf = append(buf, byte(attr.Type))
 				var valBytes [8]byte
 				switch attr.Type {
+				case storage.AttrTypeFloat32:
+					binary.LittleEndian.PutUint32(valBytes[:4], math.Float32bits(attr.Value))
 				case storage.AttrTypeFloat64:
 					binary.LittleEndian.PutUint64(valBytes[:], math.Float64bits(attr.Float64()))
 				case storage.AttrTypeInt64:
@@ -1783,25 +1911,11 @@ func DecodeUpdateRequest(data []byte) (UpdateRequest, error) {
 		offset = nextOffset
 	}
 
-	if offset+2 <= len(data) {
-		mutCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if mutCount > 0 {
-			req.Mutations = make(map[string]storage.ComputeOp, mutCount)
-			for i := 0; i < mutCount; i++ {
-				outField, nextOffset, err := readString(data, offset)
-				if err != nil {
-					return UpdateRequest{}, err
-				}
-				op, nextOffset, err := readComputeOp(data, nextOffset)
-				if err != nil {
-					return UpdateRequest{}, err
-				}
-				req.Mutations[outField] = op
-				offset = nextOffset
-			}
-		}
+	muts, _, err := readOptionalComputeOps(data, offset, "update mutations")
+	if err != nil {
+		return UpdateRequest{}, err
 	}
+	req.Mutations = muts
 
 	return req, nil
 }
@@ -1870,6 +1984,9 @@ func DecodeGraphRequest(data []byte) (GraphRequest, error) {
 	beamWidth := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+5 : offset+9]))
 	inputCount := int(binary.LittleEndian.Uint16(data[offset+9 : offset+11]))
 	offset += 11
+	if err := validateWireCount(inputCount, len(data)-offset, 2, "graph inputs"); err != nil {
+		return GraphRequest{}, err
+	}
 
 	inputs := make([]string, 0, inputCount)
 	for i := 0; i < inputCount; i++ {
@@ -1925,6 +2042,9 @@ func DecodeGraphResponsePayload(data []byte) (GraphResponsePayload, error) {
 	}
 	resultCount := int(binary.LittleEndian.Uint32(data[8:12]))
 	offset := 12
+	if err := validateWireCount(resultCount, len(data)-offset, 22, "graph response results"); err != nil {
+		return GraphResponsePayload{}, err
+	}
 
 	results := make([]storage.GraphQueryResult, 0, resultCount)
 	for i := 0; i < resultCount; i++ {
@@ -1993,6 +2113,9 @@ func DecodeGraphChainRequest(data []byte) (GraphChainRequest, error) {
 	beamWidth := math.Float32frombits(binary.LittleEndian.Uint32(data[4:8]))
 	inputCount := int(binary.LittleEndian.Uint16(data[8:10]))
 	offset := 10
+	if err := validateWireCount(inputCount, len(data)-offset, 2, "graph chain inputs"); err != nil {
+		return GraphChainRequest{}, err
+	}
 
 	inputs := make([]string, 0, inputCount)
 	for i := 0; i < inputCount; i++ {
@@ -2009,6 +2132,9 @@ func DecodeGraphChainRequest(data []byte) (GraphChainRequest, error) {
 	}
 	relCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 	offset += 2
+	if err := validateWireCount(relCount, len(data)-offset, 2, "graph chain relations"); err != nil {
+		return GraphChainRequest{}, err
+	}
 
 	relations := make([]string, 0, relCount)
 	for i := 0; i < relCount; i++ {
@@ -2097,6 +2223,9 @@ func DecodeMathRequest(data []byte) (MathRequest, error) {
 	limitK := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	wordCount := int(binary.LittleEndian.Uint16(data[offset+4 : offset+6]))
 	offset += 6
+	if err := validateWireCount(wordCount, len(data)-offset, 2, "math request words"); err != nil {
+		return MathRequest{}, err
+	}
 
 	words := make([]string, 0, wordCount)
 	for i := 0; i < wordCount; i++ {
@@ -2154,6 +2283,9 @@ func DecodeMathResponse(data []byte) (MathResponse, error) {
 	}
 	neighborCount := int(binary.LittleEndian.Uint32(data[28:32]))
 	offset := 32
+	if err := validateWireCount(neighborCount, len(data)-offset, 22, "math response neighbors"); err != nil {
+		return MathResponse{}, err
+	}
 
 	neighbors := make([]storage.GraphQueryResult, 0, neighborCount)
 	for i := 0; i < neighborCount; i++ {

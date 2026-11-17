@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,12 +15,15 @@ import (
 type rateLimiter struct {
 	mu        sync.Mutex
 	buckets   map[string]*tokenBucket
+	lru       *list.List
 	rate      float64 // tokens replenished per second
 	burst     float64 // bucket capacity
 	lastSweep time.Time
 }
 
 type tokenBucket struct {
+	key    string
+	elem   *list.Element
 	tokens float64
 	last   time.Time
 }
@@ -35,11 +39,14 @@ func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
 	}
 	return &rateLimiter{
 		buckets:   make(map[string]*tokenBucket),
+		lru:       list.New(),
 		rate:      ratePerSec,
 		burst:     float64(burst),
 		lastSweep: time.Now(),
 	}
 }
+
+const maxRateLimiterBuckets = 65536
 
 // allow reports whether a request for key may proceed, consuming one token.
 func (rl *rateLimiter) allow(key string) bool {
@@ -47,15 +54,36 @@ func (rl *rateLimiter) allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Sweep idle buckets at most once a minute.
-	if now.Sub(rl.lastSweep) > time.Minute {
+	// Sweep idle buckets at most once a minute, or proactively when reaching capacity.
+	if now.Sub(rl.lastSweep) > time.Minute || len(rl.buckets) >= maxRateLimiterBuckets {
 		rl.sweepLocked(now)
 		rl.lastSweep = now
 	}
 
 	b, ok := rl.buckets[key]
-	if !ok {
-		b = &tokenBucket{tokens: rl.burst, last: now}
+	if ok {
+		if rl.lru != nil && b.elem != nil {
+			rl.lru.MoveToFront(b.elem)
+		}
+	} else {
+		for len(rl.buckets) >= maxRateLimiterBuckets {
+			if rl.lru != nil && rl.lru.Len() > 0 {
+				oldest := rl.lru.Back()
+				if ob, valid := oldest.Value.(*tokenBucket); valid {
+					delete(rl.buckets, ob.key)
+				}
+				rl.lru.Remove(oldest)
+				continue
+			}
+			for k := range rl.buckets {
+				delete(rl.buckets, k)
+				break
+			}
+		}
+		b = &tokenBucket{key: key, tokens: rl.burst, last: now}
+		if rl.lru != nil {
+			b.elem = rl.lru.PushFront(b)
+		}
 		rl.buckets[key] = b
 	}
 
@@ -92,6 +120,9 @@ func (rl *rateLimiter) sweepLocked(now time.Time) {
 	for k, b := range rl.buckets {
 		if now.Sub(b.last).Seconds()*rl.rate >= rl.burst {
 			delete(rl.buckets, k)
+			if rl.lru != nil && b.elem != nil {
+				rl.lru.Remove(b.elem)
+			}
 		}
 	}
 }

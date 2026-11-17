@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"runtime"
@@ -137,7 +138,11 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize client: %w", err)
 	}
-	defer client.Close()
+	defer func() {
+		if closeErr := client.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: closing client: %v\n", closeErr)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFlag)
 	defer cancel()
@@ -241,13 +246,20 @@ func cmdStatus(ctx context.Context, baseURL, token string) error {
 		return fmt.Errorf("querying server status: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("server status returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
 
 	var data map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return fmt.Errorf("parsing server status response: %w", err)
 	}
 
-	out, _ := json.MarshalIndent(data, "", "  ")
+	out, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("formatting server status JSON: %w", err)
+	}
 	fmt.Println(string(out))
 	return nil
 }
@@ -267,7 +279,10 @@ func cmdGet(ctx context.Context, client *driver.Client, args []string) error {
 		"model":      client.ModelName(),
 		"properties": rec.Props(),
 	}
-	out, _ := json.MarshalIndent(output, "", "  ")
+	out, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("formatting entity JSON: %w", err)
+	}
 	fmt.Println(string(out))
 	return nil
 }
@@ -334,7 +349,10 @@ func cmdList(ctx context.Context, client *driver.Client, args []string) error {
 	}
 
 	for _, item := range res.Items {
-		propsJSON, _ := json.Marshal(item.Props())
+		propsJSON, err := json.Marshal(item.Props())
+		if err != nil {
+			return fmt.Errorf("formatting item %q properties: %w", item.Name, err)
+		}
 		fmt.Printf("• %-24s -> %s\n", item.Name, string(propsJSON))
 	}
 	return nil
@@ -352,7 +370,10 @@ func cmdSchema(ctx context.Context, client *driver.Client, args []string) error 
 		if err != nil {
 			return fmt.Errorf("get schema failed: %w", err)
 		}
-		out, _ := json.MarshalIndent(schema, "", "  ")
+		out, err := json.MarshalIndent(schema, "", "  ")
+		if err != nil {
+			return fmt.Errorf("formatting schema JSON: %w", err)
+		}
 		fmt.Printf("Model: %s\nLocked Schema Contract:\n%s\n", client.ModelName(), string(out))
 		return nil
 

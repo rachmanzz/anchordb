@@ -2,9 +2,14 @@ package wire
 
 import (
 	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/rachmanzz/anchordb/pkg/storage"
 )
 
 func TestCommitmentStore_LifecycleAndReopen(t *testing.T) {
@@ -133,5 +138,107 @@ func TestCommitmentStore_CorruptFile(t *testing.T) {
 	}
 	if _, err := OpenCommitmentStore(badPath); err == nil {
 		t.Fatal("expected error opening file with truncated record header")
+	}
+}
+
+func TestCommitmentStore_FailedPersistRollsBackMemory(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "commitments.bin")
+	store, err := OpenCommitmentStore(storePath)
+	if err != nil {
+		t.Fatalf("OpenCommitmentStore: %v", err)
+	}
+
+	v1 := [32]byte{1, 2, 3}
+	e1 := sha256.Sum256(v1[:])
+	if err := store.RegisterInitial("node-a", e1); err != nil {
+		t.Fatalf("RegisterInitial: %v", err)
+	}
+
+	// Make backing directory read-only or point filePath at non-existent nested dir so persistSyncLocked fails.
+	store.mu.Lock()
+	store.filePath = filepath.Join(tmpDir, "missing-dir", "commitments.bin")
+	store.mu.Unlock()
+
+	v2 := [32]byte{4, 5, 6}
+	e2 := sha256.Sum256(v2[:])
+	if _, err := store.StageReauth("node-a", v1, e2); err == nil {
+		t.Fatal("expected StageReauth failure when persist fails")
+	}
+
+	rec, ok := store.Get("node-a")
+	if !ok || rec.State != StateActive || rec.StagedCommitment != [32]byte{} || rec.CurrentCommitment != e1 {
+		t.Fatalf("expected in-memory record rolled back on persist failure, got %+v", rec)
+	}
+	if err := store.ConfirmOperationalExpected("node-a", e2); err != nil {
+		t.Fatalf("ConfirmOperationalExpected should be no-op on rolled-back StateActive, got %v", err)
+	}
+
+	// Restore writable path and confirm expected check catches stale connection staging.
+	store.mu.Lock()
+	store.filePath = storePath
+	store.mu.Unlock()
+	if code, err := store.StageReauth("node-a", v1, e2); err != nil || code != 0 {
+		t.Fatalf("StageReauth retry failed: code=%d err=%v", code, err)
+	}
+	wrongStaged := [32]byte{9, 9, 9}
+	if err := store.ConfirmOperationalExpected("node-a", wrongStaged); !errors.Is(err, ErrStagedCommitmentMismatch) {
+		t.Fatalf("expected ErrStagedCommitmentMismatch, got %v", err)
+	}
+	if err := store.ConfirmOperationalExpected("node-a", e2); err != nil {
+		t.Fatalf("expected ConfirmOperationalExpected to succeed with matching staged commitment, got %v", err)
+	}
+
+	// Zero-byte existing commitment file must be rejected as corrupt, not treated as empty.
+	zeroPath := filepath.Join(tmpDir, "zero.bin")
+	if err := os.WriteFile(zeroPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenCommitmentStore(zeroPath); !errors.Is(err, ErrCorruptCommitmentFile) {
+		t.Fatalf("expected ErrCorruptCommitmentFile on 0-byte file, got %v", err)
+	}
+
+	// Unknown edge action code in wire payload must error instead of decoding as "add".
+	badEdge := EncodeEdgePayload("add", "a", "r", "b", 1)
+	badEdge[0] = 99
+	if _, _, _, _, _, _, err := DecodeEdgePayloadWithDirection(badEdge); err == nil {
+		t.Fatal("expected DecodeEdgePayloadWithDirection to reject unknown action code 99")
+	}
+}
+
+func TestWire_OpSaveConcurrentWithCloseNeverHangs(t *testing.T) {
+	backend := &mockBackend{
+		dataDir: t.TempDir(),
+		models:  make(map[string]*storage.AnchorDB),
+	}
+	defer backend.CloseAll()
+
+	for round := 0; round < 20; round++ {
+		srv := NewServer(backend)
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				job := &saveJob{
+					model: "default",
+					item:  storage.BatchRecordItem{Name: "rec", Operation: storage.OpStatusActive},
+					done:  make(chan struct{}),
+				}
+				select {
+				case srv.saveJobs <- job:
+					select {
+					case <-job.done:
+					case <-srv.saveCommitterDone:
+					}
+				case <-srv.stopChan:
+				case <-srv.saveCommitterDone:
+				}
+			}()
+		}
+		if err := srv.CloseWithTimeout(time.Second); err != nil {
+			t.Fatalf("CloseWithTimeout hung or errored on round %d: %v", round, err)
+		}
+		wg.Wait()
 	}
 }

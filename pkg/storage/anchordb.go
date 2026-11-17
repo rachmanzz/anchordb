@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"math/bits"
@@ -357,6 +358,60 @@ func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
 		}
 	}
 	return AttrEntry{}, false
+}
+
+// ValidateRaw checks that any raw mmap-backed TLV attribute payload is structurally valid
+// and matches its declared attribute count without truncated lengths or unknown type tags.
+func (cr CompactRecord) ValidateRaw() error {
+	if len(cr.Raw) == 0 {
+		return nil
+	}
+	if len(cr.Raw) < 2 {
+		return fmt.Errorf("corrupt compact record: raw payload length %d < 2", len(cr.Raw))
+	}
+	countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+	isTyped := (countRaw & RawTypedFlag) != 0
+	attrCount := int(countRaw &^ RawTypedFlag)
+	offset := 2
+	for a := 0; a < attrCount; a++ {
+		if !isTyped {
+			if offset+2 > len(cr.Raw) {
+				return fmt.Errorf("corrupt compact record: truncated untyped key length at attr %d", a)
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				return fmt.Errorf("corrupt compact record: truncated untyped value at attr %d", a)
+			}
+			offset += kLen + 4
+			continue
+		}
+		if offset+1 > len(cr.Raw) {
+			return fmt.Errorf("corrupt compact record: truncated typed tag at attr %d", a)
+		}
+		tTag := AttrType(cr.Raw[offset])
+		offset++
+		if tTag > AttrTypeFloat64 {
+			return fmt.Errorf("corrupt compact record: invalid attribute type %d at attr %d", tTag, a)
+		}
+		if offset+2 > len(cr.Raw) {
+			return fmt.Errorf("corrupt compact record: truncated typed key length at attr %d", a)
+		}
+		kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+		offset += 2
+		valSize := 4
+		if tTag == AttrTypeInt64 || tTag == AttrTypeUint64 || tTag == AttrTypeFloat64 {
+			valSize = 8
+		}
+		if offset+kLen+valSize > len(cr.Raw) {
+			return fmt.Errorf("corrupt compact record: truncated typed value at attr %d", a)
+		}
+		offset += kLen + valSize
+	}
+	if offset != len(cr.Raw) {
+		return fmt.Errorf("corrupt compact record: decoded %d bytes, raw length %d", offset, len(cr.Raw))
+	}
+	return nil
 }
 
 // Set updates or inserts an attribute key-value pair as float32, expanding raw records if necessary.
@@ -743,6 +798,10 @@ type AnchorDB struct {
 	dirtyDuringSync        map[string]struct{}
 	autoSyncChan           chan struct{}
 	autoSyncDone           chan struct{}
+	autoSyncOnce           sync.Once
+	autoSyncWg             sync.WaitGroup
+	autoSyncErrMu          sync.Mutex
+	autoSyncErr            error
 
 	filePath string
 
@@ -974,6 +1033,48 @@ func attrToBigInt(a AttrEntry) *big.Int {
 	return big.NewInt(a.IntVal)
 }
 
+func applyDaysOffsetTyped(op byte, outputField, field string, days float32, val AttrEntry) (AttrEntry, error) {
+	if val.Type == AttrTypeInt64 && float32(int64(days)) == days {
+		d := int64(days)
+		res, ok := checkedInt64Op(op, val.Int64(), d)
+		if !ok {
+			return AttrEntry{}, fmt.Errorf("%w: %s %c %d days exceeds int64 range", ErrIntegerOverflow, field, op, d)
+		}
+		return NewInt64Attr(outputField, res), nil
+	}
+	if val.Type == AttrTypeUint64 && float32(int64(days)) == days {
+		d := int64(days)
+		base := val.Uint64()
+		isAdd := (op == '+' && d >= 0) || (op == '-' && d < 0)
+		var mag uint64
+		if d >= 0 {
+			mag = uint64(d)
+		} else {
+			mag = uint64(-(d + 1)) + 1
+		}
+		if isAdd {
+			res, carry := bits.Add64(base, mag, 0)
+			if carry != 0 {
+				return AttrEntry{}, fmt.Errorf("%w: %s %c %d days exceeds uint64 range", ErrIntegerOverflow, field, op, d)
+			}
+			return NewUint64Attr(outputField, res), nil
+		}
+		res, borrow := bits.Sub64(base, mag, 0)
+		if borrow != 0 {
+			return AttrEntry{}, fmt.Errorf("%w: %s %c %d days underflows uint64 range", ErrIntegerOverflow, field, op, d)
+		}
+		return NewUint64Attr(outputField, res), nil
+	}
+	res := val.Float64() + float64(days)
+	if op == '-' {
+		res = val.Float64() - float64(days)
+	}
+	if val.Type == AttrTypeFloat32 {
+		return NewFloat32Attr(outputField, float32(res)), nil
+	}
+	return NewFloat64Attr(outputField, res), nil
+}
+
 // attrMapToFloat32Props builds the legacy float32 property snapshot passed to custom ComputeOp implementations.
 func attrMapToFloat32Props(attrs map[string]AttrEntry) map[string]float32 {
 	props := make(map[string]float32, len(attrs))
@@ -1087,36 +1188,14 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
-			res, ok := checkedInt64Op('+', val.Int64(), int64(o.Days))
-			if !ok {
-				return AttrEntry{}, fmt.Errorf("%w: %s + %d days exceeds int64 range", ErrIntegerOverflow, o.Field, int64(o.Days))
-			}
-			return NewInt64Attr(outputField, res), nil
-		}
-		res := val.Float64() + float64(o.Days)
-		if val.Type == AttrTypeFloat32 {
-			return NewFloat32Attr(outputField, float32(res)), nil
-		}
-		return NewFloat64Attr(outputField, res), nil
+		return applyDaysOffsetTyped('+', outputField, o.Field, o.Days, val)
 
 	case OpSubtractDays:
 		val, _, err := resolveTypedOperand(o.Field, lookup)
 		if err != nil {
 			return AttrEntry{}, err
 		}
-		if val.Type == AttrTypeInt64 && float32(int64(o.Days)) == o.Days {
-			res, ok := checkedInt64Op('-', val.Int64(), int64(o.Days))
-			if !ok {
-				return AttrEntry{}, fmt.Errorf("%w: %s - %d days exceeds int64 range", ErrIntegerOverflow, o.Field, int64(o.Days))
-			}
-			return NewInt64Attr(outputField, res), nil
-		}
-		res := val.Float64() - float64(o.Days)
-		if val.Type == AttrTypeFloat32 {
-			return NewFloat32Attr(outputField, float32(res)), nil
-		}
-		return NewFloat64Attr(outputField, res), nil
+		return applyDaysOffsetTyped('-', outputField, o.Field, o.Days, val)
 
 	case OpDaysBetween:
 		valA, litA, err := resolveTypedOperand(o.FieldA, lookup)
@@ -1445,8 +1524,60 @@ func (f FilterCondition) MatchesAttr(attr AttrEntry) bool {
 		}
 	}
 
-	// 2. 64-bit float / mixed comparison
+	// 2. 64-bit float / mixed comparison (exact big.Float ordering when comparing 64-bit int against finite float)
 	if f.HasFloat64 || f.ValType != AttrTypeFloat32 || highType != AttrTypeFloat32 || attr.Type != AttrTypeFloat32 {
+		if isIntAttrType(attr.Type) {
+			cmpIntBound := func(bType AttrType, bInt int64, bUint uint64, b32 float32, b64 float64) (int, bool) {
+				if isIntAttrType(bType) {
+					return compareExactIntegers(attr.Type, attr.Int64(), attr.Uint64(), bType, bInt, bUint), true
+				}
+				bf := b64
+				if !f.HasFloat64 {
+					bf = float64(b32)
+				}
+				if math.IsNaN(bf) {
+					return 0, false
+				}
+				if math.IsInf(bf, 1) {
+					return -1, true
+				}
+				if math.IsInf(bf, -1) {
+					return 1, true
+				}
+				var lhs *big.Float
+				if attr.Type == AttrTypeUint64 {
+					lhs = new(big.Float).SetPrec(64).SetUint64(attr.Uint64())
+				} else {
+					lhs = new(big.Float).SetPrec(64).SetInt64(attr.Int64())
+				}
+				rhs := new(big.Float).SetPrec(64).SetFloat64(bf)
+				return lhs.Cmp(rhs), true
+			}
+			lowCmp, lowOK := cmpIntBound(f.ValType, f.ValueInt64, f.ValueUint64, f.Value, f.Value64)
+			if !lowOK {
+				return f.Operator == "!="
+			}
+			switch f.Operator {
+			case "=":
+				return lowCmp == 0
+			case "!=":
+				return lowCmp != 0
+			case ">":
+				return lowCmp > 0
+			case ">=":
+				return lowCmp >= 0
+			case "<":
+				return lowCmp < 0
+			case "<=":
+				return lowCmp <= 0
+			case "BETWEEN":
+				highCmp, highOK := cmpIntBound(highType, f.ValueHighInt64, f.ValueHighUint64, f.ValueHigh, f.ValueHigh64)
+				return highOK && lowCmp >= 0 && highCmp <= 0
+			default:
+				return false
+			}
+		}
+
 		val := attr.Float64()
 		var cmpVal float64
 		switch f.ValType {
@@ -1636,14 +1767,44 @@ func (db *AnchorDB) TriggerAutoSync() bool {
 }
 
 func (db *AnchorDB) autoSyncLoop() {
+	defer db.autoSyncWg.Done()
 	for {
+		// Prioritize shutdown signal before checking pending auto-sync triggers.
+		select {
+		case <-db.autoSyncDone:
+			return
+		default:
+		}
 		select {
 		case <-db.autoSyncDone:
 			return
 		case <-db.autoSyncChan:
-			_ = db.Sync()
+			select {
+			case <-db.autoSyncDone:
+				return
+			default:
+			}
+			if err := db.Sync(); err != nil && !errors.Is(err, ErrDatabaseClosed) {
+				db.autoSyncErrMu.Lock()
+				db.autoSyncErr = err
+				db.autoSyncErrMu.Unlock()
+			} else if err == nil {
+				db.autoSyncErrMu.Lock()
+				db.autoSyncErr = nil
+				db.autoSyncErrMu.Unlock()
+			}
 		}
 	}
+}
+
+// AutoSyncError returns the most recent error encountered by background auto-sync, if any.
+func (db *AnchorDB) AutoSyncError() error {
+	if db == nil {
+		return nil
+	}
+	db.autoSyncErrMu.Lock()
+	defer db.autoSyncErrMu.Unlock()
+	return db.autoSyncErr
 }
 
 func (db *AnchorDB) totalNodes() int {
@@ -1651,6 +1812,9 @@ func (db *AnchorDB) totalNodes() int {
 }
 
 func (db *AnchorDB) getNode(idx uint32) BinaryNodeRecord {
+	if db.isSyncing && db.deletedNodeIdx[idx] {
+		return BinaryNodeRecord{}
+	}
 	if uint64(idx) < db.syncedNodeCount && db.isMmapped && db.mmapData != nil {
 		offset := int(db.Header.NodesOffset) + int(idx)*RecordSize
 		if offset+RecordSize <= len(db.mmapData) {
@@ -1675,9 +1839,14 @@ func (db *AnchorDB) markNodeDeleted(idx uint32) {
 }
 
 // zeroNodeLocked clears the node's ID in the current mapping or pending slice.
+// When Sync is actively streaming mmapData unlocked, synced mmap writes are
+// deferred to reapplyDeletesLocked to avoid racing the streaming reader.
 // Caller must hold db.mu.
 func (db *AnchorDB) zeroNodeLocked(idx uint32) {
 	if uint64(idx) < db.syncedNodeCount && db.isMmapped && db.mmapData != nil {
+		if db.isSyncing {
+			return
+		}
 		offset := int(db.Header.NodesOffset) + int(idx)*RecordSize
 		if offset+8 <= len(db.mmapData) {
 			binary.LittleEndian.PutUint64(db.mmapData[offset:offset+8], 0)
@@ -1846,12 +2015,14 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 	db.wal = wal
 
 	// Replay WAL for crash recovery (restores mutations lost before the last Sync)
+	sawWALDelete := false
 	_, err = db.wal.ReplayEvents(func(ev WALEvent) error {
 		switch ev.Op {
 		case WalOpSave:
 			db.applyWALSaveLocked(ev.Name, ev.Record)
 		case WalOpDelete:
-			db.applyWALDeleteLocked(ev.Name)
+			sawWALDelete = true
+			db.applyWALDeleteReplayLocked(ev.Name)
 		case WalOpNode:
 			db.appendNodeLocked(ev.Word, ev.Coord, ev.Roles, ev.DomainID)
 		case WalOpSaveNode:
@@ -1870,6 +2041,21 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to replay wal: %w", err)
 	}
+	if sawWALDelete && len(db.EntityOrder) > 0 {
+		seen := make(map[string]struct{}, len(db.EntityStore))
+		compacted := db.EntityOrder[:0]
+		for _, name := range db.EntityOrder {
+			if _, live := db.EntityStore[name]; !live {
+				continue
+			}
+			if _, dup := seen[name]; dup {
+				continue
+			}
+			seen[name] = struct{}{}
+			compacted = append(compacted, name)
+		}
+		db.EntityOrder = compacted
+	}
 
 	// Replayed edge deletions may have left many tombstones; reclaim them once.
 	db.maybeCompactEdgesLocked()
@@ -1886,6 +2072,7 @@ func OpenWithOptions(filePath string, opts Options) (*AnchorDB, error) {
 		return nil, fmt.Errorf("failed to load model schema: %w", err)
 	}
 
+	db.autoSyncWg.Add(1)
 	go db.autoSyncLoop()
 
 	return db, nil
@@ -1946,18 +2133,12 @@ func (db *AnchorDB) applyWALSaveLocked(name string, cr CompactRecord) {
 	}
 }
 
-func (db *AnchorDB) applyWALDeleteLocked(name string) {
+func (db *AnchorDB) applyWALDeleteReplayLocked(name string) {
 	db.syncedEntitiesModified = true
 	delete(db.EntityStore, name)
 	if nodeIdx, exists := db.Lexicon[name]; exists {
 		delete(db.Lexicon, name)
 		db.markNodeDeleted(nodeIdx)
-	}
-	for i, n := range db.EntityOrder {
-		if n == name {
-			db.EntityOrder = append(db.EntityOrder[:i], db.EntityOrder[i+1:]...)
-			break
-		}
 	}
 }
 
@@ -2182,27 +2363,33 @@ func (db *AnchorDB) remapEntitiesLocked() {
 	}
 	data := db.mmapData[db.Header.EntityOffset:]
 	offset := 0
+	corrupted := false
+	corruptEntity := uint64(0)
 entityLoop:
 	for i := uint64(0); i < db.Header.EntityCount; i++ {
 		if offset+2 > len(data) {
+			corrupted, corruptEntity = true, i
 			break
 		}
 		nameLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 		if offset+nameLen > len(data) {
+			corrupted, corruptEntity = true, i
 			break
 		}
+		rawName := data[offset : offset+nameLen]
 		var name string
-		if i < uint64(len(db.EntityOrder)) {
+		if i < uint64(len(db.EntityOrder)) && db.EntityOrder[i] == string(rawName) {
 			name = db.EntityOrder[i]
 		} else {
-			name = string(data[offset : offset+nameLen])
+			name = string(rawName)
 		}
 		offset += nameLen
 
 		opStatus := OpStatusActive
 		if db.Header.Version >= 2 {
 			if offset+1 > len(data) {
+				corrupted, corruptEntity = true, i
 				break
 			}
 			opStatus = data[offset]
@@ -2210,6 +2397,7 @@ entityLoop:
 		}
 
 		if offset+2 > len(data) {
+			corrupted, corruptEntity = true, i
 			break
 		}
 		attrStart := offset
@@ -2221,24 +2409,29 @@ entityLoop:
 		for a := 0; a < attrCount; a++ {
 			if !isTyped {
 				if offset+2 > len(data) {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 				offset += 2
 				if offset+keyLen+4 > len(data) {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				offset += keyLen + 4
 			} else {
 				if offset+1 > len(data) {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				tTag := AttrType(data[offset])
 				offset++
 				if tTag > AttrTypeFloat64 {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				if offset+2 > len(data) {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				keyLen := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
@@ -2248,6 +2441,7 @@ entityLoop:
 					valSize = 8
 				}
 				if offset+keyLen+valSize > len(data) {
+					corrupted, corruptEntity = true, i
 					break entityLoop
 				}
 				offset += keyLen + valSize
@@ -2269,7 +2463,11 @@ entityLoop:
 			}
 		}
 	}
-	db.entitySectionEnd = int(db.Header.EntityOffset) + offset
+	if corrupted {
+		log.Printf("[STORAGE] ERROR: mmap entity corruption detected at entity %d (offset=%d) during remap; retaining unmapped in-memory state", corruptEntity, offset)
+	} else {
+		db.entitySectionEnd = int(db.Header.EntityOffset) + offset
+	}
 	db.dirtyDuringSync = nil
 	db.isSyncing = false
 	db.compactAttrPoolLocked()
@@ -2970,6 +3168,23 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		return nil, false, nil
 	}
 
+	// Hoist computation key sorting and filter-dependency check once outside the loop.
+	var compKeys []string
+	filterNeedsCompute := false
+	if len(opts.Computations) > 0 {
+		compKeys = make([]string, 0, len(opts.Computations))
+		for k := range opts.Computations {
+			compKeys = append(compKeys, k)
+		}
+		slices.Sort(compKeys)
+		for _, f := range opts.Filters {
+			if _, isComp := opts.Computations[f.Field]; isComp {
+				filterNeedsCompute = true
+				break
+			}
+		}
+	}
+
 	// Stream sequentially with Operation lifecycle filtering and early termination at limit
 	var results []EntityRecord
 	skipped := 0
@@ -3007,8 +3222,8 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			}
 		}
 
-		// Fast filter check before heap allocation if no computations
-		if len(opts.Computations) == 0 && len(opts.Filters) > 0 {
+		// Fast filter check before heap allocation when filters do not reference computed fields.
+		if !filterNeedsCompute && len(opts.Filters) > 0 {
 			matches := true
 			for _, filter := range opts.Filters {
 				if !cr.MatchesFilter(filter) {
@@ -3018,6 +3233,17 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			}
 			if !matches {
 				continue
+			}
+		}
+
+		if !filterNeedsCompute {
+			if skipped < offset {
+				skipped++
+				continue
+			}
+			if len(results) >= limit {
+				hasMore = true
+				break
 			}
 		}
 
@@ -3041,11 +3267,6 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 			snapshot := func() map[string]float32 {
 				return attrMapToFloat32Props(attrMap)
 			}
-			compKeys := make([]string, 0, len(opts.Computations))
-			for k := range opts.Computations {
-				compKeys = append(compKeys, k)
-			}
-			slices.Sort(compKeys)
 			for _, outField := range compKeys {
 				op := opts.Computations[outField]
 				newAttr, err := applyComputeOpTyped(outField, op, lookup, snapshot)
@@ -3058,29 +3279,26 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 				attrMap[outField] = newAttr
 			}
 
-			// Apply Where conditions if computations were present
-			matches := true
-			for _, filter := range opts.Filters {
-				attr, exists := attrMap[filter.Field]
-				if !exists || !filter.MatchesAttr(attr) {
-					matches = false
+			if filterNeedsCompute {
+				matches := true
+				for _, filter := range opts.Filters {
+					attr, exists := attrMap[filter.Field]
+					if !exists || !filter.MatchesAttr(attr) {
+						matches = false
+						break
+					}
+				}
+				if !matches {
+					continue
+				}
+				if skipped < offset {
+					skipped++
+					continue
+				}
+				if len(results) >= limit {
+					hasMore = true
 					break
 				}
-			}
-			if !matches {
-				continue
-			}
-
-			// Handle pagination Offset
-			if skipped < offset {
-				skipped++
-				continue
-			}
-
-			// Early Termination: Stop immediately when limit is reached! (Constant-time bound O(K))
-			if len(results) >= limit {
-				hasMore = true
-				break
 			}
 
 			if len(opts.Select) > 0 {
@@ -3102,18 +3320,6 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 				}
 			}
 		} else {
-			// Handle pagination Offset
-			if skipped < offset {
-				skipped++
-				continue
-			}
-
-			// Early Termination: Stop immediately when limit is reached! (Constant-time bound O(K))
-			if len(results) >= limit {
-				hasMore = true
-				break
-			}
-
 			if len(opts.Select) > 0 {
 				finalAttrs = make([]AttrEntry, 0, len(opts.Select))
 				finalProps = make(map[string]float32, len(opts.Select))
@@ -3179,6 +3385,43 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	}
 
 	updatedCount := 0
+	type stagedUpdate struct {
+		name string
+		cr   CompactRecord
+	}
+	var staged []stagedUpdate
+	working := make(map[string]CompactRecord)
+
+	stageMutation := func(name string, cr CompactRecord) error {
+		lookup := func(key string) (AttrEntry, bool) {
+			return cr.GetTyped(key)
+		}
+		snapshot := func() map[string]float32 {
+			return attrsToFloat32Props(cr.ExpandAttrs())
+		}
+		pending := make([]AttrEntry, 0, len(opts.Mutations))
+		for field, op := range opts.Mutations {
+			newAttr, err := applyComputeOpTyped(field, op, lookup, snapshot)
+			if err != nil {
+				return fmt.Errorf("%w: update %q field %q: %w", ErrComputeFailed, name, field, err)
+			}
+			if schemaSpecs != nil {
+				newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
+				if err := validateAttrEntry(newAttr, schemaSpecs[field]); err != nil {
+					return fmt.Errorf("update %q: %w", name, err)
+				}
+			}
+			pending = append(pending, newAttr)
+		}
+		for _, attr := range pending {
+			attr.Key = db.internAttr(attr.Key)
+			cr = cr.SetAttr(attr)
+		}
+		working[name] = cr
+		staged = append(staged, stagedUpdate{name: name, cr: cr})
+		updatedCount++
+		return nil
+	}
 
 	// PATH 1: Targeted direct list update (O(K) constant time)
 	if len(opts.TargetEntities) > 0 {
@@ -3195,18 +3438,20 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 		for _, name := range opts.TargetEntities {
 			if opts.Context != nil {
 				if err := opts.Context.Err(); err != nil {
-					return updatedCount, err
+					return 0, err
 				}
 			}
 			if updatedCount >= limit {
 				break
 			}
-			cr, exists := db.EntityStore[name]
+			cr, exists := working[name]
+			if !exists {
+				cr, exists = db.EntityStore[name]
+			}
 			if !exists || cr.Operation != OpStatusActive {
 				continue
 			}
 
-			// Check filters without allocating map on heap
 			matches := true
 			for _, f := range opts.Filters {
 				if !cr.MatchesFilter(f) {
@@ -3218,126 +3463,78 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 				continue
 			}
 
-			// Offset counts matching records, mirroring the scan path below.
 			if skipped < offset {
 				skipped++
 				continue
 			}
 
-			// Apply in-place mathematical mutations based on snapshot
-			lookup := func(key string) (AttrEntry, bool) {
-				return cr.GetTyped(key)
+			if err := stageMutation(name, cr); err != nil {
+				return 0, err
 			}
-			snapshot := func() map[string]float32 {
-				return attrsToFloat32Props(cr.ExpandAttrs())
-			}
-			pending := make([]AttrEntry, 0, len(opts.Mutations))
-			for field, op := range opts.Mutations {
-				newAttr, err := applyComputeOpTyped(field, op, lookup, snapshot)
-				if err != nil {
-					return updatedCount, fmt.Errorf("%w: update %q field %q: %w", ErrComputeFailed, name, field, err)
-				}
-				if schemaSpecs != nil {
-					newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
-					if err := validateAttrEntry(newAttr, schemaSpecs[field]); err != nil {
-						return updatedCount, fmt.Errorf("update %q: %w", name, err)
-					}
-				}
-				pending = append(pending, newAttr)
-			}
-			for _, attr := range pending {
-				attr.Key = db.internAttr(attr.Key)
-				cr = cr.SetAttr(attr)
-			}
-			if db.wal != nil {
-				if err := db.wal.WriteSave(name, cr); err != nil {
-					return updatedCount, fmt.Errorf("failed to write update for %q to wal: %w", name, err)
-				}
-			}
-			db.EntityStore[name] = cr
-			db.markEntityDirtyLocked(name)
-			db.syncedEntitiesModified = true
-			updatedCount++
 		}
-		return updatedCount, nil
+	} else {
+		// PATH 2: Bounded scan with early termination (O(K) constant-time bound)
+		limit := opts.Limit
+		if limit <= 0 {
+			limit = 10000 // default batch limit
+		}
+		skipped := 0
+		offset := opts.Offset
+
+		for _, name := range db.EntityOrder {
+			if opts.Context != nil {
+				if err := opts.Context.Err(); err != nil {
+					return 0, err
+				}
+			}
+			if updatedCount >= limit {
+				break // Constant-time bound reached: stop once Limit is satisfied!
+			}
+
+			cr := db.EntityStore[name]
+			if cr.Operation != OpStatusActive {
+				continue
+			}
+
+			matches := true
+			for _, f := range opts.Filters {
+				if !cr.MatchesFilter(f) {
+					matches = false
+					break
+				}
+			}
+			if !matches {
+				continue
+			}
+
+			if skipped < offset {
+				skipped++
+				continue
+			}
+
+			if err := stageMutation(name, cr); err != nil {
+				return 0, err
+			}
+		}
 	}
 
-	// PATH 2: Bounded scan with early termination (O(K) constant-time bound)
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 10000 // default batch limit
+	if len(staged) == 0 {
+		return 0, nil
 	}
-	skipped := 0
-	offset := opts.Offset
-
-	for _, name := range db.EntityOrder {
-		if opts.Context != nil {
-			if err := opts.Context.Err(); err != nil {
-				return updatedCount, err
-			}
+	if db.wal != nil {
+		walItems := make([]BatchSaveItem, len(staged))
+		for i, u := range staged {
+			walItems[i] = BatchSaveItem{Name: u.name, CR: u.cr}
 		}
-		if updatedCount >= limit {
-			break // Constant-time bound reached: stop once Limit is satisfied!
+		if err := db.wal.WriteSaveBatch(walItems); err != nil {
+			return 0, fmt.Errorf("failed to write updates to wal: %w", err)
 		}
-
-		cr := db.EntityStore[name]
-		if cr.Operation != OpStatusActive {
-			continue
-		}
-
-		// Check filters without allocating map on heap
-		matches := true
-		for _, f := range opts.Filters {
-			if !cr.MatchesFilter(f) {
-				matches = false
-				break
-			}
-		}
-		if !matches {
-			continue
-		}
-
-		if skipped < offset {
-			skipped++
-			continue
-		}
-
-		// Apply in-place mathematical mutations based on snapshot
-		lookup := func(key string) (AttrEntry, bool) {
-			return cr.GetTyped(key)
-		}
-		snapshot := func() map[string]float32 {
-			return attrsToFloat32Props(cr.ExpandAttrs())
-		}
-		pending := make([]AttrEntry, 0, len(opts.Mutations))
-		for field, op := range opts.Mutations {
-			newAttr, err := applyComputeOpTyped(field, op, lookup, snapshot)
-			if err != nil {
-				return updatedCount, fmt.Errorf("%w: update %q field %q: %w", ErrComputeFailed, name, field, err)
-			}
-			if schemaSpecs != nil {
-				newAttr = coerceAttrToSchemaSpec(newAttr, schemaSpecs[field])
-				if err := validateAttrEntry(newAttr, schemaSpecs[field]); err != nil {
-					return updatedCount, fmt.Errorf("update %q: %w", name, err)
-				}
-			}
-			pending = append(pending, newAttr)
-		}
-		for _, attr := range pending {
-			attr.Key = db.internAttr(attr.Key)
-			cr = cr.SetAttr(attr)
-		}
-		if db.wal != nil {
-			if err := db.wal.WriteSave(name, cr); err != nil {
-				return updatedCount, fmt.Errorf("failed to write update for %q to wal: %w", name, err)
-			}
-		}
-		db.EntityStore[name] = cr
-		db.markEntityDirtyLocked(name)
+	}
+	for _, u := range staged {
+		db.EntityStore[u.name] = u.cr
+		db.markEntityDirtyLocked(u.name)
 		db.syncedEntitiesModified = true
-		updatedCount++
 	}
-
 	return updatedCount, nil
 }
 
@@ -3350,32 +3547,45 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error
 		return 0, ErrDatabaseClosed
 	}
 
-	updated := 0
+	type statusUpdate struct {
+		name string
+		cr   CompactRecord
+	}
+	var updates []statusUpdate
+	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		cr, exists := db.EntityStore[name]
-		if !exists {
+		if _, dup := seen[name]; dup {
 			continue
 		}
-		if cr.Operation == status {
+		seen[name] = struct{}{}
+		cr, exists := db.EntityStore[name]
+		if !exists || cr.Operation == status {
 			continue
 		}
 		if db.partitionLocks[name] || status == OpStatusSafeDelete && cr.Operation == OpStatusSafeDelete {
-			return updated, fmt.Errorf("%w: use partition locking APIs to change this state for %q", ErrRecordLocked, name)
-		}
-		if db.wal != nil {
-			updatedRecord := cr
-			updatedRecord.Operation = status
-			if err := db.wal.WriteSave(name, updatedRecord); err != nil {
-				return updated, fmt.Errorf("failed to write operation status for %q to wal: %w", name, err)
-			}
+			return 0, fmt.Errorf("%w: use partition locking APIs to change this state for %q", ErrRecordLocked, name)
 		}
 		cr.Operation = status
-		db.EntityStore[name] = cr
-		db.markEntityDirtyLocked(name)
-		db.syncedEntitiesModified = true
-		updated++
+		updates = append(updates, statusUpdate{name: name, cr: cr})
 	}
-	return updated, nil
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	if db.wal != nil {
+		walItems := make([]BatchSaveItem, len(updates))
+		for i, u := range updates {
+			walItems[i] = BatchSaveItem{Name: u.name, CR: u.cr}
+		}
+		if err := db.wal.WriteSaveBatch(walItems); err != nil {
+			return 0, fmt.Errorf("failed to write operation status batch to wal: %w", err)
+		}
+	}
+	for _, u := range updates {
+		db.EntityStore[u.name] = u.cr
+		db.markEntityDirtyLocked(u.name)
+		db.syncedEntitiesModified = true
+	}
+	return len(updates), nil
 }
 
 // CompletePartitionRecords transitions records held in SafeDelete after the
@@ -3389,25 +3599,43 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 	if db.closed {
 		return 0, ErrDatabaseClosed
 	}
-	updated := 0
+	type completionUpdate struct {
+		name string
+		cr   CompactRecord
+	}
+	var updates []completionUpdate
+	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
 		cr, exists := db.EntityStore[name]
 		if !exists || cr.Operation != OpStatusSafeDelete || !db.partitionLocks[name] {
 			continue
 		}
 		cr.Operation = status
-		if db.wal != nil {
-			if err := db.wal.WriteSave(name, cr); err != nil {
-				return updated, fmt.Errorf("failed to complete partition state for %q: %w", name, err)
-			}
-		}
-		db.EntityStore[name] = cr
-		db.markEntityDirtyLocked(name)
-		db.syncedEntitiesModified = true
-		delete(db.partitionLocks, name)
-		updated++
+		updates = append(updates, completionUpdate{name: name, cr: cr})
 	}
-	return updated, nil
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	if db.wal != nil {
+		walItems := make([]BatchSaveItem, len(updates))
+		for i, u := range updates {
+			walItems[i] = BatchSaveItem{Name: u.name, CR: u.cr}
+		}
+		if err := db.wal.WriteSaveBatch(walItems); err != nil {
+			return 0, fmt.Errorf("failed to complete partition state batch: %w", err)
+		}
+	}
+	for _, u := range updates {
+		db.EntityStore[u.name] = u.cr
+		db.markEntityDirtyLocked(u.name)
+		db.syncedEntitiesModified = true
+		delete(db.partitionLocks, u.name)
+	}
+	return len(updates), nil
 }
 
 // LockPartitionRecords atomically snapshots eligible records and marks them
@@ -3430,6 +3658,7 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 	}
 
 	records := make([]EntityRecord, 0)
+	lockedCRs := make([]CompactRecord, 0)
 	for _, name := range db.EntityOrder {
 		cr, exists := db.EntityStore[name]
 		if !exists || (cr.Operation != OpStatusActive && cr.Operation != OpStatusRetry) {
@@ -3448,42 +3677,28 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 			Props:     cr.ToMap(),
 			Attrs:     slices.Clone(cr.expandAttrs()),
 		})
+		updated := cr
+		updated.Operation = OpStatusSafeDelete
+		lockedCRs = append(lockedCRs, updated)
 	}
 	if len(records) == 0 {
 		return records, nil
 	}
 
-	// Persist each lifecycle transition before exposing it in memory. If a later
-	// WAL write fails, roll the already locked prefix back to Retry where possible.
-	locked := make([]EntityRecord, 0, len(records))
-	for _, record := range records {
-		cr := db.EntityStore[record.Name]
-		updated := cr
-		updated.Operation = OpStatusSafeDelete
-		if db.wal != nil {
-			if err := db.wal.WriteSave(record.Name, updated); err != nil {
-				var rollbackErrs []error
-				for _, written := range locked {
-					current := db.EntityStore[written.Name]
-					current.Operation = OpStatusRetry
-					if db.wal != nil {
-						if rollbackErr := db.wal.WriteSave(written.Name, current); rollbackErr != nil {
-							rollbackErrs = append(rollbackErrs, fmt.Errorf("restore %q to retry: %w", written.Name, rollbackErr))
-							continue
-						}
-					}
-					db.EntityStore[written.Name] = current
-					db.markEntityDirtyLocked(written.Name)
-					delete(db.partitionLocks, written.Name)
-				}
-				return nil, errors.Join(fmt.Errorf("failed to persist partition lock for %q: %w", record.Name, err), errors.Join(rollbackErrs...))
-			}
+	if db.wal != nil {
+		walItems := make([]BatchSaveItem, len(records))
+		for i, record := range records {
+			walItems[i] = BatchSaveItem{Name: record.Name, CR: lockedCRs[i]}
 		}
-		db.EntityStore[record.Name] = updated
+		if err := db.wal.WriteSaveBatch(walItems); err != nil {
+			return nil, fmt.Errorf("failed to persist partition lock batch: %w", err)
+		}
+	}
+	for i, record := range records {
+		db.EntityStore[record.Name] = lockedCRs[i]
 		db.markEntityDirtyLocked(record.Name)
 		db.syncedEntitiesModified = true
 		db.partitionLocks[record.Name] = true
-		locked = append(locked, record)
 	}
 	return records, nil
 }
@@ -3515,22 +3730,18 @@ func (db *AnchorDB) CollectTombstones(maxBatch int) (int, error) {
 		return 0, nil
 	}
 
-	purgedSet := make(map[string]bool, len(toPurge))
-	purged := 0
-	for _, n := range toPurge {
-		if db.wal != nil {
-			if err := db.wal.WriteDelete(n); err != nil {
-				db.deleteEntityLocked(purgedSet)
-				db.removeEntityNamesLocked(purgedSet)
-				return purged, fmt.Errorf("failed to write tombstone deletion for %q to wal: %w", n, err)
-			}
+	if db.wal != nil {
+		if err := db.wal.WriteDeleteBatch(toPurge); err != nil {
+			return 0, fmt.Errorf("failed to write tombstone deletions to wal: %w", err)
 		}
+	}
+	purgedSet := make(map[string]bool, len(toPurge))
+	for _, n := range toPurge {
 		purgedSet[n] = true
-		purged++
 	}
 	db.deleteEntityLocked(purgedSet)
 	db.removeEntityNamesLocked(purgedSet)
-	return purged, nil
+	return len(toPurge), nil
 }
 
 // DeleteRecords removes specified entity names from EntityStore, EntityOrder, and graph index.
@@ -3556,19 +3767,13 @@ func (db *AnchorDB) DeleteRecords(names []string) (int, error) {
 		deleteNames = append(deleteNames, n)
 	}
 	sort.Strings(deleteNames)
-	persistedDelete := make(map[string]bool, len(toDelete))
-	for _, n := range deleteNames {
-		if db.wal != nil {
-			if err := db.wal.WriteDelete(n); err != nil {
-				db.deleteEntityLocked(persistedDelete)
-				deleted := db.removeEntityNamesLocked(persistedDelete)
-				return deleted, fmt.Errorf("failed to write deletion for %q to wal: %w", n, err)
-			}
+	if db.wal != nil {
+		if err := db.wal.WriteDeleteBatch(deleteNames); err != nil {
+			return 0, fmt.Errorf("failed to write deletions to wal: %w", err)
 		}
-		persistedDelete[n] = true
 	}
-	db.deleteEntityLocked(persistedDelete)
-	deletedCount := db.removeEntityNamesLocked(persistedDelete)
+	db.deleteEntityLocked(toDelete)
+	deletedCount := db.removeEntityNamesLocked(toDelete)
 	return deletedCount, nil
 }
 
@@ -3688,7 +3893,10 @@ func (db *AnchorDB) Sync() error {
 
 	edgesSnapshot := slices.Clone(db.edges)
 
-	hdrSnapshot := db.Header
+	oldHdr := db.Header
+	mmapSnap := db.mmapData
+
+	hdrSnapshot := oldHdr
 	hdrSnapshot.Version = DBVersion // Ensure synced header carries the current format version
 	nodesOffset := uint64(HeaderSize)
 	nodesSize := uint64(totNodes * RecordSize)
@@ -3752,11 +3960,11 @@ func (db *AnchorDB) Sync() error {
 
 	// 2. Nodes Array (streamed: synced from mmap, pending from snapshot)
 	syncedNodeBytes := syncedNodesToCopy * RecordSize
-	if syncedNodeBytes > 0 && db.mmapData != nil {
-		nStart := int(db.Header.NodesOffset)
+	if syncedNodeBytes > 0 && mmapSnap != nil {
+		nStart := int(oldHdr.NodesOffset)
 		nEnd := nStart + int(syncedNodeBytes)
-		if nStart >= 0 && nEnd <= len(db.mmapData) {
-			if _, err := writer.Write(db.mmapData[nStart:nEnd]); err != nil {
+		if nStart >= 0 && nEnd <= len(mmapSnap) {
+			if _, err := writer.Write(mmapSnap[nStart:nEnd]); err != nil {
 				return err
 			}
 		}
@@ -3779,11 +3987,11 @@ func (db *AnchorDB) Sync() error {
 	}
 
 	// 3. String Pool (streamed: synced from mmap, pending from snapshot)
-	if syncedStringBytes > 0 && db.mmapData != nil {
-		sStart := int(db.Header.StringOffset)
+	if syncedStringBytes > 0 && mmapSnap != nil {
+		sStart := int(oldHdr.StringOffset)
 		sEnd := sStart + int(syncedStringBytes)
-		if sStart >= 0 && sEnd <= len(db.mmapData) {
-			if _, err := writer.Write(db.mmapData[sStart:sEnd]); err != nil {
+		if sStart >= 0 && sEnd <= len(mmapSnap) {
+			if _, err := writer.Write(mmapSnap[sStart:sEnd]); err != nil {
 				return err
 			}
 		}
@@ -3871,11 +4079,11 @@ func (db *AnchorDB) Sync() error {
 	}
 
 	if canStreamSyncedEntities {
-		if syncedEntityBytes > 0 && db.mmapData != nil {
-			eStart := int(db.Header.EntityOffset)
+		if syncedEntityBytes > 0 && mmapSnap != nil {
+			eStart := int(oldHdr.EntityOffset)
 			eEnd := eStart + syncedEntityBytes
-			if eStart >= 0 && eEnd <= len(db.mmapData) {
-				if _, err := writer.Write(db.mmapData[eStart:eEnd]); err != nil {
+			if eStart >= 0 && eEnd <= len(mmapSnap) {
+				if _, err := writer.Write(mmapSnap[eStart:eEnd]); err != nil {
 					return err
 				}
 			}
@@ -3904,11 +4112,19 @@ func (db *AnchorDB) Sync() error {
 	if err := tempFile.Sync(); err != nil {
 		return err
 	}
-	_ = tempFile.Close()
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
 
-	// 3. Briefly acquire db.mu.Lock only for atomic file swap and WAL checkpointing
+	// 3. Briefly acquire db.mu.Lock only for atomic file swap and state update.
+	// Unmapping the old file and checkpointing the WAL run after releasing db.mu.
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	muLocked := true
+	defer func() {
+		if muLocked {
+			db.mu.Unlock()
+		}
+	}()
 
 	// Atomic rename replaces the database file cleanly without corruption risk
 	if err := os.Rename(tempPath, db.filePath); err != nil {
@@ -3921,24 +4137,24 @@ func (db *AnchorDB) Sync() error {
 	// Re-open newly synced file
 	newF, err := os.OpenFile(db.filePath, os.O_RDWR, 0644)
 	if err != nil {
-		return err
+		return errors.Join(err, dirSyncErr)
 	}
 
 	fi, err := newF.Stat()
 	if err != nil {
 		_ = newF.Close()
-		return err
+		return errors.Join(err, dirSyncErr)
 	}
 	fileSize := fi.Size()
 	mmapSize, err := mmapLen(fileSize)
 	if err != nil {
 		_ = newF.Close()
-		return err
+		return errors.Join(err, dirSyncErr)
 	}
 	mmapData, err := syscall.Mmap(int(newF.Fd()), 0, mmapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		_ = newF.Close()
-		return err
+		return errors.Join(err, dirSyncErr)
 	}
 	oldFile, oldMmap, oldMapped := db.file, db.mmapData, db.isMmapped
 	db.file = newF
@@ -3950,14 +4166,47 @@ func (db *AnchorDB) Sync() error {
 	if db.pendingEntitiesCount < 0 {
 		db.pendingEntitiesCount = 0
 	}
+	hadConcurrentMods := len(db.dirtyDuringSync) > 0 || uint64(len(db.EntityOrder)) != uint64(totEntities)
 	db.remapEntitiesLocked()
 	db.syncedEntityCount = uint64(totEntities)
-	db.syncedEntitiesModified = false
+	db.syncedEntitiesModified = hadConcurrentMods
+
+	// Prune pending nodes and copy any un-synced tail so dead prefixes are not retained.
+	addedNodes := len(pendingNodesSnapshot)
+	if len(db.pendingNodes) > addedNodes {
+		rem := len(db.pendingNodes) - addedNodes
+		kept := make([]BinaryNodeRecord, rem)
+		copy(kept, db.pendingNodes[addedNodes:])
+		db.pendingNodes = kept
+	} else {
+		db.pendingNodes = nil
+	}
+	db.syncedNodeCount += uint64(addedNodes)
+
+	// Prune pending string pool and copy any un-synced tail to release old backing array.
+	addedStringBytes := len(pendingStringsSnapshot)
+	if len(db.pendingStringPool) > addedStringBytes {
+		rem := len(db.pendingStringPool) - addedStringBytes
+		kept := make([]byte, rem)
+		copy(kept, db.pendingStringPool[addedStringBytes:])
+		db.pendingStringPool = kept
+	} else {
+		db.pendingStringPool = nil
+	}
+	db.syncedStringBytes += uint32(addedStringBytes)
+
+	// Re-apply tombstones recorded while db.mu was released during serialization
+	db.reapplyDeletesLocked()
+	wal := db.wal
+	syncSuccess = true
+	muLocked = false
+	db.mu.Unlock()
 
 	if oldMapped && oldMmap != nil {
 		if err := syscall.Munmap(oldMmap); err != nil {
-			_ = syscall.Munmap(mmapData)
-			_ = newF.Close()
+			if oldFile != nil {
+				_ = oldFile.Close()
+			}
 			return fmt.Errorf("release previous database mapping: %w", err)
 		}
 	}
@@ -3967,39 +4216,17 @@ func (db *AnchorDB) Sync() error {
 		}
 	}
 
-	// Prune pending nodes that were captured in snapshot
-	addedNodes := len(pendingNodesSnapshot)
-	if len(db.pendingNodes) >= addedNodes {
-		db.pendingNodes = db.pendingNodes[addedNodes:]
-	} else {
-		db.pendingNodes = nil
-	}
-	db.syncedNodeCount += uint64(addedNodes)
-
-	// Prune pending string pool that was captured in snapshot
-	addedStringBytes := len(pendingStringsSnapshot)
-	if len(db.pendingStringPool) >= addedStringBytes {
-		db.pendingStringPool = db.pendingStringPool[addedStringBytes:]
-	} else {
-		db.pendingStringPool = nil
-	}
-	db.syncedStringBytes += uint32(addedStringBytes)
-
-	// Re-apply tombstones recorded while db.mu was released during serialization
-	db.reapplyDeletesLocked()
-
 	if dirSyncErr != nil {
 		return fmt.Errorf("database replaced but directory fsync failed; WAL retained for recovery: %w", dirSyncErr)
 	}
 
-	// Checkpoint WAL up to the snapshot offset
-	if db.wal != nil {
-		if err := db.wal.Checkpoint(walCheckpointOffset); err != nil {
+	// Checkpoint WAL up to the snapshot offset without blocking DB readers/writers.
+	if wal != nil {
+		if err := wal.Checkpoint(walCheckpointOffset); err != nil {
 			return fmt.Errorf("failed to checkpoint wal: %w", err)
 		}
 	}
 
-	syncSuccess = true
 	return nil
 }
 
@@ -4728,9 +4955,12 @@ func (db *AnchorDB) ComputeHistogram(field string, bins int) (HistogramResult, e
 	return db.ComputeHistogramWithOptions(HistogramOptions{Field: field, Bins: bins})
 }
 
+// MaxHistogramBins caps histogram bin count to prevent unbounded allocations.
+const MaxHistogramBins = 1_000_000
+
 // ComputeHistogramWithOptions builds a K-bin linear histogram with custom
-// population filters. Two passes: min/max via ComputeStatsWithOptions (exact
-// same population semantics), then binning. O(N) time, O(bins) memory.
+// population filters. Two passes under one read lock: min/max via computeStatsLocked
+// (exact same population semantics), then binning. O(N) time, O(bins) memory.
 func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (HistogramResult, error) {
 	if opts.Field == "" {
 		return HistogramResult{}, fmt.Errorf("field must not be empty")
@@ -4738,9 +4968,18 @@ func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (Histogra
 	if opts.Bins < 1 {
 		return HistogramResult{Field: opts.Field}, fmt.Errorf("bins must be at least 1, got %d", opts.Bins)
 	}
+	if opts.Bins > MaxHistogramBins {
+		return HistogramResult{Field: opts.Field}, fmt.Errorf("bins must not exceed %d, got %d", MaxHistogramBins, opts.Bins)
+	}
 
-	// Pass 1: range from the shared stats path (same population semantics).
-	st, err := db.ComputeStatsWithOptions(StatsOptions{
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return HistogramResult{}, ErrDatabaseClosed
+	}
+
+	// Pass 1: range from the shared stats path under the same read lock.
+	st, err := db.computeStatsLocked(StatsOptions{
 		Field:                opts.Field,
 		Filters:              opts.Filters,
 		IncludeAllOperations: opts.IncludeAllOperations,
@@ -4753,12 +4992,6 @@ func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (Histogra
 		return HistogramResult{Field: opts.Field}, nil
 	}
 	lo, hi := st.Min64, st.Max64
-
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return HistogramResult{}, ErrDatabaseClosed
-	}
 
 	// Degenerate range (single value, or nothing binnable such as all-NaN):
 	// one bin holding the binned count, or empty when nothing binned.
@@ -4856,17 +5089,17 @@ func (db *AnchorDB) FilterZScore(field string, threshold float64) ([]EntityRecor
 	if math.IsNaN(threshold) || threshold < 0 {
 		return nil, fmt.Errorf("invalid z-score threshold %v: must be non-negative", threshold)
 	}
-	st, err := db.ComputeStatsWithOptions(StatsOptions{Field: field})
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	st, err := db.computeStatsLocked(StatsOptions{Field: field})
 	if err != nil {
 		return nil, err
 	}
 	if st.Count == 0 || st.StdDev == 0 {
 		return nil, nil
-	}
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return nil, ErrDatabaseClosed
 	}
 	var out []EntityRecord
 	for i := 0; i < len(db.EntityOrder); i++ {
@@ -4901,20 +5134,19 @@ func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, e
 	if math.IsNaN(k) || k <= 0 {
 		return nil, fmt.Errorf("invalid IQR multiplier %v: must be positive", k)
 	}
-	st, err := db.ComputeStatsWithOptions(StatsOptions{Field: field})
-	if err != nil {
-		return nil, err
-	}
-	if st.Count == 0 {
-		return nil, nil
-	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
 		return nil, ErrDatabaseClosed
 	}
-	var vals []float64
-	var names []string
+
+	type iqrSample struct {
+		name string
+		cr   CompactRecord
+		val  float64
+	}
+	samples := make([]iqrSample, 0, len(db.EntityOrder))
+	vals := make([]float64, 0, len(db.EntityOrder))
 	for i := 0; i < len(db.EntityOrder); i++ {
 		name := db.EntityOrder[i]
 		cr := db.EntityStore[name]
@@ -4926,13 +5158,14 @@ func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, e
 			continue
 		}
 		if v := attr.Float64(); !math.IsNaN(v) {
+			samples = append(samples, iqrSample{name: name, cr: cr, val: v})
 			vals = append(vals, v)
-			names = append(names, name)
 		}
 	}
 	if len(vals) == 0 {
 		return nil, nil
 	}
+	// selectKthFloat64 mutates vals in place; keep samples intact so outlier names stay aligned.
 	q1 := selectKthFloat64(vals, quantileRank(0.25, len(vals)))
 	q3 := selectKthFloat64(vals, quantileRank(0.75, len(vals)))
 	iqr := q3 - q1
@@ -4941,10 +5174,9 @@ func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, e
 	}
 	lo, hi := q1-k*iqr, q3+k*iqr
 	var out []EntityRecord
-	for i, v := range vals {
-		if v < lo || v > hi {
-			cr := db.EntityStore[names[i]]
-			out = append(out, EntityRecord{Name: names[i], Operation: cr.Operation, Props: cr.ToMap(), Attrs: cr.ExpandAttrs()})
+	for _, s := range samples {
+		if s.val < lo || s.val > hi {
+			out = append(out, EntityRecord{Name: s.name, Operation: s.cr.Operation, Props: s.cr.ToMap(), Attrs: s.cr.ExpandAttrs()})
 		}
 	}
 	return out, nil
@@ -4958,13 +5190,17 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 	if err := validatePercentiles(opts.Percentiles); err != nil {
 		return StatsResult{Field: opts.Field}, err
 	}
-	wantPct := len(opts.Percentiles) > 0
 
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
 		return StatsResult{}, ErrDatabaseClosed
 	}
+	return db.computeStatsLocked(opts)
+}
+
+func (db *AnchorDB) computeStatsLocked(opts StatsOptions) (StatsResult, error) {
+	wantPct := len(opts.Percentiles) > 0
 
 	totalEntities := len(db.EntityOrder)
 	if totalEntities == 0 {
@@ -5031,6 +5267,11 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 			continue
 		}
 
+		val64 := attr.Float64()
+		if math.IsNaN(val64) {
+			continue
+		}
+
 		count++
 
 		// Track integer extremes exactly in their own domain.
@@ -5054,12 +5295,9 @@ func (db *AnchorDB) ComputeStatsWithOptions(opts StatsOptions) (StatsResult, err
 			seenUint = true
 		}
 
-		val64 := attr.Float64()
 		sum += val64
 
-		// NaN never enters the percentile population (it would break
-		// partitioning order); legacy sum/mean keep their existing behavior.
-		if wantPct && !math.IsNaN(val64) {
+		if wantPct {
 			pctVals = append(pctVals, val64)
 		}
 
@@ -5226,11 +5464,10 @@ func (db *AnchorDB) ExecuteGraphChainWithContext(ctx context.Context, initialInp
 // with ErrDatabaseClosed instead of silently succeeding without WAL durability.
 func (db *AnchorDB) Close() error {
 	if db.autoSyncDone != nil {
-		select {
-		case <-db.autoSyncDone:
-		default:
+		db.autoSyncOnce.Do(func() {
 			close(db.autoSyncDone)
-		}
+		})
+		db.autoSyncWg.Wait()
 	}
 	db.syncMu.Lock()
 	defer db.syncMu.Unlock()
@@ -5242,6 +5479,9 @@ func (db *AnchorDB) Close() error {
 	}
 	db.closed = true
 	var closeErr error
+	if autoErr := db.AutoSyncError(); autoErr != nil {
+		closeErr = errors.Join(closeErr, fmt.Errorf("background auto-sync failed: %w", autoErr))
+	}
 
 	if db.wal != nil {
 		if err := db.wal.Close(); err != nil {

@@ -216,3 +216,103 @@ func TestListLimitIsCapped(t *testing.T) {
 		t.Fatal("expected has_more=true when results are capped")
 	}
 }
+
+func TestRateLimiterMaxBucketsBounded(t *testing.T) {
+	rl := newRateLimiter(1, 1)
+	for i := 0; i < maxRateLimiterBuckets+500; i++ {
+		_ = rl.allow(fmt.Sprintf("ip-%d", i))
+	}
+	rl.mu.Lock()
+	count := len(rl.buckets)
+	rl.mu.Unlock()
+	if count > maxRateLimiterBuckets {
+		t.Fatalf("rateLimiter buckets grew past cap: got %d, want <= %d", count, maxRateLimiterBuckets)
+	}
+}
+
+func TestReadOnlyGetModelDoesNotCreateEmptyFile(t *testing.T) {
+	s, dir := createFastTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	handler := s.Routes()
+
+	// GET schema on nonexistent model must return 404 and not create ghost_schema.anchordb.
+	req := httptest.NewRequest(http.MethodGet, "/v1/model/schema?model=ghost_schema", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET schema on nonexistent model = %d, want 404", rec.Code)
+	}
+	if _, err := os.Stat(dir + "/ghost_schema.anchordb"); !os.IsNotExist(err) {
+		t.Fatalf("expected no model file created for read-only schema check, stat err=%v", err)
+	}
+
+	// POST /v1/get on nonexistent model must return 404 and not create ghost_get.anchordb.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/get", bytes.NewReader([]byte(`{"model":"ghost_get","name":"missing"}`)))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("POST /v1/get on nonexistent model = %d, want 404", rec2.Code)
+	}
+	if _, err := os.Stat(dir + "/ghost_get.anchordb"); !os.IsNotExist(err) {
+		t.Fatalf("expected no model file created for read-only /v1/get, stat err=%v", err)
+	}
+}
+
+func TestRateLimiter_DeterministicLRUEviction(t *testing.T) {
+	rl := newRateLimiter(10, 10)
+	// Insert cap entries; repeatedly touch ip-0 so it moves to MRU front.
+	for i := 0; i < maxRateLimiterBuckets; i++ {
+		_ = rl.allow(fmt.Sprintf("ip-%d", i))
+	}
+	// Consume one token from ip-0 so it stays recently used at front of LRU.
+	_ = rl.allow("ip-0")
+	// Add new entry exceeding capacity: ip-1 (oldest LRU) must be evicted, while ip-0 remains.
+	_ = rl.allow("ip-overflow")
+
+	rl.mu.Lock()
+	_, hasHot := rl.buckets["ip-0"]
+	_, hasOldest := rl.buckets["ip-1"]
+	rl.mu.Unlock()
+	if !hasHot {
+		t.Fatal("expected recently active bucket ip-0 to be preserved under LRU eviction")
+	}
+	if hasOldest {
+		t.Fatal("expected oldest LRU bucket ip-1 to be evicted deterministically")
+	}
+}
+
+func TestServer_HandleGetMaxBytes413AndAllModelNames(t *testing.T) {
+	s, dir := createFastTestServer(t)
+	defer cleanupServer(t, s, dir)
+
+	// Create an unloaded .anchordb file on disk and ensure allModelNames discovers it.
+	diskModelPath := dir + "/cold_unloaded.anchordb"
+	db, err := storage.OpenWithOptions(diskModelPath, storage.Options{WAL: storage.WALOptions{SyncMode: storage.SyncNone}})
+	if err != nil {
+		t.Fatalf("storage.OpenWithOptions: %v", err)
+	}
+	_ = db.Close()
+
+	names := s.allModelNames()
+	foundDisk := false
+	for _, n := range names {
+		if n == "cold_unloaded" {
+			foundDisk = true
+		}
+	}
+	if !foundDisk {
+		t.Fatalf("expected allModelNames() to include on-disk unloaded model, got %v", names)
+	}
+
+	// Send oversized JSON body through Routes() (which wraps limitRequestBody).
+	handler := s.Routes()
+	huge := append([]byte(`{"model":"default","name":"`), bytes.Repeat([]byte("a"), maxRequestBodyBytes+1024)...)
+	huge = append(huge, []byte(`"}`)...)
+	req := httptest.NewRequest(http.MethodPost, "/v1/get", bytes.NewReader(huge))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 RequestEntityTooLarge for oversized /v1/get, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

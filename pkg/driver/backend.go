@@ -49,6 +49,7 @@ type PartitionInspectResult struct {
 	Attrs         []storage.AttrEntry `json:"attrs,omitempty"`
 	Records       []PartitionRecord   `json:"records,omitempty"`
 	Count         int                 `json:"count,omitempty"`
+	HasMore       bool                `json:"has_more,omitempty"`
 }
 
 // backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
@@ -275,8 +276,7 @@ func (b *localBackend) IsRemote() bool {
 	return false
 }
 
-func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
-	partDir := filepath.Join(filepath.Dir(b.filePath), "partitions")
+func listPartitionsInDir(partDir string) ([]PartitionMeta, error) {
 	entries, err := os.ReadDir(partDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -291,7 +291,10 @@ func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error
 		}
 		info, err := e.Info()
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to stat partition %q: %w", e.Name(), err)
 		}
 		out = append(out, PartitionMeta{
 			Name:      e.Name(),
@@ -302,9 +305,13 @@ func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error
 	return out, nil
 }
 
-func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *localBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
+	return listPartitionsInDir(filepath.Join(filepath.Dir(b.filePath), "partitions"))
+}
+
+func inspectPartitionFile(ctx context.Context, baseDir, partitionFile, recordName string, limit int) (res *PartitionInspectResult, retErr error) {
 	cleanFilename := filepath.Base(partitionFile)
-	fullPath := filepath.Join(filepath.Dir(b.filePath), "partitions", cleanFilename)
+	fullPath := filepath.Join(baseDir, "partitions", cleanFilename)
 	if _, err := os.Stat(fullPath); err != nil {
 		return nil, fmt.Errorf("partition file not found: %s", cleanFilename)
 	}
@@ -313,7 +320,12 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 	if err != nil {
 		return nil, fmt.Errorf("failed to open partition: %w", err)
 	}
-	defer pdb.Close()
+	defer func() {
+		if closeErr := pdb.Close(); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("failed closing partition %q: %w", cleanFilename, closeErr)
+			res = nil
+		}
+	}()
 
 	if recordName != "" {
 		cr, err := pdb.GetRecordTyped(recordName)
@@ -332,7 +344,7 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
-	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
+	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list records in partition: %w", err)
 	}
@@ -347,7 +359,12 @@ func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, reco
 		PartitionFile: cleanFilename,
 		Records:       out,
 		Count:         len(out),
+		HasMore:       hasMore,
 	}, nil
+}
+
+func (b *localBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return inspectPartitionFile(ctx, filepath.Dir(b.filePath), partitionFile, recordName, limit)
 }
 
 func (b *localBackend) Attach(ctx context.Context, _ string, schema storage.ModelSchema) error {
@@ -387,6 +404,7 @@ type embeddedBackend struct {
 	dataDir    string
 	cfg        clientConfig
 	models     map[string]*storage.AnchorDB
+	modelOrder []string
 	workerPool *worker.Pool
 	scheduler  *scheduler.InternalScheduler
 	closed     bool
@@ -430,7 +448,10 @@ func newEmbeddedBackend(dataDir string, cfg clientConfig) (*embeddedBackend, err
 	if cfg.enableScheduler || cfg.syncInterval > 0 {
 		sched := scheduler.NewInternalScheduler()
 		if cfg.syncInterval > 0 {
-			_ = sched.RegisterTask("embedded_periodic_sync", &embeddedSyncTask{backend: b, interval: cfg.syncInterval})
+			if err := sched.RegisterTask("embedded_periodic_sync", &embeddedSyncTask{backend: b, interval: cfg.syncInterval}); err != nil {
+				_ = b.Close()
+				return nil, fmt.Errorf("failed to register embedded periodic sync task: %w", err)
+			}
 		}
 		sched.Start()
 		b.scheduler = sched
@@ -477,12 +498,25 @@ func (b *embeddedBackend) getDB(model string) (*storage.AnchorDB, error) {
 		return db, nil
 	}
 
+	const maxEmbeddedModels = 500
+	if len(b.models) >= maxEmbeddedModels && len(b.modelOrder) > 0 {
+		victim := b.modelOrder[0]
+		b.modelOrder = b.modelOrder[1:]
+		if vdb, exists := b.models[victim]; exists {
+			delete(b.models, victim)
+			if err := errors.Join(vdb.Sync(), vdb.Close()); err != nil {
+				return nil, fmt.Errorf("failed evicting embedded model %q: %w", victim, err)
+			}
+		}
+	}
+
 	filePath := filepath.Join(b.dataDir, cleanModel+".anchordb")
 	newDB, err := storage.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open embedded model %q at %s: %w", cleanModel, filePath, err)
 	}
 	b.models[cleanModel] = newDB
+	b.modelOrder = append(b.modelOrder, cleanModel)
 	return newDB, nil
 }
 
@@ -730,13 +764,13 @@ func (b *embeddedBackend) Sync(_ context.Context, model string) error {
 	}
 	b.mu.RUnlock()
 
-	var lastErr error
+	var syncErrs []error
 	for _, db := range dbs {
 		if err := db.Sync(); err != nil {
-			lastErr = err
+			syncErrs = append(syncErrs, err)
 		}
 	}
-	return lastErr
+	return errors.Join(syncErrs...)
 }
 
 func (b *embeddedBackend) Close() error {
@@ -747,21 +781,23 @@ func (b *embeddedBackend) Close() error {
 	}
 	b.closed = true
 
+	var closeErrs []error
 	if b.scheduler != nil {
 		b.scheduler.Stop()
 	}
 	if b.workerPool != nil {
-		_ = b.workerPool.Shutdown()
+		if err := b.workerPool.Shutdown(); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
 	}
 
-	var lastErr error
 	for _, db := range b.models {
 		if err := db.Close(); err != nil {
-			lastErr = err
+			closeErrs = append(closeErrs, err)
 		}
 	}
 	b.models = make(map[string]*storage.AnchorDB)
-	return lastErr
+	return errors.Join(closeErrs...)
 }
 
 func (b *embeddedBackend) DB() *storage.AnchorDB {
@@ -777,78 +813,11 @@ func (b *embeddedBackend) IsRemote() bool {
 }
 
 func (b *embeddedBackend) ListPartitions(_ context.Context) ([]PartitionMeta, error) {
-	partDir := filepath.Join(b.dataDir, "partitions")
-	entries, err := os.ReadDir(partDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []PartitionMeta{}, nil
-		}
-		return nil, fmt.Errorf("failed to read partitions directory: %w", err)
-	}
-	var out []PartitionMeta
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		out = append(out, PartitionMeta{
-			Name:      e.Name(),
-			SizeBytes: info.Size(),
-			ModTime:   info.ModTime(),
-		})
-	}
-	return out, nil
+	return listPartitionsInDir(filepath.Join(b.dataDir, "partitions"))
 }
 
 func (b *embeddedBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
-	cleanFilename := filepath.Base(partitionFile)
-	fullPath := filepath.Join(b.dataDir, "partitions", cleanFilename)
-	if _, err := os.Stat(fullPath); err != nil {
-		return nil, fmt.Errorf("partition file not found: %s", cleanFilename)
-	}
-
-	pdb, err := storage.Open(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open partition: %w", err)
-	}
-	defer pdb.Close()
-
-	if recordName != "" {
-		cr, err := pdb.GetRecordTyped(recordName)
-		if err != nil {
-			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
-		}
-		return &PartitionInspectResult{
-			Success:       true,
-			PartitionFile: cleanFilename,
-			Name:          recordName,
-			Props:         cr.ToMap(),
-			Attrs:         cr.ExpandAttrs(),
-		}, nil
-	}
-
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
-	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list records in partition: %w", err)
-	}
-
-	out := make([]PartitionRecord, len(records))
-	for i, r := range records {
-		out[i] = PartitionRecord{Name: r.Name, Props: r.Props, Attrs: r.Attrs}
-	}
-
-	return &PartitionInspectResult{
-		Success:       true,
-		PartitionFile: cleanFilename,
-		Records:       out,
-		Count:         len(out),
-	}, nil
+	return inspectPartitionFile(ctx, b.dataDir, partitionFile, recordName, limit)
 }
 
 func (b *embeddedBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
@@ -1410,6 +1379,7 @@ func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, rec
 		Attrs         []storage.AttrEntry `json:"attrs,omitempty"`
 		Records       []PartitionRecord   `json:"records,omitempty"`
 		Count         int                 `json:"count,omitempty"`
+		HasMore       bool                `json:"has_more,omitempty"`
 	}
 	if err := b.doJSON(ctx, http.MethodPost, "/v1/partition/inspect", req, &resp); err != nil {
 		return nil, err
@@ -1422,6 +1392,7 @@ func (b *remoteBackend) InspectPartition(ctx context.Context, partitionFile, rec
 		Attrs:         resp.Attrs,
 		Records:       resp.Records,
 		Count:         resp.Count,
+		HasMore:       resp.HasMore,
 	}, nil
 }
 
@@ -1492,9 +1463,9 @@ func serializeComputeOp(op storage.ComputeOp) string {
 	case storage.OpAssign:
 		return o.Value
 	case storage.OpAddDays:
-		return fmt.Sprintf("%s + %g", o.Field, o.Days)
+		return fmt.Sprintf("%s + %s", o.Field, strconv.FormatFloat(float64(o.Days), 'g', -1, 32))
 	case storage.OpSubtractDays:
-		return fmt.Sprintf("%s - %g", o.Field, o.Days)
+		return fmt.Sprintf("%s - %s", o.Field, strconv.FormatFloat(float64(o.Days), 'g', -1, 32))
 	case storage.OpDaysBetween:
 		return fmt.Sprintf("%s - %s", o.FieldA, o.FieldB)
 	default:
@@ -1505,7 +1476,7 @@ func serializeComputeOp(op storage.ComputeOp) string {
 func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 	out := make([]map[string]string, len(filters))
 	for i, f := range filters {
-		valStr := fmt.Sprintf("%g", f.Value)
+		valStr := strconv.FormatFloat(float64(f.Value), 'g', -1, 32)
 		if f.ValType == storage.AttrTypeInt64 {
 			valStr = strconv.FormatInt(f.ValueInt64, 10)
 		} else if f.ValType == storage.AttrTypeUint64 {
@@ -1530,7 +1501,7 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 			} else if f.HasFloat64 {
 				m["value_high"] = strconv.FormatFloat(f.ValueHigh64, 'g', -1, 64)
 			} else {
-				m["value_high"] = fmt.Sprintf("%g", f.ValueHigh)
+				m["value_high"] = strconv.FormatFloat(float64(f.ValueHigh), 'g', -1, 32)
 			}
 		}
 		out[i] = m
@@ -1545,9 +1516,11 @@ func serializeFilters(filters []storage.FilterCondition) []map[string]string {
 type wireBackend struct {
 	addr      string
 	cfg       clientConfig
+	opts      []wire.ClientOption
 	poolSize  int
-	pool      chan *wire.Client
-	clients   []*wire.Client
+	sem       chan struct{}
+	idle      chan *wire.Client
+	clients   map[*wire.Client]struct{}
 	mu        sync.Mutex
 	closed    bool
 	closeChan chan struct{}
@@ -1576,29 +1549,48 @@ func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
 		opts = append(opts, wire.WithClientAdaptivePacing(cfg.targetRecords))
 	}
 
-	clients := make([]*wire.Client, 0, poolSize)
-	pool := make(chan *wire.Client, poolSize)
+	sem := make(chan struct{}, poolSize)
+	idle := make(chan *wire.Client, poolSize)
+	clients := make(map[*wire.Client]struct{}, poolSize)
 
 	for i := 0; i < poolSize; i++ {
 		wc, err := wire.Connect(addr, opts...)
 		if err != nil {
-			for _, c := range clients {
+			for c := range clients {
 				_ = c.Close()
 			}
 			return nil, fmt.Errorf("failed to initialize wire connection %d/%d: %w", i+1, poolSize, err)
 		}
-		clients = append(clients, wc)
-		pool <- wc
+		clients[wc] = struct{}{}
+		idle <- wc
 	}
 
 	return &wireBackend{
 		addr:      addr,
 		cfg:       cfg,
+		opts:      opts,
 		poolSize:  poolSize,
-		pool:      pool,
+		sem:       sem,
+		idle:      idle,
 		clients:   clients,
 		closeChan: make(chan struct{}),
 	}, nil
+}
+
+func (b *wireBackend) dial() (*wire.Client, error) {
+	wc, err := wire.Connect(b.addr, b.opts...)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		_ = wc.Close()
+		return nil, errors.New("wire client closed")
+	}
+	b.clients[wc] = struct{}{}
+	b.mu.Unlock()
+	return wc, nil
 }
 
 func (b *wireBackend) acquire(ctx context.Context) (*wire.Client, error) {
@@ -1610,28 +1602,65 @@ func (b *wireBackend) acquire(ctx context.Context) (*wire.Client, error) {
 	b.mu.Unlock()
 
 	select {
-	case wc := <-b.pool:
-		return wc, nil
+	case b.sem <- struct{}{}:
 	case <-b.closeChan:
 		return nil, errors.New("wire client closed")
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+
+	select {
+	case wc := <-b.idle:
+		return wc, nil
+	case <-b.closeChan:
+		<-b.sem
+		return nil, errors.New("wire client closed")
+	default:
+		wc, err := b.dial()
+		if err != nil {
+			<-b.sem
+			return nil, err
+		}
+		return wc, nil
+	}
 }
 
-func (b *wireBackend) release(wc *wire.Client) {
+func (b *wireBackend) release(wc *wire.Client, healthy bool) {
+	defer func() {
+		<-b.sem
+	}()
 	if wc == nil {
 		return
 	}
+
 	b.mu.Lock()
 	closed := b.closed
+	if !healthy || closed {
+		delete(b.clients, wc)
+	}
 	b.mu.Unlock()
 
-	if closed {
+	if !healthy || closed {
 		_ = wc.Close()
 		return
 	}
-	b.pool <- wc
+
+	select {
+	case b.idle <- wc:
+	default:
+		b.mu.Lock()
+		delete(b.clients, wc)
+		b.mu.Unlock()
+		_ = wc.Close()
+	}
+}
+
+func isHealthyWireResult(err error) bool {
+	if err == nil {
+		return true
+	}
+	var wireErr *wire.WireError
+	return errors.As(err, &wireErr)
 }
 
 func (b *wireBackend) withClient(ctx context.Context, model string, fn func(wc *wire.Client) error) error {
@@ -1642,14 +1671,21 @@ func (b *wireBackend) withClient(ctx context.Context, model string, fn func(wc *
 	if err != nil {
 		return err
 	}
-	defer b.release(wc)
+
+	healthy := false
+	defer func() {
+		b.release(wc, healthy)
+	}()
 
 	if model != "" && model != wc.ModelName() {
 		if err := wc.SelectModel(model); err != nil {
+			healthy = isHealthyWireResult(err)
 			return err
 		}
 	}
-	return fn(wc)
+	err = fn(wc)
+	healthy = isHealthyWireResult(err)
+	return err
 }
 
 func (b *wireBackend) Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error) {
@@ -1831,25 +1867,11 @@ func (b *wireBackend) Edge(ctx context.Context, model, action, source, relation,
 func (b *wireBackend) Causal(ctx context.Context, model string, seeds []string, relation string, relations []string, limitK int) ([]storage.CausalResult, error) {
 	var finalResults []storage.CausalResult
 	err := b.withClient(ctx, model, func(wc *wire.Client) error {
-		if len(relations) > 0 {
-			currentSeeds := seeds
-			for _, rel := range relations {
-				stepRes, err := wc.Causal(currentSeeds, rel, limitK)
-				if err != nil {
-					return err
-				}
-				finalResults = append(finalResults, stepRes...)
-				currentSeeds = make([]string, len(stepRes))
-				for i, r := range stepRes {
-					currentSeeds[i] = r.Word
-				}
-				if len(currentSeeds) == 0 {
-					break
-				}
-			}
-			return nil
-		}
 		var err error
+		if len(relations) > 0 {
+			finalResults, err = wc.CausalChain(seeds, relations, limitK)
+			return err
+		}
 		finalResults, err = wc.Causal(seeds, relation, limitK)
 		return err
 	})
@@ -1953,10 +1975,15 @@ func (b *wireBackend) Close() error {
 	}
 	b.closed = true
 	close(b.closeChan)
+	toClose := make([]*wire.Client, 0, len(b.clients))
+	for wc := range b.clients {
+		toClose = append(toClose, wc)
+	}
+	clear(b.clients)
 	b.mu.Unlock()
 
 	var lastErr error
-	for _, wc := range b.clients {
+	for _, wc := range toClose {
 		if err := wc.Close(); err != nil {
 			lastErr = err
 		}
@@ -1972,10 +1999,18 @@ func (b *wireBackend) IsRemote() bool {
 	return true
 }
 
+func (b *wireBackend) defaultModel() string {
+	if b.cfg.model != "" {
+		return b.cfg.model
+	}
+	return "default"
+}
+
 func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
 	var out []PartitionMeta
-	err := b.withClient(ctx, "default", func(wc *wire.Client) error {
-		items, err := wc.PartitionCatalog("")
+	model := b.defaultModel()
+	err := b.withClient(ctx, model, func(wc *wire.Client) error {
+		items, err := wc.PartitionCatalog(b.cfg.model)
 		if err != nil {
 			return err
 		}
@@ -1997,7 +2032,7 @@ func (b *wireBackend) ListPartitions(ctx context.Context) ([]PartitionMeta, erro
 
 func (b *wireBackend) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
 	var result *PartitionInspectResult
-	err := b.withClient(ctx, "default", func(wc *wire.Client) error {
+	err := b.withClient(ctx, b.defaultModel(), func(wc *wire.Client) error {
 		resp, err := wc.PartitionInspect(wire.PartitionInspectWireRequest{
 			PartitionFile: partitionFile,
 			RecordName:    recordName,

@@ -1,6 +1,10 @@
 package driver
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rachmanzz/anchordb/pkg/storage"
+)
 
 // TestDateReturnsError verifies that malformed date input yields an error rather
 // than panicking, and that MustDate preserves the panicking literal behaviour.
@@ -123,5 +127,25 @@ func TestDateMathOperatorsDirect(t *testing.T) {
 	}
 	if diff != 45 {
 		t.Errorf("DaysBetween = %v, want 45", diff)
+	}
+}
+
+func TestEntityResult_GetTimestampAndGetDateExactInt64(t *testing.T) {
+	// 1794816000 cannot be represented accurately in float32 (rounds by > 60s).
+	const exactTS int64 = 1794816123 // 2026-11-16 08:02:03 UTC
+	const exactDays int64 = 20773    // 2026-11-16
+
+	res := EntityResult{
+		Name: "ts-test",
+		attrs: []AttrEntry{
+			storage.NewInt64Attr("created_ts", exactTS),
+			storage.NewInt64Attr("created_day", exactDays),
+		},
+	}
+	if got := res.GetTimestamp("created_ts"); got != "2026-11-16 08:02:03" {
+		t.Fatalf("GetTimestamp lost precision: got %q, want %q", got, "2026-11-16 08:02:03")
+	}
+	if got := res.GetDate("created_day"); got != "2026-11-16" {
+		t.Fatalf("GetDate mismatch: got %q, want %q", got, "2026-11-16")
 	}
 }

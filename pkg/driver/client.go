@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -286,40 +287,52 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 
 	if strings.Contains(raw, "?") || strings.Contains(raw, "@") || strings.Contains(raw, "/") {
 		u, err := url.Parse("tcp://" + raw)
-		if err == nil {
-			if u.User != nil {
-				if pass, ok := u.User.Password(); ok && pass != "" {
-					cfg.token = pass
-				} else if u.User.Username() != "" {
-					cfg.token = u.User.Username()
-				}
-			}
-			q := u.Query()
-			if tok := q.Get("token"); tok != "" {
-				cfg.token = tok
-			}
-			if mdl := q.Get("model"); mdl != "" {
-				cfg.model = mdl
-			}
-			if p := q.Get("pacing"); p == "true" || p == "1" {
-				cfg.adaptivePacing = true
-			}
-			if tgt := q.Get("target"); tgt != "" {
-				if n, err := strconv.ParseUint(tgt, 10, 32); err == nil {
-					cfg.targetRecords = uint32(n)
-				}
-			}
-			if poolStr := q.Get("pool"); poolStr != "" {
-				if n, err := strconv.Atoi(poolStr); err == nil && n > 0 {
-					cfg.poolSize = n
-				}
-			}
-			pathModel := strings.Trim(u.Path, "/")
-			if pathModel != "" && cfg.model == "default" {
-				cfg.model = pathModel
-			}
-			raw = u.Host
+		if err != nil {
+			return nil, fmt.Errorf("invalid wire DSN %q: %w", addr, err)
 		}
+		if u.User != nil {
+			if pass, ok := u.User.Password(); ok && pass != "" {
+				cfg.token = pass
+			} else if u.User.Username() != "" {
+				cfg.token = u.User.Username()
+			}
+		}
+		q := u.Query()
+		if tok := q.Get("token"); tok != "" {
+			cfg.token = tok
+		}
+		if mdl := q.Get("model"); mdl != "" {
+			cfg.model = mdl
+		}
+		if p := q.Get("pacing"); p != "" {
+			switch strings.ToLower(p) {
+			case "true", "1":
+				cfg.adaptivePacing = true
+			case "false", "0":
+				cfg.adaptivePacing = false
+			default:
+				return nil, fmt.Errorf("invalid wire DSN pacing value %q", p)
+			}
+		}
+		if tgt := q.Get("target"); tgt != "" {
+			n, err := strconv.ParseUint(tgt, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid wire DSN target value %q: %w", tgt, err)
+			}
+			cfg.targetRecords = uint32(n)
+		}
+		if poolStr := q.Get("pool"); poolStr != "" {
+			n, err := strconv.Atoi(poolStr)
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("invalid wire DSN pool size %q: must be positive integer", poolStr)
+			}
+			cfg.poolSize = n
+		}
+		pathModel := strings.Trim(u.Path, "/")
+		if pathModel != "" && cfg.model == "default" {
+			cfg.model = pathModel
+		}
+		raw = u.Host
 	}
 
 	backend, err := newWireBackend(raw, cfg)
@@ -845,11 +858,35 @@ func (r *EntityResult) GetFloat64(field string) float64 {
 
 // GetDate returns the field value formatted as a YYYY-MM-DD date string.
 func (r *EntityResult) GetDate(field string) string {
+	if a, ok := r.GetTyped(field); ok {
+		switch a.Type {
+		case storage.AttrTypeInt64:
+			return time.Unix(a.Int64()*86400, 0).UTC().Format("2006-01-02")
+		case storage.AttrTypeUint64:
+			if a.Uint64() <= math.MaxInt64/86400 {
+				return time.Unix(int64(a.Uint64())*86400, 0).UTC().Format("2006-01-02")
+			}
+		case storage.AttrTypeFloat64:
+			return time.Unix(int64(math.Round(a.Float64()))*86400, 0).UTC().Format("2006-01-02")
+		}
+	}
 	return storage.FormatDate(r.Get(field))
 }
 
 // GetTimestamp returns the field value formatted as a YYYY-MM-DD HH:MM:SS timestamp string.
 func (r *EntityResult) GetTimestamp(field string) string {
+	if a, ok := r.GetTyped(field); ok {
+		switch a.Type {
+		case storage.AttrTypeInt64:
+			return time.Unix(a.Int64(), 0).UTC().Format("2006-01-02 15:04:05")
+		case storage.AttrTypeUint64:
+			if a.Uint64() <= math.MaxInt64 {
+				return time.Unix(int64(a.Uint64()), 0).UTC().Format("2006-01-02 15:04:05")
+			}
+		case storage.AttrTypeFloat64:
+			return time.Unix(int64(a.Float64()), 0).UTC().Format("2006-01-02 15:04:05")
+		}
+	}
 	return storage.FormatTimestamp(r.Get(field))
 }
 
@@ -1002,7 +1039,11 @@ func toFilterBetweenCondition(field string, minVal, maxVal any) (storage.FilterC
 				hasHighType = true
 			}
 		}
-	} else if lowType == storage.AttrTypeFloat64 || highType == storage.AttrTypeFloat64 || (lowIsInt != highIsInt) {
+	} else if lowIsInt != highIsInt {
+		valType = lowType
+		valHighType = highType
+		hasHighType = true
+	} else if lowType == storage.AttrTypeFloat64 || highType == storage.AttrTypeFloat64 {
 		valType = storage.AttrTypeFloat64
 		valHighType = storage.AttrTypeFloat64
 		hasLow64 = true

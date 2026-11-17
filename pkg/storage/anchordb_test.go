@@ -1342,6 +1342,141 @@ func TestListRecordsWithPaging_TypedParity(t *testing.T) {
 	}
 }
 
+func TestSync_ConcurrentDeleteNoRaceAndReleasesPendingSlices(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sync_race.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{WAL: WALOptions{SyncMode: SyncNone}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 200; i++ {
+		name := fmt.Sprintf("node_%03d", i)
+		if _, err := db.AppendNode(name, spatial.Point2D{X: float32(i), Y: 1}, [4]float32{1, 0, 0, 0}, 1); err != nil {
+			t.Fatalf("AppendNode %s: %v", name, err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatalf("initial Sync: %v", err)
+	}
+
+	// Verify pending slices are released (nil) after Sync drains them.
+	db.mu.RLock()
+	if db.pendingNodes != nil || db.pendingStringPool != nil {
+		db.mu.RUnlock()
+		t.Fatalf("expected nil pendingNodes and pendingStringPool after Sync, got caps %d / %d", cap(db.pendingNodes), cap(db.pendingStringPool))
+	}
+	db.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := db.Sync(); err != nil {
+				t.Errorf("concurrent Sync %d: %v", i, err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			name := fmt.Sprintf("node_%03d", i)
+			if _, err := db.DeleteRecords([]string{name}); err != nil {
+				t.Errorf("concurrent DeleteRecords %s: %v", name, err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestWAL_DeleteBatchDurability(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "delete_batch.anchordb")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 25; i++ {
+		if err := db.SaveRecord(fmt.Sprintf("item_%02d", i), map[string]float32{"v": float32(i)}); err != nil {
+			t.Fatalf("SaveRecord: %v", err)
+		}
+	}
+	toDel := make([]string, 15)
+	for i := 0; i < 15; i++ {
+		toDel[i] = fmt.Sprintf("item_%02d", i)
+	}
+	deleted, err := db.DeleteRecords(toDel)
+	if err != nil {
+		t.Fatalf("DeleteRecords: %v", err)
+	}
+	if deleted != 15 {
+		t.Fatalf("expected 15 deleted, got %d", deleted)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	recs, _, err := reopened.ListRecordsWithPaging(QueryOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRecordsWithPaging: %v", err)
+	}
+	if len(recs) != 10 {
+		t.Fatalf("expected 10 surviving records after WAL replay, got %d", len(recs))
+	}
+}
+
+func TestListRecordsWithPaging_ComputationsSkipFilteredAndOffset(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "list_compute_skip.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{WAL: WALOptions{SyncMode: SyncNone}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Record "bad" has zero denominator and would fail division if evaluated,
+	// but is filtered out by group=1 (or skipped by Offset).
+	_ = db.SaveRecord("bad", map[string]float32{"group": 0, "num": 10, "den": 0})
+	_ = db.SaveRecord("skip_me", map[string]float32{"group": 1, "num": 10, "den": 0})
+	_ = db.SaveRecord("good", map[string]float32{"group": 1, "num": 20, "den": 4})
+
+	recs, _, err := db.ListRecordsWithPaging(QueryOptions{
+		Filters: []FilterCondition{{Field: "group", Operator: "=", Value: 1}},
+		Offset:  1,
+		Limit:   1,
+		Computations: map[string]ComputeOp{
+			"ratio": OpDivide{FieldA: "num", FieldB: "den"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ListRecordsWithPaging failed unexpectedly: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Name != "good" || recs[0].Props["ratio"] != 5 {
+		t.Fatalf("unexpected paging result: %+v", recs)
+	}
+}
+
+func TestComputeHistogram_MaxBinsLimit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "hist_maxbins.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{WAL: WALOptions{SyncMode: SyncNone}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	_ = db.SaveRecord("r1", map[string]float32{"v": 1})
+	if _, err := db.ComputeHistogram("v", MaxHistogramBins+1); err == nil {
+		t.Fatalf("expected ComputeHistogram to reject bins > MaxHistogramBins")
+	}
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	os.Exit(code)

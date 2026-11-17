@@ -178,7 +178,12 @@ func ApplyMemoryLimit(explicitConfig string) (int64, string, error) {
 func GetMemoryStats() MemoryStats {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+	return GetMemoryStatsFrom(m)
+}
 
+// GetMemoryStatsFrom builds MemoryStats using an already-sampled runtime.MemStats,
+// allowing callers that also collect pool stats to perform only one ReadMemStats STW pause.
+func GetMemoryStatsFrom(m runtime.MemStats) MemoryStats {
 	currentLimit := debug.SetMemoryLimit(-1)
 	cgroupLimit, _ := DetectCgroupMemoryLimit()
 
@@ -383,11 +388,18 @@ func computeMemoryHeadroom() MemoryHeadroom {
 		hostUsed := hostTotal - hostAvailable
 		hostUsedPct := uint8((hostUsed * 100) / hostTotal)
 
-		if cgroupLimit > 0 && hasCgroupUsed && uint64(cgroupLimit) > cgroupUsed {
-			cgroupAvailable := uint64(cgroupLimit) - cgroupUsed
-			cgroupUsedPct := uint8((cgroupUsed * 100) / uint64(cgroupLimit))
+		if cgroupLimit > 0 && hasCgroupUsed {
+			var cgroupAvailable uint64
+			var cgroupUsedPct uint8
+			if uint64(cgroupLimit) > cgroupUsed {
+				cgroupAvailable = uint64(cgroupLimit) - cgroupUsed
+				cgroupUsedPct = uint8((cgroupUsed * 100) / uint64(cgroupLimit))
+			} else {
+				cgroupAvailable = 0
+				cgroupUsedPct = 100
+			}
 
-			// Pick the more constrained metric
+			// Pick the more constrained metric between host and cgroup.
 			effectiveUsedPct := hostUsedPct
 			if cgroupUsedPct > effectiveUsedPct {
 				effectiveUsedPct = cgroupUsedPct
@@ -418,14 +430,39 @@ func computeMemoryHeadroom() MemoryHeadroom {
 		}
 	}
 
-	// 4. Fallback for environments where /proc/meminfo is inaccessible
+	// 4. Fallback for environments where /proc/meminfo is inaccessible.
+	if cgroupLimit > 0 && hasCgroupUsed {
+		var avail uint64
+		var usedPct uint8
+		if uint64(cgroupLimit) > cgroupUsed {
+			avail = uint64(cgroupLimit) - cgroupUsed
+			usedPct = uint8((cgroupUsed * 100) / uint64(cgroupLimit))
+		} else {
+			usedPct = 100
+		}
+		return MemoryHeadroom{
+			TotalBytes:     uint64(cgroupLimit),
+			AvailableBytes: avail,
+			UsedPercent:    usedPct,
+			HeadroomBytes:  avail,
+			CgroupLimited:  true,
+			Source:         "cgroup",
+		}
+	}
+
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	currentLimit := debug.SetMemoryLimit(-1)
 
-	if currentLimit > 0 && currentLimit < math.MaxInt64 && uint64(currentLimit) > m.Sys {
-		avail := uint64(currentLimit) - m.Sys
-		usedPct := uint8((m.Sys * 100) / uint64(currentLimit))
+	if currentLimit > 0 && currentLimit < math.MaxInt64 {
+		var avail uint64
+		var usedPct uint8
+		if uint64(currentLimit) > m.Sys {
+			avail = uint64(currentLimit) - m.Sys
+			usedPct = uint8((m.Sys * 100) / uint64(currentLimit))
+		} else {
+			usedPct = 100
+		}
 		return MemoryHeadroom{
 			TotalBytes:     uint64(currentLimit),
 			AvailableBytes: avail,
@@ -507,7 +544,12 @@ func readCgroupMemoryUsage() (uint64, bool) {
 		}
 	}
 
-	// 3. Fallback to Go runtime MemStats (actual virtual/heap memory held from OS)
+	// 3. Try raw cgroup memory.current before MemStats (captures mmap + off-heap RSS)
+	if v, ok := readCgroupMemoryCurrent(); ok {
+		return v, true
+	}
+
+	// 4. Fallback to Go runtime MemStats (actual virtual/heap memory held from OS)
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	if m.Sys > m.HeapReleased {
@@ -516,8 +558,7 @@ func readCgroupMemoryUsage() (uint64, bool) {
 		return m.Sys, true
 	}
 
-	// 4. Last resort: raw cgroup memory.current
-	return readCgroupMemoryCurrent()
+	return 0, false
 }
 
 func readCgroupMemoryCurrent() (uint64, bool) {

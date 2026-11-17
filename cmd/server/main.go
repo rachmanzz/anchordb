@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +98,7 @@ type Server struct {
 	wirePort    string
 	wireServer  *wire.Server
 	models      map[string]*storage.AnchorDB
+	modelOrder  []string
 	scheduler   *scheduler.InternalScheduler
 	cronEnabled bool
 	worker      *worker.Pool
@@ -122,9 +123,18 @@ type Server struct {
 	s3DefaultSecretKey string
 
 	// Lifecycle state.
-	draining        atomic.Bool   // true once Shutdown began (readiness = 503)
-	closed          bool          // guarded by mu; registry sealed after Shutdown
-	shutdownTimeout time.Duration // total graceful-shutdown budget
+	draining        atomic.Bool        // true once Shutdown began (readiness = 503)
+	closed          bool               // guarded by mu; registry sealed after Shutdown
+	shutdownTimeout time.Duration      // total graceful-shutdown budget
+	opCtx           context.Context    // canceled when async worker drain times out
+	opCancel        context.CancelFunc // cancels opCtx
+}
+
+func (s *Server) asyncBaseContext() context.Context {
+	if s.opCtx != nil {
+		return s.opCtx
+	}
+	return context.Background()
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
@@ -193,7 +203,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		ClusterID:           "cluster-01",
 		CommitmentStorePath: filepath.Join(cfg.DataDir, "auth", "commitments.bin"),
 	})
+	if initErr := joinMgr.InitError(); initErr != nil {
+		sched.Stop()
+		_ = workerPool.Shutdown()
+		return nil, initErr
+	}
 
+	opCtx, opCancel := context.WithCancel(context.Background())
 	s := &Server{
 		dataDir:            cfg.DataDir,
 		authToken:          cfg.AuthToken,
@@ -219,6 +235,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		dbOptions: cfg.DBOptions,
 
 		shutdownTimeout: cfg.ShutdownTimeout,
+		opCtx:           opCtx,
+		opCancel:        opCancel,
 	}
 	s.wireServer = wire.NewServerWithJoinManager(s, joinMgr)
 
@@ -310,18 +328,26 @@ func recoverMiddleware(next http.Handler) http.Handler {
 
 func limitRequestBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, "failed to read request body")
-			return
-		}
-		if len(body) > maxRequestBodyBytes {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEOF bool) bool {
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err == nil {
+		return true
+	}
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return false
+	}
+	if allowEOF && errors.Is(err, io.EOF) {
+		return true
+	}
+	writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	return false
 }
 
 func dispatchErrorStatus(err error) int {
@@ -440,9 +466,9 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 	// 0. Readiness: /health reports shutting_down so traffic is routed away.
 	s.draining.Store(true)
 
-	// 1. Drain in-flight HTTP requests.
+	// 1. Drain in-flight HTTP requests (25% of budget).
 	if httpSrv != nil {
-		hctx, cancel := context.WithTimeout(ctx, budget/3)
+		hctx, cancel := context.WithTimeout(ctx, budget/4)
 		if err := httpSrv.Shutdown(hctx); err != nil {
 			errs = append(errs, fmt.Errorf("http drain: %w", err))
 			// Shutdown timed out: force-close listeners and connections so no new
@@ -453,12 +479,15 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		cancel()
 	}
 
-	// 1.5 Stop AnchorWire binary TCP daemon.
+	// 1.5 Stop AnchorWire binary TCP daemon within shutdown budget (20% of budget).
 	if s.wireServer != nil {
-		_ = s.wireServer.Close()
+		if wErr := s.wireServer.CloseWithTimeout(budget / 5); wErr != nil {
+			errs = append(errs, fmt.Errorf("wire server stop: %w", wErr))
+			safeToClose = false
+		}
 	}
 
-	// 2. Stop the cron scheduler (cancels task contexts, waits for loops).
+	// 2. Stop the cron scheduler (16.7% of budget; cancels task contexts, waits for loops).
 	if s.scheduler != nil {
 		sctx, cancel := context.WithTimeout(ctx, budget/6)
 		if err := s.scheduler.Shutdown(sctx); err != nil {
@@ -468,8 +497,8 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		cancel()
 	}
 
-	// 3. Stop the worker pool, honoring ctx (Pool.Shutdown itself is bounded by
-	// its ShutdownTimeout but takes no context).
+	// 3. Stop the worker pool, honoring ctx (Pool.Shutdown uses up to 2 * ShutdownTimeout).
+	// Total phase maxima stay within ~87% of budget, leaving margin for model sync/close.
 	if s.worker != nil {
 		done := make(chan error, 1)
 		go func() { done <- s.worker.Shutdown() }()
@@ -480,9 +509,15 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 				safeToClose = false
 			}
 		case <-ctx.Done():
+			if s.opCancel != nil {
+				s.opCancel()
+			}
 			errs = append(errs, fmt.Errorf("worker stop: %w", ctx.Err()))
 			safeToClose = false
 		}
+	}
+	if s.opCancel != nil {
+		s.opCancel()
 	}
 
 	// 4. Flush every model. Close only when nothing can still be using them.
@@ -506,6 +541,14 @@ func (s *Server) Shutdown(ctx context.Context, httpSrv *http.Server) error {
 		} else {
 			log.Printf("[WARN] Databases not closed because background work may still be running; subsequent writes after this point are not guaranteed durable under non-sync WAL mode.")
 		}
+	}
+
+	if s.s3Cache != nil && safeToClose {
+		if err := s.s3Cache.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close s3 cache: %w", err))
+		}
+	} else if s.s3Cache != nil {
+		log.Printf("[WARN] S3 partition cache not closed because background handlers may still be active.")
 	}
 
 	return errors.Join(errs...)
@@ -558,22 +601,39 @@ func (t *AutoPartitionCronTask) Schedule() string {
 	return t.schedule
 }
 
+func dispatchAndWait(ctx context.Context, pool *worker.Pool, name string, fn func(context.Context) error, opts ...worker.Option) error {
+	done := make(chan error, 1)
+	wrappedOpts := append([]worker.Option{}, opts...)
+	wrappedOpts = append(wrappedOpts,
+		worker.WithOnSuccess(func(_ context.Context) { done <- nil }),
+		worker.WithOnError(func(_ context.Context, err error) { done <- err }),
+	)
+	if err := pool.Dispatch(ctx, name, fn, wrappedOpts...); err != nil {
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 	log.Printf("[SCHEDULER] Running automatic partition maintenance (archiving data > %.0f days)...", t.retentionDays)
-	t.server.mu.RLock()
-	var loaded []string
-	for m := range t.server.models {
-		loaded = append(loaded, m)
-	}
-	t.server.mu.RUnlock()
+	models := t.server.allModelNames()
 
-	var dispatchErr error
-	for _, m := range loaded {
+	var errs []error
+	for _, m := range models {
 		modelName := m
-		err := t.server.worker.Dispatch(
+		err := dispatchAndWait(
 			ctx,
+			t.server.worker,
 			"cron_partition_"+modelName,
-			func(_ context.Context) error {
+			func(taskCtx context.Context) error {
+				if err := taskCtx.Err(); err != nil {
+					return err
+				}
 				db, err := t.server.getModel(modelName)
 				if err != nil {
 					return err
@@ -598,11 +658,11 @@ func (t *AutoPartitionCronTask) Execute(ctx context.Context) error {
 			worker.WithRetryJitter(100*time.Millisecond),
 		)
 		if err != nil {
-			log.Printf("[WARN] AutoPartition failed to dispatch task for model %q: %v", modelName, err)
-			dispatchErr = err
+			log.Printf("[WARN] AutoPartition failed for model %q: %v", modelName, err)
+			errs = append(errs, fmt.Errorf("model %s: %w", modelName, err))
 		}
 	}
-	return dispatchErr
+	return errors.Join(errs...)
 }
 
 func (t *AutoPartitionCronTask) OnError(_ context.Context, err error) {
@@ -631,10 +691,11 @@ func (t *PeriodicSyncCronTask) Schedule() string {
 }
 
 func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
-	return t.server.worker.Dispatch(
+	return dispatchAndWait(
 		ctx,
+		t.server.worker,
 		"periodic_disk_sync",
-		func(_ context.Context) error {
+		func(taskCtx context.Context) error {
 			t.server.mu.RLock()
 			var dbs []*storage.AnchorDB
 			for _, d := range t.server.models {
@@ -646,6 +707,10 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 			var purged int
 			var syncErrs []error
 			for _, d := range dbs {
+				if err := taskCtx.Err(); err != nil {
+					syncErrs = append(syncErrs, err)
+					break
+				}
 				collected, err := d.CollectTombstones(5000)
 				purged += collected
 				if err != nil {
@@ -716,6 +781,112 @@ func isValidIdentifier(token string) bool {
 	return true
 }
 
+var errModelNotFound = errors.New("model does not exist")
+
+func (s *Server) touchModelOrderLocked(modelName string) {
+	for i, m := range s.modelOrder {
+		if m == modelName {
+			copy(s.modelOrder[i:], s.modelOrder[i+1:])
+			s.modelOrder[len(s.modelOrder)-1] = modelName
+			return
+		}
+	}
+	s.modelOrder = append(s.modelOrder, modelName)
+}
+
+func (s *Server) evictLRUModelLocked() bool {
+	evict := func(victim string, vdb *storage.AnchorDB) {
+		delete(s.models, victim)
+		if err := vdb.Sync(); err != nil {
+			log.Printf("[WARN] Failed to sync evicted LRU model %q: %v", victim, err)
+		}
+		if err := vdb.Close(); err != nil {
+			log.Printf("[WARN] Failed to close evicted LRU model %q: %v", victim, err)
+		}
+	}
+	for len(s.modelOrder) > 0 {
+		victim := s.modelOrder[0]
+		s.modelOrder = s.modelOrder[1:]
+		if vdb, ok := s.models[victim]; ok {
+			evict(victim, vdb)
+			return true
+		}
+	}
+	// Defensive fallback if s.modelOrder drifted out of sync with s.models.
+	if len(s.models) > 0 {
+		var victim string
+		for k := range s.models {
+			if victim == "" || k < victim {
+				victim = k
+			}
+		}
+		if vdb, ok := s.models[victim]; ok {
+			evict(victim, vdb)
+			return true
+		}
+	}
+	return false
+}
+
+// getExistingModel opens a model only if already loaded or present on disk,
+// avoiding empty file creation and cache exhaustion on read-only lookups.
+func (s *Server) getExistingModel(modelName string) (*storage.AnchorDB, error) {
+	cleanName, err := sanitizeModelName(modelName)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	db, exists := s.models[cleanName]
+	s.mu.RUnlock()
+	if exists {
+		return db, nil
+	}
+	dbPath := filepath.Join(s.dataDir, cleanName+".anchordb")
+	if _, statErr := os.Stat(dbPath); errors.Is(statErr, os.ErrNotExist) {
+		return nil, errModelNotFound
+	}
+	return s.getModel(cleanName)
+}
+
+func closePartitionDB(pdb *storage.AnchorDB, label string) {
+	if err := pdb.Close(); err != nil {
+		log.Printf("[WARN] Failed closing partition DB (%s): %v", label, err)
+	}
+}
+
+func (s *Server) allModelNames() []string {
+	seen := make(map[string]struct{})
+	s.mu.RLock()
+	for m := range s.models {
+		seen[m] = struct{}{}
+	}
+	dataDir := s.dataDir
+	s.mu.RUnlock()
+
+	if dataDir != "" {
+		entries, err := os.ReadDir(dataDir)
+		if err != nil {
+			log.Printf("[WARN] Failed scanning data directory %s for models: %v", dataDir, err)
+		} else {
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
+					continue
+				}
+				name := strings.TrimSuffix(e.Name(), ".anchordb")
+				if name != "" {
+					seen[name] = struct{}{}
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for m := range seen {
+		names = append(names, m)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // getModel retrieves or dynamically opens an AnchorDB instance ("One DB = One Model")
 func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	cleanName, err := sanitizeModelName(modelName)
@@ -742,25 +913,36 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 
 	// Double check
 	if db, exists := s.models[modelName]; exists {
+		s.touchModelOrderLocked(modelName)
 		return db, nil
 	}
 
-	// Prevent unbounded model creation from exhausting file descriptors and memory
+	// Evict least-recently-used model when reaching maxLoadedModels cap.
 	const maxLoadedModels = 500
-	if len(s.models) >= maxLoadedModels {
-		return nil, fmt.Errorf("maximum loaded models limit reached (%d)", maxLoadedModels)
+	for len(s.models) >= maxLoadedModels {
+		if !s.evictLRUModelLocked() {
+			break
+		}
 	}
 
 	dbPath := filepath.Join(s.dataDir, modelName+".anchordb")
 	newDB, err := storage.OpenWithOptions(dbPath, s.dbOptions)
 	if err != nil {
-		// Log full detail (including the on-disk path) server-side only; the
-		// client gets a generic message so internal paths are not disclosed.
+		// Log full detail (including the on-disk path) server-side only; preserve
+		// sentinel error identity (e.g. ErrWALCorrupt) without disclosing dbPath.
 		log.Printf("[ERROR] Failed to open model %q at %s: %v", modelName, dbPath, err)
-		return nil, fmt.Errorf("failed to open model %q", modelName)
+		switch {
+		case errors.Is(err, storage.ErrWALCorrupt):
+			return nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrWALCorrupt)
+		case errors.Is(err, storage.ErrDatabaseClosed):
+			return nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrDatabaseClosed)
+		default:
+			return nil, fmt.Errorf("failed to open model %q", modelName)
+		}
 	}
 
 	s.models[modelName] = newDB
+	s.touchModelOrderLocked(modelName)
 	log.Printf("[INFO] Model %q loaded from disk: %s", modelName, dbPath)
 	return newDB, nil
 }
@@ -810,6 +992,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.draining.Load() {
 		// Readiness: tell load balancers / K8s to stop routing new traffic.
 		status, code = "shutting_down", http.StatusServiceUnavailable
+	} else if s.worker.IsBlocked() || s.scheduler.IsBlocked() {
+		status, code = "degraded", http.StatusServiceUnavailable
 	}
 
 	// Unauthenticated callers only get liveness/readiness. Internal state
@@ -831,19 +1015,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	var memSample runtime.MemStats
+	runtime.ReadMemStats(&memSample)
+
 	resp := map[string]interface{}{
 		"status":         status,
 		"engine":         "AnchorDB",
 		"uptime_seconds": time.Since(s.startTime).Seconds(),
 		"port":           s.port,
 		"loaded_models":  loadedModels,
-		"memory":         system.GetMemoryStats(),
+		"memory":         system.GetMemoryStatsFrom(memSample),
 		"background": map[string]interface{}{
 			"scheduler": map[string]interface{}{
 				"enabled": s.cronEnabled,
+				"blocked": s.scheduler.IsBlocked(),
 				"tasks":   len(s.scheduler.Tasks()),
 			},
-			"worker": s.worker.Stats(),
+			"worker":         s.worker.StatsFromMemStats(memSample),
+			"worker_blocked": s.worker.IsBlocked(),
 		},
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -859,8 +1048,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	models := len(s.models)
 	s.mu.RUnlock()
 
-	mem := system.GetMemoryStats()
-	ws := s.worker.Stats()
+	var memSample runtime.MemStats
+	runtime.ReadMemStats(&memSample)
+	mem := system.GetMemoryStatsFrom(memSample)
+	ws := s.worker.StatsFromMemStats(memSample)
 
 	draining := 0
 	if s.draining.Load() {
@@ -1150,14 +1341,13 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req SaveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1187,7 +1377,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
 				return
 			}
 			effectiveName = name
@@ -1202,7 +1392,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
 				return
 			}
 			effectiveName = name
@@ -1211,7 +1401,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 				effectiveName = uuid.NewString()
 			}
 			if _, err := db.AppendNode(effectiveName, coord, roles, uint16(opStatus)); err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
 				return
 			}
 		}
@@ -1227,7 +1417,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
 				return
 			}
 			effectiveName = name
@@ -1242,7 +1432,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 					writeJSONError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-				writeJSONError(w, http.StatusInternalServerError, err.Error())
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
 				return
 			}
 			effectiveName = name
@@ -1262,8 +1452,7 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req SaveBatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	if len(req.Records) == 0 {
@@ -1273,7 +1462,7 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1287,7 +1476,7 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1311,8 +1500,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = r.URL.Query().Get("name")
 	} else {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "invalid json body")
+		if !decodeJSONBody(w, r, &req, false) {
 			return
 		}
 	}
@@ -1332,8 +1520,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		computations[outField] = opCompute
 	}
 
-	// 1. Try Hot DB first
-	db, err := s.getModel(req.Model)
+	// 1. Try Hot DB first (read-only lookup avoids creating empty models on disk)
+	db, err := s.getExistingModel(req.Model)
+	if err != nil && !errors.Is(err, errModelNotFound) {
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
+		return
+	}
 	if err == nil {
 		cr, gErr := db.GetRecordTypedWithCompute(req.Name, computations, req.Select...)
 		if gErr == nil {
@@ -1357,6 +1549,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Transparent Cold Storage Fallback (not-found only)
 	cr, coldErr := s.GetColdRecordTyped(req.Model, req.Name, computations, req.Select)
+	if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+		writeJSONError(w, dispatchErrorStatus(coldErr), coldErr.Error())
+		return
+	}
 	if coldErr == nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":   true,
@@ -1381,14 +1577,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ListRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1451,14 +1646,13 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req UpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1482,10 +1676,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if isAsync {
 		jobID := uuid.New().String()
 		err := s.worker.DispatchAsync(
-			context.Background(),
+			s.asyncBaseContext(),
 			"update_"+req.Model,
-			func(_ context.Context) error {
+			func(taskCtx context.Context) error {
 				count, err := db.UpdateRecords(storage.UpdateOptions{
+					Context:        taskCtx,
 					TargetEntities: req.In,
 					Filters:        filters,
 					Mutations:      mutations,
@@ -1530,7 +1725,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1545,14 +1740,13 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req GraphRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1568,7 +1762,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if len(req.Relations) > 0 {
 		steps, err := db.ExecuteGraphChainWithContext(r.Context(), req.Inputs, req.Relations, limit, beamWidth)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeJSONError(w, dispatchErrorStatus(err), err.Error())
 			return
 		}
 		seq := make([]string, len(steps))
@@ -1589,7 +1783,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	results, anchor, err := db.ExecuteGraphStepWithContext(r.Context(), req.Inputs, req.Relation, limit, orderMode, beamWidth)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1606,14 +1800,13 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req EdgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1654,14 +1847,13 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req CausalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1693,14 +1885,13 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req MathRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
 	db, err := s.getModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1814,7 +2005,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1822,9 +2013,12 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("async") == "true" {
 		jobID := uuid.New().String()
 		err := s.worker.DispatchAsync(
-			context.Background(),
+			s.asyncBaseContext(),
 			"sync_"+modelName,
-			func(_ context.Context) error {
+			func(taskCtx context.Context) error {
+				if err := taskCtx.Err(); err != nil {
+					return err
+				}
 				return db.Sync()
 			},
 			worker.WithID(jobID),
@@ -1847,7 +2041,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := db.Sync(); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -1956,11 +2150,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	if req.Model != "" && req.Model != "all" {
 		targetModels = []string{req.Model}
 	} else {
-		s.mu.RLock()
-		for m := range s.models {
-			targetModels = append(targetModels, m)
-		}
-		s.mu.RUnlock()
+		targetModels = s.allModelNames()
 	}
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
@@ -1972,12 +2162,20 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		if modelTag == "" {
 			modelTag = "all"
 		}
+		completedModels := make(map[string]bool, len(targetModels))
 		err := s.worker.DispatchAsync(
-			context.Background(),
+			s.asyncBaseContext(),
 			"partition_run_async",
-			func(_ context.Context) error {
+			func(taskCtx context.Context) error {
 				var errs []error
 				for _, m := range targetModels {
+					if completedModels[m] {
+						continue
+					}
+					if err := taskCtx.Err(); err != nil {
+						errs = append(errs, err)
+						break
+					}
 					db, err := s.getModel(m)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
@@ -1994,7 +2192,10 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 					})
 					if err != nil {
 						errs = append(errs, fmt.Errorf("partition %s: %w", m, err))
-					} else if res != nil && res.ArchivedCount > 0 {
+						continue
+					}
+					completedModels[m] = true
+					if res != nil && res.ArchivedCount > 0 {
 						log.Printf("[WORKER] Async partition succeeded for model %q: %d records archived to %s",
 							m, res.ArchivedCount, res.TargetLocation)
 					}
@@ -2028,7 +2229,8 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 	for _, m := range targetModels {
 		db, err := s.getModel(m)
 		if err != nil {
-			continue
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("Partition failed opening model %s: %s", m, err.Error()))
+			return
 		}
 		res, err := partition.ExecutePartition(db, partition.PartitionPolicy{
 			ModelName:     m,
@@ -2086,7 +2288,11 @@ func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
 		}
 		info, err := e.Info()
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to stat partition %s: %s", e.Name(), err.Error()))
+			return
 		}
 		partitions = append(partitions, PartitionMetaDTO{
 			Name:      e.Name(),
@@ -2115,8 +2321,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req PartitionInspectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	if req.PartitionFile == "" {
@@ -2179,7 +2384,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open partition: %s", err.Error()))
 		return
 	}
-	defer pdb.Close()
+	defer closePartitionDB(pdb, cleanFilename)
 
 	if req.Name != "" {
 		cr, err := pdb.GetRecordTyped(req.Name)
@@ -2197,7 +2402,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	records, _, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list records in partition: %s", err.Error()))
 		return
@@ -2218,6 +2423,7 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		"partition_file": cleanFilename,
 		"records":        out,
 		"count":          len(out),
+		"has_more":       hasMore,
 	})
 }
 
@@ -2251,8 +2457,7 @@ func (s *Server) handlePartitionCatalogRecord(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var req PartitionCatalogRecordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	if req.Model == "" || req.Name == "" {
@@ -2295,8 +2500,7 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req PartitionS3ListRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
@@ -2332,7 +2536,11 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
-	sink.Region = req.S3Region
+	if region := req.S3Region; region != "" {
+		sink.Region = region
+	} else if s.s3DefaultRegion != "" {
+		sink.Region = s.s3DefaultRegion
+	}
 	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -2375,8 +2583,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req PartitionS3InspectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 
@@ -2421,7 +2628,11 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	}
 
 	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
-	sink.Region = req.S3Region
+	if region := req.S3Region; region != "" {
+		sink.Region = region
+	} else if s.s3DefaultRegion != "" {
+		sink.Region = s.s3DefaultRegion
+	}
 	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
 
 	limit := req.Limit
@@ -2432,7 +2643,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	records, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, targetKey, req.Name, limit)
+	records, hasMore, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTypedWithHasMore(ctx, sink, targetKey, req.Name, limit)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
 		return
@@ -2451,10 +2662,11 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"target":  targetKey,
-		"count":   len(records),
-		"records": records,
+		"success":  true,
+		"target":   targetKey,
+		"count":    len(records),
+		"has_more": hasMore,
+		"records":  records,
 	})
 }
 
@@ -2516,26 +2728,19 @@ func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc str
 }
 
 func (s *Server) fetchRecordTypedFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
-	var localFile string
 	if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
 		sink := s.buildS3SinkForEntry(entry, entry.PartitionFile)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-
-		var err error
-		localFile, err = s.s3Cache.EnsurePartition(ctx, sink, entry.PartitionFile)
-		if err != nil {
-			return storage.CompactRecord{}, err
-		}
-	} else {
-		localFile = filepath.Join(s.dataDir, "partitions", entry.PartitionFile)
+		return s.s3Cache.GetRecordTyped(ctx, sink, entry.PartitionFile, name, computations, selectFields)
 	}
 
+	localFile := filepath.Join(s.dataDir, "partitions", entry.PartitionFile)
 	pdb, err := storage.Open(localFile)
 	if err != nil {
 		return storage.CompactRecord{}, err
 	}
-	defer pdb.Close()
+	defer closePartitionDB(pdb, entry.PartitionFile)
 
 	if len(computations) > 0 || len(selectFields) > 0 {
 		return pdb.GetRecordTypedWithCompute(name, computations, selectFields...)
@@ -2569,23 +2774,24 @@ func (s *Server) GetColdRecordTyped(model, name string, computations map[string]
 func (s *Server) GetRecordTypedWithComputeTiered(model, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
 	// 1. Check Hot DB
 	db, err := s.getModel(model)
-	if err == nil {
-		var cr storage.CompactRecord
-		var hotErr error
-		if len(computations) > 0 || len(selectFields) > 0 {
-			cr, hotErr = db.GetRecordTypedWithCompute(name, computations, selectFields...)
-		} else {
-			cr, hotErr = db.GetRecordTyped(name)
-		}
-		if hotErr == nil {
-			return cr, nil
-		}
-		// Only a missing record may fall through to cold tier. Compute, IO,
-		// closed-DB and other failures keep their identity so callers never
-		// mistake them for "not found".
-		if !errors.Is(hotErr, storage.ErrRecordNotFound) {
-			return storage.CompactRecord{}, hotErr
-		}
+	if err != nil {
+		return storage.CompactRecord{}, err
+	}
+	var cr storage.CompactRecord
+	var hotErr error
+	if len(computations) > 0 || len(selectFields) > 0 {
+		cr, hotErr = db.GetRecordTypedWithCompute(name, computations, selectFields...)
+	} else {
+		cr, hotErr = db.GetRecordTyped(name)
+	}
+	if hotErr == nil {
+		return cr, nil
+	}
+	// Only a missing record may fall through to cold tier. Compute, IO,
+	// closed-DB and other failures keep their identity so callers never
+	// mistake them for "not found".
+	if !errors.Is(hotErr, storage.ErrRecordNotFound) {
+		return storage.CompactRecord{}, hotErr
 	}
 
 	// 2. Check Cold Tier via Partition Catalog
@@ -2666,7 +2872,7 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	if err != nil {
 		return wire.PartitionInspectWireResponse{}, err
 	}
-	defer pdb.Close()
+	defer closePartitionDB(pdb, cleanFilename)
 
 	if recordName != "" {
 		cr, err := pdb.GetRecordTyped(recordName)
@@ -2727,9 +2933,10 @@ func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 	taskName := r.URL.Query().Get("task")
 	if taskName == "" {
 		var req SchedulerRunRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
-			taskName = req.Task
+		if !decodeJSONBody(w, r, &req, true) {
+			return
 		}
+		taskName = req.Task
 	}
 	taskName = strings.TrimSpace(taskName)
 	if taskName == "" {
@@ -2782,8 +2989,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CollectorRunRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %s", err.Error()))
+	if !decodeJSONBody(w, r, &req, true) {
 		return
 	}
 
@@ -2796,11 +3002,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 	if req.Model != "" && req.Model != "*" {
 		targetModels = []string{req.Model}
 	} else {
-		s.mu.RLock()
-		for m := range s.models {
-			targetModels = append(targetModels, m)
-		}
-		s.mu.RUnlock()
+		targetModels = s.allModelNames()
 	}
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
@@ -2810,29 +3012,46 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		if modelTag == "" {
 			modelTag = "*"
 		}
+		completedModels := make(map[string]bool, len(targetModels))
+		pendingSync := make(map[string]bool, len(targetModels))
 		err := s.worker.DispatchAsync(
-			context.Background(),
+			s.asyncBaseContext(),
 			"collector_run_async",
-			func(_ context.Context) error {
+			func(taskCtx context.Context) error {
 				total := 0
 				var errs []error
 				for _, m := range targetModels {
+					if completedModels[m] {
+						continue
+					}
+					if err := taskCtx.Err(); err != nil {
+						errs = append(errs, err)
+						break
+					}
 					db, err := s.getModel(m)
 					if err != nil {
 						errs = append(errs, fmt.Errorf("model %s: %w", m, err))
 						continue
 					}
-					purged, err := db.CollectTombstones(maxBatch)
-					if err != nil {
-						errs = append(errs, fmt.Errorf("collect %s: %w", m, err))
+					if !pendingSync[m] {
+						purged, err := db.CollectTombstones(maxBatch)
+						if err != nil {
+							errs = append(errs, fmt.Errorf("collect %s: %w", m, err))
+							continue
+						}
+						total += purged
+						if purged == 0 {
+							completedModels[m] = true
+							continue
+						}
+						pendingSync[m] = true
+					}
+					if err := db.Sync(); err != nil {
+						errs = append(errs, fmt.Errorf("sync %s: %w", m, err))
 						continue
 					}
-					if purged > 0 {
-						if err := db.Sync(); err != nil {
-							errs = append(errs, fmt.Errorf("sync %s: %w", m, err))
-						}
-					}
-					total += purged
+					pendingSync[m] = false
+					completedModels[m] = true
 				}
 				if total > 0 {
 					log.Printf("[WORKER] Async collector sweep succeeded: %d tombstones purged", total)
@@ -2863,7 +3082,8 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 	for _, m := range targetModels {
 		db, err := s.getModel(m)
 		if err != nil {
-			continue
+			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("collector failed opening model %s: %s", m, err.Error()))
+			return
 		}
 		purged, err := db.CollectTombstones(maxBatch)
 		if err != nil {
@@ -2956,8 +3176,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ModelAttachRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	modelName := strings.TrimSpace(req.Model)
@@ -2971,7 +3190,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -3008,9 +3227,19 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 	if modelName == "" {
 		modelName = "default"
 	}
-	db, err := s.getModel(modelName)
+	db, err := s.getExistingModel(modelName)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, errModelNotFound) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "no schema attached to model",
+				"model":   modelName,
+			})
+			return
+		}
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -3045,8 +3274,7 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ModelResetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	if !req.Confirm {
@@ -3060,12 +3288,12 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 
 	db, err := s.getModel(modelName)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
 	if err := db.ResetSchema(); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
@@ -3090,8 +3318,15 @@ func getEnvBool(key string, fallback bool) bool {
 	if val == "" {
 		return fallback
 	}
-	val = strings.ToLower(val)
-	return val == "true" || val == "1" || val == "yes"
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
+	default:
+		log.Printf("[WARN] Invalid boolean env %s=%q; using fallback %v", key, val, fallback)
+		return fallback
+	}
 }
 
 func getEnvInt(key string, fallback int) int {
@@ -3099,10 +3334,12 @@ func getEnvInt(key string, fallback int) int {
 	if val == "" {
 		return fallback
 	}
-	if i, err := strconv.Atoi(val); err == nil {
-		return i
+	i, err := strconv.Atoi(val)
+	if err != nil {
+		log.Printf("[WARN] Invalid integer env %s=%q; using fallback %d", key, val, fallback)
+		return fallback
 	}
-	return fallback
+	return i
 }
 
 func getEnvFloat(key string, fallback float64) float64 {
@@ -3110,10 +3347,12 @@ func getEnvFloat(key string, fallback float64) float64 {
 	if val == "" {
 		return fallback
 	}
-	if f, err := strconv.ParseFloat(val, 64); err == nil {
-		return f
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		log.Printf("[WARN] Invalid float env %s=%q; using fallback %g", key, val, fallback)
+		return fallback
 	}
-	return fallback
+	return f
 }
 
 // resolveDBOptions parses the WAL durability configuration with precedence
@@ -3403,7 +3642,7 @@ func main() {
 			Enabled:         workerEnabled,
 			Concurrency:     workerConcurrency,
 			QueueSize:       workerQueueSize,
-			ShutdownTimeout: shutdownTimeout / 6,
+			ShutdownTimeout: shutdownTimeout / 8,
 			EnforceMemory:   workerEnforceMemory,
 			MemoryThreshold: workerMemoryThreshold,
 		},
@@ -3431,6 +3670,8 @@ func main() {
 		fmt.Println("  Auth        : Disabled")
 	}
 
+	listenErr := make(chan error, 2)
+
 	if wirePortStr != "none" && wirePortStr != "off" && wirePortStr != "" {
 		wireAddr := wirePortStr
 		if !strings.Contains(wireAddr, ":") {
@@ -3446,7 +3687,7 @@ func main() {
 		go func() {
 			log.Printf("[READY] AnchorWire TCP Binary Protocol listening on %s ...", wireAddr)
 			if err := server.WireServer().Serve(wireListener); err != nil && !errors.Is(err, net.ErrClosed) {
-				log.Printf("[WARN] AnchorWire server terminated with error: %v", err)
+				listenErr <- fmt.Errorf("wire server: %w", err)
 			}
 		}()
 	}
@@ -3462,7 +3703,6 @@ func main() {
 		MaxHeaderBytes:    64 << 10, // cap request headers at 64 KiB (default is 1 MiB)
 	}
 
-	listenErr := make(chan error, 1)
 	go func() {
 		log.Printf("[READY] AnchorDB Server listening on %s ...", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

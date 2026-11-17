@@ -41,6 +41,7 @@ type LayoutEvaluationReport struct {
 	MmapZeroCopyReadOpsSec   float64
 	MmapHeapBytesPerRecord   uint64
 	MmapGCPauseDuration      time.Duration
+	Errors                   int
 }
 
 // SampleBenchmarkAttrs returns 8 representative mixed-type numeric attributes.
@@ -599,63 +600,92 @@ func RunLayoutBenchmark(iterations int) LayoutEvaluationReport {
 
 	// 3 & 4. WAL Write/Recovery Speed & Mmap/GC Overhead on Real AnchorDB Engine
 	dir, err := os.MkdirTemp("", "bench_phase3_layout_*")
-	if err == nil {
-		defer os.RemoveAll(dir)
-		const engineRecords = 10_000
-		entityNames := make([]string, engineRecords)
-		for i := 0; i < engineRecords; i++ {
-			entityNames[i] = fmt.Sprintf("entity_%d", i)
-		}
-		dbPath := filepath.Join(dir, "layout.anchordb")
-		db, err := OpenWithOptions(dbPath, Options{
-			WAL: WALOptions{SyncMode: SyncNone},
-		})
-		if err == nil {
-			tWrite := time.Now()
-			for i := 0; i < engineRecords; i++ {
-				_, _ = db.SaveRecordTyped(entityNames[i], attrs)
-			}
-			writeDur := time.Since(tWrite)
-			report.WALWriteOpsSec = float64(engineRecords) / writeDur.Seconds()
+	if err != nil {
+		report.Errors++
+		return report
+	}
+	defer os.RemoveAll(dir)
+
+	const engineRecords = 10_000
+	entityNames := make([]string, engineRecords)
+	for i := 0; i < engineRecords; i++ {
+		entityNames[i] = fmt.Sprintf("entity_%d", i)
+	}
+	dbPath := filepath.Join(dir, "layout.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{
+		WAL: WALOptions{SyncMode: SyncNone},
+	})
+	if err != nil {
+		report.Errors++
+		return report
+	}
+
+	tWrite := time.Now()
+	for i := 0; i < engineRecords; i++ {
+		if _, err := db.SaveRecordTyped(entityNames[i], attrs); err != nil {
+			report.Errors++
 			_ = db.Close()
-
-			// Measure WAL Crash Recovery Speed (reopening before Sync replays all 10,000 WAL frames)
-			tRecover := time.Now()
-			dbRecovered, err := OpenWithOptions(dbPath, Options{
-				WAL: WALOptions{SyncMode: SyncNone},
-			})
-			recoverDur := time.Since(tRecover)
-			if err == nil {
-				report.WALRecoveryOpsSec = float64(engineRecords) / recoverDur.Seconds()
-
-				// Sync to mmap (.adb) so all records point to zero-copy Raw slices
-				_ = dbRecovered.Sync()
-				runtime.GC()
-				var memBefore, memAfter runtime.MemStats
-				runtime.ReadMemStats(&memBefore)
-
-				tMmapRead := time.Now()
-				for i := 0; i < engineRecords; i++ {
-					if cr, ok := dbRecovered.EntityStore[entityNames[i]]; ok {
-						_, _ = cr.GetUint("views")
-						_, _ = cr.Get("rating")
-						_, _ = cr.GetFloat64("stat_dev")
-					}
-				}
-				mmapReadDur := time.Since(tMmapRead)
-				report.MmapZeroCopyReadOpsSec = float64(engineRecords*3) / mmapReadDur.Seconds()
-
-				runtime.ReadMemStats(&memAfter)
-				if memAfter.TotalAlloc >= memBefore.TotalAlloc {
-					report.MmapHeapBytesPerRecord = (memAfter.TotalAlloc - memBefore.TotalAlloc) / engineRecords
-				}
-
-				tGC := time.Now()
-				runtime.GC()
-				report.MmapGCPauseDuration = time.Since(tGC)
-				_ = dbRecovered.Close()
-			}
+			return report
 		}
+	}
+	writeDur := time.Since(tWrite)
+	report.WALWriteOpsSec = float64(engineRecords) / writeDur.Seconds()
+	if err := db.Close(); err != nil {
+		report.Errors++
+		return report
+	}
+
+	// Measure WAL Crash Recovery Speed (reopening before Sync replays all 10,000 WAL frames)
+	tRecover := time.Now()
+	dbRecovered, err := OpenWithOptions(dbPath, Options{
+		WAL: WALOptions{SyncMode: SyncNone},
+	})
+	recoverDur := time.Since(tRecover)
+	if err != nil {
+		report.Errors++
+		return report
+	}
+	report.WALRecoveryOpsSec = float64(engineRecords) / recoverDur.Seconds()
+
+	// Sync to mmap (.adb) so all records point to zero-copy Raw slices
+	if err := dbRecovered.Sync(); err != nil {
+		report.Errors++
+		_ = dbRecovered.Close()
+		return report
+	}
+	runtime.GC()
+	var memBefore, memAfter runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
+	tMmapRead := time.Now()
+	for i := 0; i < engineRecords; i++ {
+		if cr, ok := dbRecovered.EntityStore[entityNames[i]]; ok {
+			if _, ok := cr.GetUint("views"); !ok {
+				report.Errors++
+			}
+			if _, ok := cr.Get("rating"); !ok {
+				report.Errors++
+			}
+			if _, ok := cr.GetFloat64("stat_dev"); !ok {
+				report.Errors++
+			}
+		} else {
+			report.Errors++
+		}
+	}
+	mmapReadDur := time.Since(tMmapRead)
+	report.MmapZeroCopyReadOpsSec = float64(engineRecords*3) / mmapReadDur.Seconds()
+
+	runtime.ReadMemStats(&memAfter)
+	if memAfter.TotalAlloc >= memBefore.TotalAlloc {
+		report.MmapHeapBytesPerRecord = (memAfter.TotalAlloc - memBefore.TotalAlloc) / engineRecords
+	}
+
+	tGC := time.Now()
+	runtime.GC()
+	report.MmapGCPauseDuration = time.Since(tGC)
+	if err := dbRecovered.Close(); err != nil {
+		report.Errors++
 	}
 
 	return report

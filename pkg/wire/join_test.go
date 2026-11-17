@@ -286,3 +286,25 @@ func TestJoinManager_HMACSignatureLength(t *testing.T) {
 		t.Errorf("expected 32 hex chars (128-bit) for SessionKey HMAC sig, got %d (%q)", len(sessSig), sessSig)
 	}
 }
+
+func TestJoinManager_InvalidCIDRAndNonIPFailsClosed(t *testing.T) {
+	jmBad := NewJoinManager(JoinConfig{
+		GatewayMode:        true,
+		PairingAllowedCIDR: "not-a-cidr",
+	})
+	if jmBad.InitError() == nil {
+		t.Fatal("expected InitError on invalid PairingAllowedCIDR")
+	}
+	if _, _, err := jmBad.HandleStructuredAuth(AuthRequest{Type: AuthTypePairing, NodeID: "n1"}, mockAddr{ipStr: "127.0.0.1:1234"}); err == nil {
+		t.Fatal("expected HandleStructuredAuth to fail when JoinManager has InitError")
+	}
+
+	jmCIDR := NewJoinManager(JoinConfig{
+		GatewayMode:        true,
+		PairingAllowedCIDR: "10.0.0.0/8",
+	})
+	_, code, err := jmCIDR.HandleStructuredAuth(AuthRequest{Type: AuthTypePairing, NodeID: "n1"}, mockAddr{ipStr: "not-an-ip"})
+	if err == nil || code != ErrCodeIPNotAllowed {
+		t.Fatalf("expected ErrCodeIPNotAllowed for unparsable remote IP, got code=%d err=%v", code, err)
+	}
+}

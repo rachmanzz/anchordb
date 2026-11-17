@@ -480,3 +480,145 @@ func TestWire_FullFeatureParity_EndToEnd(t *testing.T) {
 		t.Fatalf("expected GetSchema to error after reset, got nil")
 	}
 }
+
+func TestWire_ClientCloseUnblocksInFlightCall(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	client, err := Connect(l.Addr().String(), WithClientTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	serverConn := <-accepted
+	defer serverConn.Close()
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- client.Ping()
+	}()
+
+	// Give Ping a moment to block inside ReadFrame, then Close() must return immediately.
+	time.Sleep(30 * time.Millisecond)
+	start := time.Now()
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Close blocked on in-flight call for %v", elapsed)
+	}
+
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatalf("expected in-flight Ping to fail after Close")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("in-flight Ping did not unblock after Close")
+	}
+}
+
+func TestWire_CausalChainSingleRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend := &mockBackend{
+		dataDir: tmpDir,
+		models:  make(map[string]*storage.AnchorDB),
+	}
+	defer backend.CloseAll()
+
+	srv := NewServer(backend)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = srv.Serve(l) }()
+	defer srv.Close()
+
+	client, err := Connect(l.Addr().String())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Edge("add", "a", "triggers", "b", 0.5); err != nil {
+		t.Fatalf("Edge a->b: %v", err)
+	}
+	if err := client.Edge("add", "b", "causes", "c", 0.8); err != nil {
+		t.Fatalf("Edge b->c: %v", err)
+	}
+
+	res, err := client.CausalChain([]string{"a"}, []string{"triggers", "causes"}, 5)
+	if err != nil {
+		t.Fatalf("CausalChain: %v", err)
+	}
+	if len(res) != 1 || res[0].Word != "c" {
+		t.Fatalf("expected final chain node [c], got %+v", res)
+	}
+}
+
+func TestWire_NoJoinManagerAuthAndGroupCommitNodeEntityStore(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend := &mockBackend{
+		dataDir: tmpDir,
+		models:  make(map[string]*storage.AnchorDB),
+	}
+	defer backend.CloseAll()
+
+	srv := NewServer(backend)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = srv.Serve(l) }()
+	defer srv.Close()
+
+	// Structured pairing without JoinManager must return 501, not 401.
+	c1, err := Connect(l.Addr().String())
+	if err != nil {
+		t.Fatalf("Connect c1: %v", err)
+	}
+	if _, err := c1.AuthPairing("node-x"); err == nil {
+		_ = c1.Close()
+		t.Fatalf("expected pairing without JoinManager to fail")
+	} else if we, ok := err.(*WireError); !ok || we.Code != 501 {
+		_ = c1.Close()
+		t.Fatalf("expected WireError code 501, got %v", err)
+	}
+	_ = c1.Close()
+
+	// AuthTypeStatic without JoinManager must not mint an unsigned fake SESS.default ticket.
+	c2, err := Connect(l.Addr().String())
+	if err != nil {
+		t.Fatalf("Connect c2: %v", err)
+	}
+	defer c2.Close()
+	sess, err := c2.AuthStructured(AuthRequest{Type: AuthTypeStatic, NodeID: "node-x"})
+	if err != nil {
+		t.Fatalf("AuthStructured static failed: %v", err)
+	}
+	if sess != "" {
+		t.Fatalf("expected no fake session token when JoinManager is nil, got %q", sess)
+	}
+
+	// Group-committed OpSave with Coord and empty Props must enter EntityStore cleanly.
+	item := storage.BatchRecordItem{
+		Name:  "spatial-node-empty-props",
+		Coord: &spatial.Point2D{X: 3.5, Y: -2.0},
+	}
+	if _, err := c2.call(OpSave, EncodeSavePayload(item)); err != nil {
+		t.Fatalf("OpSave spatial node: %v", err)
+	}
+	if _, _, err := c2.Get("spatial-node-empty-props"); err != nil {
+		t.Fatalf("expected spatial node saved via group committer to be readable from EntityStore, got %v", err)
+	}
+}

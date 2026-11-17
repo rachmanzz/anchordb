@@ -33,6 +33,8 @@ var (
 	ErrInvalidPreimage = errors.New("wire: invalid validator preimage")
 	// ErrCorruptCommitmentFile is returned when commitments.bin fails validation.
 	ErrCorruptCommitmentFile = errors.New("wire: corrupt commitment file")
+	// ErrStagedCommitmentMismatch is returned when operational confirmation no longer matches the staged commitment.
+	ErrStagedCommitmentMismatch = errors.New("wire: staged commitment mismatch")
 )
 
 // CommitmentRecord holds persistent commitment state for a registered connector node.
@@ -92,7 +94,7 @@ func (cs *CommitmentStore) load() error {
 	var hdr [16]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil
+			return fmt.Errorf("%w: empty or truncated commitment header", ErrCorruptCommitmentFile)
 		}
 		return fmt.Errorf("wire: failed to read commitment header: %w", err)
 	}
@@ -157,6 +159,19 @@ func (cs *CommitmentStore) load() error {
 	return nil
 }
 
+func (cs *CommitmentStore) persistWithRestoreLocked(nodeID string, hadPrev bool, prev CommitmentRecord) error {
+	if err := cs.persistSyncLocked(); err != nil {
+		if hadPrev {
+			restored := prev
+			cs.records[nodeID] = &restored
+		} else {
+			delete(cs.records, nodeID)
+		}
+		return err
+	}
+	return nil
+}
+
 // RegisterInitial registers an initial commitment for a newly paired or enrolled node.
 func (cs *CommitmentStore) RegisterInitial(nodeID string, commitment [32]byte) error {
 	if nodeID == "" {
@@ -166,13 +181,14 @@ func (cs *CommitmentStore) RegisterInitial(nodeID string, commitment [32]byte) e
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	rec, exists := cs.records[nodeID]
-	if exists {
-		// Update existing node commitment
-		rec.CurrentCommitment = commitment
-		rec.StagedCommitment = [32]byte{}
-		rec.State = StateActive
-		rec.LastRotatedAt = time.Now().UnixNano()
+	var prev CommitmentRecord
+	existing, hadPrev := cs.records[nodeID]
+	if hadPrev {
+		prev = *existing
+		existing.CurrentCommitment = commitment
+		existing.StagedCommitment = [32]byte{}
+		existing.State = StateActive
+		existing.LastRotatedAt = time.Now().UnixNano()
 	} else {
 		cs.records[nodeID] = &CommitmentRecord{
 			NodeID:            nodeID,
@@ -182,7 +198,7 @@ func (cs *CommitmentStore) RegisterInitial(nodeID string, commitment [32]byte) e
 		}
 	}
 
-	return cs.persistSyncLocked()
+	return cs.persistWithRestoreLocked(nodeID, hadPrev, prev)
 }
 
 // StageReauth validates the current validator preimage and stages the next commitment.
@@ -197,13 +213,14 @@ func (cs *CommitmentStore) StageReauth(nodeID string, validator [32]byte, nextCo
 	}
 
 	givenHash := sha256.Sum256(validator[:])
+	prev := *rec
 
 	// Case A: Validator matches CurrentCommitment (Normal Rotation)
 	if subtle.ConstantTimeCompare(givenHash[:], rec.CurrentCommitment[:]) == 1 {
 		rec.StagedCommitment = nextCommitment
 		rec.State = StateStagedPending
 		rec.LastRotatedAt = time.Now().UnixNano()
-		if err := cs.persistSyncLocked(); err != nil {
+		if err := cs.persistWithRestoreLocked(nodeID, true, prev); err != nil {
 			return 500, err
 		}
 		return 0, nil
@@ -215,7 +232,7 @@ func (cs *CommitmentStore) StageReauth(nodeID string, validator [32]byte, nextCo
 		rec.StagedCommitment = nextCommitment
 		rec.State = StateStagedPending
 		rec.LastRotatedAt = time.Now().UnixNano()
-		if err := cs.persistSyncLocked(); err != nil {
+		if err := cs.persistWithRestoreLocked(nodeID, true, prev); err != nil {
 			return 500, err
 		}
 		return 0, nil
@@ -227,6 +244,15 @@ func (cs *CommitmentStore) StageReauth(nodeID string, validator [32]byte, nextCo
 
 // ConfirmOperational promotes any staged commitment to active once an operational frame is received.
 func (cs *CommitmentStore) ConfirmOperational(nodeID string) error {
+	return cs.confirmOperational(nodeID, nil)
+}
+
+// ConfirmOperationalExpected promotes the staged commitment only if it still matches expectedStaged.
+func (cs *CommitmentStore) ConfirmOperationalExpected(nodeID string, expectedStaged [32]byte) error {
+	return cs.confirmOperational(nodeID, &expectedStaged)
+}
+
+func (cs *CommitmentStore) confirmOperational(nodeID string, expectedStaged *[32]byte) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -234,11 +260,15 @@ func (cs *CommitmentStore) ConfirmOperational(nodeID string) error {
 	if !exists || rec.State != StateStagedPending {
 		return nil
 	}
+	if expectedStaged != nil && subtle.ConstantTimeCompare(rec.StagedCommitment[:], expectedStaged[:]) != 1 {
+		return ErrStagedCommitmentMismatch
+	}
 
+	prev := *rec
 	rec.CurrentCommitment = rec.StagedCommitment
 	rec.StagedCommitment = [32]byte{}
 	rec.State = StateActive
-	return cs.persistSyncLocked()
+	return cs.persistWithRestoreLocked(nodeID, true, prev)
 }
 
 // Get retrieves a snapshot of the commitment record for a given node.
@@ -276,8 +306,9 @@ func (cs *CommitmentStore) persistSyncLocked() error {
 		nodeBytes := []byte(rec.NodeID)
 		nodeLen := len(nodeBytes)
 		if nodeLen > 65535 {
-			nodeBytes = nodeBytes[:65535]
-			nodeLen = 65535
+			_ = f.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("commitment node ID length %d exceeds 65535-byte limit", nodeLen)
 		}
 
 		payloadLen := 2 + nodeLen + 32 + 32 + 1 + 8

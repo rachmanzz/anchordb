@@ -58,18 +58,28 @@ type JoinTokenEntry struct {
 
 // JoinManager coordinates pairing windows, one-time keys, session tickets, and gateway isolation.
 type JoinManager struct {
-	mu              sync.RWMutex
-	gatewayMode     bool
-	joinMode        string
-	pairingActive   bool
-	pairingExpiry   time.Time
-	allowedNets     []*net.IPNet
-	sessionSecret   []byte
-	staticToken     string
-	clusterID       string
-	otkSecret       []byte
-	otkTokens       map[string]*JoinTokenEntry
-	commitmentStore *CommitmentStore
+	mu               sync.RWMutex
+	gatewayMode      bool
+	joinMode         string
+	explicitJoinMode bool
+	pairingActive    bool
+	pairingExpiry    time.Time
+	allowedNets      []*net.IPNet
+	sessionSecret    []byte
+	staticToken      string
+	clusterID        string
+	otkSecret        []byte
+	otkTokens        map[string]*JoinTokenEntry
+	commitmentStore  *CommitmentStore
+	initErr          error
+}
+
+// InitError returns any configuration or storage error encountered while initializing JoinManager.
+func (jm *JoinManager) InitError() error {
+	if jm == nil {
+		return nil
+	}
+	return jm.initErr
 }
 
 // NewJoinManager creates and initializes a JoinManager.
@@ -80,6 +90,7 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 	if cfg.PairingTimeout <= 0 {
 		cfg.PairingTimeout = 120 * time.Second
 	}
+	explicitJoinMode := cfg.JoinMode != ""
 	if cfg.JoinMode == "" {
 		if cfg.GatewayMode {
 			cfg.JoinMode = "pairing"
@@ -88,13 +99,14 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 		}
 	}
 
+	var initErrs []error
 	var sessionSecretBytes []byte
 	if cfg.SessionSecret != "" {
 		sessionSecretBytes = []byte(cfg.SessionSecret)
 	} else {
 		sessionSecretBytes = make([]byte, 32)
 		if _, err := rand.Read(sessionSecretBytes); err != nil {
-			copy(sessionSecretBytes, []byte("anchordb-default-session-secret-key-32b"))
+			initErrs = append(initErrs, fmt.Errorf("wire: failed generating session secret entropy: %w", err))
 		}
 	}
 
@@ -123,6 +135,8 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 			}
 			if _, cidrNet, err := net.ParseCIDR(part); err == nil {
 				allowedNets = append(allowedNets, cidrNet)
+			} else {
+				initErrs = append(initErrs, fmt.Errorf("wire: invalid pairing CIDR %q: %w", part, err))
 			}
 		}
 	}
@@ -132,24 +146,28 @@ func NewJoinManager(cfg JoinConfig) *JoinManager {
 		cs = cfg.CommitmentStore
 	} else if cfg.CommitmentStorePath != "" {
 		opened, err := OpenCommitmentStore(cfg.CommitmentStorePath)
-		if err == nil {
+		if err != nil {
+			initErrs = append(initErrs, fmt.Errorf("wire: failed opening commitment store: %w", err))
+		} else {
 			cs = opened
 		}
 	}
 
 	jm := &JoinManager{
-		gatewayMode:     cfg.GatewayMode,
-		joinMode:        cfg.JoinMode,
-		sessionSecret:   sessionSecretBytes,
-		staticToken:     cfg.AuthToken,
-		clusterID:       cfg.ClusterID,
-		otkSecret:       otkSecretBytes,
-		otkTokens:       make(map[string]*JoinTokenEntry),
-		allowedNets:     allowedNets,
-		commitmentStore: cs,
+		gatewayMode:      cfg.GatewayMode,
+		joinMode:         cfg.JoinMode,
+		explicitJoinMode: explicitJoinMode,
+		sessionSecret:    sessionSecretBytes,
+		staticToken:      cfg.AuthToken,
+		clusterID:        cfg.ClusterID,
+		otkSecret:        otkSecretBytes,
+		otkTokens:        make(map[string]*JoinTokenEntry),
+		allowedNets:      allowedNets,
+		commitmentStore:  cs,
+		initErr:          errors.Join(initErrs...),
 	}
 
-	if cfg.GatewayMode || cfg.JoinMode == "pairing" {
+	if jm.initErr == nil && (cfg.GatewayMode || cfg.JoinMode == "pairing") {
 		jm.pairingActive = true
 		jm.pairingExpiry = time.Now().Add(cfg.PairingTimeout)
 	}
@@ -384,6 +402,9 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 	if jm == nil {
 		return "", ErrCodeUnauthorized, ErrInvalidToken
 	}
+	if jm.initErr != nil {
+		return "", 500, jm.initErr
+	}
 
 	switch req.Type {
 	case AuthTypePairing:
@@ -401,18 +422,20 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 				host = remoteAddr.String()
 			}
 			ip := net.ParseIP(host)
-			if ip != nil {
-				matched := false
-				for _, allowed := range jm.allowedNets {
-					if allowed.Contains(ip) {
-						matched = true
-						break
-					}
+			if ip == nil {
+				jm.mu.Unlock()
+				return "", ErrCodeIPNotAllowed, ErrIPNotAllowed
+			}
+			matched := false
+			for _, allowed := range jm.allowedNets {
+				if allowed.Contains(ip) {
+					matched = true
+					break
 				}
-				if !matched {
-					jm.mu.Unlock()
-					return "", ErrCodeIPNotAllowed, ErrIPNotAllowed
-				}
+			}
+			if !matched {
+				jm.mu.Unlock()
+				return "", ErrCodeIPNotAllowed, ErrIPNotAllowed
 			}
 		}
 
@@ -421,8 +444,12 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 		jm.mu.Unlock()
 
 		sessKey := jm.GenerateSessionKey(req.NodeID)
-		if req.HasCommitment && jm.commitmentStore != nil {
-			_ = jm.commitmentStore.RegisterInitial(req.NodeID, req.InitialCommitment)
+		if req.HasCommitment {
+			if cs := jm.CommitmentStore(); cs != nil {
+				if rErr := cs.RegisterInitial(req.NodeID, req.InitialCommitment); rErr != nil {
+					return "", 500, fmt.Errorf("failed registering initial commitment: %w", rErr)
+				}
+			}
 		}
 		return sessKey, 0, nil
 
@@ -432,8 +459,12 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 			return "", ErrCodeOTKExpiredOrBurned, ErrOTKExpiredOrBurned
 		}
 		sessKey := jm.GenerateSessionKey(req.NodeID)
-		if req.HasCommitment && jm.commitmentStore != nil {
-			_ = jm.commitmentStore.RegisterInitial(req.NodeID, req.InitialCommitment)
+		if req.HasCommitment {
+			if cs := jm.CommitmentStore(); cs != nil {
+				if rErr := cs.RegisterInitial(req.NodeID, req.InitialCommitment); rErr != nil {
+					return "", 500, fmt.Errorf("failed registering initial commitment: %w", rErr)
+				}
+			}
 		}
 		return sessKey, 0, nil
 
@@ -446,10 +477,11 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 		return req.Credential, 0, nil
 
 	case AuthTypeStagedReauth:
-		if jm.commitmentStore == nil {
+		cs := jm.CommitmentStore()
+		if cs == nil {
 			return "", ErrCodeUnauthorized, ErrUnknownNodeID
 		}
-		code, aErr := jm.commitmentStore.StageReauth(req.NodeID, req.Validator, req.NextCommitment)
+		code, aErr := cs.StageReauth(req.NodeID, req.Validator, req.NextCommitment)
 		if aErr != nil {
 			return "", code, aErr
 		}
@@ -460,6 +492,9 @@ func (jm *JoinManager) HandleStructuredAuth(req AuthRequest, remoteAddr net.Addr
 			return "", ErrCodeUnauthorized, ErrUnauthorizedGateway
 		}
 		if jm.staticToken == "" {
+			if jm.explicitJoinMode && (jm.joinMode == "pairing" || jm.joinMode == "otk") {
+				return "", ErrCodeUnauthorized, ErrInvalidToken
+			}
 			return "", 0, nil
 		}
 		if subtle.ConstantTimeCompare([]byte(req.Credential), []byte(jm.staticToken)) == 1 {

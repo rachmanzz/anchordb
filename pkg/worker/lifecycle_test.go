@@ -556,3 +556,100 @@ func TestShutdownGlobalReturnsShutdownTimeout(t *testing.T) {
 		t.Fatal("global registry should be cleared after shutdown attempt")
 	}
 }
+
+func TestShutdown_CancelsTaskContextAndDrainsPending(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 8
+	cfg.ShutdownTimeout = 40 * time.Millisecond
+	p := NewPool(cfg)
+	p.Start()
+
+	started := make(chan struct{})
+	var ctxCanceled atomic.Bool
+	if err := p.DispatchAsync(context.Background(), "ctx-aware", func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		ctxCanceled.Store(true)
+		return ctx.Err()
+	}); err != nil {
+		t.Fatalf("dispatch running: %v", err)
+	}
+	<-started
+
+	var canceledQueued atomic.Int32
+	for i := 0; i < 3; i++ {
+		if err := p.DispatchAsync(context.Background(), "queued", func(context.Context) error {
+			return nil
+		}, WithOnError(func(_ context.Context, err error) {
+			if errors.Is(err, ErrCanceled) {
+				canceledQueued.Add(1)
+			}
+		})); err != nil {
+			t.Fatalf("dispatch queued: %v", err)
+		}
+	}
+
+	if err := p.Shutdown(); err != nil {
+		t.Fatalf("expected clean force-cancel shutdown, got %v", err)
+	}
+	if !ctxCanceled.Load() {
+		t.Fatal("expected Shutdown phase 2 to cancel task context")
+	}
+	if st := p.Stats(); st.Queued != 0 || st.InFlight != 0 || p.pending.Load() != 0 {
+		t.Fatalf("expected Queued=0/InFlight=0/pending=0 after Shutdown, got %+v (pending=%d)", st, p.pending.Load())
+	}
+	if canceledQueued.Load() == 0 {
+		t.Fatal("expected unconsumed queued tasks to be reported as canceled")
+	}
+}
+
+func TestCancelMatching_PredicatePanicDoesNotDeadlock(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 8
+	p := NewPool(cfg)
+	p.Start()
+	defer func() { _ = p.Shutdown() }()
+
+	block := make(chan struct{})
+	_ = p.Dispatch(context.Background(), "blocker", func(context.Context) error {
+		<-block
+		return nil
+	})
+	_ = p.Dispatch(context.Background(), "queued-item", func(context.Context) error { return nil })
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		p.CancelMatching(func(Task) bool {
+			panic("predicate boom")
+		})
+	}()
+	if recovered == nil {
+		t.Fatal("expected predicate panic to propagate after releasing chanMu")
+	}
+	close(block)
+
+	if err := p.Dispatch(context.Background(), "after-panic", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("pool should remain usable after predicate panic, got %v", err)
+	}
+}
+
+func TestDispatch_RejectedTaskDoesNotInflateDispatchedCount(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Concurrency = 1
+	cfg.QueueSize = 1
+	p := NewPool(cfg)
+	p.Start()
+	defer func() { _ = p.Shutdown() }()
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.DispatchAsync(canceledCtx, "canceled", func(context.Context) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if st := p.Stats(); st.Dispatched != 0 || p.pending.Load() != 0 {
+		t.Fatalf("rejected task must not increment Dispatched/pending, got dispatched=%d pending=%d", st.Dispatched, p.pending.Load())
+	}
+}

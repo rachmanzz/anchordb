@@ -24,6 +24,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -147,14 +148,16 @@ type runState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	stop   chan struct{}
+	done   chan struct{}
 	wg     sync.WaitGroup
 }
 
 // InternalScheduler provides pure Go standard library task scheduling.
 type InternalScheduler struct {
-	mu    sync.RWMutex
-	tasks map[string]*registeredTask
-	run   *runState // non-nil only while running
+	mu          sync.RWMutex
+	tasks       map[string]*registeredTask
+	run         *runState // non-nil only while running
+	drainingRun *runState // non-nil if a previous Shutdown timed out with active workers
 
 	timeoutNs atomic.Int64 // per-execution timeout (ns); 0 = none
 	jitterNs  atomic.Int64 // max random delay added to fire time (ns); 0 = none
@@ -399,22 +402,62 @@ func (s *InternalScheduler) Tasks() []TaskInfo {
 	return res
 }
 
+// ErrSchedulerStartBlocked indicates the scheduler cannot restart while
+// timed-out task loops from a previous forced Shutdown are still winding down.
+var ErrSchedulerStartBlocked = errors.New("scheduler restart blocked while timed-out task loops are still shutting down")
+
+// IsBlocked reports whether a previous timed-out Shutdown still has active
+// draining task loops preventing a restart.
+func (s *InternalScheduler) IsBlocked() bool {
+	s.mu.RLock()
+	draining := s.drainingRun
+	s.mu.RUnlock()
+	if draining == nil {
+		return false
+	}
+	select {
+	case <-draining.done:
+		return false
+	default:
+		return true
+	}
+}
+
 // Start launches the background scheduler goroutines. It is idempotent while
-// running; after Stop it can be started again (fresh run state).
+// running; after Stop it can be started again (fresh run state). Refuses to
+// overlap if a previous timed-out Shutdown still has active task loops.
 func (s *InternalScheduler) Start() {
+	if err := s.StartWithError(); err != nil {
+		log.Printf("[SCHEDULER] %v", err)
+	}
+}
+
+// StartWithError launches the background scheduler goroutines and returns
+// ErrSchedulerStartBlocked if previous timed-out task loops are still active.
+func (s *InternalScheduler) StartWithError() error {
 	s.mu.Lock()
 	if s.run != nil {
 		s.mu.Unlock()
-		return
+		return nil
+	}
+	if s.drainingRun != nil {
+		select {
+		case <-s.drainingRun.done:
+			s.drainingRun = nil
+		default:
+			s.mu.Unlock()
+			return ErrSchedulerStartBlocked
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	rs := &runState{ctx: ctx, cancel: cancel, stop: make(chan struct{})}
+	rs := &runState{ctx: ctx, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{})}
 	s.run = rs
 	for _, t := range s.tasks {
 		rs.wg.Add(1)
 		go s.runTaskLoop(rs, t)
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
@@ -476,6 +519,16 @@ func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
 // slice so that clock jumps are respected and stop is responsive.
 func (s *InternalScheduler) waitUntil(rs *runState, task *registeredTask, fireAt time.Time) bool {
 	for {
+		// Check cancellation/stop signals before returning ready on remaining <= 0.
+		select {
+		case <-rs.stop:
+			return false
+		case <-rs.ctx.Done():
+			return false
+		case <-task.stop:
+			return false
+		default:
+		}
 		remaining := fireAt.Sub(s.now())
 		if remaining <= 0 {
 			return true
@@ -499,7 +552,9 @@ func (s *InternalScheduler) waitUntil(rs *runState, task *registeredTask, fireAt
 // tasks receive context cancellation; if they ignore it, Stop returns after the
 // timeout instead of blocking forever.
 func (s *InternalScheduler) Stop() {
-	_ = s.ShutdownWithTimeout(5 * time.Second)
+	if err := s.ShutdownWithTimeout(5 * time.Second); err != nil {
+		log.Printf("[SCHEDULER] Stop shutdown error: %v", err)
+	}
 }
 
 // ShutdownWithTimeout is Shutdown with an explicit deadline.
@@ -520,19 +575,24 @@ func (s *InternalScheduler) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	s.run = nil // block any future wg.Add for this run before waiting
+	s.drainingRun = rs
 	s.mu.Unlock()
 
 	close(rs.stop)
 	rs.cancel()
 
-	done := make(chan struct{})
 	go func() {
 		rs.wg.Wait()
-		close(done)
+		close(rs.done)
+		s.mu.Lock()
+		if s.drainingRun == rs {
+			s.drainingRun = nil
+		}
+		s.mu.Unlock()
 	}()
 
 	select {
-	case <-done:
+	case <-rs.done:
 		return nil
 	case <-ctx.Done():
 		log.Printf("[SCHEDULER] Background scheduler forcibly stopped (timeout: %v).", ctx.Err())
@@ -546,7 +606,14 @@ func (s *InternalScheduler) RunNow(taskName string) error {
 	s.mu.RLock()
 	task, exists := s.tasks[taskName]
 	rs := s.run
+	if exists && rs != nil {
+		rs.wg.Add(1)
+	}
 	s.mu.RUnlock()
+
+	if exists && rs != nil {
+		defer rs.wg.Done()
+	}
 
 	if !exists {
 		return fmt.Errorf("task %q not found", taskName)

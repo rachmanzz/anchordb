@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -95,7 +98,12 @@ func OpenWALWithOptions(path string, opts WALOptions) (*WALManager, error) {
 	}
 	// A freshly created WAL must be durable (file *and* directory entry) before
 	// any frame is appended, or a crash right after creation can lose the file.
-	if fi, statErr := f.Stat(); statErr == nil && fi.Size() == 0 {
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("failed to stat wal %s: %w", path, statErr)
+	}
+	if fi.Size() == 0 {
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("failed to fsync new wal %s: %w", path, err)
@@ -212,6 +220,20 @@ func (w *WALManager) CurrentOffset() (int64, error) {
 	return w.file.Seek(0, io.SeekCurrent)
 }
 
+// checkWritableLocked verifies WAL handle health and prior async sync status. Caller must hold w.mu.
+func (w *WALManager) checkWritableLocked() error {
+	if w.file == nil {
+		return fmt.Errorf("wal file is not open")
+	}
+	if w.corrupt {
+		return fmt.Errorf("%w: writes are disabled until the wal is repaired", ErrWALCorrupt)
+	}
+	if w.syncErr != nil {
+		return fmt.Errorf("wal background sync failed: %w", w.syncErr)
+	}
+	return nil
+}
+
 // writeEntry encodes and appends a framed entry:
 // [1 byte Magic][1 byte Version][1 byte OpCode][4 byte PayloadLen][4 byte CRC32][Payload]
 func (w *WALManager) writeEntry(op byte, payload []byte) error {
@@ -220,11 +242,8 @@ func (w *WALManager) writeEntry(op byte, payload []byte) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.file == nil {
-		return fmt.Errorf("wal file is closed")
-	}
-	if w.corrupt {
-		return fmt.Errorf("%w: writes are disabled until the wal is repaired", ErrWALCorrupt)
+	if err := w.checkWritableLocked(); err != nil {
+		return err
 	}
 	start, err := w.file.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -379,6 +398,74 @@ func (w *WALManager) WriteDelete(name string) error {
 	return w.writeEntry(WalOpDelete, buf)
 }
 
+// WriteDeleteBatch writes multiple entity deletion events to WAL under one lock
+// and a single sync at the end when SyncAlways is enabled.
+func (w *WALManager) WriteDeleteBatch(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	var batchBuf bytes.Buffer
+	batchBuf.Grow(len(names) * 24)
+	for _, name := range names {
+		nameBytes := []byte(name)
+		if len(nameBytes) > math.MaxUint16 {
+			return fmt.Errorf("wal record name exceeds %d bytes", math.MaxUint16)
+		}
+		payloadLen := 2 + len(nameBytes)
+		if payloadLen > maxWALPayloadSize {
+			return fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
+		}
+		var hdr [11]byte
+		var payload [2]byte
+		binary.LittleEndian.PutUint16(payload[0:2], uint16(len(nameBytes)))
+		crc := crc32.NewIEEE()
+		_, _ = crc.Write(payload[:])
+		_, _ = crc.Write(nameBytes)
+
+		hdr[0] = walMagic
+		hdr[1] = walVer
+		hdr[2] = WalOpDelete
+		binary.LittleEndian.PutUint32(hdr[3:7], uint32(payloadLen))
+		binary.LittleEndian.PutUint32(hdr[7:11], crc.Sum32())
+
+		batchBuf.Write(hdr[:])
+		batchBuf.Write(payload[:])
+		batchBuf.Write(nameBytes)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.checkWritableLocked(); err != nil {
+		return err
+	}
+
+	start, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek wal end: %w", err)
+	}
+	rollback := func(cause error) error {
+		if truncErr := w.file.Truncate(start); truncErr != nil {
+			return errors.Join(cause, fmt.Errorf("rollback partial wal delete batch: %w", truncErr))
+		}
+		if _, seekErr := w.file.Seek(0, io.SeekEnd); seekErr != nil {
+			return errors.Join(cause, fmt.Errorf("seek wal after rollback: %w", seekErr))
+		}
+		if syncErr := w.file.Sync(); syncErr != nil {
+			return errors.Join(cause, fmt.Errorf("sync wal after rollback: %w", syncErr))
+		}
+		return cause
+	}
+	if _, err := w.file.Write(batchBuf.Bytes()); err != nil {
+		return rollback(err)
+	}
+	if w.syncMode == SyncAlways {
+		if err := w.file.Sync(); err != nil {
+			return rollback(err)
+		}
+	}
+	return nil
+}
+
 // WriteNode writes a graph node append event to WAL.
 // Payload: [2 byte WordLen][Word][4 byte X][4 byte Y][16 byte Roles][2 byte DomainID]
 func (w *WALManager) WriteNode(word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error {
@@ -450,14 +537,8 @@ func (w *WALManager) WriteSaveBatch(items []BatchSaveItem) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.file == nil {
-		return fmt.Errorf("wal file is not open")
-	}
-	if w.corrupt {
-		return fmt.Errorf("cannot write to corrupt wal: %w", w.syncErr)
-	}
-	if w.syncErr != nil {
-		return fmt.Errorf("wal background sync failed: %w", w.syncErr)
+	if err := w.checkWritableLocked(); err != nil {
+		return err
 	}
 
 	start, err := w.file.Seek(0, io.SeekEnd)
@@ -478,6 +559,8 @@ func (w *WALManager) WriteSaveBatch(items []BatchSaveItem) error {
 		return cause
 	}
 
+	var batchBuf bytes.Buffer
+	batchBuf.Grow(len(items) * 64)
 	for _, it := range items {
 		var op byte
 		var payload []byte
@@ -493,24 +576,26 @@ func (w *WALManager) WriteSaveBatch(items []BatchSaveItem) error {
 			}
 			node, err := encodeWALNode(it.Name, coord, roles, it.DomainID)
 			if err != nil {
-				return rollback(err)
+				return err
 			}
 			save, err := encodeWALSave(it.Name, it.CR)
 			if err != nil {
-				return rollback(err)
+				return err
 			}
 			if len(node)+len(save) > maxWALPayloadSize {
-				return rollback(fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize))
+				return fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
 			}
 			op = WalOpSaveNode
-			payload = append(node, save...)
+			payload = make([]byte, len(node)+len(save))
+			copy(payload, node)
+			copy(payload[len(node):], save)
 		} else {
 			save, err := encodeWALSave(it.Name, it.CR)
 			if err != nil {
-				return rollback(err)
+				return err
 			}
 			if len(save) > maxWALPayloadSize {
-				return rollback(fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize))
+				return fmt.Errorf("wal payload exceeds maximum size of %d bytes", maxWALPayloadSize)
 			}
 			op = WalOpSave
 			payload = save
@@ -524,14 +609,12 @@ func (w *WALManager) WriteSaveBatch(items []BatchSaveItem) error {
 		binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(payload)))
 		binary.LittleEndian.PutUint32(hdr[7:11], checksum)
 
-		if _, err := w.file.Write(hdr[:]); err != nil {
-			return rollback(err)
-		}
-		if len(payload) > 0 {
-			if _, err := w.file.Write(payload); err != nil {
-				return rollback(err)
-			}
-		}
+		batchBuf.Write(hdr[:])
+		batchBuf.Write(payload)
+	}
+
+	if _, err := w.file.Write(batchBuf.Bytes()); err != nil {
+		return rollback(err)
 	}
 
 	if w.syncMode == SyncAlways {
@@ -667,14 +750,8 @@ func (w *WALManager) WriteEdgeBatch(items []EdgeRecord) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.file == nil {
-		return fmt.Errorf("wal file is not open")
-	}
-	if w.corrupt {
-		return fmt.Errorf("cannot write to corrupt wal: %w", w.syncErr)
-	}
-	if w.syncErr != nil {
-		return fmt.Errorf("wal background sync failed: %w", w.syncErr)
+	if err := w.checkWritableLocked(); err != nil {
+		return err
 	}
 
 	start, err := w.file.Seek(0, io.SeekEnd)
@@ -695,16 +772,18 @@ func (w *WALManager) WriteEdgeBatch(items []EdgeRecord) error {
 		return cause
 	}
 
+	var batchBuf bytes.Buffer
+	batchBuf.Grow(len(items) * 36)
 	for _, it := range items {
 		buf, err := appendWALString(nil, it.Source)
 		if err != nil {
-			return rollback(err)
+			return err
 		}
 		if buf, err = appendWALString(buf, it.Relation); err != nil {
-			return rollback(err)
+			return err
 		}
 		if buf, err = appendWALString(buf, it.Target); err != nil {
-			return rollback(err)
+			return err
 		}
 		var wb [4]byte
 		binary.LittleEndian.PutUint32(wb[:], math.Float32bits(it.Weight))
@@ -718,14 +797,12 @@ func (w *WALManager) WriteEdgeBatch(items []EdgeRecord) error {
 		binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(buf)))
 		binary.LittleEndian.PutUint32(hdr[7:11], checksum)
 
-		if _, err := w.file.Write(hdr[:]); err != nil {
-			return rollback(err)
-		}
-		if len(buf) > 0 {
-			if _, err := w.file.Write(buf); err != nil {
-				return rollback(err)
-			}
-		}
+		batchBuf.Write(hdr[:])
+		batchBuf.Write(buf)
+	}
+
+	if _, err := w.file.Write(batchBuf.Bytes()); err != nil {
+		return rollback(err)
 	}
 
 	if w.syncMode == SyncAlways {
@@ -865,14 +942,22 @@ func (w *WALManager) ReplayEvents(handler func(ev WALEvent) error) (count int, r
 // end of the last fully valid frame. Caller must hold w.mu and have positioned
 // the file at the start.
 func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncomplete bool) (count int, lastValidOffset int64, retErr error) {
-	lastValidOffset = 0
+	frameOffset, seekErr := w.file.Seek(0, io.SeekCurrent)
+	if seekErr != nil {
+		return 0, 0, seekErr
+	}
+	fi, statErr := w.file.Stat()
+	if statErr != nil {
+		return 0, 0, statErr
+	}
+	fileSize := fi.Size()
+
+	lastValidOffset = frameOffset
+	reader := bufio.NewReaderSize(w.file, 64*1024)
+	var scratch []byte
 	var hdr [11]byte
 	for {
-		frameOffset, seekErr := w.file.Seek(0, io.SeekCurrent)
-		if seekErr != nil {
-			return count, lastValidOffset, seekErr
-		}
-		_, err := io.ReadFull(w.file, hdr[:])
+		_, err := io.ReadFull(reader, hdr[:])
 		if err == io.EOF {
 			break
 		}
@@ -900,15 +985,8 @@ func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncompl
 		}
 		// A valid frame cannot exceed the bytes remaining in the WAL. Bound the
 		// allocation before converting the untrusted on-disk length to int.
-		pos, seekErr := w.file.Seek(0, io.SeekCurrent)
-		if seekErr != nil {
-			return count, lastValidOffset, seekErr
-		}
-		fi, statErr := w.file.Stat()
-		if statErr != nil {
-			return count, lastValidOffset, statErr
-		}
-		if uint64(payloadLen) > uint64(fi.Size()-pos) {
+		payloadStart := frameOffset + 11
+		if uint64(payloadLen) > uint64(fileSize-payloadStart) {
 			if truncateIncomplete {
 				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
 					return count, lastValidOffset, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, terr)
@@ -917,8 +995,11 @@ func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncompl
 			return count, lastValidOffset, nil
 		}
 
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(w.file, payload); err != nil {
+		if cap(scratch) < int(payloadLen) {
+			scratch = make([]byte, payloadLen)
+		}
+		payload := scratch[:payloadLen]
+		if _, err := io.ReadFull(reader, payload); err != nil {
 			if truncateIncomplete {
 				if terr := w.truncateReplayTail(lastValidOffset); terr != nil {
 					return count, lastValidOffset, fmt.Errorf("truncate incomplete payload at %d: %w", frameOffset, terr)
@@ -1131,10 +1212,8 @@ func (w *WALManager) scanWALLocked(handler func(WALEvent) error, truncateIncompl
 			return count, lastValidOffset, fmt.Errorf("%w: invalid opcode %d or payload at offset %d", ErrWALCorrupt, op, frameOffset)
 		}
 		// Only a completely decoded, checksummed frame advances the durable end.
-		lastValidOffset, err = w.file.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return count, lastValidOffset, err
-		}
+		frameOffset = payloadStart + int64(payloadLen)
+		lastValidOffset = frameOffset
 	}
 
 	return count, lastValidOffset, nil
@@ -1164,8 +1243,15 @@ func RepairWALFile(path string) (*WALRepairResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer w.Close()
-	return w.Repair()
+	res, repairErr := w.Repair()
+	closeErr := w.Close()
+	if err := errors.Join(repairErr, closeErr); err != nil {
+		if repairErr == nil {
+			return res, err
+		}
+		return nil, err
+	}
+	return res, nil
 }
 
 // Repair performs the scan/truncate described by RepairWALFile on an open WAL.
@@ -1238,14 +1324,18 @@ func copyFileRange(src *os.File, dstPath string, off, n int64) error {
 }
 
 // Replay is the legacy recovery callback. It keeps its original signature for
-// backward compatibility and simply ignores edge opcodes, which the legacy
-// callback shape cannot express. Combined saves are delivered as node then
-// save callbacks. New code should use ReplayEvents.
+// backward compatibility and omits edge opcodes (which legacy callers cannot
+// express). Only events delivered to handler (or counted non-edge events) are
+// included in the returned count; use ReplayEvents for full edge recovery.
 func (w *WALManager) Replay(handler func(op byte, name string, cr CompactRecord, word string, coord spatial.Point2D, roles [4]float32, domainID uint16) error) (int, error) {
-	return w.ReplayEvents(func(ev WALEvent) error {
+	var handledCount int
+	var skippedEdges int
+	_, err := w.ReplayEvents(func(ev WALEvent) error {
 		if ev.Op == WalOpEdge || ev.Op == WalOpEdgeDelete {
+			skippedEdges++
 			return nil
 		}
+		handledCount++
 		if handler == nil {
 			return nil
 		}
@@ -1257,6 +1347,10 @@ func (w *WALManager) Replay(handler func(op byte, name string, cr CompactRecord,
 		}
 		return handler(ev.Op, ev.Name, ev.Record, ev.Word, ev.Coord, ev.Roles, ev.DomainID)
 	})
+	if skippedEdges > 0 {
+		log.Printf("[WAL] Legacy Replay skipped %d edge records (use ReplayEvents for edge recovery)", skippedEdges)
+	}
+	return handledCount, err
 }
 
 func (w *WALManager) truncateReplayTail(offset int64) error {

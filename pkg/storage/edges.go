@@ -223,6 +223,63 @@ type GraphDegreeStats struct {
 	TopHubs        []HubScore `json:"top_hubs"`
 }
 
+// keepTopK returns up to k highest-ranked items in O(N log K) time and O(K) space.
+func keepTopK[T any](items []T, k int, better func(a, b T) bool) []T {
+	if k <= 0 || len(items) == 0 {
+		return nil
+	}
+	if len(items) <= k {
+		out := make([]T, len(items))
+		copy(out, items)
+		sort.Slice(out, func(i, j int) bool { return better(out[i], out[j]) })
+		return out
+	}
+
+	h := make([]T, 0, k)
+	siftUp := func(i int) {
+		for i > 0 {
+			p := (i - 1) / 2
+			// Min-heap orders by "worse" at root: better(parent, child) means child is worse.
+			if better(h[p], h[i]) {
+				h[p], h[i] = h[i], h[p]
+				i = p
+			} else {
+				break
+			}
+		}
+	}
+	siftDown := func(i int) {
+		n := len(h)
+		for {
+			l, r := 2*i+1, 2*i+2
+			worst := i
+			if l < n && better(h[worst], h[l]) {
+				worst = l
+			}
+			if r < n && better(h[worst], h[r]) {
+				worst = r
+			}
+			if worst == i {
+				break
+			}
+			h[i], h[worst] = h[worst], h[i]
+			i = worst
+		}
+	}
+
+	for _, item := range items {
+		if len(h) < k {
+			h = append(h, item)
+			siftUp(len(h) - 1)
+		} else if better(item, h[0]) {
+			h[0] = item
+			siftDown(0)
+		}
+	}
+	sort.Slice(h, func(i, j int) bool { return better(h[i], h[j]) })
+	return h
+}
+
 // GraphDegreeStats computes in/out-degree distribution over live edges in one
 // O(V+E) pass. TopHubs ranks by in-degree (ties by node name, ascending) and
 // holds at most topK entries; topK <= 0 skips the ranking.
@@ -235,9 +292,13 @@ func (db *AnchorDB) GraphDegreeStats(topK int) (GraphDegreeStats, error) {
 	if db.closed {
 		return GraphDegreeStats{}, ErrDatabaseClosed
 	}
-	nodes := make(map[string]bool)
-	inDeg := make(map[string]int)
-	outDeg := make(map[string]int)
+	estNodes := len(db.Lexicon)
+	if estNodes == 0 && len(db.edges) > 0 {
+		estNodes = len(db.edges)
+	}
+	nodes := make(map[string]bool, estNodes)
+	inDeg := make(map[string]int, estNodes)
+	outDeg := make(map[string]int, estNodes)
 	var edgeCount uint64
 	for _, e := range db.edges {
 		if e.Source == "" {
@@ -271,21 +332,17 @@ func (db *AnchorDB) GraphDegreeStats(topK int) (GraphDegreeStats, error) {
 	if len(ordered) > 0 {
 		stats.DegreeVariance = acc / float64(len(ordered))
 	}
-	if topK > 0 {
-		hubs := make([]HubScore, 0, len(ordered))
-		for _, node := range ordered {
-			hubs = append(hubs, HubScore{Node: node, Degree: inDeg[node]})
+	if topK > 0 && len(ordered) > 0 {
+		hubs := make([]HubScore, len(ordered))
+		for i, node := range ordered {
+			hubs[i] = HubScore{Node: node, Degree: inDeg[node]}
 		}
-		sort.Slice(hubs, func(i, j int) bool {
-			if hubs[i].Degree != hubs[j].Degree {
-				return hubs[i].Degree > hubs[j].Degree
+		stats.TopHubs = keepTopK(hubs, topK, func(a, b HubScore) bool {
+			if a.Degree != b.Degree {
+				return a.Degree > b.Degree
 			}
-			return hubs[i].Node < hubs[j].Node
+			return a.Node < b.Node
 		})
-		if len(hubs) > topK {
-			hubs = hubs[:topK]
-		}
-		stats.TopHubs = hubs
 	}
 	return stats, nil
 }
@@ -328,17 +385,19 @@ func (db *AnchorDB) PageRank(damping, tolerance float64, maxIter, topK int) (Pag
 	if db.closed {
 		return PageRankResult{}, ErrDatabaseClosed
 	}
-	nodes := make(map[string]bool)
-	outDeg := make(map[string]int)
+	estNodes := len(db.Lexicon)
+	if estNodes == 0 && len(db.edges) > 0 {
+		estNodes = len(db.edges)
+	}
+	nodes := make(map[string]bool, estNodes)
 	type link struct{ from, to string }
-	var links []link
+	links := make([]link, 0, len(db.edges))
 	for _, e := range db.edges {
 		if e.Source == "" {
 			continue // tombstoned slot
 		}
 		nodes[e.Source] = true
 		nodes[e.Target] = true
-		outDeg[e.Source]++
 		links = append(links, link{from: e.Source, to: e.Target})
 	}
 	ordered := make([]string, 0, len(nodes))
@@ -400,21 +459,17 @@ func (db *AnchorDB) PageRank(damping, tolerance float64, maxIter, topK int) (Pag
 		scores[node] = rank[i]
 	}
 	res := PageRankResult{Scores: scores, Iterations: iterations, Converged: converged}
-	if topK > 0 {
-		top := make([]NodeScore, 0, v)
-		for node, s := range scores {
-			top = append(top, NodeScore{Node: node, Score: s})
+	if topK > 0 && v > 0 {
+		candidates := make([]NodeScore, v)
+		for i, node := range ordered {
+			candidates[i] = NodeScore{Node: node, Score: rank[i]}
 		}
-		sort.Slice(top, func(i, j int) bool {
-			if top[i].Score != top[j].Score {
-				return top[i].Score > top[j].Score
+		res.Top = keepTopK(candidates, topK, func(a, b NodeScore) bool {
+			if a.Score != b.Score {
+				return a.Score > b.Score
 			}
-			return top[i].Node < top[j].Node
+			return a.Node < b.Node
 		})
-		if len(top) > topK {
-			top = top[:topK]
-		}
-		res.Top = top
 	}
 	return res, nil
 }
@@ -534,6 +589,10 @@ func (db *AnchorDB) ExecuteCausalChain(ctx context.Context, seeds []string, rela
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
+	maxFrontier := limitK * 64
+	if maxFrontier < 4096 {
+		maxFrontier = 4096
+	}
 	frontier := make(map[string]float32, len(seeds))
 	for _, s := range seeds {
 		frontier[s] = 1.0
@@ -543,7 +602,7 @@ func (db *AnchorDB) ExecuteCausalChain(ctx context.Context, seeds []string, rela
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		next := make(map[string]float32)
+		next := make(map[string]float32, len(frontier))
 		for word, incoming := range frontier {
 			for _, i := range db.adjOut[word] {
 				e := db.edges[i]
@@ -555,6 +614,27 @@ func (db *AnchorDB) ExecuteCausalChain(ctx context.Context, seeds []string, rela
 					next[e.Target] = score
 				}
 			}
+		}
+		if len(next) > maxFrontier {
+			type frontierNode struct {
+				word  string
+				score float32
+			}
+			all := make([]frontierNode, 0, len(next))
+			for w, sc := range next {
+				all = append(all, frontierNode{word: w, score: sc})
+			}
+			kept := keepTopK(all, maxFrontier, func(a, b frontierNode) bool {
+				if a.score != b.score {
+					return a.score > b.score
+				}
+				return a.word < b.word
+			})
+			pruned := make(map[string]float32, len(kept))
+			for _, fn := range kept {
+				pruned[fn.word] = fn.score
+			}
+			next = pruned
 		}
 		last = next
 		frontier = next

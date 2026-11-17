@@ -250,3 +250,26 @@ func TestRotationStagedResponse_EncodeDecode(t *testing.T) {
 		t.Errorf("message mismatch: got %q, want %q", gotMsg, msg)
 	}
 }
+
+func TestStructuredAuth_RejectsMalformedCommitmentAndLegacyStrip(t *testing.T) {
+	comm := [32]byte{0x01, 0x02, 0x03}
+	valid := EncodeStructuredAuthPairingWithCommitment("node-a", comm)
+	// Truncate the trailing commitment block by 4 bytes; must fail rather than silently drop.
+	truncated := valid[:len(valid)-4]
+	if _, err := DecodeStructuredAuth(truncated); err != ErrMalformedAuthRequest {
+		t.Fatalf("expected ErrMalformedAuthRequest on truncated commitment, got %v", err)
+	}
+
+	// Corrupt commitment length field ( != 32 ).
+	badLen := append([]byte(nil), valid...)
+	badLen[len(valid)-34] = 16
+	badLen[len(valid)-33] = 0
+	if _, err := DecodeStructuredAuth(badLen); err != ErrMalformedAuthRequest {
+		t.Fatalf("expected ErrMalformedAuthRequest on invalid commitment length, got %v", err)
+	}
+
+	// DecodeAuthPayload must reject non-static structured payloads instead of stripping fields.
+	if _, err := DecodeAuthPayload(valid); err != ErrMalformedAuthRequest {
+		t.Fatalf("expected DecodeAuthPayload to reject pairing payload with %v, got %v", ErrMalformedAuthRequest, err)
+	}
+}

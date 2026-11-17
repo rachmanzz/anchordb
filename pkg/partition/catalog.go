@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -79,8 +81,55 @@ func OpenCatalog(filePath string) (*Catalog, error) {
 	return c, nil
 }
 
+func cloneCatalogEntry(e *CatalogEntry) *CatalogEntry {
+	if e == nil {
+		return nil
+	}
+	cp := *e
+	cp.RecordNames = slices.Clone(e.RecordNames)
+	if e.S3Metadata != nil {
+		meta := *e.S3Metadata
+		cp.S3Metadata = &meta
+	}
+	return &cp
+}
+
+func (c *Catalog) rebuildIndexesLocked() {
+	c.recordIndex = make(map[string]map[string]*CatalogEntry)
+	c.fileIndex = make(map[string]*CatalogEntry)
+	for _, e := range c.entries {
+		if e.PartitionFile != "" {
+			c.fileIndex[e.PartitionFile] = e
+		}
+		if e.TargetLocation != "" {
+			c.fileIndex[e.TargetLocation] = e
+		}
+		if _, ok := c.recordIndex[e.Model]; !ok {
+			c.recordIndex[e.Model] = make(map[string]*CatalogEntry)
+		}
+		for _, name := range e.RecordNames {
+			c.recordIndex[e.Model][name] = e
+		}
+	}
+}
+
 func (c *Catalog) indexEntry(e *CatalogEntry) {
-	c.entries = append(c.entries, e)
+	// Deduplicate by ID/PartitionFile so re-registration replaces rather than duplicates.
+	replaced := false
+	for i, existing := range c.entries {
+		if (e.ID != "" && existing.ID == e.ID) || (e.PartitionFile != "" && existing.PartitionFile == e.PartitionFile) {
+			c.entries[i] = e
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		c.entries = append(c.entries, e)
+	}
+	if replaced {
+		c.rebuildIndexesLocked()
+		return
+	}
 	if e.PartitionFile != "" {
 		c.fileIndex[e.PartitionFile] = e
 	}
@@ -101,18 +150,26 @@ func (c *Catalog) RegisterPartition(e *CatalogEntry) error {
 	if e == nil {
 		return errors.New("catalog entry cannot be nil")
 	}
-	if e.ID == "" {
-		e.ID = e.PartitionFile
-	}
-	if e.CreatedAt.IsZero() {
-		e.CreatedAt = time.Now().UTC()
-	}
+	entry := cloneCatalogEntry(e)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.indexEntry(e)
-	return c.saveLocked()
+	if entry.ID == "" {
+		entry.ID = entry.PartitionFile
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+
+	prevEntries := slices.Clone(c.entries)
+	c.indexEntry(entry)
+	if err := c.saveLocked(); err != nil {
+		c.entries = prevEntries
+		c.rebuildIndexesLocked()
+		return err
+	}
+	return nil
 }
 
 func (c *Catalog) saveLocked() error {
@@ -122,13 +179,31 @@ func (c *Catalog) saveLocked() error {
 	}
 
 	tmpFile := fmt.Sprintf("%s.tmp.%d", c.filePath, time.Now().UnixNano())
-	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("failed opening temporary catalog file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed writing temporary catalog file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed syncing temporary catalog file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed closing temporary catalog file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, c.filePath); err != nil {
 		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed atomically publishing catalog file: %w", err)
+	}
+	if err := syncPartitionDir(filepath.Dir(c.filePath)); err != nil {
+		return fmt.Errorf("failed syncing catalog directory: %w", err)
 	}
 
 	return nil
@@ -142,7 +217,7 @@ func (c *Catalog) ListEntries(model string) []*CatalogEntry {
 	out := make([]*CatalogEntry, 0, len(c.entries))
 	for _, e := range c.entries {
 		if model == "" || e.Model == model {
-			out = append(out, e)
+			out = append(out, cloneCatalogEntry(e))
 		}
 	}
 	return out
@@ -158,7 +233,7 @@ func (c *Catalog) FindRecord(model, recordName string) (*CatalogEntry, bool) {
 		return nil, false
 	}
 	entry, ok := modelMap[recordName]
-	return entry, ok
+	return cloneCatalogEntry(entry), ok
 }
 
 // GetEntry returns a partition catalog entry by its filename or target location.
@@ -172,5 +247,5 @@ func (c *Catalog) GetEntry(fileOrLoc string) (*CatalogEntry, bool) {
 		base := filepath.Base(fileOrLoc)
 		e, ok = c.fileIndex[base]
 	}
-	return e, ok
+	return cloneCatalogEntry(e), ok
 }

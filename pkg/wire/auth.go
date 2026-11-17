@@ -199,14 +199,18 @@ func DecodeStructuredAuth(payload []byte) (AuthRequest, error) {
 		Credential: cred,
 	}
 
-	// Check optional InitialCommitment for Pairing / OTK
-	if len(payload) >= offset+2+32 {
-		commLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-		if commLen == 32 && len(payload) >= offset+2+32 {
-			offset += 2
-			copy(req.InitialCommitment[:], payload[offset:offset+32])
-			req.HasCommitment = true
+	// Validate optional InitialCommitment trailing block for Pairing / OTK
+	if len(payload) > offset {
+		if len(payload) != offset+2+32 {
+			return AuthRequest{}, ErrMalformedAuthRequest
 		}
+		commLen := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
+		if commLen != 32 {
+			return AuthRequest{}, ErrMalformedAuthRequest
+		}
+		offset += 2
+		copy(req.InitialCommitment[:], payload[offset:offset+32])
+		req.HasCommitment = true
 	}
 
 	return req, nil

@@ -344,3 +344,54 @@ func TestTimeoutAndJitterGetters(t *testing.T) {
 		t.Fatalf("expected 10s, got %v", s.Jitter())
 	}
 }
+
+func TestShutdown_TimeoutRefusesOverlappingRestart(t *testing.T) {
+	s := NewInternalScheduler()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var runs atomic.Int32
+
+	if err := s.RegisterTask("stuck", ctxTask{
+		sched: "@every 5ms",
+		run: func(_ context.Context) error {
+			if runs.Add(1) == 1 {
+				close(started)
+				<-release
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTask: %v", err)
+	}
+
+	s.Start()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded on stuck shutdown, got %v", err)
+	}
+
+	s.Start()
+	s.mu.RLock()
+	restarted := s.run != nil
+	s.mu.RUnlock()
+	if restarted {
+		t.Fatal("Start must refuse restarting while timed-out runTaskLoop is still active")
+	}
+
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		stillDraining := s.drainingRun != nil
+		s.mu.RUnlock()
+		if !stillDraining {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.Start()
+	_ = s.ShutdownWithTimeout(time.Second)
+}
