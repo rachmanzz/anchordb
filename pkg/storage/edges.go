@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"github.com/rachmanzz/anchordb/pkg/spatial"
 )
 
 // edgeSectionMagic marks the optional causal-edge section appended after the
@@ -108,6 +110,48 @@ func (db *AnchorDB) AddEdgesBatch(items []EdgeRecord) error {
 		db.upsertEdge(it.Source, it.Relation, it.Target, it.Weight)
 	}
 	return nil
+}
+
+// ExportPartitionEdges returns a snapshot of all edges whose source or target belongs to names.
+func (db *AnchorDB) ExportPartitionEdges(names []string) ([]EdgeRecord, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if len(names) == 0 || len(db.edges) == 0 {
+		return nil, nil
+	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		nameSet[n] = struct{}{}
+	}
+	var out []EdgeRecord
+	for _, e := range db.edges {
+		if _, hasSrc := nameSet[e.Source]; hasSrc {
+			if _, hasDst := nameSet[e.Target]; hasDst {
+				out = append(out, e)
+			}
+		}
+	}
+	return out, nil
+}
+
+// ExportRelations returns a copy of defined spatial relation vectors in this database.
+func (db *AnchorDB) ExportRelations() (map[string]spatial.Point2D, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+	if len(db.relations) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]spatial.Point2D, len(db.relations))
+	for k, v := range db.relations {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // upsertEdge is the WAL-free mutation used both by AddEdge (after a successful

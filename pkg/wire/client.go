@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,18 +24,19 @@ import (
 // concurrent multi-model workloads; the driver pool in pkg/driver already
 // follows this rule by giving each checkout exclusive ownership of its Client.
 type Client struct {
-	connMu        sync.Mutex
-	conn          net.Conn
-	reader        *bufio.Reader
-	writer        *bufio.Writer
-	mu            sync.Mutex
-	seq           atomic.Uint32
-	modelMu       sync.RWMutex
-	model         string
-	timeout       time.Duration
-	negoMu        sync.RWMutex
-	negotiation   *MemoryNegotiationResponse
-	pacingEnabled bool
+	connMu             sync.Mutex
+	conn               net.Conn
+	reader             *bufio.Reader
+	writer             *bufio.Writer
+	mu                 sync.Mutex
+	seq                atomic.Uint32
+	modelMu            sync.RWMutex
+	model              string
+	timeout            time.Duration
+	negoMu             sync.RWMutex
+	negotiation        *MemoryNegotiationResponse
+	negotiatedExplicit bool
+	pacingEnabled      bool
 }
 
 // ClientConfig holds wire connection options.
@@ -214,13 +214,14 @@ func (c *Client) call(opCode byte, payload []byte) (Frame, error) {
 				AllocatedBatchSize: 500,
 				ReleaseIntervalMs:  10,
 			}
-		} else {
+		} else if c.negotiation.Status == MemoryStatusGranted {
+			// Escalate only Granted -> Hold; keep an explicit MemoryStatusThrottled budget intact.
 			c.negotiation.Status = MemoryStatusHold
 		}
 		c.negoMu.Unlock()
 	} else {
 		c.negoMu.Lock()
-		if c.negotiation != nil && c.negotiation.Status == MemoryStatusHold {
+		if c.negotiation != nil && c.negotiation.Status == MemoryStatusHold && !c.negotiatedExplicit {
 			c.negotiation.Status = MemoryStatusGranted
 			if c.negotiation.AllocatedBatchSize == 0 {
 				c.negotiation.AllocatedBatchSize = 1000
@@ -249,14 +250,22 @@ func (c *Client) Ping() error {
 
 // Auth authenticates this client connection with the given bearer token.
 func (c *Client) Auth(token string) error {
-	_, err := c.call(OpAuth, EncodeAuthPayload(token))
+	payload, err := EncodeAuthPayload(token)
+	if err != nil {
+		return err
+	}
+	_, err = c.call(OpAuth, payload)
 	return err
 }
 
 // AuthStructured performs a structured handshake authentication with the server,
 // returning an issued session key or status message if one was provided in the response.
 func (c *Client) AuthStructured(req AuthRequest) (string, error) {
-	resp, err := c.call(OpAuth, EncodeStructuredAuth(req))
+	payload, err := EncodeStructuredAuth(req)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.call(OpAuth, payload)
 	if err != nil {
 		return "", err
 	}
@@ -342,7 +351,11 @@ func (c *Client) ModelName() string {
 // sequential use. Do not call it concurrently with other operations on the
 // same Client for a different model; open a separate Client per model instead.
 func (c *Client) SelectModel(model string) error {
-	_, err := c.call(OpSelectModel, EncodeSelectModelPayload(model))
+	payload, err := EncodeSelectModelPayload(model)
+	if err != nil {
+		return err
+	}
+	_, err = c.call(OpSelectModel, payload)
 	if err == nil {
 		c.modelMu.Lock()
 		c.model = model
@@ -369,6 +382,7 @@ func (c *Client) NegotiateMemory(targetRecords, estimatedRecordSizeBytes, prefer
 
 	c.negoMu.Lock()
 	c.negotiation = &nego
+	c.negotiatedExplicit = true
 	c.negoMu.Unlock()
 
 	return nego, nil
@@ -392,16 +406,24 @@ func (c *Client) GetNegotiation() *MemoryNegotiationResponse {
 	return &negoCopy
 }
 
+func isWireBackpressureError(err error) bool {
+	var wErr *WireError
+	return errors.As(err, &wErr) && wErr.Code == 507
+}
+
 // Save stores an entity record and returns its effective name.
 func (c *Client) Save(item storage.BatchRecordItem) (string, error) {
+	payload, err := EncodeSavePayload(item)
+	if err != nil {
+		return "", err
+	}
 	var resp Frame
-	var err error
 	for attempt := 0; attempt < 5; attempt++ {
-		resp, err = c.call(OpSave, EncodeSavePayload(item))
+		resp, err = c.call(OpSave, payload)
 		if err == nil {
 			break
 		}
-		if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
+		if isWireBackpressureError(err) {
 			time.Sleep(time.Duration(15*(attempt+1)) * time.Millisecond)
 			continue
 		}
@@ -422,10 +444,15 @@ func (c *Client) SaveTyped(name string, opStatus uint8, attrs []storage.AttrEntr
 	})
 }
 
-// SaveBatch stores multiple records in a single high-throughput frame, automatically pacing if enabled.
+// SaveBatch stores multiple records atomically in a single high-throughput frame, applying adaptive pre-send pacing if enabled.
 func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) {
 	if len(records) == 0 {
 		return nil, nil
+	}
+
+	payload, err := EncodeSaveBatchPayload(records)
+	if err != nil {
+		return nil, err
 	}
 
 	c.negoMu.RLock()
@@ -437,58 +464,17 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	}
 	c.negoMu.RUnlock()
 
-	// If pacing is enabled and negotiation indicates hold status
-	if pacing && nego != nil && nego.Status == MemoryStatusHold {
-		// Slicing into negotiated batch size
-		batchSize := int(nego.AllocatedBatchSize)
-		if batchSize <= 0 {
-			batchSize = 500
-		}
-
-		if len(records) > batchSize {
-			var allNames []string
-			for i := 0; i < len(records); i += batchSize {
-				end := i + batchSize
-				if end > len(records) {
-					end = len(records)
-				}
-				chunk := records[i:end]
-				var err error
-				for attempt := 0; attempt < 4; attempt++ {
-					_, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(chunk))
-					if err == nil {
-						break
-					}
-					if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
-						time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
-						continue
-					}
-					return allNames, fmt.Errorf("partial batch save failed (%d/%d committed): %w", len(allNames), len(records), err)
-				}
-				if err != nil {
-					return allNames, fmt.Errorf("partial batch save failed (%d/%d committed): %w", len(allNames), len(records), err)
-				}
-				for _, r := range chunk {
-					allNames = append(allNames, r.Name)
-				}
-
-				// Progressive release delay between slices
-				if nego.ReleaseIntervalMs > 0 && end < len(records) {
-					time.Sleep(time.Duration(nego.ReleaseIntervalMs) * time.Millisecond)
-				}
-			}
-			return allNames, nil
-		}
+	if pacing && nego != nil && nego.Status != MemoryStatusGranted && nego.ReleaseIntervalMs > 0 {
+		time.Sleep(time.Duration(nego.ReleaseIntervalMs) * time.Millisecond)
 	}
 
-	// Direct send (single chunk or unpaced)
-	var err error
+	var resp Frame
 	for attempt := 0; attempt < 4; attempt++ {
-		_, err = c.call(OpSaveBatch, EncodeSaveBatchPayload(records))
+		resp, err = c.call(OpSaveBatch, payload)
 		if err == nil {
 			break
 		}
-		if strings.Contains(err.Error(), "507") || strings.Contains(err.Error(), "backpressure") {
+		if isWireBackpressureError(err) {
 			time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 			continue
 		}
@@ -497,11 +483,7 @@ func (c *Client) SaveBatch(records []storage.BatchRecordItem) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, len(records))
-	for i, r := range records {
-		names[i] = r.Name
-	}
-	return names, nil
+	return DecodeSaveBatchResponse(resp.Payload)
 }
 
 // Get retrieves an entity's properties and operation lifecycle state.
@@ -511,7 +493,11 @@ func (c *Client) Get(name string) (map[string]float32, uint8, error) {
 
 // GetWithOptions retrieves an entity's properties with optional projection and computations.
 func (c *Client) GetWithOptions(req GetRequest) (map[string]float32, uint8, error) {
-	resp, err := c.call(OpGet, EncodeGetRequest(req))
+	payload, err := EncodeGetRequest(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := c.call(OpGet, payload)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -526,7 +512,11 @@ func (c *Client) GetTyped(name string) (storage.CompactRecord, error) {
 
 // GetWithOptionsTyped retrieves an entity's typed attributes with optional projection and computations.
 func (c *Client) GetWithOptionsTyped(req GetRequest) (storage.CompactRecord, error) {
-	resp, err := c.call(OpGet, EncodeGetRequest(req))
+	payload, err := EncodeGetRequest(req)
+	if err != nil {
+		return storage.CompactRecord{}, err
+	}
+	resp, err := c.call(OpGet, payload)
 	if err != nil {
 		return storage.CompactRecord{}, err
 	}
@@ -540,19 +530,31 @@ func (c *Client) GetWithOptionsTyped(req GetRequest) (storage.CompactRecord, err
 
 // Edge adds or removes an explicit graph edge.
 func (c *Client) Edge(action, source, relation, target string, weight float32) error {
-	_, err := c.call(OpEdge, EncodeEdgePayload(action, source, relation, target, weight))
+	payload, err := EncodeEdgePayload(action, source, relation, target, weight)
+	if err != nil {
+		return err
+	}
+	_, err = c.call(OpEdge, payload)
 	return err
 }
 
 // SetRelation registers or replaces a query direction vector on the active model.
 func (c *Client) SetRelation(name string, direction spatial.Point2D) error {
-	_, err := c.call(OpEdge, EncodeEdgePayloadWithDirection("set_relation", "", name, "", 0, &direction))
+	payload, err := EncodeEdgePayloadWithDirection("set_relation", "", name, "", 0, &direction)
+	if err != nil {
+		return err
+	}
+	_, err = c.call(OpEdge, payload)
 	return err
 }
 
 // Causal executes a causal step traversal over graph edges.
 func (c *Client) Causal(seeds []string, relation string, limitK int) ([]storage.CausalResult, error) {
-	resp, err := c.call(OpCausal, EncodeCausalPayload(seeds, relation, limitK))
+	payload, err := EncodeCausalPayload(seeds, relation, limitK)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.call(OpCausal, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -561,7 +563,11 @@ func (c *Client) Causal(seeds []string, relation string, limitK int) ([]storage.
 
 // CausalChain executes a multi-hop causal chain query in a single round-trip.
 func (c *Client) CausalChain(seeds []string, relations []string, limitK int) ([]storage.CausalResult, error) {
-	resp, err := c.call(OpCausalChain, EncodeCausalChainPayload(seeds, relations, limitK))
+	payload, err := EncodeCausalChainPayload(seeds, relations, limitK)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.call(OpCausalChain, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -570,7 +576,11 @@ func (c *Client) CausalChain(seeds []string, relations []string, limitK int) ([]
 
 // List executes a structured query returning records matching filters and computations.
 func (c *Client) List(req ListRequest) (ListResponse, error) {
-	resp, err := c.call(OpList, EncodeListRequest(req))
+	payload, err := EncodeListRequest(req)
+	if err != nil {
+		return ListResponse{}, err
+	}
+	resp, err := c.call(OpList, payload)
 	if err != nil {
 		return ListResponse{}, err
 	}
@@ -579,7 +589,11 @@ func (c *Client) List(req ListRequest) (ListResponse, error) {
 
 // Update applies atomic mutations to records matching filter conditions.
 func (c *Client) Update(req UpdateRequest) (int, error) {
-	resp, err := c.call(OpUpdate, EncodeUpdateRequest(req))
+	payload, err := EncodeUpdateRequest(req)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.call(OpUpdate, payload)
 	if err != nil {
 		return 0, err
 	}
@@ -588,7 +602,11 @@ func (c *Client) Update(req UpdateRequest) (int, error) {
 
 // Graph executes a beam search step along spatial graph edges.
 func (c *Client) Graph(req GraphRequest) (GraphResponsePayload, error) {
-	resp, err := c.call(OpGraph, EncodeGraphRequest(req))
+	payload, err := EncodeGraphRequest(req)
+	if err != nil {
+		return GraphResponsePayload{}, err
+	}
+	resp, err := c.call(OpGraph, payload)
 	if err != nil {
 		return GraphResponsePayload{}, err
 	}
@@ -597,7 +615,11 @@ func (c *Client) Graph(req GraphRequest) (GraphResponsePayload, error) {
 
 // GraphChain executes a multi-hop graph chain traversal across specified relations.
 func (c *Client) GraphChain(req GraphChainRequest) ([]storage.GraphQueryResult, error) {
-	resp, err := c.call(OpGraphChain, EncodeGraphChainRequest(req))
+	reqPayload, err := EncodeGraphChainRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.call(OpGraphChain, reqPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +632,11 @@ func (c *Client) GraphChain(req GraphChainRequest) ([]storage.GraphQueryResult, 
 
 // AttachSchema registers a fixed schema definition for the active model.
 func (c *Client) AttachSchema(schemaJSON string) error {
-	_, err := c.call(OpAttachSchema, EncodeAttachSchemaPayload(schemaJSON))
+	payload, err := EncodeAttachSchemaPayload(schemaJSON)
+	if err != nil {
+		return err
+	}
+	_, err = c.call(OpAttachSchema, payload)
 	return err
 }
 
@@ -631,7 +657,11 @@ func (c *Client) ResetModel(confirm bool) error {
 
 // Math performs in-engine geometric or spatial math operations (distance, centroid, cosine_similarity, nearest).
 func (c *Client) Math(req MathRequest) (MathResponse, error) {
-	resp, err := c.call(OpMath, EncodeMathRequest(req))
+	payload, err := EncodeMathRequest(req)
+	if err != nil {
+		return MathResponse{}, err
+	}
+	resp, err := c.call(OpMath, payload)
 	if err != nil {
 		return MathResponse{}, err
 	}

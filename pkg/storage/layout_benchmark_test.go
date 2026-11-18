@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -218,9 +219,9 @@ func BenchmarkLayout_MmapAndGCOverhead(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		cr := db.EntityStore[names[i&(recordCount-1)]]
-		_, _ = cr.GetUint("views")
-		_, _ = cr.Get("rating")
-		_, _ = cr.GetFloat64("stat_dev")
+		_, _, _ = cr.GetUint("views")
+		_, _, _ = cr.Get("rating")
+		_, _, _ = cr.GetFloat64("stat_dev")
 	}
 }
 
@@ -272,8 +273,8 @@ func TestLayoutCandidates_Correctness(t *testing.T) {
 	// Truncated right before value bytes (after 2B count + 1B type + 2B kLen(0) = 5 bytes)
 	truncatedRaw := rawEmptyBase[:5]
 	crTruncated := CompactRecord{Operation: OpStatusActive, Raw: truncatedRaw}
-	if _, ok := crTruncated.GetTyped(""); ok {
-		t.Fatalf("expected truncated CompactRecord.Raw to return false without panic")
+	if _, _, err := crTruncated.GetTyped(""); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("expected truncated CompactRecord.Raw to return ErrCorruptRecord, got %v", err)
 	}
 	if _, ok := DecodeBaselineTLVGet(truncatedRaw, ""); ok {
 		t.Fatalf("expected truncated DecodeBaselineTLVGet to return false without panic")

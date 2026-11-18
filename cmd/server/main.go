@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,7 +60,7 @@ type ServerConfig struct {
 	// Background subsystems (Minimal Dependencies: pure Go, zero external broker)
 	CronEnabled       bool
 	PartitionSchedule string
-	RetentionDays     float32
+	RetentionDays     float64
 	SyncInterval      string
 	CronTaskTimeout   time.Duration
 	CronJitter        time.Duration
@@ -154,8 +155,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("data dir %q is not writable: %w", cfg.DataDir, err)
 	}
-	_ = probe.Close()
-	_ = os.Remove(probe.Name())
+	if err := probe.Close(); err != nil {
+		log.Printf("[WARN] Closing data dir write probe failed: %v", err)
+	}
+	if err := os.Remove(probe.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[WARN] Removing data dir write probe failed: %v", err)
+	}
 	ipFilter, err := security.NewIPFilter(cfg.IPWhitelist, cfg.TrustProxy)
 	if err != nil {
 		return nil, fmt.Errorf("invalid IP whitelist %q: %w", cfg.IPWhitelist, err)
@@ -214,7 +219,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	})
 	if initErr := joinMgr.InitError(); initErr != nil {
 		sched.Stop()
-		_ = workerPool.Shutdown()
+		if wErr := workerPool.Shutdown(); wErr != nil {
+			log.Printf("[WARN] Worker pool shutdown during init abort failed: %v", wErr)
+		}
 		return nil, initErr
 	}
 
@@ -253,6 +260,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	if cfg.RateLimitPerSec > 0 {
 		s.limiter = newRateLimiter(cfg.RateLimitPerSec, cfg.RateLimitBurst)
+		s.wireServer.SetRateLimiter(s.limiter)
 	}
 
 	// Register top-global scheduled tasks if cron is enabled. Schedules were
@@ -260,7 +268,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// everything and fail startup rather than running without retention/sync.
 	failStartup := func(task string, err error) (*Server, error) {
 		s.scheduler.Stop()
-		_ = workerPool.Shutdown()
+		if wErr := workerPool.Shutdown(); wErr != nil {
+			log.Printf("[WARN] Worker pool shutdown during startup abort failed: %v", wErr)
+		}
 		return nil, fmt.Errorf("failed to register cron task %s: %w", task, err)
 	}
 	if cfg.CronEnabled {
@@ -329,9 +339,7 @@ func recoverMiddleware(next http.Handler) http.Handler {
 					panic(rec)
 				}
 				log.Printf("[ERROR] panic recovered serving %s %s: %v", r.Method, r.URL.Path, rec)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = io.WriteString(w, `{"error":"internal server error"}`)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -383,16 +391,44 @@ func requireMethod(w http.ResponseWriter, r *http.Request, allowed ...string) bo
 			return true
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusMethodNotAllowed)
-	_, _ = io.WriteString(w, fmt.Sprintf(`{"error":"method not allowed; use %s"}`, strings.Join(allowed, " or ")))
+	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
+		"error": fmt.Sprintf("method not allowed; use %s", strings.Join(allowed, " or ")),
+	})
 	return false
 }
 
-func writeJSONError(w http.ResponseWriter, status int, message string) {
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[ERROR] Failed marshaling HTTP JSON response: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		if _, wErr := io.WriteString(w, `{"error":"internal serialization error"}`); wErr != nil {
+			log.Printf("[WARN] Failed writing serialization error response: %v", wErr)
+		}
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+	if _, err := w.Write(data); err != nil {
+		log.Printf("[WARN] Failed writing HTTP JSON response: %v", err)
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func checkMemoryWriteAdmission(w http.ResponseWriter, db *storage.AnchorDB) bool {
+	headroom := system.GetMemoryHeadroom()
+	if headroom.LimitKnown && headroom.UsedPercent >= 88 {
+		db.TriggerAutoSync()
+	}
+	if headroom.LimitKnown && headroom.UsedPercent >= 93 {
+		writeJSONError(w, http.StatusInsufficientStorage, fmt.Sprintf("storage admission control: container memory pressure %d%%", headroom.UsedPercent))
+		return false
+	}
+	return true
 }
 
 // validateS3Endpoint rejects endpoints that would let an authenticated caller
@@ -620,10 +656,10 @@ func (s *Server) RequiresAuth() bool {
 type AutoPartitionCronTask struct {
 	server        *Server
 	schedule      string
-	retentionDays float32
+	retentionDays float64
 }
 
-func NewAutoPartitionCronTask(s *Server, schedule string, retentionDays float32) *AutoPartitionCronTask {
+func NewAutoPartitionCronTask(s *Server, schedule string, retentionDays float64) *AutoPartitionCronTask {
 	return &AutoPartitionCronTask{
 		server:        s,
 		schedule:      schedule,
@@ -731,12 +767,7 @@ func (t *PeriodicSyncCronTask) Execute(ctx context.Context) error {
 		t.server.worker,
 		"periodic_disk_sync",
 		func(taskCtx context.Context) error {
-			t.server.mu.RLock()
-			names := make([]string, 0, len(t.server.models))
-			for name := range t.server.models {
-				names = append(names, name)
-			}
-			t.server.mu.RUnlock()
+			names := t.server.allModelNames()
 
 			var synced int
 			var purged int
@@ -1038,6 +1069,14 @@ func (s *Server) getModel(modelName string) (*storage.AnchorDB, error) {
 	return db, err
 }
 
+type redactedPathError struct {
+	msg string
+	err error
+}
+
+func (e *redactedPathError) Error() string { return e.msg }
+func (e *redactedPathError) Unwrap() error { return e.err }
+
 func (s *Server) acquireModelInternal(modelName string, pinned bool) (*storage.AnchorDB, func(), error) {
 	cleanName, err := sanitizeModelName(modelName)
 	if err != nil {
@@ -1110,13 +1149,10 @@ func (s *Server) acquireModelInternal(modelName string, pinned bool) (*storage.A
 		// Log full detail (including the on-disk path) server-side only; preserve
 		// sentinel error identity (e.g. ErrWALCorrupt) without disclosing dbPath.
 		log.Printf("[ERROR] Failed to open model %q at %s: %v", modelName, dbPath, err)
-		switch {
-		case errors.Is(err, storage.ErrWALCorrupt):
-			return nil, nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrWALCorrupt)
-		case errors.Is(err, storage.ErrDatabaseClosed):
-			return nil, nil, fmt.Errorf("failed to open model %q: %w", modelName, storage.ErrDatabaseClosed)
-		default:
-			return nil, nil, fmt.Errorf("failed to open model %q", modelName)
+		redacted := strings.ReplaceAll(err.Error(), dbPath, modelName)
+		return nil, nil, &redactedPathError{
+			msg: fmt.Sprintf("failed to open model %q: %s", modelName, redacted),
+			err: err,
 		}
 	}
 
@@ -1154,9 +1190,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	limited := limitRequestBody(next)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.gatewayMode {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
 				"success": false,
 				"error":   "gateway_mode_enforced",
 				"message": "direct HTTP queries are disabled in gateway mode; all requests must route through anchor-connector",
@@ -1174,20 +1208,19 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // Health check endpoint
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	headroom := system.GetMemoryHeadroom()
 	status, code := "ok", http.StatusOK
 	if s.draining.Load() {
 		// Readiness: tell load balancers / K8s to stop routing new traffic.
 		status, code = "shutting_down", http.StatusServiceUnavailable
-	} else if s.worker.IsBlocked() || s.scheduler.IsBlocked() {
+	} else if s.worker.IsBlocked() || s.scheduler.IsBlocked() || (s.wireServer != nil && s.wireServer.IsClosed()) || (headroom.LimitKnown && headroom.UsedPercent >= 93) {
 		status, code = "degraded", http.StatusServiceUnavailable
 	}
 
 	// Unauthenticated callers only get liveness/readiness. Internal state
 	// (loaded model names, memory, scheduler/worker stats) requires auth.
 	if !s.isAuthorized(r) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, code, map[string]interface{}{
 			"status": status,
 			"engine": "AnchorDB",
 		})
@@ -1220,9 +1253,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"worker_blocked": s.worker.IsBlocked(),
 		},
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, code, resp)
 }
 
 const memStatsCacheTTL = 2 * time.Second
@@ -1287,7 +1318,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&b, "# HELP anchordb_worker_jobs_in_flight Worker jobs currently in flight.\n")
 	fmt.Fprintf(&b, "# TYPE anchordb_worker_jobs_in_flight gauge\nanchordb_worker_jobs_in_flight %d\n", ws.InFlight)
 
-	_, _ = io.WriteString(w, b.String())
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		log.Printf("[WARN] Failed writing /metrics response: %v", err)
+	}
 }
 
 // Request / Response types for REST API
@@ -1440,8 +1473,12 @@ func parseFilterVal(str string) (v32 float32, v64 float64, vInt64 int64, vUint64
 	if str == "" {
 		return 0, 0, 0, 0, storage.AttrTypeFloat32, false, nil
 	}
-	if d, err := storage.ParseDate(str); err == nil {
-		return d, float64(d), int64(d), uint64(d), storage.AttrTypeFloat32, false, nil
+	if d, err := storage.ParseDateInt(str); err == nil {
+		var u uint64
+		if d >= 0 {
+			u = uint64(d)
+		}
+		return float32(d), float64(d), d, u, storage.AttrTypeInt64, true, nil
 	}
 	if i, err := strconv.ParseInt(str, 10, 64); err == nil {
 		var u uint64
@@ -1550,6 +1587,10 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if !checkMemoryWriteAdmission(w, db) {
+		return
+	}
+
 	opStatus := storage.OpStatusActive
 	if req.Operation != nil {
 		opStatus = *req.Operation
@@ -1630,7 +1671,7 @@ func (s *Server) handleSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":   true,
 		"name":      effectiveName,
 		"operation": opStatus,
@@ -1658,6 +1699,10 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if !checkMemoryWriteAdmission(w, db) {
+		return
+	}
+
 	names, err := db.SaveRecordsBatch(req.Records)
 	if err != nil {
 		if errors.Is(err, storage.ErrMissingRequiredField) ||
@@ -1672,7 +1717,7 @@ func (s *Server) handleSaveBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"count":   len(names),
 		"names":   names,
@@ -1722,12 +1767,22 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		cr, gErr := db.GetRecordTypedWithCompute(req.Name, computations, req.Select...)
 		release()
 		if gErr == nil {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			props, pErr := cr.ToMap()
+			if pErr != nil {
+				writeJSONError(w, dispatchErrorStatus(pErr), pErr.Error())
+				return
+			}
+			attrs, aErr := cr.ExpandAttrs()
+			if aErr != nil {
+				writeJSONError(w, dispatchErrorStatus(aErr), aErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"success":   true,
 				"name":      req.Name,
 				"operation": cr.Operation,
-				"props":     cr.ToMap(),
-				"attrs":     cr.ExpandAttrs(),
+				"props":     props,
+				"attrs":     attrs,
 				"tier":      "hot",
 			})
 			return
@@ -1747,12 +1802,22 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if coldErr == nil {
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		props, pErr := cr.ToMap()
+		if pErr != nil {
+			writeJSONError(w, dispatchErrorStatus(pErr), pErr.Error())
+			return
+		}
+		attrs, aErr := cr.ExpandAttrs()
+		if aErr != nil {
+			writeJSONError(w, dispatchErrorStatus(aErr), aErr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":   true,
 			"name":      req.Name,
 			"operation": cr.Operation,
-			"props":     cr.ToMap(),
-			"attrs":     cr.ExpandAttrs(),
+			"props":     props,
+			"attrs":     attrs,
 			"tier":      "cold",
 		})
 		return
@@ -1797,8 +1862,21 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Limit < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit %d cannot be negative", req.Limit))
+		return
+	}
+	if req.Offset < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("offset %d cannot be negative", req.Offset))
+		return
+	}
+	if req.Page < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("page %d cannot be negative", req.Page))
+		return
+	}
+
 	limit := req.Limit
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 10
 	}
 	if limit > maxQueryLimit {
@@ -1808,11 +1886,9 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if req.Page > 1 {
 		offset = (req.Page - 1) * limit
 	}
-	if offset < 0 {
-		offset = 0
-	}
 
-	records, hasMore, err := db.ListRecordsWithPaging(storage.QueryOptions{
+	queryOpts := storage.QueryOptions{
+		Context:              r.Context(),
 		Select:               req.Select,
 		Filters:              filters,
 		Limit:                limit,
@@ -1821,17 +1897,32 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		IncludeAllOperations: req.IncludeAllOperations,
 		OperationFilter:      req.Operation,
 		AllowedOperations:    req.AllowedOperations,
-	})
+	}
+	records, hasMore, err := db.ListRecordsWithPaging(queryOpts)
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
+	tier := "hot"
+	if len(records) == 0 {
+		coldRecs, coldHasMore, coldErr := s.ListColdRecords(req.Model, queryOpts)
+		if coldErr != nil {
+			writeJSONError(w, dispatchErrorStatus(coldErr), coldErr.Error())
+			return
+		}
+		if len(coldRecs) > 0 {
+			records = coldRecs
+			hasMore = coldHasMore
+			tier = "cold"
+		}
+	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":  true,
 		"items":    records,
 		"has_more": hasMore,
 		"count":    len(records),
+		"tier":     tier,
 	})
 }
 
@@ -1841,6 +1932,14 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req UpdateRequest
 	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	if req.Limit < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit %d cannot be negative", req.Limit))
+		return
+	}
+	if req.Offset < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("offset %d cannot be negative", req.Offset))
 		return
 	}
 
@@ -1897,8 +1996,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("failed to dispatch update to worker: %s", err.Error()))
 			return
 		}
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
 			"status":  "accepted",
 			"job_id":  jobID,
 			"model":   req.Model,
@@ -1915,13 +2013,27 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	count, err := db.UpdateRecords(storage.UpdateOptions{
+	if !checkMemoryWriteAdmission(w, db) {
+		return
+	}
+
+	updateOpts := storage.UpdateOptions{
+		Context:        r.Context(),
 		TargetEntities: req.In,
 		Filters:        filters,
 		Mutations:      mutations,
 		Limit:          req.Limit,
 		Offset:         req.Offset,
-	})
+	}
+	count, err := db.UpdateRecords(updateOpts)
+	if err == nil && count == 0 {
+		coldCount, coldErr := s.UpdateColdRecords(req.Model, updateOpts)
+		if coldErr != nil {
+			err = coldErr
+		} else {
+			count = coldCount
+		}
+	}
 	if err != nil {
 		if errors.Is(err, storage.ErrUnknownField) ||
 			errors.Is(err, storage.ErrInvalidFieldType) ||
@@ -1933,7 +2045,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":       true,
 		"updated_count": count,
 	})
@@ -1955,17 +2067,39 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	if req.LimitK < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit_k %d cannot be negative", req.LimitK))
+		return
+	}
+	if req.BeamWidth < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("beam_width %g cannot be negative", req.BeamWidth))
+		return
+	}
 	limit := req.LimitK
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 5
 	}
 	beamWidth := req.BeamWidth
-	if beamWidth <= 0 {
+	if beamWidth == 0 {
 		beamWidth = 0.05
 	}
 
 	if len(req.Relations) > 0 {
 		steps, err := db.ExecuteGraphChainWithContext(r.Context(), req.Inputs, req.Relations, limit, beamWidth)
+		if (err == nil && len(steps) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+			coldSteps, coldErr := s.ExecuteColdGraphChain(r.Context(), req.Model, wire.GraphChainRequest{
+				Inputs:        req.Inputs,
+				RelationChain: req.Relations,
+				LimitK:        limit,
+				BeamWidth:     beamWidth,
+			})
+			if coldErr == nil && len(coldSteps) > 0 {
+				steps = coldSteps
+				err = nil
+			} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
 			writeJSONError(w, dispatchErrorStatus(err), err.Error())
 			return
@@ -1974,7 +2108,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		for i, s := range steps {
 			seq[i] = s.Word
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":  true,
 			"sequence": seq,
 			"steps":    steps,
@@ -1987,12 +2121,28 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		orderMode = storage.OrderByCompositeDesc
 	}
 	results, anchor, err := db.ExecuteGraphStepWithContext(r.Context(), req.Inputs, req.Relation, limit, orderMode, beamWidth)
+	if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+		coldRes, coldAnchor, coldErr := s.ExecuteColdGraph(r.Context(), req.Model, wire.GraphRequest{
+			Inputs:    req.Inputs,
+			Relation:  req.Relation,
+			LimitK:    limit,
+			OrderMode: uint8(orderMode),
+			BeamWidth: beamWidth,
+		})
+		if coldErr == nil && len(coldRes) > 0 {
+			results = coldRes
+			anchor = coldAnchor
+			err = nil
+		} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+			err = coldErr
+		}
+	}
 	if err != nil {
 		writeJSONError(w, dispatchErrorStatus(err), err.Error())
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"anchor":  anchor,
 		"results": results,
@@ -2018,6 +2168,9 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 
 	switch strings.ToLower(strings.TrimSpace(req.Action)) {
 	case "", "add", "link":
+		if !checkMemoryWriteAdmission(w, db) {
+			return
+		}
 		if err := db.AddEdge(req.Source, req.Relation, req.Target, req.Weight); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
@@ -2028,6 +2181,9 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "set_relation", "relation":
+		if !checkMemoryWriteAdmission(w, db) {
+			return
+		}
 		if req.Direction == nil {
 			writeJSONError(w, http.StatusBadRequest, "direction is required for set_relation")
 			return
@@ -2041,7 +2197,7 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
 		"edge_count": db.EdgeCount(),
 	})
@@ -2056,6 +2212,10 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
+	if req.LimitK < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit_k %d cannot be negative", req.LimitK))
+		return
+	}
 
 	db, release, err := s.acquireModel(req.Model)
 	if err != nil {
@@ -2065,26 +2225,55 @@ func (s *Server) handleCausal(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	limit := req.LimitK
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 5
 	}
 
 	var results []storage.CausalResult
 	if len(req.Relations) > 0 {
 		results, err = db.ExecuteCausalChain(r.Context(), req.Seeds, req.Relations, limit)
+		if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+			coldRes, coldErr := s.ExecuteColdCausalChain(r.Context(), req.Model, req.Seeds, req.Relations, limit)
+			if coldErr == nil && len(coldRes) > 0 {
+				results = coldRes
+				err = nil
+			} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 	} else {
 		results, err = db.ExecuteCausalStep(r.Context(), req.Seeds, req.Relation, limit)
+		if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+			coldRes, coldErr := s.ExecuteColdCausal(r.Context(), req.Model, req.Seeds, req.Relation, limit)
+			if coldErr == nil && len(coldRes) > 0 {
+				results = coldRes
+				err = nil
+			} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 	}
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeDispatchOrBadRequestError(w, err)
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
 		"results":    results,
 		"edge_count": db.EdgeCount(),
 	})
+}
+
+func writeDispatchOrBadRequestError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, storage.ErrRecordNotFound) ||
+		errors.Is(err, storage.ErrComputeFailed) ||
+		errors.Is(err, storage.ErrDatabaseClosed) ||
+		errors.Is(err, worker.ErrWorkerUnavailable) {
+		status = dispatchErrorStatus(err)
+	}
+	writeJSONError(w, status, err.Error())
 }
 
 func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
@@ -2110,11 +2299,19 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dist, err := db.CalculateDistance(req.Words[0], req.Words[1])
+		if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+			coldRes, coldErr := s.ExecuteColdMath(req.Model, wire.MathRequest{Op: "distance", Words: req.Words})
+			if coldErr == nil {
+				dist, err = coldRes.Value, nil
+			} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":  true,
 			"distance": dist,
 		})
@@ -2124,11 +2321,19 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		coord, roles, err := db.CalculateCentroid(req.Words)
+		if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+			coldRes, coldErr := s.ExecuteColdMath(req.Model, wire.MathRequest{Op: "centroid", Words: req.Words})
+			if coldErr == nil {
+				coord, roles, err = coldRes.Coord, coldRes.Roles, nil
+			} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"coord":   coord,
 			"roles":   roles,
@@ -2139,11 +2344,19 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sim, err := db.CalculateCosineSimilarity(req.Words[0], req.Words[1])
+		if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+			coldRes, coldErr := s.ExecuteColdMath(req.Model, wire.MathRequest{Op: "cosine_similarity", Words: req.Words})
+			if coldErr == nil {
+				sim, err = coldRes.Value, nil
+			} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":    true,
 			"similarity": sim,
 		})
@@ -2152,16 +2365,28 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "nearest requires at least 1 word")
 			return
 		}
+		if req.LimitK < 0 {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit_k %d cannot be negative", req.LimitK))
+			return
+		}
 		limit := req.LimitK
-		if limit <= 0 {
+		if limit == 0 {
 			limit = 5
 		}
 		neighbors, err := db.FindNearestNeighbors(req.Words[0], limit)
+		if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+			coldRes, coldErr := s.ExecuteColdMath(req.Model, wire.MathRequest{Op: "nearest", Words: req.Words, LimitK: limit})
+			if coldErr == nil {
+				neighbors, err = coldRes.Neighbors, nil
+			} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":   true,
 			"neighbors": neighbors,
 		})
@@ -2171,11 +2396,19 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dist, err := db.CalculateHaversineDistance(req.Words[0], req.Words[1])
+		if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+			coldDist, coldErr := s.executeColdHaversine(req.Model, req.Words[0], req.Words[1])
+			if coldErr == nil {
+				dist, err = coldDist, nil
+			} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":     true,
 			"distance_km": dist,
 		})
@@ -2189,11 +2422,19 @@ func (s *Server) handleMath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stats, err := db.ComputeStats(field)
+		if err == nil && stats.Count == 0 {
+			coldStats, coldErr := s.executeColdStats(req.Model, field)
+			if coldErr == nil && coldStats.Count > 0 {
+				stats = coldStats
+			} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+				err = coldErr
+			}
+		}
 		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeDispatchOrBadRequestError(w, err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"stats":   stats,
 		})
@@ -2254,13 +2495,36 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, dispatchErrorStatus(err), fmt.Sprintf("failed to dispatch sync task to worker: %s", err.Error()))
 			return
 		}
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
 			"status":  "accepted",
 			"job_id":  jobID,
 			"model":   modelName,
 			"async":   true,
 			"message": fmt.Sprintf("Sync for model %q queued to background worker engine", modelName),
+		})
+		return
+	}
+
+	if modelName == "all" || modelName == "*" {
+		for _, m := range s.allModelNames() {
+			db, release, err := s.acquireExistingModel(m)
+			if err != nil {
+				if errors.Is(err, errModelNotFound) {
+					continue
+				}
+				writeJSONError(w, dispatchErrorStatus(err), err.Error())
+				return
+			}
+			syncErr := db.Sync()
+			release()
+			if syncErr != nil {
+				writeJSONError(w, dispatchErrorStatus(syncErr), syncErr.Error())
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "sync complete",
 		})
 		return
 	}
@@ -2277,7 +2541,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "sync complete",
 	})
@@ -2286,16 +2550,95 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 type PartitionRunRequest struct {
 	Model         string  `json:"model"`
 	DateField     string  `json:"date_field"`
-	RetentionDays float32 `json:"retention_days"`
+	RetentionDays float64 `json:"retention_days"`
 	SinkType      string  `json:"sink_type"` // "local" or "s3"
 	TargetPath    string  `json:"target_path"`
 	S3Endpoint    string  `json:"s3_endpoint"`
 	S3Bucket      string  `json:"s3_bucket"`
 	S3Prefix      string  `json:"s3_prefix"`
+	S3Region      string  `json:"s3_region"`
 	S3AccessKey   string  `json:"s3_access_key"`
 	S3SecretKey   string  `json:"s3_secret_key"`
 	PruneHotDB    *bool   `json:"prune_hot_db"`
 	Async         bool    `json:"async"` // If true, offloads to worker pool (returns HTTP 202)
+}
+
+type s3RequestParams struct {
+	Endpoint  string
+	Bucket    string
+	Prefix    string
+	Region    string
+	AccessKey string
+	SecretKey string
+}
+
+// buildRequestS3Sink resolves S3 sink configuration from request overrides and server defaults.
+func (s *Server) buildRequestS3Sink(params s3RequestParams, defaultBucket, defaultPrefix string) (*partition.S3Sink, int, error) {
+	endpoint := params.Endpoint
+	if endpoint == "" {
+		endpoint = s.s3DefaultEndpoint
+	}
+	allowPrivate, err := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	if err := validateS3Endpoint(endpoint, allowPrivate); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid s3_endpoint: %s", err.Error())
+	}
+
+	bucket := params.Bucket
+	if bucket == "" {
+		bucket = s.s3DefaultBucket
+	}
+	if bucket == "" {
+		if defaultBucket == "" {
+			return nil, http.StatusBadRequest, errors.New("s3_bucket is required")
+		}
+		bucket = defaultBucket
+	}
+
+	prefix := params.Prefix
+	if prefix == "" {
+		prefix = s.s3DefaultPrefix
+	}
+	if prefix == "" && defaultPrefix != "" {
+		prefix = defaultPrefix
+	}
+
+	accessKey := params.AccessKey
+	if accessKey == "" {
+		accessKey = s.s3DefaultAccessKey
+	}
+	secretKey := params.SecretKey
+	if secretKey == "" {
+		secretKey = s.s3DefaultSecretKey
+	}
+
+	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
+	if region := params.Region; region != "" {
+		sink.Region = region
+	} else if s.s3DefaultRegion != "" {
+		sink.Region = s.s3DefaultRegion
+	}
+
+	allowInsecure, err := getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	sink.AllowInsecureHTTP = allowInsecure
+	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
+	return sink, 0, nil
+}
+
+func (s *Server) resolveTargetModels(model string) ([]string, error) {
+	if model != "" && model != "all" && model != "*" {
+		cleanModel, err := sanitizeModelName(model)
+		if err != nil {
+			return nil, err
+		}
+		return []string{cleanModel}, nil
+	}
+	return s.allModelNames(), nil
 }
 
 func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
@@ -2314,8 +2657,12 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		dateField = "date"
 	}
 
+	if req.RetentionDays < 0 || math.IsNaN(req.RetentionDays) || math.IsInf(req.RetentionDays, 0) {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid retention_days %v", req.RetentionDays))
+		return
+	}
 	retentionDays := req.RetentionDays
-	if retentionDays <= 0 {
+	if retentionDays == 0 {
 		retentionDays = 180 // Default 6 months
 	}
 
@@ -2326,23 +2673,18 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 
 	var sink partition.PartitionSink
 	if strings.ToLower(req.SinkType) == "s3" {
-		allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
-		if err := validateS3Endpoint(req.S3Endpoint, allowPrivate); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+		s3sink, code, err := s.buildRequestS3Sink(s3RequestParams{
+			Endpoint:  req.S3Endpoint,
+			Bucket:    req.S3Bucket,
+			Prefix:    req.S3Prefix,
+			Region:    req.S3Region,
+			AccessKey: req.S3AccessKey,
+			SecretKey: req.S3SecretKey,
+		}, "anchordb-archive", "partitions")
+		if err != nil {
+			writeJSONError(w, code, err.Error())
 			return
 		}
-		endpoint := req.S3Endpoint
-		bucket := req.S3Bucket
-		if bucket == "" {
-			bucket = "anchordb-archive"
-		}
-		prefix := req.S3Prefix
-		if prefix == "" {
-			prefix = "partitions"
-		}
-		s3sink := partition.NewS3Sink(endpoint, bucket, prefix, req.S3AccessKey, req.S3SecretKey)
-		s3sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
-		s3sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 		sink = s3sink
 	} else {
 		targetDir := req.TargetPath
@@ -2379,11 +2721,10 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		sink = partition.NewLocalDiskSink(targetDir)
 	}
 
-	var targetModels []string
-	if req.Model != "" && req.Model != "all" {
-		targetModels = []string{req.Model}
-	} else {
-		targetModels = s.allModelNames()
+	targetModels, err := s.resolveTargetModels(req.Model)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
@@ -2447,8 +2788,7 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
 			"status":  "accepted",
 			"job_id":  jobID,
 			"async":   true,
@@ -2484,23 +2824,58 @@ func (s *Server) handlePartitionRun(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"results": results,
 	})
 }
 
-// handlePartitionList lists available partition archives in s.dataDir/partitions
+// handlePartitionList lists available partition archives in s.dataDir/partitions (optionally filtered by ?model=).
 func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
 		return
 	}
+	modelFilter := strings.TrimSpace(r.URL.Query().Get("model"))
+	if modelFilter == "" && r.Method == http.MethodPost {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if !decodeJSONBody(w, r, &body, true) {
+			return
+		}
+		modelFilter = strings.TrimSpace(body.Model)
+	}
+
+	type PartitionMetaDTO struct {
+		Name      string    `json:"name"`
+		SizeBytes int64     `json:"size_bytes"`
+		ModTime   time.Time `json:"mod_time"`
+	}
+
+	if modelFilter != "" && s.catalog != nil {
+		entries := s.catalog.ListEntries(modelFilter)
+		if len(entries) > 0 {
+			partitions := make([]PartitionMetaDTO, 0, len(entries))
+			for _, entry := range entries {
+				partitions = append(partitions, PartitionMetaDTO{
+					Name:      entry.PartitionFile,
+					SizeBytes: entry.SizeBytes,
+					ModTime:   entry.CreatedAt,
+				})
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success":    true,
+				"partitions": partitions,
+			})
+			return
+		}
+	}
+
 	partDir := filepath.Join(s.dataDir, "partitions")
 	entries, err := os.ReadDir(partDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"success":    true,
 				"partitions": []interface{}{},
 			})
@@ -2510,15 +2885,12 @@ func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type PartitionMetaDTO struct {
-		Name      string    `json:"name"`
-		SizeBytes int64     `json:"size_bytes"`
-		ModTime   time.Time `json:"mod_time"`
-	}
-
-	var partitions []PartitionMetaDTO
+	partitions := make([]PartitionMetaDTO, 0)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".anchordb") {
+			continue
+		}
+		if modelFilter != "" && !strings.HasPrefix(e.Name(), modelFilter+"_") {
 			continue
 		}
 		info, err := e.Info()
@@ -2536,17 +2908,20 @@ func (s *Server) handlePartitionList(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
 		"partitions": partitions,
 	})
 }
 
 type PartitionInspectRequest struct {
-	PartitionFile string `json:"partition_file"`
-	Name          string `json:"name,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
+	PartitionFile string            `json:"partition_file"`
+	Name          string            `json:"name,omitempty"`
+	Limit         int               `json:"limit,omitempty"`
+	Offset        int               `json:"offset,omitempty"`
+	Filters       []FilterDTO       `json:"filters,omitempty"`
+	Select        []string          `json:"select,omitempty"`
+	Computations  map[string]string `json:"computations,omitempty"`
 }
 
 // handlePartitionInspect safely reads records from an archived partition file via the engine.
@@ -2563,10 +2938,36 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, "partition_file is required")
 		return
 	}
+	if req.Limit < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit %d cannot be negative", req.Limit))
+		return
+	}
+	if req.Offset < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("offset %d cannot be negative", req.Offset))
+		return
+	}
+
+	filters, err := buildFilters(req.Filters)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	computations := make(map[string]storage.ComputeOp, len(req.Computations))
+	for outField, expr := range req.Computations {
+		op, cErr := parseComputeOp(expr)
+		if cErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid computation %q for field %q: %s", expr, outField, cErr.Error()))
+			return
+		}
+		computations[outField] = op
+	}
 
 	limit := req.Limit
-	if limit <= 0 || limit > 100 {
+	if limit == 0 {
 		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	// 1. Check if S3 partition (either starts with s3:// or registered in catalog with SinkType == "s3")
@@ -2576,17 +2977,28 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if strings.HasPrefix(req.PartitionFile, "s3://") || (entry != nil && entry.SinkType == "s3") {
-		sink := s.buildS3SinkForEntry(entry, req.PartitionFile)
+		sink, sErr := s.buildS3SinkForEntry(entry, req.PartitionFile)
+		if sErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, sErr.Error())
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		records, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTyped(ctx, sink, req.PartitionFile, req.Name, limit)
+		records, hasMore, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionQuery(ctx, sink, req.PartitionFile, partition.PartitionInspectQuery{
+			RecordName:   req.Name,
+			Limit:        limit,
+			Offset:       req.Offset,
+			Filters:      filters,
+			Select:       req.Select,
+			Computations: computations,
+		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
 			return
 		}
 		if req.Name != "" {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"success":        true,
 				"partition_file": req.PartitionFile,
 				"name":           req.Name,
@@ -2596,11 +3008,12 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 			})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":        true,
 			"partition_file": req.PartitionFile,
 			"records":        records,
 			"count":          len(records),
+			"has_more":       hasMore,
 			"source":         "s3",
 		})
 		return
@@ -2622,22 +3035,44 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 	defer closePartitionDB(pdb, cleanFilename)
 
 	if req.Name != "" {
-		cr, err := pdb.GetRecordTyped(req.Name)
+		var cr storage.CompactRecord
+		if len(computations) > 0 || len(req.Select) > 0 {
+			cr, err = pdb.GetRecordTypedWithCompute(req.Name, computations, req.Select...)
+		} else {
+			cr, err = pdb.GetRecordTyped(req.Name)
+		}
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("record %q not found in partition", req.Name))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		props, pErr := cr.ToMap()
+		if pErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("corrupt partition record %q: %v", req.Name, pErr))
+			return
+		}
+		attrs, aErr := cr.ExpandAttrs()
+		if aErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("corrupt partition record %q: %v", req.Name, aErr))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":        true,
 			"partition_file": cleanFilename,
 			"name":           req.Name,
-			"props":          cr.ToMap(),
-			"attrs":          cr.ExpandAttrs(),
+			"props":          props,
+			"attrs":          attrs,
 		})
 		return
 	}
 
-	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{
+		Context:      r.Context(),
+		Limit:        limit,
+		Offset:       req.Offset,
+		Filters:      filters,
+		Select:       req.Select,
+		Computations: computations,
+	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list records in partition: %s", err.Error()))
 		return
@@ -2649,11 +3084,11 @@ func (s *Server) handlePartitionInspect(w http.ResponseWriter, r *http.Request) 
 		Attrs []storage.AttrEntry `json:"attrs,omitempty"`
 	}
 	out := make([]RecordDTO, len(records))
-	for i, r := range records {
-		out[i] = RecordDTO{Name: r.Name, Props: r.Props, Attrs: r.Attrs}
+	for i, rec := range records {
+		out[i] = RecordDTO{Name: rec.Name, Props: rec.Props, Attrs: rec.Attrs}
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        true,
 		"partition_file": cleanFilename,
 		"records":        out,
@@ -2672,8 +3107,7 @@ func (s *Server) handlePartitionCatalog(w http.ResponseWriter, r *http.Request) 
 	if s.catalog != nil {
 		entries = s.catalog.ListEntries(model)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
 		"count":      len(entries),
 		"partitions": entries,
@@ -2710,8 +3144,7 @@ func (s *Server) handlePartitionCatalogRecord(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":   true,
 		"model":     req.Model,
 		"name":      req.Name,
@@ -2739,46 +3172,18 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	endpoint := req.S3Endpoint
-	if endpoint == "" {
-		endpoint = s.s3DefaultEndpoint
-	}
-	allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
-	if err := validateS3Endpoint(endpoint, allowPrivate); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
+	sink, code, err := s.buildRequestS3Sink(s3RequestParams{
+		Endpoint:  req.S3Endpoint,
+		Bucket:    req.S3Bucket,
+		Prefix:    req.S3Prefix,
+		Region:    req.S3Region,
+		AccessKey: req.S3AccessKey,
+		SecretKey: req.S3SecretKey,
+	}, "", "")
+	if err != nil {
+		writeJSONError(w, code, err.Error())
 		return
 	}
-
-	bucket := req.S3Bucket
-	if bucket == "" {
-		bucket = s.s3DefaultBucket
-	}
-	if bucket == "" {
-		writeJSONError(w, http.StatusBadRequest, "s3_bucket is required")
-		return
-	}
-
-	prefix := req.S3Prefix
-	if prefix == "" {
-		prefix = s.s3DefaultPrefix
-	}
-	accessKey := req.S3AccessKey
-	if accessKey == "" {
-		accessKey = s.s3DefaultAccessKey
-	}
-	secretKey := req.S3SecretKey
-	if secretKey == "" {
-		secretKey = s.s3DefaultSecretKey
-	}
-
-	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
-	if region := req.S3Region; region != "" {
-		sink.Region = region
-	} else if s.s3DefaultRegion != "" {
-		sink.Region = s.s3DefaultRegion
-	}
-	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
-	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -2789,12 +3194,11 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":    true,
-		"endpoint":   endpoint,
-		"bucket":     bucket,
-		"prefix":     prefix,
+		"endpoint":   sink.Endpoint,
+		"bucket":     sink.Bucket,
+		"prefix":     sink.Prefix,
 		"count":      len(partitions),
 		"partitions": partitions,
 	})
@@ -2802,16 +3206,20 @@ func (s *Server) handlePartitionS3List(w http.ResponseWriter, r *http.Request) {
 
 // PartitionS3InspectRequest represents parameters to directly inspect an S3 partition file.
 type PartitionS3InspectRequest struct {
-	S3Endpoint    string `json:"s3_endpoint"`
-	S3Bucket      string `json:"s3_bucket"`
-	S3Prefix      string `json:"s3_prefix,omitempty"`
-	S3Key         string `json:"s3_key"`
-	PartitionFile string `json:"partition_file,omitempty"`
-	S3AccessKey   string `json:"s3_access_key,omitempty"`
-	S3SecretKey   string `json:"s3_secret_key,omitempty"`
-	S3Region      string `json:"s3_region,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
+	S3Endpoint    string            `json:"s3_endpoint"`
+	S3Bucket      string            `json:"s3_bucket"`
+	S3Prefix      string            `json:"s3_prefix,omitempty"`
+	S3Key         string            `json:"s3_key"`
+	PartitionFile string            `json:"partition_file,omitempty"`
+	S3AccessKey   string            `json:"s3_access_key,omitempty"`
+	S3SecretKey   string            `json:"s3_secret_key,omitempty"`
+	S3Region      string            `json:"s3_region,omitempty"`
+	Name          string            `json:"name,omitempty"`
+	Limit         int               `json:"limit,omitempty"`
+	Offset        int               `json:"offset,omitempty"`
+	Filters       []FilterDTO       `json:"filters,omitempty"`
+	Select        []string          `json:"select,omitempty"`
+	Computations  map[string]string `json:"computations,omitempty"`
 }
 
 // handlePartitionS3Inspect reads records from an S3 partition file without requiring manual pre-downloading.
@@ -2832,65 +3240,68 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "s3_key or partition_file is required")
 		return
 	}
-
-	endpoint := req.S3Endpoint
-	if endpoint == "" {
-		endpoint = s.s3DefaultEndpoint
-	}
-	allowPrivate := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
-	if err := validateS3Endpoint(endpoint, allowPrivate); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid s3_endpoint: %s", err.Error()))
+	if req.Limit < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit %d cannot be negative", req.Limit))
 		return
 	}
-
-	bucket := req.S3Bucket
-	if bucket == "" {
-		bucket = s.s3DefaultBucket
-	}
-	if bucket == "" {
-		writeJSONError(w, http.StatusBadRequest, "s3_bucket is required")
+	if req.Offset < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("offset %d cannot be negative", req.Offset))
 		return
 	}
+	filters, err := buildFilters(req.Filters)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	computations := make(map[string]storage.ComputeOp, len(req.Computations))
+	for outField, expr := range req.Computations {
+		op, cErr := parseComputeOp(expr)
+		if cErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid computation %q for field %q: %s", expr, outField, cErr.Error()))
+			return
+		}
+		computations[outField] = op
+	}
 
-	prefix := req.S3Prefix
-	if prefix == "" {
-		prefix = s.s3DefaultPrefix
+	sink, code, err := s.buildRequestS3Sink(s3RequestParams{
+		Endpoint:  req.S3Endpoint,
+		Bucket:    req.S3Bucket,
+		Prefix:    req.S3Prefix,
+		Region:    req.S3Region,
+		AccessKey: req.S3AccessKey,
+		SecretKey: req.S3SecretKey,
+	}, "", "")
+	if err != nil {
+		writeJSONError(w, code, err.Error())
+		return
 	}
-	accessKey := req.S3AccessKey
-	if accessKey == "" {
-		accessKey = s.s3DefaultAccessKey
-	}
-	secretKey := req.S3SecretKey
-	if secretKey == "" {
-		secretKey = s.s3DefaultSecretKey
-	}
-
-	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
-	if region := req.S3Region; region != "" {
-		sink.Region = region
-	} else if s.s3DefaultRegion != "" {
-		sink.Region = s.s3DefaultRegion
-	}
-	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
-	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
 
 	limit := req.Limit
-	if limit <= 0 || limit > 100 {
+	if limit == 0 {
 		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	records, hasMore, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionTypedWithHasMore(ctx, sink, targetKey, req.Name, limit)
+	records, hasMore, specificProps, specificAttrs, err := s.s3Cache.InspectPartitionQuery(ctx, sink, targetKey, partition.PartitionInspectQuery{
+		RecordName:   req.Name,
+		Limit:        limit,
+		Offset:       req.Offset,
+		Filters:      filters,
+		Select:       req.Select,
+		Computations: computations,
+	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed inspecting s3 partition: %s", err.Error()))
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	if req.Name != "" {
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"target":  targetKey,
 			"name":    req.Name,
@@ -2900,7 +3311,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":  true,
 		"target":   targetKey,
 		"count":    len(records),
@@ -2909,7 +3320,7 @@ func (s *Server) handlePartitionS3Inspect(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc string) *partition.S3Sink {
+func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc string) (*partition.S3Sink, error) {
 	endpoint := s.s3DefaultEndpoint
 	bucket := s.s3DefaultBucket
 	prefix := s.s3DefaultPrefix
@@ -2960,16 +3371,30 @@ func (s *Server) buildS3SinkForEntry(entry *partition.CatalogEntry, keyOrLoc str
 		}
 	}
 
+	allowInsecure, err := getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
+	if err != nil {
+		return nil, err
+	}
+	allowPrivate, err := getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false)
+	if err != nil {
+		return nil, err
+	}
+
 	sink := partition.NewS3Sink(endpoint, bucket, prefix, accessKey, secretKey)
-	sink.Region = region
-	sink.AllowInsecureHTTP = getEnvBool("ANCHORDB_ALLOW_INSECURE_S3_HTTP", false)
-	sink.HTTPClient = partition.NewS3HTTPClient(getEnvBool("ANCHORDB_ALLOW_S3_PRIVATE_ENDPOINT", false))
-	return sink
+	if region != "" {
+		sink.Region = region
+	}
+	sink.AllowInsecureHTTP = allowInsecure
+	sink.HTTPClient = partition.NewS3HTTPClient(allowPrivate)
+	return sink, nil
 }
 
 func (s *Server) fetchRecordTypedFromCatalogEntry(entry *partition.CatalogEntry, name string, computations map[string]storage.ComputeOp, selectFields []string) (storage.CompactRecord, error) {
 	if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
-		sink := s.buildS3SinkForEntry(entry, entry.PartitionFile)
+		sink, err := s.buildS3SinkForEntry(entry, entry.PartitionFile)
+		if err != nil {
+			return storage.CompactRecord{}, err
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return s.s3Cache.GetRecordTyped(ctx, sink, entry.PartitionFile, name, computations, selectFields)
@@ -3042,7 +3467,397 @@ func (s *Server) GetRecordWithComputeTiered(model, name string, computations map
 	if err != nil {
 		return nil, 0, err
 	}
-	return cr.ToMap(), cr.Operation, nil
+	props, err := cr.ToMap()
+	if err != nil {
+		return nil, 0, err
+	}
+	return props, cr.Operation, nil
+}
+
+func (s *Server) forEachColdPartition(model string, fn func(entry *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error)) error {
+	if s.catalog == nil {
+		return nil
+	}
+	entries := s.catalog.ListEntries(model)
+	for _, entry := range entries {
+		var stop bool
+		var err error
+		if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
+			sink, sErr := s.buildS3SinkForEntry(entry, entry.PartitionFile)
+			if sErr != nil {
+				return sErr
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			err = s.s3Cache.RunOnPartition(ctx, sink, entry.PartitionFile, func(pdb *storage.AnchorDB) error {
+				var cbErr error
+				stop, cbErr = fn(entry, pdb)
+				return cbErr
+			})
+			cancel()
+		} else {
+			localFile := filepath.Join(s.dataDir, "partitions", filepath.Base(entry.PartitionFile))
+			pdb, openErr := storage.Open(localFile)
+			if openErr != nil {
+				return openErr
+			}
+			stop, err = fn(entry, pdb)
+			closePartitionDB(pdb, entry.PartitionFile)
+		}
+		if err != nil {
+			return err
+		}
+		if stop {
+			break
+		}
+	}
+	return nil
+}
+
+// ListColdRecords implements wire.ColdOperationsBackend across archived partitions for a model.
+func (s *Server) ListColdRecords(model string, opts storage.QueryOptions) ([]storage.EntityRecord, bool, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	offset := opts.Offset
+	if offset < 0 {
+		return nil, false, fmt.Errorf("negative offset %d", offset)
+	}
+	seen := make(map[string]struct{})
+	var all []storage.EntityRecord
+	var hasMore bool
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		partOpts := opts
+		partOpts.Offset = 0
+		partOpts.Limit = offset + limit + 1 - len(all)
+		if partOpts.Limit < 1 {
+			partOpts.Limit = 1
+		}
+		recs, partMore, lErr := pdb.ListRecordsWithPaging(partOpts)
+		if lErr != nil {
+			return false, lErr
+		}
+		for _, rec := range recs {
+			if _, dup := seen[rec.Name]; dup {
+				continue
+			}
+			seen[rec.Name] = struct{}{}
+			all = append(all, rec)
+		}
+		if len(all) > offset+limit {
+			hasMore = true
+			return true, nil
+		}
+		if partMore {
+			hasMore = true
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if offset >= len(all) {
+		return nil, false, nil
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	} else if len(all) > end {
+		hasMore = true
+	}
+	return all[offset:end], hasMore, nil
+}
+
+// UpdateColdRecords implements wire.ColdOperationsBackend for writable local partition archives.
+func (s *Server) UpdateColdRecords(model string, opts storage.UpdateOptions) (int, error) {
+	if s.catalog == nil {
+		return 0, nil
+	}
+	remaining := opts.Limit
+	if remaining < 0 {
+		return 0, fmt.Errorf("negative update limit %d", remaining)
+	}
+	totalUpdated := 0
+	entries := s.catalog.ListEntries(model)
+	for _, entry := range entries {
+		if entry.SinkType == "s3" || strings.HasPrefix(entry.TargetLocation, "s3://") {
+			for _, target := range opts.TargetEntities {
+				if slices.Contains(entry.RecordNames, target) {
+					return totalUpdated, fmt.Errorf("cannot update immutable s3 partition record %q (%s)", target, entry.PartitionFile)
+				}
+			}
+			continue
+		}
+		localFile := filepath.Join(s.dataDir, "partitions", filepath.Base(entry.PartitionFile))
+		pdb, err := storage.Open(localFile)
+		if err != nil {
+			return totalUpdated, err
+		}
+		partOpts := opts
+		if opts.Limit > 0 {
+			partOpts.Limit = remaining - totalUpdated
+			if partOpts.Limit <= 0 {
+				closePartitionDB(pdb, entry.PartitionFile)
+				break
+			}
+		}
+		updated, uErr := pdb.UpdateRecords(partOpts)
+		if uErr == nil && updated > 0 {
+			uErr = pdb.Sync()
+		}
+		closePartitionDB(pdb, entry.PartitionFile)
+		if uErr != nil {
+			return totalUpdated, uErr
+		}
+		totalUpdated += updated
+		if opts.Limit > 0 && totalUpdated >= opts.Limit {
+			break
+		}
+	}
+	return totalUpdated, nil
+}
+
+func (s *Server) hotModelRelations(model string) (map[string]spatial.Point2D, error) {
+	db, release, err := s.acquireExistingModel(model)
+	if err != nil {
+		if errors.Is(err, errModelNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer release()
+	return db.ExportRelations()
+}
+
+func applyRelationsToColdDB(pdb *storage.AnchorDB, rels map[string]spatial.Point2D) error {
+	for relName, vec := range rels {
+		if _, ok := pdb.Relation(relName); ok {
+			continue
+		}
+		if err := pdb.SetRelation(relName, vec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ExecuteColdGraph implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) ExecuteColdGraph(ctx context.Context, model string, req wire.GraphRequest) ([]storage.GraphQueryResult, spatial.Point2D, error) {
+	hotRels, err := s.hotModelRelations(model)
+	if err != nil {
+		return nil, spatial.Point2D{}, err
+	}
+	var bestRes []storage.GraphQueryResult
+	var bestAnchor spatial.Point2D
+	err = s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		if rErr := applyRelationsToColdDB(pdb, hotRels); rErr != nil {
+			return false, rErr
+		}
+		res, anchor, gErr := pdb.ExecuteGraphStepWithContext(ctx, req.Inputs, req.Relation, req.LimitK, storage.OrderByMode(req.OrderMode), req.BeamWidth)
+		if gErr != nil {
+			if errors.Is(gErr, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, gErr
+		}
+		if len(res) > 0 {
+			bestRes = res
+			bestAnchor = anchor
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, spatial.Point2D{}, err
+	}
+	if len(bestRes) == 0 {
+		return nil, spatial.Point2D{}, storage.ErrRecordNotFound
+	}
+	return bestRes, bestAnchor, nil
+}
+
+// ExecuteColdGraphChain implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) ExecuteColdGraphChain(ctx context.Context, model string, req wire.GraphChainRequest) ([]storage.GraphQueryResult, error) {
+	hotRels, err := s.hotModelRelations(model)
+	if err != nil {
+		return nil, err
+	}
+	var bestRes []storage.GraphQueryResult
+	err = s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		if rErr := applyRelationsToColdDB(pdb, hotRels); rErr != nil {
+			return false, rErr
+		}
+		res, gErr := pdb.ExecuteGraphChainWithContext(ctx, req.Inputs, req.RelationChain, req.LimitK, req.BeamWidth)
+		if gErr != nil {
+			if errors.Is(gErr, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, gErr
+		}
+		if len(res) > 0 {
+			bestRes = res
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(bestRes) == 0 {
+		return nil, storage.ErrRecordNotFound
+	}
+	return bestRes, nil
+}
+
+// ExecuteColdCausal implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) ExecuteColdCausal(ctx context.Context, model string, seeds []string, relation string, limitK int) ([]storage.CausalResult, error) {
+	var combined []storage.CausalResult
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		res, cErr := pdb.ExecuteCausalStep(ctx, seeds, relation, limitK)
+		if cErr != nil {
+			if errors.Is(cErr, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, cErr
+		}
+		combined = append(combined, res...)
+		return len(combined) >= limitK && limitK > 0, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if limitK > 0 && len(combined) > limitK {
+		combined = combined[:limitK]
+	}
+	return combined, nil
+}
+
+// ExecuteColdCausalChain implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) ExecuteColdCausalChain(ctx context.Context, model string, seeds []string, relations []string, limitK int) ([]storage.CausalResult, error) {
+	var combined []storage.CausalResult
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		res, cErr := pdb.ExecuteCausalChain(ctx, seeds, relations, limitK)
+		if cErr != nil {
+			if errors.Is(cErr, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, cErr
+		}
+		combined = append(combined, res...)
+		return len(combined) >= limitK && limitK > 0, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if limitK > 0 && len(combined) > limitK {
+		combined = combined[:limitK]
+	}
+	return combined, nil
+}
+
+// ExecuteColdMath implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) ExecuteColdMath(model string, req wire.MathRequest) (wire.MathResponse, error) {
+	var out wire.MathResponse
+	var found bool
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		var mErr error
+		switch req.Op {
+		case "distance":
+			if len(req.Words) >= 2 {
+				out.Value, mErr = pdb.CalculateDistance(req.Words[0], req.Words[1])
+			}
+		case "centroid":
+			out.Coord, out.Roles, mErr = pdb.CalculateCentroid(req.Words)
+		case "cosine_similarity", "similarity":
+			if len(req.Words) >= 2 {
+				out.Value, mErr = pdb.CalculateCosineSimilarity(req.Words[0], req.Words[1])
+			}
+		case "nearest":
+			if len(req.Words) >= 1 {
+				out.Neighbors, mErr = pdb.FindNearestNeighbors(req.Words[0], req.LimitK)
+			}
+		default:
+			return true, fmt.Errorf("unsupported math op: %s", req.Op)
+		}
+		if mErr != nil {
+			if errors.Is(mErr, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, mErr
+		}
+		found = true
+		return true, nil
+	})
+	if err != nil {
+		return wire.MathResponse{}, err
+	}
+	if !found {
+		return wire.MathResponse{}, storage.ErrRecordNotFound
+	}
+	return out, nil
+}
+
+func (s *Server) executeColdHaversine(model, wordA, wordB string) (float32, error) {
+	var dist float32
+	var found bool
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		d, err := pdb.CalculateHaversineDistance(wordA, wordB)
+		if err != nil {
+			if errors.Is(err, storage.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		dist = d
+		found = true
+		return true, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, storage.ErrRecordNotFound
+	}
+	return dist, nil
+}
+
+func (s *Server) executeColdStats(model, field string) (storage.StatsResult, error) {
+	var out storage.StatsResult
+	var found bool
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		st, err := pdb.ComputeStats(field)
+		if err != nil {
+			return false, err
+		}
+		if st.Count > 0 {
+			out = st
+			found = true
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return storage.StatsResult{}, err
+	}
+	if !found {
+		return storage.StatsResult{}, nil
+	}
+	return out, nil
+}
+
+// GetColdSchema implements wire.ColdOperationsBackend across archived partitions.
+func (s *Server) GetColdSchema(model string) (storage.ModelSchema, bool, error) {
+	var out storage.ModelSchema
+	var found bool
+	err := s.forEachColdPartition(model, func(_ *partition.CatalogEntry, pdb *storage.AnchorDB) (bool, error) {
+		if ms, ok := pdb.GetSchema(); ok {
+			out = ms
+			found = true
+			return true, nil
+		}
+		return false, nil
+	})
+	return out, found, err
 }
 
 // GetPartitionCatalog implements wire.PartitionBackend.
@@ -3071,18 +3886,38 @@ func (s *Server) GetPartitionCatalog(model string) ([]wire.PartitionCatalogItemD
 }
 
 // InspectPartition implements wire.PartitionBackend.
-func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire.PartitionInspectWireResponse, error) {
+func (s *Server) InspectPartition(req wire.PartitionInspectWireRequest) (wire.PartitionInspectWireResponse, error) {
+	if req.Limit < 0 {
+		return wire.PartitionInspectWireResponse{}, fmt.Errorf("limit %d cannot be negative", req.Limit)
+	}
+	if req.Offset < 0 {
+		return wire.PartitionInspectWireResponse{}, fmt.Errorf("offset %d cannot be negative", req.Offset)
+	}
+	fileOrLoc := req.PartitionFile
+	recordName := req.RecordName
+	limit := req.Limit
+
 	var entry *partition.CatalogEntry
 	if s.catalog != nil {
 		entry, _ = s.catalog.GetEntry(fileOrLoc)
 	}
 
 	if (entry != nil && entry.SinkType == "s3") || strings.HasPrefix(fileOrLoc, "s3://") {
-		sink := s.buildS3SinkForEntry(entry, fileOrLoc)
+		sink, sErr := s.buildS3SinkForEntry(entry, fileOrLoc)
+		if sErr != nil {
+			return wire.PartitionInspectWireResponse{}, sErr
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		records, hasMore, props, attrs, err := s.s3Cache.InspectPartitionTypedWithHasMore(ctx, sink, fileOrLoc, recordName, limit)
+		records, hasMore, props, attrs, err := s.s3Cache.InspectPartitionQuery(ctx, sink, fileOrLoc, partition.PartitionInspectQuery{
+			RecordName:   recordName,
+			Limit:        limit,
+			Offset:       req.Offset,
+			Filters:      req.Filters,
+			Select:       req.Select,
+			Computations: req.Computations,
+		})
 		if err != nil {
 			return wire.PartitionInspectWireResponse{}, err
 		}
@@ -3109,22 +3944,41 @@ func (s *Server) InspectPartition(fileOrLoc, recordName string, limit int) (wire
 	defer closePartitionDB(pdb, cleanFilename)
 
 	if recordName != "" {
-		cr, err := pdb.GetRecordTyped(recordName)
+		var cr storage.CompactRecord
+		if len(req.Computations) > 0 || len(req.Select) > 0 {
+			cr, err = pdb.GetRecordTypedWithCompute(recordName, req.Computations, req.Select...)
+		} else {
+			cr, err = pdb.GetRecordTyped(recordName)
+		}
 		if err != nil {
 			return wire.PartitionInspectWireResponse{}, err
+		}
+		props, pErr := cr.ToMap()
+		if pErr != nil {
+			return wire.PartitionInspectWireResponse{}, pErr
+		}
+		attrs, aErr := cr.ExpandAttrs()
+		if aErr != nil {
+			return wire.PartitionInspectWireResponse{}, aErr
 		}
 		return wire.PartitionInspectWireResponse{
 			PartitionFile: cleanFilename,
 			RecordName:    recordName,
-			Props:         cr.ToMap(),
-			Attrs:         cr.ExpandAttrs(),
+			Props:         props,
+			Attrs:         attrs,
 		}, nil
 	}
 
-	if limit <= 0 || limit > 1000 {
+	if limit == 0 || limit > 1000 {
 		limit = 50
 	}
-	recs, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	recs, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{
+		Limit:        limit,
+		Offset:       req.Offset,
+		Filters:      req.Filters,
+		Select:       req.Select,
+		Computations: req.Computations,
+	})
 	if err != nil {
 		return wire.PartitionInspectWireResponse{}, err
 	}
@@ -3144,8 +3998,7 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tasks := s.scheduler.Tasks()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":      true,
 		"enabled":      s.cronEnabled,
 		"task_timeout": s.scheduler.TaskTimeout().String(),
@@ -3192,8 +4045,7 @@ func (s *Server) handleSchedulerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"task":    taskName,
 		"message": fmt.Sprintf("Scheduled task %q triggered and executed successfully", taskName),
@@ -3204,8 +4056,7 @@ func (s *Server) handleWorkerStatus(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet, http.MethodPost) {
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"worker":  s.worker.Stats(),
 	})
@@ -3228,16 +4079,19 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.MaxBatch < 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("max_batch %d cannot be negative", req.MaxBatch))
+		return
+	}
 	maxBatch := req.MaxBatch
-	if maxBatch <= 0 {
+	if maxBatch == 0 {
 		maxBatch = 5000
 	}
 
-	var targetModels []string
-	if req.Model != "" && req.Model != "*" {
-		targetModels = []string{req.Model}
-	} else {
-		targetModels = s.allModelNames()
+	targetModels, err := s.resolveTargetModels(req.Model)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	isAsync := req.Async || r.URL.Query().Get("async") == "true"
@@ -3307,8 +4161,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
 			"status":  "accepted",
 			"job_id":  jobID,
 			"async":   true,
@@ -3342,8 +4195,7 @@ func (s *Server) handleCollectorRun(w http.ResponseWriter, r *http.Request) {
 		totalPurged += purged
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":        true,
 		"purged_records": totalPurged,
 		"models":         targetModels,
@@ -3367,14 +4219,13 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	if req.JobID != "" {
 		ok := s.worker.CancelByID(req.JobID)
 		if !ok {
 			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("Task with job_id %q not found in queue", req.JobID))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":        true,
 			"job_id":         req.JobID,
 			"canceled_tasks": 1,
@@ -3385,7 +4236,7 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 
 	if req.Model != "" && req.Model != "*" {
 		canceled := s.worker.CancelByModel(req.Model)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":        true,
 			"model":          req.Model,
 			"canceled_tasks": canceled,
@@ -3396,7 +4247,7 @@ func (s *Server) handleWorkerCancel(w http.ResponseWriter, r *http.Request) {
 
 	if req.All || req.Model == "*" {
 		canceled := s.worker.SafeCancel()
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":        true,
 			"scope":          "global",
 			"canceled_tasks": canceled,
@@ -3439,9 +4290,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 
 	if err := db.AttachSchema(req.Schema); err != nil {
 		if errors.Is(err, storage.ErrSchemaMismatch) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
 				"success": false,
 				"error":   "schema_mismatch",
 				"model":   modelName,
@@ -3453,8 +4302,7 @@ func (s *Server) handleModelAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"model":   modelName,
 		"status":  "LOCKED",
@@ -3473,9 +4321,20 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 	db, release, err := s.acquireExistingModel(modelName)
 	if err != nil {
 		if errors.Is(err, errModelNotFound) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			if coldSchema, ok, coldErr := s.GetColdSchema(modelName); coldErr != nil {
+				writeJSONError(w, dispatchErrorStatus(coldErr), coldErr.Error())
+				return
+			} else if ok {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"success": true,
+					"model":   modelName,
+					"locked":  true,
+					"schema":  coldSchema,
+					"tier":    "cold",
+				})
+				return
+			}
+			writeJSON(w, http.StatusNotFound, map[string]interface{}{
 				"success": false,
 				"error":   "no schema attached to model",
 				"model":   modelName,
@@ -3489,9 +4348,20 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 
 	schema, ok := db.GetSchema()
 	if !ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		if coldSchema, coldOK, coldErr := s.GetColdSchema(modelName); coldErr != nil {
+			writeJSONError(w, dispatchErrorStatus(coldErr), coldErr.Error())
+			return
+		} else if coldOK {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"model":   modelName,
+				"locked":  true,
+				"schema":  coldSchema,
+				"tier":    "cold",
+			})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]interface{}{
 			"success": false,
 			"error":   "no schema attached to model",
 			"model":   modelName,
@@ -3499,8 +4369,7 @@ func (s *Server) handleModelSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"model":   modelName,
 		"locked":  true,
@@ -3542,8 +4411,7 @@ func (s *Server) handleModelReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"model":   modelName,
 		"message": "model schema reset successfully",
@@ -3558,46 +4426,43 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func getEnvBool(key string, fallback bool) bool {
+func getEnvBool(key string, fallback bool) (bool, error) {
 	val := os.Getenv(key)
 	if val == "" {
-		return fallback
+		return fallback, nil
 	}
 	switch strings.ToLower(strings.TrimSpace(val)) {
 	case "true", "1", "yes":
-		return true
+		return true, nil
 	case "false", "0", "no":
-		return false
+		return false, nil
 	default:
-		log.Printf("[WARN] Invalid boolean env %s=%q; using fallback %v", key, val, fallback)
-		return fallback
+		return false, fmt.Errorf("invalid boolean env %s=%q", key, val)
 	}
 }
 
-func getEnvInt(key string, fallback int) int {
-	val := os.Getenv(key)
+func getEnvInt(key string, fallback int) (int, error) {
+	val := strings.TrimSpace(os.Getenv(key))
 	if val == "" {
-		return fallback
+		return fallback, nil
 	}
 	i, err := strconv.Atoi(val)
 	if err != nil {
-		log.Printf("[WARN] Invalid integer env %s=%q; using fallback %d", key, val, fallback)
-		return fallback
+		return 0, fmt.Errorf("invalid integer env %s=%q: %w", key, val, err)
 	}
-	return i
+	return i, nil
 }
 
-func getEnvFloat(key string, fallback float64) float64 {
-	val := os.Getenv(key)
+func getEnvFloat(key string, fallback float64) (float64, error) {
+	val := strings.TrimSpace(os.Getenv(key))
 	if val == "" {
-		return fallback
+		return fallback, nil
 	}
 	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
-		log.Printf("[WARN] Invalid float env %s=%q; using fallback %g", key, val, fallback)
-		return fallback
+		return 0, fmt.Errorf("invalid float env %s=%q: %w", key, val, err)
 	}
-	return f
+	return f, nil
 }
 
 // resolveDBOptions parses the WAL durability configuration with precedence
@@ -3661,7 +4526,7 @@ func main() {
 	flagWorkerEnabled := flag.Bool("worker-enabled", true, "Enable background worker pool (overrides ANCHORDB_WORKER_ENABLED)")
 	flagWorkerConcurrency := flag.Int("worker-concurrency", 0, "Worker pool concurrency (overrides ANCHORDB_WORKER_CONCURRENCY)")
 	flagWorkerQueueSize := flag.Int("worker-queue-size", 0, "Worker pool task queue size (overrides ANCHORDB_WORKER_QUEUE_SIZE)")
-	flagWorkerEnforceMemory := flag.Bool("worker-enforce-memory", false, "Enable worker memory admission control (overrides ANCHORDB_WORKER_ENFORCE_MEMORY)")
+	flagWorkerEnforceMemory := flag.Bool("worker-enforce-memory", true, "Enable worker memory admission control (overrides ANCHORDB_WORKER_ENFORCE_MEMORY)")
 	flagWorkerMemoryThreshold := flag.Float64("worker-memory-threshold", 0.85, "Worker memory threshold (overrides ANCHORDB_WORKER_MEMORY_THRESHOLD)")
 
 	// 4. Durability & Abuse-Control Flags
@@ -3680,7 +4545,10 @@ func main() {
 	flag.Parse()
 
 	// Resolve Gateway & Cluster Join Parameters (Flag > ENV > Default)
-	gatewayMode := resolveBoolFlag("gateway-mode", *flagGatewayMode, "ANCHORDB_GATEWAY_MODE", false)
+	gatewayMode, err := resolveBoolFlag("gateway-mode", *flagGatewayMode, "ANCHORDB_GATEWAY_MODE", false)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid gateway-mode configuration: %v", err)
+	}
 	joinMode := resolveStringFlag("join-mode", *flagJoinMode, "ANCHORDB_JOIN_MODE", "pairing")
 
 	pairingTimeout, err := resolveDurationFlag("pairing-timeout", *flagPairingTimeout, "ANCHORDB_PAIRING_TIMEOUT", 120*time.Second, false)
@@ -3706,7 +4574,11 @@ func main() {
 	if *flagToken != "" {
 		log.Printf("[WARN] Auth token provided via CLI flag; its value is visible in `ps`/cmdline. Use ANCHORDB_AUTH_TOKEN instead.")
 	}
-	if authToken == "" && !gatewayMode && !getEnvBool("ANCHORDB_ALLOW_INSECURE", false) {
+	allowInsecure, err := getEnvBool("ANCHORDB_ALLOW_INSECURE", false)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid ANCHORDB_ALLOW_INSECURE configuration: %v", err)
+	}
+	if authToken == "" && !gatewayMode && !allowInsecure {
 		log.Fatalf("[FATAL] ANCHORDB_AUTH_TOKEN is not set. Server refuses to run without authentication. " +
 			"Set a strong token (e.g. `openssl rand -hex 32`), enable ANCHORDB_GATEWAY_MODE=true, or for trusted LOCAL access only set ANCHORDB_ALLOW_INSECURE=true.")
 	}
@@ -3720,15 +4592,27 @@ func main() {
 	}
 
 	ipWhitelist := resolveStringFlag("ip-whitelist", *flagIPWhitelist, "ANCHORDB_IP_WHITELIST", "")
-	trustProxy := resolveBoolFlag("trust-proxy", *flagTrustProxy, "ANCHORDB_TRUST_PROXY", false)
+	trustProxy, err := resolveBoolFlag("trust-proxy", *flagTrustProxy, "ANCHORDB_TRUST_PROXY", false)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid trust-proxy configuration: %v", err)
+	}
 
 	// Resolve Cron Parameters
-	cronEnabled := resolveBoolFlag("cron-enabled", *flagCronEnabled, "ANCHORDB_CRON_ENABLED", true)
+	cronEnabled, err := resolveBoolFlag("cron-enabled", *flagCronEnabled, "ANCHORDB_CRON_ENABLED", true)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid cron-enabled configuration: %v", err)
+	}
 	partitionSched := resolveStringFlag("partition-schedule", *flagPartitionSchedule, "ANCHORDB_PARTITION_SCHEDULE", "23:00")
 
-	retentionDays := float32(*flagRetentionDays)
+	retentionDays := *flagRetentionDays
 	if !flagPassed("retention-days") {
-		retentionDays = float32(getEnvFloat("ANCHORDB_PARTITION_RETENTION_DAYS", 180))
+		retentionDays, err = getEnvFloat("ANCHORDB_PARTITION_RETENTION_DAYS", 180)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid retention-days configuration: %v", err)
+		}
+	}
+	if retentionDays < 0 || math.IsNaN(retentionDays) || math.IsInf(retentionDays, 0) {
+		log.Fatalf("[FATAL] Invalid retention-days value %v: must be >= 0", retentionDays)
 	}
 
 	syncInterval := resolveStringFlag("sync-interval", *flagSyncInterval, "ANCHORDB_SYNC_INTERVAL", "5m")
@@ -3744,26 +4628,48 @@ func main() {
 	}
 
 	// Resolve Worker Parameters
-	workerEnabled := resolveBoolFlag("worker-enabled", *flagWorkerEnabled, "ANCHORDB_WORKER_ENABLED", true)
+	workerEnabled, err := resolveBoolFlag("worker-enabled", *flagWorkerEnabled, "ANCHORDB_WORKER_ENABLED", true)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid worker-enabled configuration: %v", err)
+	}
 
 	workerConcurrency := *flagWorkerConcurrency
 	if !flagPassed("worker-concurrency") {
-		workerConcurrency = getEnvInt("ANCHORDB_WORKER_CONCURRENCY", runtime.NumCPU()*2)
+		workerConcurrency, err = getEnvInt("ANCHORDB_WORKER_CONCURRENCY", runtime.NumCPU()*2)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid worker-concurrency configuration: %v", err)
+		}
 		if workerConcurrency < 2 {
 			workerConcurrency = 2
 		}
+	} else if workerConcurrency <= 0 {
+		log.Fatalf("[FATAL] Invalid worker-concurrency %d: must be > 0", workerConcurrency)
 	}
 
 	workerQueueSize := *flagWorkerQueueSize
 	if !flagPassed("worker-queue-size") {
-		workerQueueSize = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
+		workerQueueSize, err = getEnvInt("ANCHORDB_WORKER_QUEUE_SIZE", 1000)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid worker-queue-size configuration: %v", err)
+		}
+	} else if workerQueueSize <= 0 {
+		log.Fatalf("[FATAL] Invalid worker-queue-size %d: must be > 0", workerQueueSize)
 	}
 
-	workerEnforceMemory := resolveBoolFlag("worker-enforce-memory", *flagWorkerEnforceMemory, "ANCHORDB_WORKER_ENFORCE_MEMORY", false)
+	workerEnforceMemory, err := resolveBoolFlag("worker-enforce-memory", *flagWorkerEnforceMemory, "ANCHORDB_WORKER_ENFORCE_MEMORY", true)
+	if err != nil {
+		log.Fatalf("[FATAL] Invalid worker-enforce-memory configuration: %v", err)
+	}
 
 	workerMemoryThreshold := *flagWorkerMemoryThreshold
 	if !flagPassed("worker-memory-threshold") {
-		workerMemoryThreshold = getEnvFloat("ANCHORDB_WORKER_MEMORY_THRESHOLD", 0.85)
+		workerMemoryThreshold, err = getEnvFloat("ANCHORDB_WORKER_MEMORY_THRESHOLD", 0.85)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid worker-memory-threshold configuration: %v", err)
+		}
+	}
+	if workerMemoryThreshold <= 0 || workerMemoryThreshold > 1 {
+		log.Fatalf("[FATAL] Invalid worker-memory-threshold %g: must be in (0, 1]", workerMemoryThreshold)
 	}
 
 	// Initialize and enforce Soft Memory Limit (GOMEMLIMIT)
@@ -3789,11 +4695,23 @@ func main() {
 	// Resolve per-client rate limit (Flag > ENV > disabled).
 	rateLimit := *flagRateLimit
 	if !flagPassed("rate-limit") {
-		rateLimit = getEnvFloat("ANCHORDB_RATE_LIMIT", 0)
+		rateLimit, err = getEnvFloat("ANCHORDB_RATE_LIMIT", 0)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid rate-limit configuration: %v", err)
+		}
+	}
+	if rateLimit < 0 || math.IsNaN(rateLimit) || math.IsInf(rateLimit, 0) {
+		log.Fatalf("[FATAL] Invalid rate-limit %v: must be >= 0", rateLimit)
 	}
 	rateLimitBurst := *flagRateLimitBurst
 	if !flagPassed("rate-limit-burst") {
-		rateLimitBurst = getEnvInt("ANCHORDB_RATE_LIMIT_BURST", 0)
+		rateLimitBurst, err = getEnvInt("ANCHORDB_RATE_LIMIT_BURST", 0)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid rate-limit-burst configuration: %v", err)
+		}
+	}
+	if rateLimitBurst < 0 {
+		log.Fatalf("[FATAL] Invalid rate-limit-burst %d: must be >= 0", rateLimitBurst)
 	}
 
 	serverConfig := ServerConfig{
@@ -3938,14 +4856,14 @@ func flagPassed(name string) bool {
 	return flagPassedIn(flag.CommandLine, name)
 }
 
-func resolveBoolFlagIn(fs *flag.FlagSet, name string, flagVal bool, envKey string, defaultVal bool) bool {
+func resolveBoolFlagIn(fs *flag.FlagSet, name string, flagVal bool, envKey string, defaultVal bool) (bool, error) {
 	if flagPassedIn(fs, name) {
-		return flagVal
+		return flagVal, nil
 	}
 	return getEnvBool(envKey, defaultVal)
 }
 
-func resolveBoolFlag(name string, flagVal bool, envKey string, defaultVal bool) bool {
+func resolveBoolFlag(name string, flagVal bool, envKey string, defaultVal bool) (bool, error) {
 	return resolveBoolFlagIn(flag.CommandLine, name, flagVal, envKey, defaultVal)
 }
 

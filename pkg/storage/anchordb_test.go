@@ -593,7 +593,10 @@ func TestMatchesFilter_ZeroAlloc(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := cr.MatchesFilter(tc.filter)
+		got, err := cr.MatchesFilter(tc.filter)
+		if err != nil {
+			t.Errorf("MatchesFilter(%+v) unexpected err: %v", tc.filter, err)
+		}
 		if got != tc.want {
 			t.Errorf("MatchesFilter(%+v) = %v, want %v", tc.filter, got, tc.want)
 		}
@@ -1147,17 +1150,17 @@ func TestZeroCopyMmapEntities(t *testing.T) {
 	}
 
 	// 3. Verify zero-copy reads
-	price, exists := cr1Synced.Get("price")
-	if !exists || price != 10.5 {
-		t.Fatalf("expected price 10.5, got %v (exists=%v)", price, exists)
+	price, exists, err := cr1Synced.Get("price")
+	if err != nil || !exists || price != 10.5 {
+		t.Fatalf("expected price 10.5, got %v (exists=%v, err=%v)", price, exists, err)
 	}
-	stock, exists := cr1Synced.Get("stock")
-	if !exists || stock != 50 {
-		t.Fatalf("expected stock 50, got %v (exists=%v)", stock, exists)
+	stock, exists, err := cr1Synced.Get("stock")
+	if err != nil || !exists || stock != 50 {
+		t.Fatalf("expected stock 50, got %v (exists=%v, err=%v)", stock, exists, err)
 	}
-	m := cr1Synced.ToMap()
-	if m["price"] != 10.5 || m["stock"] != 50 {
-		t.Fatalf("ToMap mismatch: %v", m)
+	m, err := cr1Synced.ToMap()
+	if err != nil || m["price"] != 10.5 || m["stock"] != 50 {
+		t.Fatalf("ToMap mismatch: %v (err=%v)", m, err)
 	}
 
 	// 4. In-memory mutation on synced record: expands Attrs
@@ -1168,9 +1171,9 @@ func TestZeroCopyMmapEntities(t *testing.T) {
 	if len(cr1Updated.Raw) != 0 {
 		t.Fatalf("expected Raw cleared upon mutation, got %d bytes", len(cr1Updated.Raw))
 	}
-	disc, exists := cr1Updated.Get("discount")
-	if !exists || disc != 0.2 {
-		t.Fatalf("expected discount 0.2, got %v", disc)
+	disc, exists, err := cr1Updated.Get("discount")
+	if err != nil || !exists || disc != 0.2 {
+		t.Fatalf("expected discount 0.2, got %v (err=%v)", disc, err)
 	}
 }
 

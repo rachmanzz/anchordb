@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -97,8 +98,12 @@ func (s *LocalDiskSink) savePartition(filename string, src io.Reader) (string, e
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
+		if err := tmp.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Printf("[PARTITION] warning: close temp file %s: %v", tmpPath, err)
+		}
+		if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[PARTITION] warning: remove temp file %s: %v", tmpPath, err)
+		}
 	}
 	if _, err := io.Copy(tmp, src); err != nil {
 		cleanup()
@@ -109,11 +114,15 @@ func (s *LocalDiskSink) savePartition(filename string, src io.Reader) (string, e
 		return "", fmt.Errorf("failed syncing partition file %s: %w", targetPath, err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[PARTITION] warning: remove temp file %s: %v", tmpPath, rmErr)
+		}
 		return "", fmt.Errorf("failed closing partition file %s: %w", targetPath, err)
 	}
 	if err := os.Chmod(tmpPath, 0600); err != nil {
-		_ = os.Remove(tmpPath)
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[PARTITION] warning: remove temp file %s: %v", tmpPath, rmErr)
+		}
 		return "", fmt.Errorf("failed setting partition file permissions: %w", err)
 	}
 	// Publish via os.Link instead of os.Rename so an existing archive (e.g. when a
@@ -126,15 +135,21 @@ func (s *LocalDiskSink) savePartition(filename string, src io.Reader) (string, e
 			uniqueName := fmt.Sprintf("%s_%s%s", stem, GenerateUUID(), ext)
 			targetPath = filepath.Join(s.BaseDir, uniqueName)
 			if linkErr := os.Link(tmpPath, targetPath); linkErr != nil {
-				_ = os.Remove(tmpPath)
+				if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					log.Printf("[PARTITION] warning: remove temp file %s: %v", tmpPath, rmErr)
+				}
 				return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, linkErr)
 			}
 		} else {
-			_ = os.Remove(tmpPath)
+			if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("[PARTITION] warning: remove temp file %s: %v", tmpPath, rmErr)
+			}
 			return "", fmt.Errorf("failed publishing partition file %s: %w", targetPath, err)
 		}
 	}
-	_ = os.Remove(tmpPath)
+	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("[PARTITION] warning: remove temp file %s after publish: %v", tmpPath, err)
+	}
 	// The archive must survive a crash before its source can be pruned.
 	if err := syncPartitionDir(s.BaseDir); err != nil {
 		return "", fmt.Errorf("failed syncing partition directory for %s: %w", targetPath, err)
@@ -395,7 +410,10 @@ func (s *S3Sink) put(filename string, body io.ReadSeeker, size int64) (string, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		snippet, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if rErr != nil {
+			return "", fmt.Errorf("S3Sink: server returned status %d (failed reading body: %v)", resp.StatusCode, rErr)
+		}
 		return "", fmt.Errorf("S3Sink: server returned status %d: %s", resp.StatusCode, string(snippet))
 	}
 
@@ -483,11 +501,17 @@ func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath str
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		snippet, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if rErr != nil {
+			return fmt.Errorf("%w: HTTP 404 (failed reading body: %v)", ErrS3ObjectNotFound, rErr)
+		}
 		return fmt.Errorf("%w: HTTP 404: %s", ErrS3ObjectNotFound, string(snippet))
 	}
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		snippet, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if rErr != nil {
+			return fmt.Errorf("S3Sink: download returned HTTP %d (failed reading body: %v)", resp.StatusCode, rErr)
+		}
 		return fmt.Errorf("S3Sink: download returned HTTP %d: %s", resp.StatusCode, string(snippet))
 	}
 
@@ -501,23 +525,33 @@ func (s *S3Sink) FetchPartition(ctx context.Context, keyOrFilename, destPath str
 		return fmt.Errorf("S3Sink: create temporary download file: %w", err)
 	}
 
+	cleanupTmp := func() {
+		if cErr := f.Close(); cErr != nil && !errors.Is(cErr, os.ErrClosed) {
+			log.Printf("[PARTITION] warning: close temp download %s: %v", tmpFile, cErr)
+		}
+		if rmErr := os.Remove(tmpFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[PARTITION] warning: remove temp download %s: %v", tmpFile, rmErr)
+		}
+	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpFile)
+		cleanupTmp()
 		return fmt.Errorf("S3Sink: stream download: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpFile)
+		cleanupTmp()
 		return fmt.Errorf("S3Sink: sync temporary download file: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpFile)
+		if rmErr := os.Remove(tmpFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[PARTITION] warning: remove temp download %s: %v", tmpFile, rmErr)
+		}
 		return fmt.Errorf("S3Sink: close temporary download file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, destPath); err != nil {
-		_ = os.Remove(tmpFile)
+		if rmErr := os.Remove(tmpFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("[PARTITION] warning: remove temp download %s: %v", tmpFile, rmErr)
+		}
 		return fmt.Errorf("S3Sink: atomic rename download file: %w", err)
 	}
 
@@ -577,14 +611,21 @@ func (s *S3Sink) ListPartitions(ctx context.Context) ([]S3ObjectInfo, error) {
 			return nil, fmt.Errorf("S3Sink: list request to %s failed: %w", req.URL, err)
 		}
 		if resp.StatusCode != http.StatusOK {
-			snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			_ = resp.Body.Close()
+			snippet, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+			if cErr := resp.Body.Close(); cErr != nil {
+				log.Printf("[PARTITION] warning: close S3 list error body: %v", cErr)
+			}
+			if rErr != nil {
+				return nil, fmt.Errorf("S3Sink: list returned HTTP %d (failed reading body: %v)", resp.StatusCode, rErr)
+			}
 			return nil, fmt.Errorf("S3Sink: list returned HTTP %d: %s", resp.StatusCode, string(snippet))
 		}
 
 		var res listBucketResult
 		decErr := xml.NewDecoder(resp.Body).Decode(&res)
-		_ = resp.Body.Close()
+		if cErr := resp.Body.Close(); cErr != nil {
+			log.Printf("[PARTITION] warning: close S3 list body: %v", cErr)
+		}
 		if decErr != nil {
 			return nil, fmt.Errorf("S3Sink: parse XML list response: %w", decErr)
 		}

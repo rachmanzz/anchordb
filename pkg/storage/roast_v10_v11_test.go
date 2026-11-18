@@ -78,8 +78,8 @@ func TestRoastV10_ConcurrentSyncAndLifecycleMutationsNoUseAfterMunmap(t *testing
 		if err != nil {
 			t.Fatalf("GetRecordTyped(%s) after concurrent Sync: %v", name, err)
 		}
-		if v, ok := cr.Get("v"); !ok || v != float32(i) {
-			t.Fatalf("unexpected value for %s: got (%v, %v)", name, v, ok)
+		if v, ok, err := cr.Get("v"); err != nil || !ok || v != float32(i) {
+			t.Fatalf("unexpected value for %s: got (%v, %v, %v)", name, v, ok, err)
 		}
 	}
 }
@@ -230,10 +230,64 @@ func TestRoastV11_RepairRefusesNonCorruptIOErrorAndFailedSyncReappliesDeletes(t 
 			t.Fatal("expected Sync to fail in 0555 directory")
 		}
 		db.mu.RLock()
-		nodeRec := db.getNode(0)
+		nodeRec, _ := db.getNode(0)
 		db.mu.RUnlock()
 		if nodeRec.ID != 0 {
 			t.Fatalf("expected deleted node ID to be zeroed after failed Sync, got ID=%d", nodeRec.ID)
 		}
+	}
+}
+
+func TestPE14_SyncPhysicallyCompactsDeletedNodesStringsAndGrid(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "compact.anchordb")
+	db, err := OpenWithOptions(dbPath, Options{WAL: WALOptions{SyncMode: SyncNone}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.SaveRecordWithNode("dead_node_long_word_payload_1", OpStatusActive, map[string]float32{"v": 1}, spatial.Point2D{X: 0.25, Y: 0.25}, [4]float32{1, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveRecordWithNode("dead_node_long_word_payload_2", OpStatusActive, map[string]float32{"v": 2}, spatial.Point2D{X: 0.26, Y: 0.26}, [4]float32{1, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveRecordWithNode("live_node", OpStatusActive, map[string]float32{"v": 3}, spatial.Point2D{X: 0.75, Y: 0.75}, [4]float32{1, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	beforeSize := db.Header.EntityOffset
+
+	if n, err := db.DeleteRecords([]string{"dead_node_long_word_payload_1", "dead_node_long_word_payload_2"}); err != nil || n != 2 {
+		t.Fatalf("DeleteRecords = (%d, %v)", n, err)
+	}
+	// Grid must already be pruned before Sync.
+	db.mu.RLock()
+	for _, list := range db.Grid {
+		for _, idx := range list {
+			rec, _ := db.getNode(idx)
+			if rec.ID == 0 {
+				db.mu.RUnlock()
+				t.Fatalf("stale tombstoned node index %d still in db.Grid before Sync", idx)
+			}
+		}
+	}
+	db.mu.RUnlock()
+
+	if err := db.Sync(); err != nil {
+		t.Fatalf("Sync compaction: %v", err)
+	}
+	if db.Header.NodeCount != 1 {
+		t.Fatalf("expected compacted NodeCount=1, got %d", db.Header.NodeCount)
+	}
+	if db.Header.EntityOffset >= beforeSize {
+		t.Fatalf("expected EntityOffset to shrink after node+string compaction, before=%d after=%d", beforeSize, db.Header.EntityOffset)
+	}
+	res, err := db.FindNodesInRadius(spatial.Point2D{X: 0.75, Y: 0.75}, 0.1, 10)
+	if err != nil || len(res) != 1 || res[0].Word != "live_node" {
+		t.Fatalf("unexpected FindNodesInRadius after compaction: res=%+v err=%v", res, err)
 	}
 }

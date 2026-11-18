@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 )
 
@@ -46,6 +47,8 @@ var (
 	ErrMalformedAuthRequest = errors.New("wire: malformed structured auth request payload")
 	// ErrMalformedAuthResponse is returned when structured auth response cannot be decoded.
 	ErrMalformedAuthResponse = errors.New("wire: malformed structured auth response payload")
+	// ErrPayloadOverflow is returned when a wire string, slice, or count exceeds protocol limits.
+	ErrPayloadOverflow = errors.New("wire: payload field exceeds protocol limit")
 )
 
 // AuthRequest represents a structured handshake authentication payload.
@@ -60,11 +63,11 @@ type AuthRequest struct {
 }
 
 // EncodeStructuredAuth encodes an AuthRequest into wire binary format.
-// Fields exceeding math.MaxUint16 bytes are defensively clamped to prevent numeric overflow.
-func EncodeStructuredAuth(req AuthRequest) []byte {
+// Fields exceeding math.MaxUint16 bytes return ErrPayloadOverflow instead of truncating.
+func EncodeStructuredAuth(req AuthRequest) ([]byte, error) {
 	nodeIDBytes := []byte(req.NodeID)
 	if len(nodeIDBytes) > math.MaxUint16 {
-		nodeIDBytes = nodeIDBytes[:math.MaxUint16]
+		return nil, fmt.Errorf("%w: node id length %d exceeds max uint16 (%d)", ErrPayloadOverflow, len(nodeIDBytes), math.MaxUint16)
 	}
 
 	if req.Type == AuthTypeStagedReauth {
@@ -87,12 +90,12 @@ func EncodeStructuredAuth(req AuthRequest) []byte {
 		binary.LittleEndian.PutUint16(buf[offset:offset+2], 32)
 		offset += 2
 		copy(buf[offset:offset+32], req.NextCommitment[:])
-		return buf
+		return buf, nil
 	}
 
 	credBytes := []byte(req.Credential)
 	if len(credBytes) > math.MaxUint16 {
-		credBytes = credBytes[:math.MaxUint16]
+		return nil, fmt.Errorf("%w: credential length %d exceeds max uint16 (%d)", ErrPayloadOverflow, len(credBytes), math.MaxUint16)
 	}
 
 	totalLen := 1 + 1 + 2 + len(nodeIDBytes) + 2 + len(credBytes)
@@ -121,7 +124,7 @@ func EncodeStructuredAuth(req AuthRequest) []byte {
 		copy(buf[offset:offset+32], req.InitialCommitment[:])
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeStructuredAuth parses an AuthRequest from a binary payload,
@@ -176,6 +179,10 @@ func DecodeStructuredAuth(payload []byte) (AuthRequest, error) {
 			return AuthRequest{}, ErrMalformedAuthRequest
 		}
 		copy(nextCommitment[:], payload[offset:offset+32])
+		offset += 32
+		if len(payload) != offset {
+			return AuthRequest{}, ErrMalformedAuthRequest
+		}
 
 		return AuthRequest{
 			Type:           AuthTypeStagedReauth,
@@ -220,17 +227,17 @@ func DecodeStructuredAuth(payload []byte) (AuthRequest, error) {
 }
 
 // EncodeAuthResponse encodes an issued SessionKey into an OpResponseOK payload.
-// Keys exceeding math.MaxUint16 bytes are defensively clamped to prevent numeric overflow.
-func EncodeAuthResponse(sessionKey string) []byte {
+// Keys exceeding math.MaxUint16 bytes return ErrPayloadOverflow.
+func EncodeAuthResponse(sessionKey string) ([]byte, error) {
 	keyBytes := []byte(sessionKey)
 	if len(keyBytes) > math.MaxUint16 {
-		keyBytes = keyBytes[:math.MaxUint16]
+		return nil, fmt.Errorf("%w: session key length %d exceeds max uint16 (%d)", ErrPayloadOverflow, len(keyBytes), math.MaxUint16)
 	}
 	buf := make([]byte, 1+2+len(keyBytes))
 	buf[0] = StructuredRespMagic
 	binary.LittleEndian.PutUint16(buf[1:3], uint16(len(keyBytes)))
 	copy(buf[3:], keyBytes)
-	return buf
+	return buf, nil
 }
 
 // DecodeAuthResponse extracts an issued SessionKey from an OpResponseOK payload.
@@ -242,24 +249,24 @@ func DecodeAuthResponse(payload []byte) (string, error) {
 		return "", errors.New("wire: auth response is not a structured session response")
 	}
 	keyLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+keyLen {
+	if len(payload) != 3+keyLen {
 		return "", ErrMalformedAuthResponse
 	}
 	return string(payload[3 : 3+keyLen]), nil
 }
 
 // EncodeRotationStagedResponse encodes an OpResponseOK payload carrying SubCodeRotationStaged.
-func EncodeRotationStagedResponse(msg string) []byte {
+func EncodeRotationStagedResponse(msg string) ([]byte, error) {
 	msgBytes := []byte(msg)
 	if len(msgBytes) > math.MaxUint16 {
-		msgBytes = msgBytes[:math.MaxUint16]
+		return nil, fmt.Errorf("%w: rotation message length %d exceeds max uint16 (%d)", ErrPayloadOverflow, len(msgBytes), math.MaxUint16)
 	}
 	buf := make([]byte, 1+1+2+len(msgBytes))
 	buf[0] = StructuredRotationRespMagic
 	buf[1] = SubCodeRotationStaged
 	binary.LittleEndian.PutUint16(buf[2:4], uint16(len(msgBytes)))
 	copy(buf[4:], msgBytes)
-	return buf
+	return buf, nil
 }
 
 // DecodeRotationStagedResponse decodes an OpResponseOK payload carrying SubCodeRotationStaged.
@@ -272,14 +279,14 @@ func DecodeRotationStagedResponse(payload []byte) (byte, string, error) {
 	}
 	subCode := payload[1]
 	msgLen := int(binary.LittleEndian.Uint16(payload[2:4]))
-	if len(payload) < 4+msgLen {
+	if len(payload) != 4+msgLen {
 		return 0, "", ErrMalformedAuthResponse
 	}
 	return subCode, string(payload[4 : 4+msgLen]), nil
 }
 
 // EncodeStructuredAuthPairing encodes an AuthRequest for initial node pairing.
-func EncodeStructuredAuthPairing(nodeID string) []byte {
+func EncodeStructuredAuthPairing(nodeID string) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:   AuthTypePairing,
 		NodeID: nodeID,
@@ -287,7 +294,7 @@ func EncodeStructuredAuthPairing(nodeID string) []byte {
 }
 
 // EncodeStructuredAuthPairingWithCommitment encodes a pairing request with an initial commitment.
-func EncodeStructuredAuthPairingWithCommitment(nodeID string, commitment [32]byte) []byte {
+func EncodeStructuredAuthPairingWithCommitment(nodeID string, commitment [32]byte) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:              AuthTypePairing,
 		NodeID:            nodeID,
@@ -297,7 +304,7 @@ func EncodeStructuredAuthPairingWithCommitment(nodeID string, commitment [32]byt
 }
 
 // EncodeStructuredAuthOTK encodes an AuthRequest for single-use OTK joining.
-func EncodeStructuredAuthOTK(nodeID, otk string) []byte {
+func EncodeStructuredAuthOTK(nodeID, otk string) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:       AuthTypeOTK,
 		NodeID:     nodeID,
@@ -306,7 +313,7 @@ func EncodeStructuredAuthOTK(nodeID, otk string) []byte {
 }
 
 // EncodeStructuredAuthOTKWithCommitment encodes an OTK request with an initial commitment.
-func EncodeStructuredAuthOTKWithCommitment(nodeID, otk string, commitment [32]byte) []byte {
+func EncodeStructuredAuthOTKWithCommitment(nodeID, otk string, commitment [32]byte) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:              AuthTypeOTK,
 		NodeID:            nodeID,
@@ -317,7 +324,7 @@ func EncodeStructuredAuthOTKWithCommitment(nodeID, otk string, commitment [32]by
 }
 
 // EncodeStructuredAuthSession encodes an AuthRequest with an existing session ticket.
-func EncodeStructuredAuthSession(nodeID, sessionKey string) []byte {
+func EncodeStructuredAuthSession(nodeID, sessionKey string) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:       AuthTypeSession,
 		NodeID:     nodeID,
@@ -326,7 +333,7 @@ func EncodeStructuredAuthSession(nodeID, sessionKey string) []byte {
 }
 
 // EncodeStructuredAuthStagedReauth encodes an AuthTypeStagedReauth request.
-func EncodeStructuredAuthStagedReauth(nodeID string, validator [32]byte, nextCommitment [32]byte) []byte {
+func EncodeStructuredAuthStagedReauth(nodeID string, validator [32]byte, nextCommitment [32]byte) ([]byte, error) {
 	return EncodeStructuredAuth(AuthRequest{
 		Type:           AuthTypeStagedReauth,
 		NodeID:         nodeID,

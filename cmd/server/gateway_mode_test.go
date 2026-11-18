@@ -132,12 +132,16 @@ func TestGatewayMode_WirePairingAndSessionIsolation(t *testing.T) {
 	}
 	defer conn1.Close()
 
+	legacyAuthPayload, err := wire.EncodeAuthPayload("some-static-token")
+	if err != nil {
+		t.Fatalf("EncodeAuthPayload failed: %v", err)
+	}
 	legacyAuthFrame := wire.Frame{
 		Magic:   wire.Magic,
 		Version: wire.Version,
 		Seq:     1,
 		OpCode:  wire.OpAuth,
-		Payload: wire.EncodeAuthPayload("some-static-token"),
+		Payload: legacyAuthPayload,
 	}
 	if err := wire.WriteFrame(conn1, legacyAuthFrame); err != nil {
 		t.Fatalf("failed to write legacy auth frame: %v", err)
@@ -163,11 +167,14 @@ func TestGatewayMode_WirePairingAndSessionIsolation(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	pairingPayload := wire.EncodeStructuredAuth(wire.AuthRequest{
+	pairingPayload, err := wire.EncodeStructuredAuth(wire.AuthRequest{
 		Type:       wire.AuthTypePairing,
 		NodeID:     "connector-gateway-01",
 		Credential: "",
 	})
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuth failed: %v", err)
+	}
 	pairingFrame := wire.Frame{
 		Magic:   wire.Magic,
 		Version: wire.Version,
@@ -231,11 +238,14 @@ func TestGatewayMode_WirePairingAndSessionIsolation(t *testing.T) {
 	}
 	defer connSession.Close()
 
-	sessionAuthPayload := wire.EncodeStructuredAuth(wire.AuthRequest{
+	sessionAuthPayload, err := wire.EncodeStructuredAuth(wire.AuthRequest{
 		Type:       wire.AuthTypeSession,
 		NodeID:     "connector-gateway-01",
 		Credential: sessionKey,
 	})
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuth failed: %v", err)
+	}
 	sessionAuthFrame := wire.Frame{
 		Magic:   wire.Magic,
 		Version: wire.Version,
@@ -261,7 +271,10 @@ func TestGatewayMode_WirePairingAndSessionIsolation(t *testing.T) {
 			"cpu": 45.0,
 		},
 	}
-	savePayloadBinary := wire.EncodeSavePayload(item)
+	savePayloadBinary, err := wire.EncodeSavePayload(item)
+	if err != nil {
+		t.Fatalf("EncodeSavePayload failed: %v", err)
+	}
 	saveFrame := wire.Frame{
 		Magic:   wire.Magic,
 		Version: wire.Version,

@@ -407,14 +407,14 @@ func TestDriver_SaveAndGetTyped(t *testing.T) {
 		t.Fatalf("GetTyped failed: %v", err)
 	}
 
-	v, ok := cr.GetInt("views")
-	if !ok || v != exactViews {
-		t.Fatalf("expected exact views %d, got %d (ok=%v)", exactViews, v, ok)
+	v, ok, err := cr.GetInt("views")
+	if err != nil || !ok || v != exactViews {
+		t.Fatalf("expected exact views %d, got %d (ok=%v, err=%v)", exactViews, v, ok, err)
 	}
 
-	u, ok := cr.GetUint("uid")
-	if !ok || u != exactUID {
-		t.Fatalf("expected exact uid %d, got %d (ok=%v)", exactUID, u, ok)
+	u, ok, err := cr.GetUint("uid")
+	if err != nil || !ok || u != exactUID {
+		t.Fatalf("expected exact uid %d, got %d (ok=%v, err=%v)", exactUID, u, ok, err)
 	}
 }
 

@@ -22,7 +22,10 @@ func TestPoint2D_DistanceSq(t *testing.T) {
 
 func TestRay_Project_OnLine(t *testing.T) {
 	// Ray from (0, 0) pointing directly along +X axis: (1, 0)
-	ray := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 1, Y: 0})
+	ray, err := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 1, Y: 0})
+	if err != nil {
+		t.Fatalf("NewRay failed: %v", err)
+	}
 
 	// Target point directly on the line at (5, 0)
 	target := Point2D{X: 5, Y: 0}
@@ -43,7 +46,10 @@ func TestRay_Project_OnLine(t *testing.T) {
 
 func TestRay_Project_Offset(t *testing.T) {
 	// Ray from (0, 0) pointing along +Y axis: (0, 1)
-	ray := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 0, Y: 1})
+	ray, err := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 0, Y: 1})
+	if err != nil {
+		t.Fatalf("NewRay failed: %v", err)
+	}
 
 	// Target point offset at (3, 4): t should be 4, d_perp should be 3 (distSqPerp = 9)
 	target := Point2D{X: 3, Y: 4}
@@ -59,7 +65,10 @@ func TestRay_Project_Offset(t *testing.T) {
 
 func TestRay_Project_Behind(t *testing.T) {
 	// Ray pointing along +X: (1, 0)
-	ray := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 1, Y: 0})
+	ray, err := NewRay(Point2D{X: 0, Y: 0}, Point2D{X: 1, Y: 0})
+	if err != nil {
+		t.Fatalf("NewRay failed: %v", err)
+	}
 
 	// Target point behind ray at (-2, 0)
 	target := Point2D{X: -2, Y: 0}

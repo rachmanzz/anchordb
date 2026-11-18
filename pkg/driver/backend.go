@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rachmanzz/anchordb/pkg/partition"
 	"github.com/rachmanzz/anchordb/pkg/scheduler"
 	"github.com/rachmanzz/anchordb/pkg/spatial"
 	"github.com/rachmanzz/anchordb/pkg/storage"
@@ -53,6 +54,17 @@ type PartitionInspectResult struct {
 	HasMore       bool                `json:"has_more,omitempty"`
 }
 
+// PartitionInspectOptions configures partition inspection queries across backends.
+type PartitionInspectOptions struct {
+	PartitionFile string
+	RecordName    string
+	Limit         int
+	Offset        int
+	Filters       []storage.FilterCondition
+	Select        []string
+	Computations  map[string]storage.ComputeOp
+}
+
 // backend defines the internal execution contract shared by local, embedded, and remote engine drivers.
 type backend interface {
 	Save(ctx context.Context, model, name string, op *uint8, props map[string]float32) (string, error)
@@ -78,6 +90,7 @@ type backend interface {
 	IsRemote() bool
 	ListPartitions(ctx context.Context, model string) ([]PartitionMeta, error)
 	InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error)
+	InspectPartitionWithOptions(ctx context.Context, model string, opts PartitionInspectOptions) (*PartitionInspectResult, error)
 	Attach(ctx context.Context, model string, schema storage.ModelSchema) error
 	GetSchema(ctx context.Context, model string) (storage.ModelSchema, error)
 	ResetModel(ctx context.Context, model string, confirm bool) error
@@ -175,7 +188,15 @@ func (b *localBackend) Get(ctx context.Context, model string, name string, selec
 	if err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: name, props: cr.ToMap(), attrs: cr.ExpandAttrs()}, nil
+	props, err := cr.ToMap()
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := cr.ExpandAttrs()
+	if err != nil {
+		return nil, err
+	}
+	return &EntityResult{Name: name, props: props, attrs: attrs}, nil
 }
 
 func (b *localBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
@@ -383,8 +404,14 @@ func (b *localBackend) ListPartitions(_ context.Context, model string) ([]Partit
 	return listPartitionsInDir(filepath.Join(filepath.Dir(b.filePath), "partitions"))
 }
 
-func inspectPartitionFile(ctx context.Context, baseDir, partitionFile, recordName string, limit int) (res *PartitionInspectResult, retErr error) {
-	cleanFilename := filepath.Base(partitionFile)
+func inspectPartitionFile(ctx context.Context, baseDir string, opts PartitionInspectOptions) (res *PartitionInspectResult, retErr error) {
+	if opts.Limit < 0 {
+		return nil, fmt.Errorf("partition inspect limit %d cannot be negative", opts.Limit)
+	}
+	if opts.Offset < 0 {
+		return nil, fmt.Errorf("partition inspect offset %d cannot be negative", opts.Offset)
+	}
+	cleanFilename := filepath.Base(opts.PartitionFile)
 	fullPath := filepath.Join(baseDir, "partitions", cleanFilename)
 	if _, err := os.Stat(fullPath); err != nil {
 		return nil, fmt.Errorf("partition file not found: %s", cleanFilename)
@@ -401,24 +428,45 @@ func inspectPartitionFile(ctx context.Context, baseDir, partitionFile, recordNam
 		}
 	}()
 
-	if recordName != "" {
-		cr, err := pdb.GetRecordTyped(recordName)
+	if opts.RecordName != "" {
+		var cr storage.CompactRecord
+		if len(opts.Select) > 0 || len(opts.Computations) > 0 {
+			cr, err = pdb.GetRecordTypedWithCompute(opts.RecordName, opts.Computations, opts.Select...)
+		} else {
+			cr, err = pdb.GetRecordTyped(opts.RecordName)
+		}
 		if err != nil {
-			return nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
+			return nil, fmt.Errorf("record %q not found in partition: %w", opts.RecordName, err)
+		}
+		props, err := cr.ToMap()
+		if err != nil {
+			return nil, fmt.Errorf("corrupt partition record %q: %w", opts.RecordName, err)
+		}
+		attrs, err := cr.ExpandAttrs()
+		if err != nil {
+			return nil, fmt.Errorf("corrupt partition record %q: %w", opts.RecordName, err)
 		}
 		return &PartitionInspectResult{
 			Success:       true,
 			PartitionFile: cleanFilename,
-			Name:          recordName,
-			Props:         cr.ToMap(),
-			Attrs:         cr.ExpandAttrs(),
+			Name:          opts.RecordName,
+			Props:         props,
+			Attrs:         attrs,
 		}, nil
 	}
 
+	limit := opts.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
-	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{Limit: limit, Context: ctx})
+	records, hasMore, err := pdb.ListRecordsWithPaging(storage.QueryOptions{
+		Limit:        limit,
+		Offset:       opts.Offset,
+		Filters:      opts.Filters,
+		Select:       opts.Select,
+		Computations: opts.Computations,
+		Context:      ctx,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list records in partition: %w", err)
 	}
@@ -438,10 +486,18 @@ func inspectPartitionFile(ctx context.Context, baseDir, partitionFile, recordNam
 }
 
 func (b *localBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return b.InspectPartitionWithOptions(ctx, model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+		Limit:         limit,
+	})
+}
+
+func (b *localBackend) InspectPartitionWithOptions(ctx context.Context, model string, opts PartitionInspectOptions) (*PartitionInspectResult, error) {
 	if err := b.checkModel(model); err != nil {
 		return nil, err
 	}
-	return inspectPartitionFile(ctx, filepath.Dir(b.filePath), partitionFile, recordName, limit)
+	return inspectPartitionFile(ctx, filepath.Dir(b.filePath), opts)
 }
 
 func (b *localBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
@@ -833,7 +889,15 @@ func (b *embeddedBackend) Get(ctx context.Context, model, name string, selectFie
 	if err != nil {
 		return nil, err
 	}
-	return &EntityResult{Name: name, props: cr.ToMap(), attrs: cr.ExpandAttrs()}, nil
+	props, err := cr.ToMap()
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := cr.ExpandAttrs()
+	if err != nil {
+		return nil, err
+	}
+	return &EntityResult{Name: name, props: props, attrs: attrs}, nil
 }
 
 func (b *embeddedBackend) List(ctx context.Context, model string, opts storage.QueryOptions) (*PagedListResult, error) {
@@ -1095,12 +1159,51 @@ func (b *embeddedBackend) IsRemote() bool {
 	return false
 }
 
-func (b *embeddedBackend) ListPartitions(_ context.Context, _ string) ([]PartitionMeta, error) {
-	return listPartitionsInDir(filepath.Join(b.dataDir, "partitions"))
+func (b *embeddedBackend) ListPartitions(_ context.Context, model string) ([]PartitionMeta, error) {
+	partDir := filepath.Join(b.dataDir, "partitions")
+	catalogPath := filepath.Join(partDir, "catalog.json")
+	if _, err := os.Stat(catalogPath); err == nil {
+		cat, err := partition.OpenCatalog(catalogPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed loading partition catalog: %w", err)
+		}
+		entries := cat.ListEntries(model)
+		out := make([]PartitionMeta, len(entries))
+		for i, e := range entries {
+			out[i] = PartitionMeta{
+				Name:      e.PartitionFile,
+				SizeBytes: e.SizeBytes,
+				ModTime:   e.CreatedAt,
+			}
+		}
+		return out, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed stating partition catalog: %w", err)
+	}
+	all, err := listPartitionsInDir(partDir)
+	if err != nil || model == "" || model == "default" {
+		return all, err
+	}
+	var filtered []PartitionMeta
+	prefix := model + "_"
+	for _, m := range all {
+		if strings.HasPrefix(m.Name, prefix) {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered, nil
 }
 
-func (b *embeddedBackend) InspectPartition(ctx context.Context, _, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
-	return inspectPartitionFile(ctx, b.dataDir, partitionFile, recordName, limit)
+func (b *embeddedBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return b.InspectPartitionWithOptions(ctx, model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+		Limit:         limit,
+	})
+}
+
+func (b *embeddedBackend) InspectPartitionWithOptions(ctx context.Context, _ string, opts PartitionInspectOptions) (*PartitionInspectResult, error) {
+	return inspectPartitionFile(ctx, b.dataDir, opts)
 }
 
 func (b *embeddedBackend) Attach(ctx context.Context, model string, schema storage.ModelSchema) error {
@@ -1653,26 +1756,63 @@ func (b *remoteBackend) IsRemote() bool {
 	return true
 }
 
-func (b *remoteBackend) ListPartitions(ctx context.Context, _ string) ([]PartitionMeta, error) {
+func (b *remoteBackend) ListPartitions(ctx context.Context, model string) ([]PartitionMeta, error) {
+	endpoint := "/v1/partition/list"
+	if model != "" && model != "default" {
+		endpoint += "?model=" + url.QueryEscape(model)
+	}
 	var resp struct {
 		Success    bool            `json:"success"`
 		Partitions []PartitionMeta `json:"partitions"`
 	}
-	if err := b.doJSON(ctx, http.MethodGet, "/v1/partition/list", nil, &resp); err != nil {
+	if err := b.doJSON(ctx, http.MethodGet, endpoint, nil, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Partitions, nil
 }
 
-func (b *remoteBackend) InspectPartition(ctx context.Context, _, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+func (b *remoteBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return b.InspectPartitionWithOptions(ctx, model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+		Limit:         limit,
+	})
+}
+
+func (b *remoteBackend) InspectPartitionWithOptions(ctx context.Context, model string, opts PartitionInspectOptions) (*PartitionInspectResult, error) {
+	if opts.Limit < 0 {
+		return nil, fmt.Errorf("partition inspect limit %d cannot be negative", opts.Limit)
+	}
+	if opts.Offset < 0 {
+		return nil, fmt.Errorf("partition inspect offset %d cannot be negative", opts.Offset)
+	}
 	req := map[string]interface{}{
-		"partition_file": partitionFile,
+		"partition_file": opts.PartitionFile,
 	}
-	if recordName != "" {
-		req["name"] = recordName
+	if model != "" {
+		req["model"] = model
 	}
-	if limit > 0 {
-		req["limit"] = limit
+	if opts.RecordName != "" {
+		req["name"] = opts.RecordName
+	}
+	if opts.Limit > 0 {
+		req["limit"] = opts.Limit
+	}
+	if opts.Offset > 0 {
+		req["offset"] = opts.Offset
+	}
+	if len(opts.Select) > 0 {
+		req["select"] = opts.Select
+	}
+	if len(opts.Filters) > 0 {
+		req["filters"] = serializeFilters(opts.Filters)
+	}
+	if len(opts.Computations) > 0 {
+		comps := make(map[string]string, len(opts.Computations))
+		for k, op := range opts.Computations {
+			comps[k] = serializeComputeOp(op)
+		}
+		req["computations"] = comps
 	}
 
 	var resp struct {
@@ -1767,9 +1907,9 @@ func serializeComputeOp(op storage.ComputeOp) string {
 	case storage.OpAssign:
 		return o.Value
 	case storage.OpAddDays:
-		return fmt.Sprintf("%s + %s", o.Field, strconv.FormatFloat(float64(o.Days), 'g', -1, 32))
+		return fmt.Sprintf("%s + %s", o.Field, strconv.FormatFloat(o.Days, 'g', -1, 64))
 	case storage.OpSubtractDays:
-		return fmt.Sprintf("%s - %s", o.Field, strconv.FormatFloat(float64(o.Days), 'g', -1, 32))
+		return fmt.Sprintf("%s - %s", o.Field, strconv.FormatFloat(o.Days, 'g', -1, 64))
 	case storage.OpDaysBetween:
 		return fmt.Sprintf("%s - %s", o.FieldA, o.FieldB)
 	default:
@@ -1831,6 +1971,9 @@ type wireBackend struct {
 }
 
 func newWireBackend(addr string, cfg clientConfig) (*wireBackend, error) {
+	if strings.TrimSpace(addr) == "" {
+		return nil, fmt.Errorf("wire address cannot be empty")
+	}
 	poolSize := cfg.poolSize
 	if poolSize <= 0 {
 		poolSize = runtime.NumCPU() * 2
@@ -2077,10 +2220,18 @@ func (b *wireBackend) Get(ctx context.Context, model, name string, selectFields 
 	if err != nil {
 		return nil, err
 	}
+	props, err := cr.ToMap()
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := cr.ExpandAttrs()
+	if err != nil {
+		return nil, err
+	}
 	return &EntityResult{
 		Name:  name,
-		props: cr.ToMap(),
-		attrs: cr.ExpandAttrs(),
+		props: props,
+		attrs: attrs,
 	}, nil
 }
 
@@ -2368,15 +2519,34 @@ func (b *wireBackend) ListPartitions(ctx context.Context, model string) ([]Parti
 }
 
 func (b *wireBackend) InspectPartition(ctx context.Context, model, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
+	return b.InspectPartitionWithOptions(ctx, model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+		Limit:         limit,
+	})
+}
+
+func (b *wireBackend) InspectPartitionWithOptions(ctx context.Context, model string, opts PartitionInspectOptions) (*PartitionInspectResult, error) {
+	if opts.Limit < 0 {
+		return nil, fmt.Errorf("partition inspect limit %d cannot be negative", opts.Limit)
+	}
+	if opts.Offset < 0 {
+		return nil, fmt.Errorf("partition inspect offset %d cannot be negative", opts.Offset)
+	}
 	var result *PartitionInspectResult
 	if model == "" {
 		model = b.defaultModel()
 	}
 	err := b.withClient(ctx, model, func(wc *wire.Client) error {
 		resp, err := wc.PartitionInspect(wire.PartitionInspectWireRequest{
-			PartitionFile: partitionFile,
-			RecordName:    recordName,
-			Limit:         limit,
+			Model:         model,
+			PartitionFile: opts.PartitionFile,
+			RecordName:    opts.RecordName,
+			Limit:         opts.Limit,
+			Offset:        opts.Offset,
+			Filters:       opts.Filters,
+			Select:        opts.Select,
+			Computations:  opts.Computations,
 		})
 		if err != nil {
 			return err

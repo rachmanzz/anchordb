@@ -120,16 +120,17 @@ func DecodeBaselineTLVGet(raw []byte, key string) (AttrEntry, bool) {
 
 		if kLen == len(key) && (kLen == 0 || unsafe.String(&raw[offset], kLen) == key) {
 			vOff := offset + kLen
-			if tTag == AttrTypeFloat32 {
+			switch tTag {
+			case AttrTypeFloat32:
 				valBits := binary.LittleEndian.Uint32(raw[vOff : vOff+4])
 				return NewFloat32Attr(key, math.Float32frombits(valBits)), true
-			} else if tTag == AttrTypeInt64 {
+			case AttrTypeInt64:
 				v := int64(binary.LittleEndian.Uint64(raw[vOff : vOff+8]))
 				return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
-			} else if tTag == AttrTypeUint64 {
+			case AttrTypeUint64:
 				v := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 				return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
-			} else if tTag == AttrTypeFloat64 {
+			case AttrTypeFloat64:
 				u64 := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 				f64 := math.Float64frombits(u64)
 				return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true
@@ -171,25 +172,26 @@ func DecodeBaselineTLVScan(raw []byte, fn func(attr AttrEntry) bool) {
 		}
 		offset += kLen
 
-		if tTag == AttrTypeFloat32 {
+		switch tTag {
+		case AttrTypeFloat32:
 			valBits := binary.LittleEndian.Uint32(raw[offset : offset+4])
 			offset += 4
 			if !fn(NewFloat32Attr(kStr, math.Float32frombits(valBits))) {
 				return
 			}
-		} else if tTag == AttrTypeInt64 {
+		case AttrTypeInt64:
 			v := int64(binary.LittleEndian.Uint64(raw[offset : offset+8]))
 			offset += 8
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
 				return
 			}
-		} else if tTag == AttrTypeUint64 {
+		case AttrTypeUint64:
 			v := binary.LittleEndian.Uint64(raw[offset : offset+8])
 			offset += 8
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
 				return
 			}
-		} else if tTag == AttrTypeFloat64 {
+		case AttrTypeFloat64:
 			u64 := binary.LittleEndian.Uint64(raw[offset : offset+8])
 			offset += 8
 			f64 := math.Float64frombits(u64)
@@ -268,16 +270,17 @@ func DecodeFixedWidthSlotGet(raw []byte, key string) (AttrEntry, bool) {
 
 		if match {
 			vOff := valsOffset + i*8
-			if tTag == AttrTypeFloat32 {
+			switch tTag {
+			case AttrTypeFloat32:
 				valBits := binary.LittleEndian.Uint32(raw[vOff : vOff+4])
 				return NewFloat32Attr(key, math.Float32frombits(valBits)), true
-			} else if tTag == AttrTypeInt64 {
+			case AttrTypeInt64:
 				v := int64(binary.LittleEndian.Uint64(raw[vOff : vOff+8]))
 				return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
-			} else if tTag == AttrTypeUint64 {
+			case AttrTypeUint64:
 				v := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 				return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
-			} else if tTag == AttrTypeFloat64 {
+			case AttrTypeFloat64:
 				u64 := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 				f64 := math.Float64frombits(u64)
 				return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true
@@ -318,28 +321,29 @@ func DecodeFixedWidthSlotScan(raw []byte, fn func(attr AttrEntry) bool) {
 		curKeyOffset += kLen
 
 		vOff := valsOffset + i*8
-		if tTag == AttrTypeFloat32 {
+		switch tTag {
+		case AttrTypeFloat32:
 			valBits := binary.LittleEndian.Uint32(raw[vOff : vOff+4])
 			if !fn(NewFloat32Attr(kStr, math.Float32frombits(valBits))) {
 				return
 			}
-		} else if tTag == AttrTypeInt64 {
+		case AttrTypeInt64:
 			v := int64(binary.LittleEndian.Uint64(raw[vOff : vOff+8]))
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
 				return
 			}
-		} else if tTag == AttrTypeUint64 {
+		case AttrTypeUint64:
 			v := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
 				return
 			}
-		} else if tTag == AttrTypeFloat64 {
+		case AttrTypeFloat64:
 			u64 := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 			f64 := math.Float64frombits(u64)
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}) {
 				return
 			}
-		} else {
+		default:
 			return
 		}
 	}
@@ -422,25 +426,26 @@ func DecodePackedTypedColumnsGet(raw []byte, key string) (AttrEntry, bool) {
 
 		if match {
 			vOff := valsOffset + valRelOffset
-			if tTag == AttrTypeFloat32 {
+			switch tTag {
+			case AttrTypeFloat32:
 				if vOff+4 > len(raw) {
 					return AttrEntry{}, false
 				}
 				valBits := binary.LittleEndian.Uint32(raw[vOff : vOff+4])
 				return NewFloat32Attr(key, math.Float32frombits(valBits)), true
-			} else if tTag == AttrTypeInt64 {
+			case AttrTypeInt64:
 				if vOff+8 > len(raw) {
 					return AttrEntry{}, false
 				}
 				v := int64(binary.LittleEndian.Uint64(raw[vOff : vOff+8]))
 				return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
-			} else if tTag == AttrTypeUint64 {
+			case AttrTypeUint64:
 				if vOff+8 > len(raw) {
 					return AttrEntry{}, false
 				}
 				v := binary.LittleEndian.Uint64(raw[vOff : vOff+8])
 				return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
-			} else if tTag == AttrTypeFloat64 {
+			case AttrTypeFloat64:
 				if vOff+8 > len(raw) {
 					return AttrEntry{}, false
 				}
@@ -485,7 +490,8 @@ func DecodePackedTypedColumnsScan(raw []byte, fn func(attr AttrEntry) bool) {
 		curKeyOffset += kLen
 
 		vOff := valsOffset + valRelOffset
-		if tTag == AttrTypeFloat32 {
+		switch tTag {
+		case AttrTypeFloat32:
 			if vOff+4 > len(raw) {
 				return
 			}
@@ -493,7 +499,7 @@ func DecodePackedTypedColumnsScan(raw []byte, fn func(attr AttrEntry) bool) {
 			if !fn(NewFloat32Attr(kStr, math.Float32frombits(valBits))) {
 				return
 			}
-		} else if tTag == AttrTypeInt64 {
+		case AttrTypeInt64:
 			if vOff+8 > len(raw) {
 				return
 			}
@@ -501,7 +507,7 @@ func DecodePackedTypedColumnsScan(raw []byte, fn func(attr AttrEntry) bool) {
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
 				return
 			}
-		} else if tTag == AttrTypeUint64 {
+		case AttrTypeUint64:
 			if vOff+8 > len(raw) {
 				return
 			}
@@ -509,7 +515,7 @@ func DecodePackedTypedColumnsScan(raw []byte, fn func(attr AttrEntry) bool) {
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
 				return
 			}
-		} else if tTag == AttrTypeFloat64 {
+		case AttrTypeFloat64:
 			if vOff+8 > len(raw) {
 				return
 			}
@@ -518,7 +524,7 @@ func DecodePackedTypedColumnsScan(raw []byte, fn func(attr AttrEntry) bool) {
 			if !fn(AttrEntry{Key: kStr, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}) {
 				return
 			}
-		} else {
+		default:
 			return
 		}
 	}
@@ -660,13 +666,13 @@ func RunLayoutBenchmark(iterations int) LayoutEvaluationReport {
 	tMmapRead := time.Now()
 	for i := 0; i < engineRecords; i++ {
 		if cr, ok := dbRecovered.EntityStore[entityNames[i]]; ok {
-			if _, ok := cr.GetUint("views"); !ok {
+			if _, ok, err := cr.GetUint("views"); err != nil || !ok {
 				report.Errors++
 			}
-			if _, ok := cr.Get("rating"); !ok {
+			if _, ok, err := cr.Get("rating"); err != nil || !ok {
 				report.Errors++
 			}
-			if _, ok := cr.GetFloat64("stat_dev"); !ok {
+			if _, ok, err := cr.GetFloat64("stat_dev"); err != nil || !ok {
 				report.Errors++
 			}
 		} else {

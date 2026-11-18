@@ -48,13 +48,19 @@ func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
 
 const maxRateLimiterBuckets = 65536
 
+// Allow exports token-bucket rate limiting for shared TCP/HTTP abuse control.
+func (rl *rateLimiter) Allow(key string) bool {
+	return rl.allow(key)
+}
+
 // allow reports whether a request for key may proceed, consuming one token.
 func (rl *rateLimiter) allow(key string) bool {
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// Sweep idle buckets periodically; the LRU eviction loop below handles maxRateLimiterBuckets in O(1).
+	// Sweep idle buckets periodically; also sweep before LRU eviction under cap pressure
+	// so stale refilled buckets are pruned before active client buckets are evicted.
 	if now.Sub(rl.lastSweep) > time.Minute {
 		rl.sweepLocked(now)
 		rl.lastSweep = now
@@ -66,6 +72,10 @@ func (rl *rateLimiter) allow(key string) bool {
 			rl.lru.MoveToFront(b.elem)
 		}
 	} else {
+		if len(rl.buckets) >= maxRateLimiterBuckets {
+			rl.sweepLocked(now)
+			rl.lastSweep = now
+		}
 		for len(rl.buckets) >= maxRateLimiterBuckets {
 			if rl.lru != nil && rl.lru.Len() > 0 {
 				oldest := rl.lru.Back()

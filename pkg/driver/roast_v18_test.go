@@ -102,6 +102,6 @@ func (m *wireCatalogModelBackend) GetPartitionCatalog(model string) ([]wire.Part
 	}, nil
 }
 
-func (m *wireCatalogModelBackend) InspectPartition(_, _ string, _ int) (wire.PartitionInspectWireResponse, error) {
+func (m *wireCatalogModelBackend) InspectPartition(_ wire.PartitionInspectWireRequest) (wire.PartitionInspectWireResponse, error) {
 	return wire.PartitionInspectWireResponse{}, nil
 }

@@ -277,7 +277,8 @@ func cmdGet(ctx context.Context, client *driver.Client, args []string) error {
 	output := map[string]any{
 		"name":       rec.Name,
 		"model":      client.ModelName(),
-		"properties": rec.Props(),
+		"properties": typedAttrsMap(rec),
+		"attrs":      rec.Attrs(),
 	}
 	out, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
@@ -287,30 +288,61 @@ func cmdGet(ctx context.Context, client *driver.Client, args []string) error {
 	return nil
 }
 
+func typedAttrsMap(rec *driver.EntityResult) map[string]any {
+	attrs := rec.Attrs()
+	out := make(map[string]any, len(attrs))
+	for _, a := range attrs {
+		switch a.Type {
+		case driver.AttrTypeInt64:
+			out[a.Key] = a.Int64()
+		case driver.AttrTypeUint64:
+			out[a.Key] = a.Uint64()
+		case driver.AttrTypeFloat64:
+			out[a.Key] = a.Float64()
+		default:
+			out[a.Key] = a.Value
+		}
+	}
+	if len(out) == 0 {
+		for k, v := range rec.Props() {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 func cmdSave(_ context.Context, client *driver.Client, args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: anchordb save <entity_name> <field1=value1> [field2=value2 ...]")
 	}
 	name := args[0]
-	props := make(map[string]float32)
+	attrs := make([]driver.AttrEntry, 0, len(args)-1)
 
 	for _, pair := range args[1:] {
 		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
 			return fmt.Errorf("invalid property argument: %q (expected key=value)", pair)
 		}
-		val, err := strconv.ParseFloat(parts[1], 32)
-		if err != nil {
-			return fmt.Errorf("invalid float32 value for %q: %w", parts[0], err)
+		key, rawVal := parts[0], parts[1]
+		if d, dErr := driver.DateInt(rawVal); dErr == nil {
+			attrs = append(attrs, driver.NewInt64Attr(key, d))
+		} else if iVal, iErr := strconv.ParseInt(rawVal, 10, 64); iErr == nil {
+			attrs = append(attrs, driver.NewInt64Attr(key, iVal))
+		} else if uVal, uErr := strconv.ParseUint(rawVal, 10, 64); uErr == nil {
+			attrs = append(attrs, driver.NewUint64Attr(key, uVal))
+		} else if fVal, fErr := strconv.ParseFloat(rawVal, 64); fErr == nil {
+			attrs = append(attrs, driver.NewFloat64Attr(key, fVal))
+		} else {
+			return fmt.Errorf("invalid numeric or date value for %q: %q", key, rawVal)
 		}
-		props[parts[0]] = float32(val)
 	}
 
-	if err := client.Save(name, props); err != nil {
+	savedName, err := client.SaveTyped(name, attrs)
+	if err != nil {
 		return fmt.Errorf("save failed: %w", err)
 	}
 
-	fmt.Printf("OK: saved entity %q to model %q with %d properties\n", name, client.ModelName(), len(props))
+	fmt.Printf("OK: saved entity %q to model %q with %d properties\n", savedName, client.ModelName(), len(attrs))
 	return nil
 }
 
@@ -330,11 +362,7 @@ func cmdList(ctx context.Context, client *driver.Client, args []string) error {
 		if len(parts) != 3 {
 			return fmt.Errorf("invalid where filter: %q (expected 'field op value')", *where)
 		}
-		val, err := strconv.ParseFloat(parts[2], 32)
-		if err != nil {
-			return fmt.Errorf("invalid filter numeric value %q: %w", parts[2], err)
-		}
-		builder.Where(parts[0], parts[1], float32(val))
+		builder.Where(parts[0], parts[1], parts[2])
 	}
 
 	res, err := builder.Execute(ctx)
@@ -349,7 +377,8 @@ func cmdList(ctx context.Context, client *driver.Client, args []string) error {
 	}
 
 	for _, item := range res.Items {
-		propsJSON, err := json.Marshal(item.Props())
+		itemCopy := item
+		propsJSON, err := json.Marshal(typedAttrsMap(&itemCopy))
 		if err != nil {
 			return fmt.Errorf("formatting item %q properties: %w", item.Name, err)
 		}

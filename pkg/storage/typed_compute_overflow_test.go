@@ -116,8 +116,8 @@ func TestTypedCompute_OverflowReturnsError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRecordTyped failed: %v", err)
 		}
-		if a, _ := cr.GetTyped("big"); a.Int64() != math.MaxInt64 {
-			t.Fatalf("expected big to stay MaxInt64 after failed update, got %d", a.Int64())
+		if a, _, err := cr.GetTyped("big"); err != nil || a.Int64() != math.MaxInt64 {
+			t.Fatalf("expected big to stay MaxInt64 after failed update, got %d (err=%v)", a.Int64(), err)
 		}
 	})
 
@@ -188,8 +188,8 @@ func TestTypedCompute_CustomOpReceivesRecordAttributes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRecordTypedWithCompute failed: %v", err)
 	}
-	if a, ok := cr.GetTyped("out"); !ok || a.Float32() != 11 {
-		t.Fatalf("expected typed Get out=11, got %+v (ok=%v)", a, ok)
+	if a, ok, err := cr.GetTyped("out"); err != nil || !ok || a.Float32() != 11 {
+		t.Fatalf("expected typed Get out=11, got %+v (ok=%v, err=%v)", a, ok, err)
 	}
 
 	recs, _, err := db.ListRecordsWithPaging(QueryOptions{Computations: map[string]ComputeOp{"out": op}})
@@ -221,7 +221,7 @@ func TestTypedCompute_CustomOpReceivesRecordAttributes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRecordTyped failed: %v", err)
 	}
-	if a, _ := updated.GetTyped("x"); a.Float32() != 11 {
-		t.Fatalf("expected updated x=11, got %v", a.Float32())
+	if a, _, err := updated.GetTyped("x"); err != nil || a.Float32() != 11 {
+		t.Fatalf("expected updated x=11, got %v (err=%v)", a.Float32(), err)
 	}
 }

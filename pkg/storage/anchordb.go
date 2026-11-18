@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"math/big"
 	"math/bits"
@@ -44,6 +43,10 @@ var ErrIntegerOverflow = errors.New("anchordb: integer arithmetic overflow")
 // and 404 are allowed) from compute/IO/closed failures (which must propagate
 // with their own status and never masquerade as not-found).
 var ErrRecordNotFound = errors.New("anchordb: record not found")
+
+// ErrCorruptRecord marks a truncated or structurally invalid binary record payload,
+// out-of-bounds node/word lookup, or corrupt mmap entity mapping.
+var ErrCorruptRecord = errors.New("anchordb: corrupt record payload")
 
 // ErrComputeFailed marks a failed in-storage computation (overflow, division
 // by zero, unknown field, custom-op error). Get/List/Update wrap it with %w so
@@ -232,132 +235,147 @@ func NewCompactRecord(op uint8, attrs []AttrEntry) CompactRecord {
 	}
 }
 
-// Get retrieves the float32 value associated with key, returning false if not found.
-func (cr CompactRecord) Get(key string) (float32, bool) {
-	if attr, ok := cr.GetTyped(key); ok {
-		return attr.Value, true
+// Get retrieves the float32 value associated with key, returning (0, false, nil) if not found
+// or ErrCorruptRecord if the raw payload is corrupt.
+func (cr CompactRecord) Get(key string) (float32, bool, error) {
+	attr, ok, err := cr.GetTyped(key)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	return 0, false
+	return attr.Value, true, nil
 }
 
-// GetInt retrieves the exact int64 value associated with key, returning false if not found.
-func (cr CompactRecord) GetInt(key string) (int64, bool) {
-	if attr, ok := cr.GetTyped(key); ok {
-		return attr.Int64(), true
+// GetInt retrieves the exact int64 value associated with key.
+func (cr CompactRecord) GetInt(key string) (int64, bool, error) {
+	attr, ok, err := cr.GetTyped(key)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	return 0, false
+	return attr.Int64(), true, nil
 }
 
-// GetUint retrieves the exact uint64 value associated with key, returning false if not found.
-func (cr CompactRecord) GetUint(key string) (uint64, bool) {
-	if attr, ok := cr.GetTyped(key); ok {
-		return attr.Uint64(), true
+// GetUint retrieves the exact uint64 value associated with key.
+func (cr CompactRecord) GetUint(key string) (uint64, bool, error) {
+	attr, ok, err := cr.GetTyped(key)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	return 0, false
+	return attr.Uint64(), true, nil
 }
 
-// GetFloat64 retrieves the exact float64 value associated with key, returning false if not found.
-func (cr CompactRecord) GetFloat64(key string) (float64, bool) {
-	if attr, ok := cr.GetTyped(key); ok {
-		return attr.Float64(), true
+// GetFloat64 retrieves the exact float64 value associated with key.
+func (cr CompactRecord) GetFloat64(key string) (float64, bool, error) {
+	attr, ok, err := cr.GetTyped(key)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	return 0, false
+	return attr.Float64(), true, nil
 }
 
-// GetTyped retrieves the full typed AttrEntry associated with key, returning false if not found.
-func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool) {
+// GetTyped retrieves the full typed AttrEntry associated with key, failing closed
+// with ErrCorruptRecord if the mmap raw payload is truncated or invalid.
+func (cr CompactRecord) GetTyped(key string) (AttrEntry, bool, error) {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
 			if cr.Attrs[i].Key == key {
-				return cr.Attrs[i], true
+				return cr.Attrs[i], true, nil
 			}
 		}
-		return AttrEntry{}, false
+		return AttrEntry{}, false, nil
 	}
-	if len(cr.Raw) >= 2 {
-		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
-		isTyped := (countRaw & RawTypedFlag) != 0
-		attrCount := int(countRaw &^ RawTypedFlag)
-		offset := 2
-		for a := 0; a < attrCount; a++ {
-			if !isTyped {
-				if offset+2 > len(cr.Raw) {
-					break
+	if len(cr.Raw) == 0 {
+		return AttrEntry{}, false, nil
+	}
+	if len(cr.Raw) < 2 {
+		return AttrEntry{}, false, ErrCorruptRecord
+	}
+	countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+	isTyped := (countRaw & RawTypedFlag) != 0
+	attrCount := int(countRaw &^ RawTypedFlag)
+	offset := 2
+	for a := 0; a < attrCount; a++ {
+		if !isTyped {
+			if offset+2 > len(cr.Raw) {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			if match {
+				val := math.Float32frombits(valBits)
+				return NewFloat32Attr(key, val), true, nil
+			}
+		} else {
+			if offset+1 > len(cr.Raw) {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			tTag := AttrType(cr.Raw[offset])
+			offset++
+			if tTag > AttrTypeFloat64 {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			if offset+2 > len(cr.Raw) {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen > len(cr.Raw) {
+				return AttrEntry{}, false, ErrCorruptRecord
+			}
+			match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
+			offset += kLen
+			switch tTag {
+			case AttrTypeFloat32:
+				if offset+4 > len(cr.Raw) {
+					return AttrEntry{}, false, ErrCorruptRecord
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen+4 > len(cr.Raw) {
-					break
-				}
-				match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
-				offset += kLen
 				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
 				offset += 4
 				if match {
 					val := math.Float32frombits(valBits)
-					return NewFloat32Attr(key, val), true
+					return NewFloat32Attr(key, val), true, nil
 				}
-			} else {
-				if offset+1 > len(cr.Raw) {
-					break
+			case AttrTypeInt64:
+				if offset+8 > len(cr.Raw) {
+					return AttrEntry{}, false, ErrCorruptRecord
 				}
-				tTag := AttrType(cr.Raw[offset])
-				offset++
-				if offset+2 > len(cr.Raw) {
-					break
+				v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+				offset += 8
+				if match {
+					return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true, nil
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen > len(cr.Raw) {
-					break
+			case AttrTypeUint64:
+				if offset+8 > len(cr.Raw) {
+					return AttrEntry{}, false, ErrCorruptRecord
 				}
-				match := kLen == len(key) && (kLen == 0 || unsafe.String(&cr.Raw[offset], kLen) == key)
-				offset += kLen
-				if tTag == AttrTypeFloat32 {
-					if offset+4 > len(cr.Raw) {
-						break
-					}
-					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-					offset += 4
-					if match {
-						val := math.Float32frombits(valBits)
-						return NewFloat32Attr(key, val), true
-					}
-				} else if tTag == AttrTypeInt64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
-					offset += 8
-					if match {
-						return AttrEntry{Key: key, Type: AttrTypeInt64, Value: float32(v), IntVal: v}, true
-					}
-				} else if tTag == AttrTypeUint64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					if match {
-						return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true
-					}
-				} else if tTag == AttrTypeFloat64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					if match {
-						f64 := math.Float64frombits(u64)
-						return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true
-					}
-				} else {
-					break
+				v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				if match {
+					return AttrEntry{Key: key, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}, true, nil
+				}
+			case AttrTypeFloat64:
+				if offset+8 > len(cr.Raw) {
+					return AttrEntry{}, false, ErrCorruptRecord
+				}
+				u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				if match {
+					f64 := math.Float64frombits(u64)
+					return AttrEntry{Key: key, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}, true, nil
 				}
 			}
 		}
 	}
-	return AttrEntry{}, false
+	if offset != len(cr.Raw) {
+		return AttrEntry{}, false, ErrCorruptRecord
+	}
+	return AttrEntry{}, false, nil
 }
 
 // ValidateRaw checks that any raw mmap-backed TLV attribute payload is structurally valid
@@ -437,8 +455,10 @@ func (cr CompactRecord) SetFloat64(key string, val float64) CompactRecord {
 // SetAttr updates or inserts a typed AttrEntry, expanding raw records if necessary.
 func (cr CompactRecord) SetAttr(entry AttrEntry) CompactRecord {
 	if len(cr.Attrs) == 0 && len(cr.Raw) >= 2 {
-		cr.Attrs = cr.expandAttrs()
-		cr.Raw = nil
+		if expanded, err := cr.expandAttrs(); err == nil {
+			cr.Attrs = expanded
+			cr.Raw = nil
+		}
 	} else if len(cr.Attrs) > 0 {
 		cr.Attrs = slices.Clone(cr.Attrs)
 	}
@@ -453,251 +473,291 @@ func (cr CompactRecord) SetAttr(entry AttrEntry) CompactRecord {
 }
 
 // ExpandAttrs returns the full slice of typed attributes for the record.
-func (cr CompactRecord) ExpandAttrs() []AttrEntry {
+func (cr CompactRecord) ExpandAttrs() ([]AttrEntry, error) {
 	if len(cr.Attrs) > 0 {
-		return slices.Clone(cr.Attrs)
+		return slices.Clone(cr.Attrs), nil
 	}
 	return cr.expandAttrs()
 }
 
-func (cr CompactRecord) expandAttrs() []AttrEntry {
+func (cr CompactRecord) expandAttrs() ([]AttrEntry, error) {
 	if len(cr.Attrs) > 0 {
-		return cr.Attrs
+		return cr.Attrs, nil
+	}
+	if len(cr.Raw) == 0 {
+		return nil, nil
 	}
 	if len(cr.Raw) < 2 {
-		return nil
+		return nil, ErrCorruptRecord
 	}
 	attrs := make([]AttrEntry, 0, cr.AttrCount())
-	cr.ForEachAttrTyped(func(attr AttrEntry) bool {
+	if err := cr.ForEachAttrTyped(func(attr AttrEntry) bool {
 		attr.Key = strings.Clone(attr.Key)
 		attrs = append(attrs, attr)
 		return true
-	})
-	return attrs
+	}); err != nil {
+		return nil, err
+	}
+	return attrs, nil
 }
 
 // ToMap decodes and returns all attributes as a standard Go map.
-func (cr CompactRecord) ToMap() map[string]float32 {
+func (cr CompactRecord) ToMap() (map[string]float32, error) {
 	m := make(map[string]float32, cr.AttrCount())
-	cr.ForEachAttrTyped(func(attr AttrEntry) bool {
+	if err := cr.ForEachAttrTyped(func(attr AttrEntry) bool {
 		m[strings.Clone(attr.Key)] = attr.Value
 		return true
-	})
-	return m
+	}); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Project extracts only the requested field subset as a map.
-func (cr CompactRecord) Project(selectFields []string) map[string]float32 {
+func (cr CompactRecord) Project(selectFields []string) (map[string]float32, error) {
 	if len(selectFields) == 0 {
 		return cr.ToMap()
 	}
+	if err := cr.ValidateRaw(); err != nil {
+		return nil, err
+	}
 	m := make(map[string]float32, len(selectFields))
 	for _, f := range selectFields {
-		if val, exists := cr.Get(f); exists {
+		val, exists, err := cr.Get(f)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
 			m[f] = val
 		}
 	}
-	return m
+	return m, nil
 }
 
 // ForEachAttr iterates over all attributes without allocating an intermediate map or slice.
-func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) {
+// Note: key passed to fn aliases cr.Raw via unsafe.String; for internal mmap-backed
+// records, callers that retain key beyond fn or across Sync/Close must copy with strings.Clone.
+// Records returned by GetRecordTyped already own a heap-cloned Raw buffer.
+func (cr CompactRecord) ForEachAttr(fn func(key string, val float32) bool) error {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
 			if !fn(cr.Attrs[i].Key, cr.Attrs[i].Value) {
-				return
+				return nil
 			}
 		}
-		return
+		return nil
 	}
-	if len(cr.Raw) >= 2 {
-		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
-		isTyped := (countRaw & RawTypedFlag) != 0
-		attrCount := int(countRaw &^ RawTypedFlag)
-		offset := 2
-		for a := 0; a < attrCount; a++ {
-			if !isTyped {
-				if offset+2 > len(cr.Raw) {
-					break
+	if len(cr.Raw) == 0 {
+		return nil
+	}
+	if len(cr.Raw) < 2 {
+		return ErrCorruptRecord
+	}
+	countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+	isTyped := (countRaw & RawTypedFlag) != 0
+	attrCount := int(countRaw &^ RawTypedFlag)
+	offset := 2
+	for a := 0; a < attrCount; a++ {
+		if !isTyped {
+			if offset+2 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			var kStr string
+			if kLen > 0 {
+				kStr = unsafe.String(&cr.Raw[offset], kLen)
+			}
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			if !fn(kStr, math.Float32frombits(valBits)) {
+				return nil
+			}
+		} else {
+			if offset+1 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			tTag := AttrType(cr.Raw[offset])
+			offset++
+			if tTag > AttrTypeFloat64 {
+				return ErrCorruptRecord
+			}
+			if offset+2 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			var kStr string
+			if kLen > 0 {
+				kStr = unsafe.String(&cr.Raw[offset], kLen)
+			}
+			offset += kLen
+			switch tTag {
+			case AttrTypeFloat32:
+				if offset+4 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen+4 > len(cr.Raw) {
-					break
-				}
-				var kStr string
-				if kLen > 0 {
-					kStr = unsafe.String(&cr.Raw[offset], kLen)
-				}
-				offset += kLen
 				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
 				offset += 4
 				if !fn(kStr, math.Float32frombits(valBits)) {
-					return
+					return nil
 				}
-			} else {
-				if offset+1 > len(cr.Raw) {
-					break
+			case AttrTypeInt64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				tTag := AttrType(cr.Raw[offset])
-				offset++
-				if offset+2 > len(cr.Raw) {
-					break
+				v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+				offset += 8
+				if !fn(kStr, float32(v)) {
+					return nil
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen > len(cr.Raw) {
-					break
+			case AttrTypeUint64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				var kStr string
-				if kLen > 0 {
-					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				if !fn(kStr, float32(v)) {
+					return nil
 				}
-				offset += kLen
-				if tTag == AttrTypeFloat32 {
-					if offset+4 > len(cr.Raw) {
-						break
-					}
-					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-					offset += 4
-					if !fn(kStr, math.Float32frombits(valBits)) {
-						return
-					}
-				} else if tTag == AttrTypeInt64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
-					offset += 8
-					if !fn(kStr, float32(v)) {
-						return
-					}
-				} else if tTag == AttrTypeUint64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					if !fn(kStr, float32(v)) {
-						return
-					}
-				} else if tTag == AttrTypeFloat64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					f64 := math.Float64frombits(u64)
-					if !fn(kStr, float32(f64)) {
-						return
-					}
-				} else {
-					break
+			case AttrTypeFloat64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
+				}
+				u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				f64 := math.Float64frombits(u64)
+				if !fn(kStr, float32(f64)) {
+					return nil
 				}
 			}
 		}
 	}
+	if offset != len(cr.Raw) {
+		return ErrCorruptRecord
+	}
+	return nil
 }
 
 // ForEachAttrTyped iterates over all typed attributes without allocating an intermediate map or slice.
-func (cr CompactRecord) ForEachAttrTyped(fn func(attr AttrEntry) bool) {
+// Note: attr.Key passed to fn aliases cr.Raw via unsafe.String; for internal mmap-backed
+// records, callers that retain attr.Key beyond fn or across Sync/Close must copy with strings.Clone.
+// Records returned by GetRecordTyped already own a heap-cloned Raw buffer.
+func (cr CompactRecord) ForEachAttrTyped(fn func(attr AttrEntry) bool) error {
 	if len(cr.Attrs) > 0 {
 		for i := range cr.Attrs {
 			if !fn(cr.Attrs[i]) {
-				return
+				return nil
 			}
 		}
-		return
+		return nil
 	}
-	if len(cr.Raw) >= 2 {
-		countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
-		isTyped := (countRaw & RawTypedFlag) != 0
-		attrCount := int(countRaw &^ RawTypedFlag)
-		offset := 2
-		for a := 0; a < attrCount; a++ {
-			if !isTyped {
-				if offset+2 > len(cr.Raw) {
-					break
+	if len(cr.Raw) == 0 {
+		return nil
+	}
+	if len(cr.Raw) < 2 {
+		return ErrCorruptRecord
+	}
+	countRaw := binary.LittleEndian.Uint16(cr.Raw[:2])
+	isTyped := (countRaw & RawTypedFlag) != 0
+	attrCount := int(countRaw &^ RawTypedFlag)
+	offset := 2
+	for a := 0; a < attrCount; a++ {
+		if !isTyped {
+			if offset+2 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen+4 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			var kStr string
+			if kLen > 0 {
+				kStr = unsafe.String(&cr.Raw[offset], kLen)
+			}
+			offset += kLen
+			valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
+			offset += 4
+			val := math.Float32frombits(valBits)
+			if !fn(NewFloat32Attr(kStr, val)) {
+				return nil
+			}
+		} else {
+			if offset+1 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			tTag := AttrType(cr.Raw[offset])
+			offset++
+			if tTag > AttrTypeFloat64 {
+				return ErrCorruptRecord
+			}
+			if offset+2 > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
+			offset += 2
+			if offset+kLen > len(cr.Raw) {
+				return ErrCorruptRecord
+			}
+			var kStr string
+			if kLen > 0 {
+				kStr = unsafe.String(&cr.Raw[offset], kLen)
+			}
+			offset += kLen
+			switch tTag {
+			case AttrTypeFloat32:
+				if offset+4 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen+4 > len(cr.Raw) {
-					break
-				}
-				var kStr string
-				if kLen > 0 {
-					kStr = unsafe.String(&cr.Raw[offset], kLen)
-				}
-				offset += kLen
 				valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
 				offset += 4
 				val := math.Float32frombits(valBits)
 				if !fn(NewFloat32Attr(kStr, val)) {
-					return
+					return nil
 				}
-			} else {
-				if offset+1 > len(cr.Raw) {
-					break
+			case AttrTypeInt64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				tTag := AttrType(cr.Raw[offset])
-				offset++
-				if offset+2 > len(cr.Raw) {
-					break
+				v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
+				offset += 8
+				if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
+					return nil
 				}
-				kLen := int(binary.LittleEndian.Uint16(cr.Raw[offset : offset+2]))
-				offset += 2
-				if offset+kLen > len(cr.Raw) {
-					break
+			case AttrTypeUint64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
 				}
-				var kStr string
-				if kLen > 0 {
-					kStr = unsafe.String(&cr.Raw[offset], kLen)
+				v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
+					return nil
 				}
-				offset += kLen
-				if tTag == AttrTypeFloat32 {
-					if offset+4 > len(cr.Raw) {
-						break
-					}
-					valBits := binary.LittleEndian.Uint32(cr.Raw[offset : offset+4])
-					offset += 4
-					val := math.Float32frombits(valBits)
-					if !fn(NewFloat32Attr(kStr, val)) {
-						return
-					}
-				} else if tTag == AttrTypeInt64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := int64(binary.LittleEndian.Uint64(cr.Raw[offset : offset+8]))
-					offset += 8
-					if !fn(AttrEntry{Key: kStr, Type: AttrTypeInt64, Value: float32(v), IntVal: v}) {
-						return
-					}
-				} else if tTag == AttrTypeUint64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					v := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					if !fn(AttrEntry{Key: kStr, Type: AttrTypeUint64, Value: float32(v), IntVal: int64(v)}) {
-						return
-					}
-				} else if tTag == AttrTypeFloat64 {
-					if offset+8 > len(cr.Raw) {
-						break
-					}
-					u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
-					offset += 8
-					f64 := math.Float64frombits(u64)
-					if !fn(AttrEntry{Key: kStr, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}) {
-						return
-					}
-				} else {
-					break
+			case AttrTypeFloat64:
+				if offset+8 > len(cr.Raw) {
+					return ErrCorruptRecord
+				}
+				u64 := binary.LittleEndian.Uint64(cr.Raw[offset : offset+8])
+				offset += 8
+				f64 := math.Float64frombits(u64)
+				if !fn(AttrEntry{Key: kStr, Type: AttrTypeFloat64, Value: float32(f64), IntVal: int64(u64)}) {
+					return nil
 				}
 			}
 		}
 	}
+	if offset != len(cr.Raw) {
+		return ErrCorruptRecord
+	}
+	return nil
 }
 
 // AttrCount returns the total number of attributes stored in the record.
@@ -712,12 +772,15 @@ func (cr CompactRecord) AttrCount() int {
 }
 
 // MatchesFilter evaluates a FilterCondition directly on CompactRecord without allocating a map on the heap.
-func (cr CompactRecord) MatchesFilter(f FilterCondition) bool {
-	attr, exists := cr.GetTyped(f.Field)
-	if !exists {
-		return false
+func (cr CompactRecord) MatchesFilter(f FilterCondition) (bool, error) {
+	attr, exists, err := cr.GetTyped(f.Field)
+	if err != nil {
+		return false, err
 	}
-	return f.MatchesAttr(attr)
+	if !exists {
+		return false, nil
+	}
+	return f.MatchesAttr(attr), nil
 }
 
 // AnchorDB is the computational spatial graph storage engine.
@@ -751,6 +814,7 @@ type AnchorDB struct {
 	// Pending nodes are newly appended nodes in memory awaiting the next Sync().
 	syncedNodeCount uint64
 	pendingNodes    []BinaryNodeRecord
+	hasDeletedNodes bool // true when any node slot was deleted or loaded with ID==0 and awaits physical compaction in Sync
 
 	// deletedNodeIdx records node indices tombstoned since the last Sync, so a
 	// deletion that races with Sync's unlocked snapshot/remap window can be
@@ -847,12 +911,20 @@ func (db *AnchorDB) Relation(name string) (spatial.Point2D, bool) {
 
 // ParseDate converts YYYY-MM-DD string to numeric Epoch Days (days since 1970-01-01)
 func ParseDate(dateStr string) (float32, error) {
+	days, err := ParseDateInt(dateStr)
+	if err != nil {
+		return 0, err
+	}
+	return float32(days), nil
+}
+
+// ParseDateInt converts YYYY-MM-DD string to exact int64 Epoch Days (days since 1970-01-01).
+func ParseDateInt(dateStr string) (int64, error) {
 	t, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
 		return 0, err
 	}
-	days := float32(t.Unix() / 86400)
-	return days, nil
+	return t.Unix() / 86400, nil
 }
 
 // FormatDate converts numeric Epoch Days back to YYYY-MM-DD string
@@ -861,8 +933,22 @@ func FormatDate(epochDays float32) string {
 	return time.Unix(sec, 0).UTC().Format("2006-01-02")
 }
 
+// FormatDateInt converts exact int64 Epoch Days back to YYYY-MM-DD string.
+func FormatDateInt(epochDays int64) string {
+	return time.Unix(epochDays*86400, 0).UTC().Format("2006-01-02")
+}
+
 // ParseTimestamp converts YYYY-MM-DD HH:MM:SS or RFC3339 string to Unix timestamp seconds
 func ParseTimestamp(tsStr string) (float32, error) {
+	sec, err := ParseTimestampInt(tsStr)
+	if err != nil {
+		return 0, err
+	}
+	return float32(sec), nil
+}
+
+// ParseTimestampInt converts YYYY-MM-DD HH:MM:SS or RFC3339 string to exact int64 Unix seconds.
+func ParseTimestampInt(tsStr string) (int64, error) {
 	t, err := time.Parse("2006-01-02 15:04:05", tsStr)
 	if err != nil {
 		t, err = time.Parse(time.RFC3339, tsStr)
@@ -870,12 +956,17 @@ func ParseTimestamp(tsStr string) (float32, error) {
 			return 0, err
 		}
 	}
-	return float32(t.Unix()), nil
+	return t.Unix(), nil
 }
 
 // FormatTimestamp converts Unix timestamp seconds to YYYY-MM-DD HH:MM:SS string
 func FormatTimestamp(unixSec float32) string {
 	return time.Unix(int64(unixSec), 0).UTC().Format("2006-01-02 15:04:05")
+}
+
+// FormatTimestampInt converts exact int64 Unix timestamp seconds to YYYY-MM-DD HH:MM:SS string.
+func FormatTimestampInt(unixSec int64) string {
+	return time.Unix(unixSec, 0).UTC().Format("2006-01-02 15:04:05")
 }
 
 // resolveValue resolves a field name, numeric literal, or date literal string.
@@ -914,11 +1005,6 @@ func resolveTypedOperand(token string, lookup func(string) (AttrEntry, bool)) (A
 		return NewInt64Attr(token, t.Unix()/86400), true, nil
 	}
 	return AttrEntry{}, false, fmt.Errorf("field, numeric constant, or date %q not found", token)
-}
-
-func resolveTypedValue(token string, lookup func(string) (AttrEntry, bool)) (AttrEntry, error) {
-	attr, _, err := resolveTypedOperand(token, lookup)
-	return attr, err
 }
 
 func isFloatResultFloat32(valA AttrEntry, litA bool, valB AttrEntry, litB bool) bool {
@@ -1033,8 +1119,8 @@ func attrToBigInt(a AttrEntry) *big.Int {
 	return big.NewInt(a.IntVal)
 }
 
-func applyDaysOffsetTyped(op byte, outputField, field string, days float32, val AttrEntry) (AttrEntry, error) {
-	if val.Type == AttrTypeInt64 && float32(int64(days)) == days {
+func applyDaysOffsetTyped(op byte, outputField, field string, days float64, val AttrEntry) (AttrEntry, error) {
+	if val.Type == AttrTypeInt64 && float64(int64(days)) == days {
 		d := int64(days)
 		res, ok := checkedInt64Op(op, val.Int64(), d)
 		if !ok {
@@ -1042,7 +1128,7 @@ func applyDaysOffsetTyped(op byte, outputField, field string, days float32, val 
 		}
 		return NewInt64Attr(outputField, res), nil
 	}
-	if val.Type == AttrTypeUint64 && float32(int64(days)) == days {
+	if val.Type == AttrTypeUint64 && float64(int64(days)) == days {
 		d := int64(days)
 		base := val.Uint64()
 		isAdd := (op == '+' && d >= 0) || (op == '-' && d < 0)
@@ -1065,11 +1151,11 @@ func applyDaysOffsetTyped(op byte, outputField, field string, days float32, val 
 		}
 		return NewUint64Attr(outputField, res), nil
 	}
-	res := val.Float64() + float64(days)
+	res := val.Float64() + days
 	if op == '-' {
-		res = val.Float64() - float64(days)
+		res = val.Float64() - days
 	}
-	if val.Type == AttrTypeFloat32 {
+	if val.Type == AttrTypeFloat32 && float64(float32(days)) == days {
 		return NewFloat32Attr(outputField, float32(res)), nil
 	}
 	return NewFloat64Attr(outputField, res), nil
@@ -1246,6 +1332,9 @@ func applyComputeOpTyped(outputField string, op ComputeOp, lookup func(string) (
 		return val, nil
 
 	default:
+		if typedOp, ok := op.(TypedComputeOp); ok {
+			return typedOp.ApplyTyped(outputField, lookup)
+		}
 		var props map[string]float32
 		if snapshot != nil {
 			props = snapshot()
@@ -1280,6 +1369,12 @@ func coerceAttrToSchemaSpec(attr AttrEntry, spec FieldSpec) AttrEntry {
 // ComputeOp defines an in-flight computation rule
 type ComputeOp interface {
 	Apply(props map[string]float32) (float32, error)
+}
+
+// TypedComputeOp is a full-precision typed computation rule operating directly on AttrEntry values.
+type TypedComputeOp interface {
+	ComputeOp
+	ApplyTyped(outputField string, lookup func(string) (AttrEntry, bool)) (AttrEntry, error)
 }
 
 // OpDivide computes FieldA / FieldB (where fields can be attribute names or literal numbers)
@@ -1364,7 +1459,7 @@ func (op OpSubtract) Apply(props map[string]float32) (float32, error) {
 // OpAddDays adds N days to a date field (stored as epoch days)
 type OpAddDays struct {
 	Field string
-	Days  float32
+	Days  float64
 }
 
 // Apply adds N days to the specified date field.
@@ -1373,13 +1468,13 @@ func (op OpAddDays) Apply(props map[string]float32) (float32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return val + op.Days, nil
+	return float32(float64(val) + op.Days), nil
 }
 
 // OpSubtractDays subtracts N days from a date field
 type OpSubtractDays struct {
 	Field string
-	Days  float32
+	Days  float64
 }
 
 // Apply subtracts N days from the specified date field.
@@ -1388,7 +1483,7 @@ func (op OpSubtractDays) Apply(props map[string]float32) (float32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return val - op.Days, nil
+	return float32(float64(val) - op.Days), nil
 }
 
 // OpDaysBetween calculates number of days between two dates (FieldA - FieldB)
@@ -1671,27 +1766,14 @@ type QueryOptions struct {
 	Offset               int
 }
 
-// projectProperties filters props to only include fields specified in selectFields.
-// If selectFields is empty, it returns all props unmodified.
-func projectProperties(props map[string]float32, selectFields []string) map[string]float32 {
-	if len(selectFields) == 0 {
-		return props
-	}
-	projected := make(map[string]float32, len(selectFields))
-	for _, f := range selectFields {
-		if val, exists := props[f]; exists {
-			projected[f] = val
-		}
-	}
-	return projected
-}
-
 // EntityRecord represents a returned entity with properties and operation lifecycle state
 type EntityRecord struct {
 	Name      string             `json:"name"`
 	Operation uint8              `json:"operation"`
 	Props     map[string]float32 `json:"props"`
 	Attrs     []AttrEntry        `json:"attrs,omitempty"`
+	Coord     *spatial.Point2D   `json:"coord,omitempty"`
+	Roles     *[4]float32        `json:"roles,omitempty"`
 }
 
 func (db *AnchorDB) internAttr(s string) string {
@@ -1752,11 +1834,14 @@ func (db *AnchorDB) markEntityDirtyLocked(name string) {
 	}
 }
 
-func (db *AnchorDB) detachRecordToHeapLocked(cr CompactRecord) CompactRecord {
+func (db *AnchorDB) detachRecordToHeapLocked(cr CompactRecord) (CompactRecord, error) {
 	if cr.Raw == nil {
-		return cr
+		return cr, nil
 	}
-	expanded := cr.expandAttrs()
+	expanded, err := cr.expandAttrs()
+	if err != nil {
+		return CompactRecord{}, err
+	}
 	attrs := make([]AttrEntry, len(expanded))
 	for i, a := range expanded {
 		a.Key = db.internAttr(a.Key)
@@ -1764,7 +1849,7 @@ func (db *AnchorDB) detachRecordToHeapLocked(cr CompactRecord) CompactRecord {
 	}
 	cr.Attrs = attrs
 	cr.Raw = nil
-	return cr
+	return cr, nil
 }
 
 // TriggerAutoSync requests an asynchronous background Sync to flush pending records
@@ -1826,31 +1911,62 @@ func (db *AnchorDB) totalNodes() int {
 	return int(db.syncedNodeCount) + len(db.pendingNodes)
 }
 
-func (db *AnchorDB) getNode(idx uint32) BinaryNodeRecord {
+func (db *AnchorDB) getNode(idx uint32) (BinaryNodeRecord, error) {
 	if db.isSyncing && db.deletedNodeIdx[idx] {
-		return BinaryNodeRecord{}
+		return BinaryNodeRecord{}, nil
 	}
-	if uint64(idx) < db.syncedNodeCount && db.isMmapped && db.mmapData != nil {
-		offset := int(db.Header.NodesOffset) + int(idx)*RecordSize
-		if offset+RecordSize <= len(db.mmapData) {
-			var rec BinaryNodeRecord
-			DecodeRecord(db.mmapData[offset:offset+RecordSize], &rec)
-			return rec
+	if uint64(idx) < db.syncedNodeCount {
+		if !db.isMmapped || db.mmapData == nil {
+			return BinaryNodeRecord{}, fmt.Errorf("%w: synced node %d unavailable (unmapped)", ErrCorruptRecord, idx)
 		}
+		offset := int(db.Header.NodesOffset) + int(idx)*RecordSize
+		if offset < 0 || offset+RecordSize > len(db.mmapData) {
+			return BinaryNodeRecord{}, fmt.Errorf("%w: node index %d offset %d out of bounds (mmap=%d)", ErrCorruptRecord, idx, offset, len(db.mmapData))
+		}
+		var rec BinaryNodeRecord
+		DecodeRecord(db.mmapData[offset:offset+RecordSize], &rec)
+		return rec, nil
 	}
 	pIdx := int(idx) - int(db.syncedNodeCount)
 	if pIdx >= 0 && pIdx < len(db.pendingNodes) {
-		return db.pendingNodes[pIdx]
+		return db.pendingNodes[pIdx], nil
 	}
-	return BinaryNodeRecord{}
+	return BinaryNodeRecord{}, fmt.Errorf("%w: node index %d out of bounds (total=%d)", ErrCorruptRecord, idx, db.totalNodes())
+}
+
+func (db *AnchorDB) removeNodeFromGridLocked(idx uint32, rec BinaryNodeRecord) {
+	if rec.ID == 0 || len(db.Grid) == 0 {
+		return
+	}
+	cell := PointToCell(spatial.Point2D{X: rec.X, Y: rec.Y}, GridDim)
+	cellIdx := uint32(CellIndex(cell, GridDim))
+	list := db.Grid[cellIdx]
+	if len(list) == 0 {
+		return
+	}
+	filtered := list[:0]
+	for _, nIdx := range list {
+		if nIdx != idx {
+			filtered = append(filtered, nIdx)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(db.Grid, cellIdx)
+	} else {
+		db.Grid[cellIdx] = filtered
+	}
 }
 
 func (db *AnchorDB) markNodeDeleted(idx uint32) {
+	if rec, err := db.getNode(idx); err == nil {
+		db.removeNodeFromGridLocked(idx, rec)
+	}
 	db.zeroNodeLocked(idx)
 	if db.deletedNodeIdx == nil {
 		db.deletedNodeIdx = make(map[uint32]bool)
 	}
 	db.deletedNodeIdx[idx] = true
+	db.hasDeletedNodes = true
 }
 
 // zeroNodeLocked clears the node's ID in the current mapping or pending slice.
@@ -2102,7 +2218,11 @@ func (db *AnchorDB) reconcileInterruptedOperationsLocked() (int, error) {
 	for _, name := range db.EntityOrder {
 		cr, exists := db.EntityStore[name]
 		if exists && cr.Operation == OpStatusSafeDelete {
-			cr = db.detachRecordToHeapLocked(cr)
+			cr, err := db.detachRecordToHeapLocked(cr)
+			if err != nil {
+				clear(db.partitionLocks)
+				return reconciled, fmt.Errorf("failed to detach record %q: %w", name, err)
+			}
 			cr.Operation = OpStatusRetry
 			db.EntityStore[name] = cr
 			db.syncedEntitiesModified = true
@@ -2247,6 +2367,7 @@ func (db *AnchorDB) buildIndex() error {
 		}
 		DecodeRecord(db.mmapData[offset:offset+RecordSize], &rec)
 		if rec.ID == 0 {
+			db.hasDeletedNodes = true
 			continue
 		}
 
@@ -2370,17 +2491,18 @@ func (db *AnchorDB) loadEntities() error {
 
 // remapEntitiesLocked iterates the entity section in mmapData and points
 // all non-dirtied records in EntityStore directly to mmap bytes, dropping
-// heap AttrEntry slices. Caller must hold db.mu.Lock.
-func (db *AnchorDB) remapEntitiesLocked() {
-	if db.Header.EntityCount == 0 || db.Header.EntityOffset == 0 || len(db.mmapData) == 0 {
+// heap AttrEntry slices. Returns ErrCorruptRecord if mmap entity layout is invalid.
+// Caller must hold db.mu.Lock.
+func (db *AnchorDB) remapEntitiesLocked() error {
+	if db.Header.EntityCount == 0 {
 		db.dirtyDuringSync = nil
 		db.isSyncing = false
-		return
+		return nil
 	}
-	if int(db.Header.EntityOffset) >= len(db.mmapData) {
+	if db.Header.EntityOffset == 0 || len(db.mmapData) == 0 || int(db.Header.EntityOffset) >= len(db.mmapData) {
 		db.dirtyDuringSync = nil
 		db.isSyncing = false
-		return
+		return fmt.Errorf("%w: invalid entity section offset %d (mmap=%d)", ErrCorruptRecord, db.Header.EntityOffset, len(db.mmapData))
 	}
 	data := db.mmapData[db.Header.EntityOffset:]
 	offset := 0
@@ -2485,18 +2607,26 @@ entityLoop:
 		}
 	}
 	if corrupted {
-		log.Printf("[STORAGE] ERROR: mmap entity corruption detected at entity %d (offset=%d) during remap; retaining unmapped in-memory state", corruptEntity, offset)
-	} else {
-		db.entitySectionEnd = int(db.Header.EntityOffset) + offset
+		db.dirtyDuringSync = nil
+		db.isSyncing = false
+		return fmt.Errorf("%w: mmap entity corruption at entity %d (offset=%d)", ErrCorruptRecord, corruptEntity, offset)
 	}
+	db.entitySectionEnd = int(db.Header.EntityOffset) + offset
 	for name := range db.dirtyDuringSync {
 		if cr, exists := db.EntityStore[name]; exists && cr.Raw != nil {
-			db.EntityStore[name] = db.detachRecordToHeapLocked(cr)
+			det, err := db.detachRecordToHeapLocked(cr)
+			if err != nil {
+				db.dirtyDuringSync = nil
+				db.isSyncing = false
+				return err
+			}
+			db.EntityStore[name] = det
 		}
 	}
 	db.dirtyDuringSync = nil
 	db.isSyncing = false
 	db.compactAttrPoolLocked()
+	return nil
 }
 
 // AppendNode adds a new node record into AnchorDB.
@@ -2512,7 +2642,11 @@ func (db *AnchorDB) AppendNode(word string, coord spatial.Point2D, roles [4]floa
 
 	// If already exists, return existing
 	if idx, exists := db.Lexicon[word]; exists {
-		return db.getNode(idx).ID, nil
+		rec, err := db.getNode(idx)
+		if err != nil {
+			return 0, err
+		}
+		return rec.ID, nil
 	}
 	if db.wal != nil {
 		if err := db.wal.WriteNode(word, coord, roles, domainID); err != nil {
@@ -2541,7 +2675,9 @@ func validateNodeGeometry(coord spatial.Point2D, roles [4]float32) error {
 // appendNodeLocked adds a node without acquiring mutex (caller must hold db.mu.Lock)
 func (db *AnchorDB) appendNodeLocked(word string, coord spatial.Point2D, roles [4]float32, domainID uint16) uint64 {
 	if idx, exists := db.Lexicon[word]; exists {
-		return db.getNode(idx).ID
+		if rec, err := db.getNode(idx); err == nil {
+			return rec.ID
+		}
 	}
 
 	newID := uint64(db.totalNodes() + 1)
@@ -3029,6 +3165,9 @@ func (db *AnchorDB) GetRecordTyped(name string) (CompactRecord, error) {
 	if !exists || cr.Operation == OpStatusTombstone {
 		return CompactRecord{}, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
+	if err := cr.ValidateRaw(); err != nil {
+		return CompactRecord{}, err
+	}
 
 	return CompactRecord{
 		Operation: cr.Operation,
@@ -3050,8 +3189,11 @@ func (db *AnchorDB) GetRecord(name string, selectFields ...string) (map[string]f
 	if !exists || cr.Operation == OpStatusTombstone {
 		return nil, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
+	if err := cr.ValidateRaw(); err != nil {
+		return nil, err
+	}
 
-	return cr.Project(selectFields), nil
+	return cr.Project(selectFields)
 }
 
 // GetRecordWithOperation retrieves stored properties along with the operation lifecycle state.
@@ -3066,31 +3208,25 @@ func (db *AnchorDB) GetRecordWithOperation(name string, selectFields ...string) 
 	if !exists || cr.Operation == OpStatusTombstone {
 		return nil, 0, fmt.Errorf("record not found: %q: %w", name, ErrRecordNotFound)
 	}
+	if err := cr.ValidateRaw(); err != nil {
+		return nil, 0, err
+	}
 
-	return cr.Project(selectFields), cr.Operation, nil
+	props, err := cr.Project(selectFields)
+	if err != nil {
+		return nil, 0, err
+	}
+	return props, cr.Operation, nil
 }
 
-// GetRecordWithCompute retrieves raw properties AND computes derived fields in-storage (CALCULATING),
-// optionally selecting specific fields (SELECTING / PROJECTION).
-// e.g., input {distance: 100, duration: 2, area: 500} -> with Compute("speed", Divide("distance", "duration"))
-// and selectFields "distance", "duration", "speed" -> returns {distance: 100, duration: 2, speed: 50} (area is not returned!)
+// GetRecordWithCompute retrieves properties AND computes derived fields in-storage (CALCULATING),
+// using full 64-bit typed execution internally before projecting to map[string]float32.
 func (db *AnchorDB) GetRecordWithCompute(name string, computations map[string]ComputeOp, selectFields ...string) (map[string]float32, error) {
-	// Retrieve raw without projection first so computations have access to all fields
-	props, err := db.GetRecord(name)
+	cr, err := db.GetRecordTypedWithCompute(name, computations, selectFields...)
 	if err != nil {
 		return nil, err
 	}
-
-	// Calculate computed fields on-the-fly in storage
-	for outputField, op := range computations {
-		val, err := op.Apply(props)
-		if err != nil {
-			return nil, fmt.Errorf("calculation failed for field %q: %w", outputField, err)
-		}
-		props[outputField] = val
-	}
-
-	return projectProperties(props, selectFields), nil
+	return cr.ToMap()
 }
 
 // GetRecordTypedWithCompute retrieves typed attributes and calculates derived fields in-storage with mixed arithmetic,
@@ -3106,7 +3242,11 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 		}
 		selectedAttrs := make([]AttrEntry, 0, len(selectFields))
 		for _, f := range selectFields {
-			if a, ok := cr.GetTyped(f); ok {
+			a, ok, err := cr.GetTyped(f)
+			if err != nil {
+				return CompactRecord{}, err
+			}
+			if ok {
 				selectedAttrs = append(selectedAttrs, a)
 			}
 		}
@@ -3116,7 +3256,10 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 		}, nil
 	}
 
-	attrs := cr.expandAttrs()
+	attrs, err := cr.expandAttrs()
+	if err != nil {
+		return CompactRecord{}, err
+	}
 	attrMap := make(map[string]AttrEntry, len(attrs)+len(computations))
 	order := make([]string, 0, len(attrs)+len(computations))
 	for _, a := range attrs {
@@ -3174,6 +3317,12 @@ func (db *AnchorDB) GetRecordTypedWithCompute(name string, computations map[stri
 
 // ListRecordsWithPaging retrieves entities with filtering, on-the-fly computation, and constant-time bounded paging.
 func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bool, error) {
+	if opts.Limit < 0 {
+		return nil, false, fmt.Errorf("limit must not be negative, got %d", opts.Limit)
+	}
+	if opts.Offset < 0 {
+		return nil, false, fmt.Errorf("offset must not be negative, got %d", opts.Offset)
+	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
@@ -3181,13 +3330,10 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 	}
 
 	limit := opts.Limit
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 10
 	}
 	offset := opts.Offset
-	if offset < 0 {
-		offset = 0
-	}
 
 	totalEntities := len(db.EntityOrder)
 	if offset >= totalEntities {
@@ -3252,7 +3398,11 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		if !filterNeedsCompute && len(opts.Filters) > 0 {
 			matches := true
 			for _, filter := range opts.Filters {
-				if !cr.MatchesFilter(filter) {
+				ok, err := cr.MatchesFilter(filter)
+				if err != nil {
+					return nil, false, err
+				}
+				if !ok {
 					matches = false
 					break
 				}
@@ -3277,7 +3427,10 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 		var finalProps map[string]float32
 
 		if len(opts.Computations) > 0 {
-			attrs := cr.ExpandAttrs()
+			attrs, err := cr.ExpandAttrs()
+			if err != nil {
+				return nil, false, err
+			}
 			attrMap := make(map[string]AttrEntry, len(attrs)+len(opts.Computations))
 			order := make([]string, 0, len(attrs)+len(opts.Computations))
 			for _, a := range attrs {
@@ -3346,18 +3499,32 @@ func (db *AnchorDB) ListRecordsWithPaging(opts QueryOptions) ([]EntityRecord, bo
 				}
 			}
 		} else {
+			if err := cr.ValidateRaw(); err != nil {
+				return nil, false, err
+			}
 			if len(opts.Select) > 0 {
 				finalAttrs = make([]AttrEntry, 0, len(opts.Select))
 				finalProps = make(map[string]float32, len(opts.Select))
 				for _, f := range opts.Select {
-					if a, ok := cr.GetTyped(f); ok {
+					a, ok, err := cr.GetTyped(f)
+					if err != nil {
+						return nil, false, err
+					}
+					if ok {
 						finalAttrs = append(finalAttrs, a)
 						finalProps[f] = a.Float32()
 					}
 				}
 			} else {
-				finalAttrs = cr.ExpandAttrs()
-				finalProps = cr.ToMap()
+				var err error
+				finalAttrs, err = cr.ExpandAttrs()
+				if err != nil {
+					return nil, false, err
+				}
+				finalProps, err = cr.ToMap()
+				if err != nil {
+					return nil, false, err
+				}
 			}
 		}
 
@@ -3386,6 +3553,12 @@ type UpdateOptions struct {
 // If an error occurs after one or more records have been committed, the returned
 // count reports those committed records; batch updates are not transactional.
 func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
+	if opts.Limit < 0 {
+		return 0, fmt.Errorf("update limit must not be negative, got %d", opts.Limit)
+	}
+	if opts.Offset < 0 {
+		return 0, fmt.Errorf("update offset must not be negative, got %d", opts.Offset)
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -3419,11 +3592,19 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	working := make(map[string]CompactRecord)
 
 	stageMutation := func(name string, cr CompactRecord) error {
+		if err := cr.ValidateRaw(); err != nil {
+			return err
+		}
+		expandedAttrs, err := cr.ExpandAttrs()
+		if err != nil {
+			return err
+		}
 		lookup := func(key string) (AttrEntry, bool) {
-			return cr.GetTyped(key)
+			a, ok, _ := cr.GetTyped(key)
+			return a, ok
 		}
 		snapshot := func() map[string]float32 {
-			return attrsToFloat32Props(cr.ExpandAttrs())
+			return attrsToFloat32Props(expandedAttrs)
 		}
 		pending := make([]AttrEntry, 0, len(opts.Mutations))
 		for field, op := range opts.Mutations {
@@ -3452,13 +3633,10 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	// PATH 1: Targeted direct list update (O(K) constant time)
 	if len(opts.TargetEntities) > 0 {
 		limit := opts.Limit
-		if limit <= 0 || limit > len(opts.TargetEntities) {
+		if limit == 0 || limit > len(opts.TargetEntities) {
 			limit = len(opts.TargetEntities)
 		}
 		offset := opts.Offset
-		if offset < 0 {
-			offset = 0
-		}
 		skipped := 0
 
 		for _, name := range opts.TargetEntities {
@@ -3480,7 +3658,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 
 			matches := true
 			for _, f := range opts.Filters {
-				if !cr.MatchesFilter(f) {
+				ok, err := cr.MatchesFilter(f)
+				if err != nil {
+					return 0, err
+				}
+				if !ok {
 					matches = false
 					break
 				}
@@ -3501,7 +3683,7 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 	} else {
 		// PATH 2: Bounded scan with early termination (O(K) constant-time bound)
 		limit := opts.Limit
-		if limit <= 0 {
+		if limit == 0 {
 			limit = 10000 // default batch limit
 		}
 		skipped := 0
@@ -3524,7 +3706,11 @@ func (db *AnchorDB) UpdateRecords(opts UpdateOptions) (int, error) {
 
 			matches := true
 			for _, f := range opts.Filters {
-				if !cr.MatchesFilter(f) {
+				ok, err := cr.MatchesFilter(f)
+				if err != nil {
+					return 0, err
+				}
+				if !ok {
 					matches = false
 					break
 				}
@@ -3591,7 +3777,10 @@ func (db *AnchorDB) SetOperationStatus(names []string, status uint8) (int, error
 		if db.partitionLocks[name] || status == OpStatusSafeDelete && cr.Operation == OpStatusSafeDelete {
 			return 0, fmt.Errorf("%w: use partition locking APIs to change this state for %q", ErrRecordLocked, name)
 		}
-		cr = db.detachRecordToHeapLocked(cr)
+		cr, err := db.detachRecordToHeapLocked(cr)
+		if err != nil {
+			return 0, err
+		}
 		cr.Operation = status
 		updates = append(updates, statusUpdate{name: name, cr: cr})
 	}
@@ -3641,7 +3830,10 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 		if !exists || cr.Operation != OpStatusSafeDelete || !db.partitionLocks[name] {
 			continue
 		}
-		cr = db.detachRecordToHeapLocked(cr)
+		cr, err := db.detachRecordToHeapLocked(cr)
+		if err != nil {
+			return 0, err
+		}
 		cr.Operation = status
 		updates = append(updates, completionUpdate{name: name, cr: cr})
 	}
@@ -3666,10 +3858,9 @@ func (db *AnchorDB) CompletePartitionRecords(names []string, status uint8) (int,
 	return len(updates), nil
 }
 
-// LockPartitionRecords atomically snapshots eligible records and marks them
-// SafeDelete. The caller may then archive the returned immutable property maps
-// without racing a concurrent update.
-func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit int) ([]EntityRecord, error) {
+// LockPartitionRecords atomically snapshots eligible records (including 64-bit
+// typed attributes and node spatial geometry) and marks them SafeDelete.
+func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float64, limit int) ([]EntityRecord, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -3678,7 +3869,7 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 	if dateField == "" {
 		return nil, fmt.Errorf("partition date field must not be empty")
 	}
-	if math.IsNaN(float64(cutoff)) || math.IsInf(float64(cutoff), 0) {
+	if math.IsNaN(cutoff) || math.IsInf(cutoff, 0) {
 		return nil, fmt.Errorf("partition cutoff must be finite")
 	}
 	if limit <= 0 {
@@ -3692,20 +3883,63 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 		if !exists || (cr.Operation != OpStatusActive && cr.Operation != OpStatusRetry) {
 			continue
 		}
-		date, exists := cr.Get(dateField)
-		if !exists || date >= cutoff {
+		dateAttr, exists, err := cr.GetTyped(dateField)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			continue
+		}
+		eligible := false
+		if math.Trunc(cutoff) == cutoff && cutoff >= float64(math.MinInt64) && cutoff <= float64(math.MaxInt64) {
+			switch dateAttr.Type {
+			case AttrTypeInt64:
+				eligible = dateAttr.Int64() < int64(cutoff)
+			case AttrTypeUint64:
+				if cutoff <= 0 {
+					eligible = false
+				} else {
+					eligible = dateAttr.Uint64() < uint64(cutoff)
+				}
+			default:
+				eligible = dateAttr.Float64() < cutoff
+			}
+		} else {
+			eligible = dateAttr.Float64() < cutoff
+		}
+		if !eligible {
 			continue
 		}
 		if len(records) >= limit {
 			break
 		}
-		updated := db.detachRecordToHeapLocked(cr)
-		records = append(records, EntityRecord{
+		updated, err := db.detachRecordToHeapLocked(cr)
+		if err != nil {
+			return nil, err
+		}
+		props, err := cr.ToMap()
+		if err != nil {
+			return nil, err
+		}
+		rec := EntityRecord{
 			Name:      name,
 			Operation: cr.Operation,
-			Props:     cr.ToMap(),
+			Props:     props,
 			Attrs:     slices.Clone(updated.Attrs),
-		})
+		}
+		if nodeIdx, ok := db.Lexicon[name]; ok {
+			nodeRec, nErr := db.getNode(nodeIdx)
+			if nErr != nil {
+				return nil, nErr
+			}
+			if nodeRec.ID != 0 {
+				pt := spatial.Point2D{X: nodeRec.X, Y: nodeRec.Y}
+				roles := nodeRec.Roles
+				rec.Coord = &pt
+				rec.Roles = &roles
+			}
+		}
+		records = append(records, rec)
 		updated.Operation = OpStatusSafeDelete
 		lockedCRs = append(lockedCRs, updated)
 	}
@@ -3734,7 +3968,10 @@ func (db *AnchorDB) LockPartitionRecords(dateField string, cutoff float32, limit
 // CollectTombstones purges up to maxBatch entities marked with OpStatusTombstone (2).
 // It returns the number deleted and any WAL persistence error.
 func (db *AnchorDB) CollectTombstones(maxBatch int) (int, error) {
-	if maxBatch <= 0 {
+	if maxBatch < 0 {
+		return 0, fmt.Errorf("maxBatch must not be negative, got %d", maxBatch)
+	}
+	if maxBatch == 0 {
 		maxBatch = 1000
 	}
 
@@ -3889,11 +4126,51 @@ func (db *AnchorDB) Sync() error {
 
 	syncedNodesToCopy := db.syncedNodeCount
 	pendingNodesSnapshot := slices.Clone(db.pendingNodes)
-	totNodes := int(syncedNodesToCopy) + len(pendingNodesSnapshot)
+	oldTotalNodes := int(syncedNodesToCopy) + len(pendingNodesSnapshot)
 
 	syncedStringBytes := db.syncedStringBytes
 	pendingStringsSnapshot := slices.Clone(db.pendingStringPool)
-	totStringSize := uint64(syncedStringBytes) + uint64(len(pendingStringsSnapshot))
+	oldTotalStringBytes := syncedStringBytes + uint32(len(pendingStringsSnapshot))
+
+	compactedMode := db.hasDeletedNodes
+	var compactedNodes []BinaryNodeRecord
+	var compactedStrings []byte
+	var nodeIndexRemap map[uint32]uint32
+	var totNodes int
+	var totStringSize uint64
+
+	if compactedMode {
+		compactedNodes = make([]BinaryNodeRecord, 0, oldTotalNodes)
+		compactedStrings = make([]byte, 0, oldTotalStringBytes)
+		nodeIndexRemap = make(map[uint32]uint32, oldTotalNodes)
+		for oldIdx := uint32(0); oldIdx < uint32(oldTotalNodes); oldIdx++ {
+			rec, err := db.getNode(oldIdx)
+			if err != nil {
+				db.mu.Unlock()
+				return fmt.Errorf("sync node compaction read failed: %w", err)
+			}
+			if rec.ID == 0 {
+				continue
+			}
+			word, err := db.getWord(rec.WordOffset, rec.WordLen)
+			if err != nil {
+				db.mu.Unlock()
+				return fmt.Errorf("sync node compaction word lookup failed: %w", err)
+			}
+			newIdx := uint32(len(compactedNodes))
+			rec.ID = uint64(newIdx + 1)
+			rec.WordOffset = uint32(len(compactedStrings))
+			rec.WordLen = uint16(len(word))
+			compactedStrings = append(compactedStrings, word...)
+			compactedNodes = append(compactedNodes, rec)
+			nodeIndexRemap[oldIdx] = newIdx
+		}
+		totNodes = len(compactedNodes)
+		totStringSize = uint64(len(compactedStrings))
+	} else {
+		totNodes = oldTotalNodes
+		totStringSize = uint64(oldTotalStringBytes)
+	}
 
 	canStreamSyncedEntities := !db.syncedEntitiesModified &&
 		db.syncedEntityCount > 0 &&
@@ -4017,47 +4294,71 @@ func (db *AnchorDB) Sync() error {
 		return err
 	}
 
-	// 2. Nodes Array (streamed: synced from mmap, pending from snapshot)
-	syncedNodeBytes := syncedNodesToCopy * RecordSize
-	if syncedNodeBytes > 0 && mmapSnap != nil {
-		nStart := int(oldHdr.NodesOffset)
-		nEnd := nStart + int(syncedNodeBytes)
-		if nStart >= 0 && nEnd <= len(mmapSnap) {
-			if _, err := writer.Write(mmapSnap[nStart:nEnd]); err != nil {
+	// 2. Nodes Array and String Pool
+	if compactedMode {
+		if len(compactedNodes) > 0 {
+			var batch [1024 * RecordSize]byte
+			for i := 0; i < len(compactedNodes); i += 1024 {
+				end := i + 1024
+				if end > len(compactedNodes) {
+					end = len(compactedNodes)
+				}
+				batchSlice := batch[:(end-i)*RecordSize]
+				for j := i; j < end; j++ {
+					compactedNodes[j].Encode(batchSlice[(j-i)*RecordSize : (j-i+1)*RecordSize])
+				}
+				if _, err := writer.Write(batchSlice); err != nil {
+					return err
+				}
+			}
+		}
+		if len(compactedStrings) > 0 {
+			if _, err := writer.Write(compactedStrings); err != nil {
 				return err
 			}
 		}
-	}
-	if len(pendingNodesSnapshot) > 0 {
-		var batch [1024 * RecordSize]byte
-		for i := 0; i < len(pendingNodesSnapshot); i += 1024 {
-			end := i + 1024
-			if end > len(pendingNodesSnapshot) {
-				end = len(pendingNodesSnapshot)
-			}
-			batchSlice := batch[:(end-i)*RecordSize]
-			for j := i; j < end; j++ {
-				pendingNodesSnapshot[j].Encode(batchSlice[(j-i)*RecordSize : (j-i+1)*RecordSize])
-			}
-			if _, err := writer.Write(batchSlice); err != nil {
-				return err
+	} else {
+		syncedNodeBytes := syncedNodesToCopy * RecordSize
+		if syncedNodeBytes > 0 && mmapSnap != nil {
+			nStart := int(oldHdr.NodesOffset)
+			nEnd := nStart + int(syncedNodeBytes)
+			if nStart >= 0 && nEnd <= len(mmapSnap) {
+				if _, err := writer.Write(mmapSnap[nStart:nEnd]); err != nil {
+					return err
+				}
 			}
 		}
-	}
+		if len(pendingNodesSnapshot) > 0 {
+			var batch [1024 * RecordSize]byte
+			for i := 0; i < len(pendingNodesSnapshot); i += 1024 {
+				end := i + 1024
+				if end > len(pendingNodesSnapshot) {
+					end = len(pendingNodesSnapshot)
+				}
+				batchSlice := batch[:(end-i)*RecordSize]
+				for j := i; j < end; j++ {
+					pendingNodesSnapshot[j].Encode(batchSlice[(j-i)*RecordSize : (j-i+1)*RecordSize])
+				}
+				if _, err := writer.Write(batchSlice); err != nil {
+					return err
+				}
+			}
+		}
 
-	// 3. String Pool (streamed: synced from mmap, pending from snapshot)
-	if syncedStringBytes > 0 && mmapSnap != nil {
-		sStart := int(oldHdr.StringOffset)
-		sEnd := sStart + int(syncedStringBytes)
-		if sStart >= 0 && sEnd <= len(mmapSnap) {
-			if _, err := writer.Write(mmapSnap[sStart:sEnd]); err != nil {
-				return err
+		// 3. String Pool (streamed: synced from mmap, pending from snapshot)
+		if syncedStringBytes > 0 && mmapSnap != nil {
+			sStart := int(oldHdr.StringOffset)
+			sEnd := sStart + int(syncedStringBytes)
+			if sStart >= 0 && sEnd <= len(mmapSnap) {
+				if _, err := writer.Write(mmapSnap[sStart:sEnd]); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	if len(pendingStringsSnapshot) > 0 {
-		if _, err := writer.Write(pendingStringsSnapshot); err != nil {
-			return err
+		if len(pendingStringsSnapshot) > 0 {
+			if _, err := writer.Write(pendingStringsSnapshot); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -4098,7 +4399,10 @@ func (db *AnchorDB) Sync() error {
 			}
 		}
 
-		attrs := entry.CR.expandAttrs()
+		attrs, err := entry.CR.expandAttrs()
+		if err != nil {
+			return err
+		}
 		binary.LittleEndian.PutUint16(lBuf[:], uint16(len(attrs))|RawTypedFlag)
 		if _, err := writer.Write(lBuf[:]); err != nil {
 			return err
@@ -4226,38 +4530,104 @@ func (db *AnchorDB) Sync() error {
 		db.pendingEntitiesCount = 0
 	}
 	hadConcurrentMods := len(db.dirtyDuringSync) > 0 || uint64(len(db.EntityOrder)) != uint64(totEntities)
-	db.remapEntitiesLocked()
+	remapErr := db.remapEntitiesLocked()
 	db.syncedEntityCount = uint64(totEntities)
 	db.syncedEntitiesModified = hadConcurrentMods
 
-	// Prune pending nodes and copy any un-synced tail so dead prefixes are not retained.
 	addedNodes := len(pendingNodesSnapshot)
-	if len(db.pendingNodes) > addedNodes {
-		rem := len(db.pendingNodes) - addedNodes
-		kept := make([]BinaryNodeRecord, rem)
-		copy(kept, db.pendingNodes[addedNodes:])
-		db.pendingNodes = kept
-	} else {
-		db.pendingNodes = nil
-	}
-	db.syncedNodeCount += uint64(addedNodes)
-
-	// Prune pending string pool and copy any un-synced tail to release old backing array.
 	addedStringBytes := len(pendingStringsSnapshot)
-	if len(db.pendingStringPool) > addedStringBytes {
-		rem := len(db.pendingStringPool) - addedStringBytes
-		kept := make([]byte, rem)
-		copy(kept, db.pendingStringPool[addedStringBytes:])
-		db.pendingStringPool = kept
+	if compactedMode {
+		newSyncedNodes := uint64(len(compactedNodes))
+		newSyncedStrBytes := uint32(len(compactedStrings))
+
+		var keptNodes []BinaryNodeRecord
+		if len(db.pendingNodes) > addedNodes {
+			tail := db.pendingNodes[addedNodes:]
+			keptNodes = make([]BinaryNodeRecord, len(tail))
+			copy(keptNodes, tail)
+			for k := range keptNodes {
+				oldTailIdx := uint32(oldTotalNodes + k)
+				newTailIdx := uint32(newSyncedNodes) + uint32(k)
+				nodeIndexRemap[oldTailIdx] = newTailIdx
+				if keptNodes[k].ID != 0 {
+					keptNodes[k].ID = uint64(newTailIdx + 1)
+				}
+				if keptNodes[k].WordOffset >= oldTotalStringBytes {
+					keptNodes[k].WordOffset = (keptNodes[k].WordOffset - oldTotalStringBytes) + newSyncedStrBytes
+				}
+			}
+		}
+		db.pendingNodes = keptNodes
+		db.syncedNodeCount = newSyncedNodes
+
+		if len(db.pendingStringPool) > addedStringBytes {
+			rem := len(db.pendingStringPool) - addedStringBytes
+			kept := make([]byte, rem)
+			copy(kept, db.pendingStringPool[addedStringBytes:])
+			db.pendingStringPool = kept
+		} else {
+			db.pendingStringPool = nil
+		}
+		db.syncedStringBytes = newSyncedStrBytes
+
+		for w, oldIdx := range db.Lexicon {
+			if newIdx, ok := nodeIndexRemap[oldIdx]; ok {
+				db.Lexicon[w] = newIdx
+			}
+		}
+		newGrid := make(map[uint32][]uint32, len(db.Grid))
+		for cellIdx, list := range db.Grid {
+			var filtered []uint32
+			for _, oldIdx := range list {
+				if newIdx, ok := nodeIndexRemap[oldIdx]; ok {
+					filtered = append(filtered, newIdx)
+				}
+			}
+			if len(filtered) > 0 {
+				newGrid[cellIdx] = filtered
+			}
+		}
+		db.Grid = newGrid
+
+		if len(db.deletedNodeIdx) > 0 {
+			remappedDel := make(map[uint32]bool)
+			for oldIdx := range db.deletedNodeIdx {
+				if newIdx, ok := nodeIndexRemap[oldIdx]; ok {
+					remappedDel[newIdx] = true
+				}
+			}
+			db.deletedNodeIdx = remappedDel
+		}
+		db.hasDeletedNodes = len(db.deletedNodeIdx) > 0
+		db.Header.NodeCount = uint64(db.totalNodes())
 	} else {
-		db.pendingStringPool = nil
+		// Prune pending nodes and copy any un-synced tail so dead prefixes are not retained.
+		if len(db.pendingNodes) > addedNodes {
+			rem := len(db.pendingNodes) - addedNodes
+			kept := make([]BinaryNodeRecord, rem)
+			copy(kept, db.pendingNodes[addedNodes:])
+			db.pendingNodes = kept
+		} else {
+			db.pendingNodes = nil
+		}
+		db.syncedNodeCount += uint64(addedNodes)
+
+		// Prune pending string pool and copy any un-synced tail to release old backing array.
+		if len(db.pendingStringPool) > addedStringBytes {
+			rem := len(db.pendingStringPool) - addedStringBytes
+			kept := make([]byte, rem)
+			copy(kept, db.pendingStringPool[addedStringBytes:])
+			db.pendingStringPool = kept
+		} else {
+			db.pendingStringPool = nil
+		}
+		db.syncedStringBytes += uint32(addedStringBytes)
 	}
-	db.syncedStringBytes += uint32(addedStringBytes)
 
 	// Re-apply tombstones recorded while db.mu was released during serialization
 	db.reapplyDeletesLocked()
 	wal := db.wal
-	syncSuccess = true
+	syncSuccess = remapErr == nil
 	muLocked = false
 	db.mu.Unlock()
 
@@ -4266,15 +4636,18 @@ func (db *AnchorDB) Sync() error {
 			if oldFile != nil {
 				_ = oldFile.Close()
 			}
-			return fmt.Errorf("release previous database mapping: %w", err)
+			return errors.Join(remapErr, fmt.Errorf("release previous database mapping: %w", err))
 		}
 	}
 	if oldFile != nil {
 		if err := oldFile.Close(); err != nil {
-			return fmt.Errorf("close previous database file: %w", err)
+			return errors.Join(remapErr, fmt.Errorf("close previous database file: %w", err))
 		}
 	}
 
+	if remapErr != nil {
+		return remapErr
+	}
 	if dirSyncErr != nil {
 		return fmt.Errorf("database replaced but directory fsync failed; WAL retained for recovery: %w", dirSyncErr)
 	}
@@ -4331,9 +4704,12 @@ func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []st
 	for _, word := range inputs {
 		idx, exists := db.Lexicon[word]
 		if !exists {
-			return nil, spatial.Point2D{}, fmt.Errorf("word not found in anchor db: %q", word)
+			return nil, spatial.Point2D{}, fmt.Errorf("word not found in anchor db: %q: %w", word, ErrRecordNotFound)
 		}
-		rec := db.getNode(idx)
+		rec, err := db.getNode(idx)
+		if err != nil {
+			return nil, spatial.Point2D{}, err
+		}
 		sumCoord = sumCoord.Add(spatial.Point2D{X: rec.X, Y: rec.Y})
 		for r := 0; r < 4; r++ {
 			sumRoles[r] += rec.Roles[r]
@@ -4356,9 +4732,15 @@ func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []st
 	}
 
 	// Get Ray Direction
-	rayDir := shift.Normalize()
+	rayDir, err := shift.Normalize()
+	if err != nil {
+		return nil, spatial.Point2D{}, err
+	}
 
-	ray := spatial.NewRay(barycenter, rayDir)
+	ray, err := spatial.NewRay(barycenter, rayDir)
+	if err != nil {
+		return nil, spatial.Point2D{}, err
+	}
 	beamWidthSq := beamWidth * beamWidth
 	cellSize := 2.0 / float32(GridDim)
 	cellRadius := int(math.Ceil(float64(2 * beamWidth / cellSize)))
@@ -4393,7 +4775,11 @@ func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []st
 					}
 					visitedNodes[nodeIdx] = true
 
-					rec := db.getNode(nodeIdx)
+					rec, err := db.getNode(nodeIdx)
+					if err != nil {
+						contextErr = err
+						return false
+					}
 					if rec.ID == 0 {
 						continue // tombstone / deleted node
 					}
@@ -4417,7 +4803,11 @@ func (db *AnchorDB) ExecuteGraphStepWithContext(ctx context.Context, inputs []st
 					finalScore := beamEnergy * (1.0 + 1.5*roleFit) / (1.0 + 0.5*t)
 
 					// Retrieve word from string pool
-					word := db.getWord(rec.WordOffset, rec.WordLen)
+					word, err := db.getWord(rec.WordOffset, rec.WordLen)
+					if err != nil {
+						contextErr = err
+						return false
+					}
 
 					candidates = append(candidates, GraphQueryResult{
 						Word:       word,
@@ -4499,15 +4889,21 @@ func (db *AnchorDB) CalculateDistance(wordA, wordB string) (float32, error) {
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
-		return 0, fmt.Errorf("word not found: %q", wordA)
+		return 0, fmt.Errorf("word not found: %q: %w", wordA, ErrRecordNotFound)
 	}
 	idxB, existsB := db.Lexicon[wordB]
 	if !existsB {
-		return 0, fmt.Errorf("word not found: %q", wordB)
+		return 0, fmt.Errorf("word not found: %q: %w", wordB, ErrRecordNotFound)
 	}
 
-	recA := db.getNode(idxA)
-	recB := db.getNode(idxB)
+	recA, err := db.getNode(idxA)
+	if err != nil {
+		return 0, err
+	}
+	recB, err := db.getNode(idxB)
+	if err != nil {
+		return 0, err
+	}
 
 	pA := spatial.Point2D{X: recA.X, Y: recA.Y}
 	pB := spatial.Point2D{X: recB.X, Y: recB.Y}
@@ -4525,15 +4921,21 @@ func (db *AnchorDB) CalculateHaversineDistance(wordA, wordB string) (float32, er
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
-		return 0, fmt.Errorf("word not found: %q", wordA)
+		return 0, fmt.Errorf("word not found: %q: %w", wordA, ErrRecordNotFound)
 	}
 	idxB, existsB := db.Lexicon[wordB]
 	if !existsB {
-		return 0, fmt.Errorf("word not found: %q", wordB)
+		return 0, fmt.Errorf("word not found: %q: %w", wordB, ErrRecordNotFound)
 	}
 
-	recA := db.getNode(idxA)
-	recB := db.getNode(idxB)
+	recA, err := db.getNode(idxA)
+	if err != nil {
+		return 0, err
+	}
+	recB, err := db.getNode(idxB)
+	if err != nil {
+		return 0, err
+	}
 
 	pA := spatial.Point2D{X: recA.X, Y: recA.Y}
 	pB := spatial.Point2D{X: recB.X, Y: recB.Y}
@@ -4559,9 +4961,12 @@ func (db *AnchorDB) CalculateCentroid(words []string) (spatial.Point2D, [4]float
 	for _, w := range words {
 		idx, exists := db.Lexicon[w]
 		if !exists {
-			return spatial.Point2D{}, [4]float32{}, fmt.Errorf("word not found: %q", w)
+			return spatial.Point2D{}, [4]float32{}, fmt.Errorf("word not found: %q: %w", w, ErrRecordNotFound)
 		}
-		rec := db.getNode(idx)
+		rec, err := db.getNode(idx)
+		if err != nil {
+			return spatial.Point2D{}, [4]float32{}, err
+		}
 		sumCoord = sumCoord.Add(spatial.Point2D{X: rec.X, Y: rec.Y})
 		for r := 0; r < 4; r++ {
 			sumRoles[r] += rec.Roles[r]
@@ -4590,15 +4995,23 @@ func (db *AnchorDB) CalculateCosineSimilarity(wordA, wordB string) (float32, err
 
 	idxA, existsA := db.Lexicon[wordA]
 	if !existsA {
-		return 0, fmt.Errorf("word not found: %q", wordA)
+		return 0, fmt.Errorf("word not found: %q: %w", wordA, ErrRecordNotFound)
 	}
 	idxB, existsB := db.Lexicon[wordB]
 	if !existsB {
-		return 0, fmt.Errorf("word not found: %q", wordB)
+		return 0, fmt.Errorf("word not found: %q: %w", wordB, ErrRecordNotFound)
 	}
 
-	rolesA := db.getNode(idxA).Roles
-	rolesB := db.getNode(idxB).Roles
+	recA, err := db.getNode(idxA)
+	if err != nil {
+		return 0, err
+	}
+	recB, err := db.getNode(idxB)
+	if err != nil {
+		return 0, err
+	}
+	rolesA := recA.Roles
+	rolesB := recB.Roles
 
 	dot := float32(0.0)
 	magA := float32(0.0)
@@ -4630,10 +5043,13 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 
 	targetIdx, exists := db.Lexicon[word]
 	if !exists {
-		return nil, fmt.Errorf("word not found: %q", word)
+		return nil, fmt.Errorf("word not found: %q: %w", word, ErrRecordNotFound)
 	}
 
-	targetRec := db.getNode(targetIdx)
+	targetRec, err := db.getNode(targetIdx)
+	if err != nil {
+		return nil, err
+	}
 	targetCoord := spatial.Point2D{X: targetRec.X, Y: targetRec.Y}
 
 	var results []GraphQueryResult
@@ -4644,13 +5060,19 @@ func (db *AnchorDB) FindNearestNeighbors(word string, limitK int) ([]GraphQueryR
 		if uint32(idx) == targetIdx {
 			continue
 		}
-		rec := db.getNode(uint32(idx))
+		rec, err := db.getNode(uint32(idx))
+		if err != nil {
+			return nil, err
+		}
 		if rec.ID == 0 {
 			continue
 		}
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
 		dist := p.Distance(targetCoord)
-		w := db.getWord(rec.WordOffset, rec.WordLen)
+		w, err := db.getWord(rec.WordOffset, rec.WordLen)
+		if err != nil {
+			return nil, err
+		}
 
 		results = append(results, GraphQueryResult{
 			Word:       w,
@@ -4691,13 +5113,19 @@ func (db *AnchorDB) FindNodesInPolygon(poly spatial.Polygon2D, limitK int) ([]Gr
 	var results []GraphQueryResult
 	totNodes := db.totalNodes()
 	for idx := 0; idx < totNodes; idx++ {
-		rec := db.getNode(uint32(idx))
+		rec, err := db.getNode(uint32(idx))
+		if err != nil {
+			return nil, err
+		}
 		if rec.ID == 0 {
 			continue
 		}
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
 		if poly.Contains(p) {
-			w := db.getWord(rec.WordOffset, rec.WordLen)
+			w, err := db.getWord(rec.WordOffset, rec.WordLen)
+			if err != nil {
+				return nil, err
+			}
 			results = append(results, GraphQueryResult{
 				Word:  w,
 				Coord: p,
@@ -4728,13 +5156,19 @@ func (db *AnchorDB) FindNodesInRadius(center spatial.Point2D, radius float32, li
 	var results []GraphQueryResult
 	totNodes := db.totalNodes()
 	for idx := 0; idx < totNodes; idx++ {
-		rec := db.getNode(uint32(idx))
+		rec, err := db.getNode(uint32(idx))
+		if err != nil {
+			return nil, err
+		}
 		if rec.ID == 0 {
 			continue
 		}
 		p := spatial.Point2D{X: rec.X, Y: rec.Y}
 		if spatial.WithinRadius(p, center, radius) {
-			w := db.getWord(rec.WordOffset, rec.WordLen)
+			w, err := db.getWord(rec.WordOffset, rec.WordLen)
+			if err != nil {
+				return nil, err
+			}
 			dist := p.Distance(center)
 			results = append(results, GraphQueryResult{
 				Word:       w,
@@ -5058,10 +5492,18 @@ func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (Histogra
 		var n uint64
 		for i := 0; i < len(db.EntityOrder); i++ {
 			cr := db.EntityStore[db.EntityOrder[i]]
-			if !matchHistogramRecord(cr, opts) {
+			matched, err := matchHistogramRecord(cr, opts)
+			if err != nil {
+				return HistogramResult{Field: opts.Field}, err
+			}
+			if !matched {
 				continue
 			}
-			if v, ok := cr.GetTyped(opts.Field); ok && !math.IsNaN(v.Float64()) {
+			v, ok, err := cr.GetTyped(opts.Field)
+			if err != nil {
+				return HistogramResult{Field: opts.Field}, err
+			}
+			if ok && !math.IsNaN(v.Float64()) {
 				n++
 			}
 		}
@@ -5081,10 +5523,17 @@ func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (Histogra
 	var n uint64
 	for i := 0; i < len(db.EntityOrder); i++ {
 		cr := db.EntityStore[db.EntityOrder[i]]
-		if !matchHistogramRecord(cr, opts) {
+		matched, err := matchHistogramRecord(cr, opts)
+		if err != nil {
+			return HistogramResult{Field: opts.Field}, err
+		}
+		if !matched {
 			continue
 		}
-		attr, ok := cr.GetTyped(opts.Field)
+		attr, ok, err := cr.GetTyped(opts.Field)
+		if err != nil {
+			return HistogramResult{Field: opts.Field}, err
+		}
 		if !ok {
 			continue
 		}
@@ -5110,7 +5559,7 @@ func (db *AnchorDB) ComputeHistogramWithOptions(opts HistogramOptions) (Histogra
 
 // matchHistogramRecord mirrors the population filter of ComputeStatsWithOptions
 // (operation gate + attribute filters) so both passes bin the same records.
-func matchHistogramRecord(cr CompactRecord, opts HistogramOptions) bool {
+func matchHistogramRecord(cr CompactRecord, opts HistogramOptions) (bool, error) {
 	if len(opts.AllowedOperations) > 0 {
 		matched := false
 		for _, allowed := range opts.AllowedOperations {
@@ -5120,21 +5569,25 @@ func matchHistogramRecord(cr CompactRecord, opts HistogramOptions) bool {
 			}
 		}
 		if !matched {
-			return false
+			return false, nil
 		}
 	} else if !opts.IncludeAllOperations {
 		if cr.Operation != OpStatusActive {
-			return false
+			return false, nil
 		}
 	}
 	if len(opts.Filters) > 0 {
 		for _, f := range opts.Filters {
-			if !cr.MatchesFilter(f) {
-				return false
+			ok, err := cr.MatchesFilter(f)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
 			}
 		}
 	}
-	return true
+	return true, nil
 }
 
 // FilterZScore returns active records whose field value is a z-score outlier:
@@ -5167,7 +5620,10 @@ func (db *AnchorDB) FilterZScore(field string, threshold float64) ([]EntityRecor
 		if cr.Operation != OpStatusActive {
 			continue
 		}
-		attr, ok := cr.GetTyped(field)
+		attr, ok, err := cr.GetTyped(field)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
 		}
@@ -5176,7 +5632,15 @@ func (db *AnchorDB) FilterZScore(field string, threshold float64) ([]EntityRecor
 			continue
 		}
 		if math.Abs(v-st.Mean)/st.StdDev > threshold {
-			out = append(out, EntityRecord{Name: name, Operation: cr.Operation, Props: cr.ToMap(), Attrs: cr.ExpandAttrs()})
+			props, err := cr.ToMap()
+			if err != nil {
+				return nil, err
+			}
+			attrs, err := cr.ExpandAttrs()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, EntityRecord{Name: name, Operation: cr.Operation, Props: props, Attrs: attrs})
 		}
 	}
 	return out, nil
@@ -5212,7 +5676,10 @@ func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, e
 		if cr.Operation != OpStatusActive {
 			continue
 		}
-		attr, ok := cr.GetTyped(field)
+		attr, ok, err := cr.GetTyped(field)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
 		}
@@ -5235,7 +5702,15 @@ func (db *AnchorDB) FilterIQROutlier(field string, k float64) ([]EntityRecord, e
 	var out []EntityRecord
 	for _, s := range samples {
 		if s.val < lo || s.val > hi {
-			out = append(out, EntityRecord{Name: s.name, Operation: s.cr.Operation, Props: s.cr.ToMap(), Attrs: s.cr.ExpandAttrs()})
+			props, err := s.cr.ToMap()
+			if err != nil {
+				return nil, err
+			}
+			attrs, err := s.cr.ExpandAttrs()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, EntityRecord{Name: s.name, Operation: s.cr.Operation, Props: props, Attrs: attrs})
 		}
 	}
 	return out, nil
@@ -5270,8 +5745,8 @@ func (db *AnchorDB) computeStatsLocked(opts StatsOptions) (StatsResult, error) {
 	var sum float64
 	var minVal float32 = math.MaxFloat32
 	var maxVal float32 = -math.MaxFloat32
-	var minVal64 float64 = math.MaxFloat64
-	var maxVal64 float64 = -math.MaxFloat64
+	minVal64 := math.MaxFloat64
+	maxVal64 := -math.MaxFloat64
 	// Exact integer extremes: plain integer compares per record (no big.Int in
 	// the hot loop); cross-domain resolution happens once at the end.
 	// Float extremes for resolution track only float-typed values: the legacy
@@ -5311,7 +5786,11 @@ func (db *AnchorDB) computeStatsLocked(opts StatsOptions) (StatsResult, error) {
 		if len(opts.Filters) > 0 {
 			matches := true
 			for _, f := range opts.Filters {
-				if !cr.MatchesFilter(f) {
+				ok, err := cr.MatchesFilter(f)
+				if err != nil {
+					return StatsResult{Field: opts.Field}, err
+				}
+				if !ok {
 					matches = false
 					break
 				}
@@ -5321,7 +5800,10 @@ func (db *AnchorDB) computeStatsLocked(opts StatsOptions) (StatsResult, error) {
 			}
 		}
 
-		attr, exists := cr.GetTyped(opts.Field)
+		attr, exists, err := cr.GetTyped(opts.Field)
+		if err != nil {
+			return StatsResult{Field: opts.Field}, err
+		}
 		if !exists {
 			continue
 		}
@@ -5450,24 +5932,22 @@ func (db *AnchorDB) computeStatsLocked(opts StatsOptions) (StatsResult, error) {
 	}, nil
 }
 
-func (db *AnchorDB) getWord(offset uint32, length uint16) string {
+func (db *AnchorDB) getWord(offset uint32, length uint16) (string, error) {
+	if length == 0 {
+		return "", nil
+	}
 	if offset < db.syncedStringBytes {
 		absOffset := int(db.Header.StringOffset) + int(offset)
-		if absOffset+int(length) <= len(db.mmapData) {
-			return string(db.mmapData[absOffset : absOffset+int(length)])
+		if db.mmapData != nil && absOffset >= 0 && absOffset+int(length) <= len(db.mmapData) {
+			return string(db.mmapData[absOffset : absOffset+int(length)]), nil
 		}
-		return ""
+		return "", fmt.Errorf("%w: word offset %d length %d exceeds mmap bounds", ErrCorruptRecord, offset, length)
 	}
 	pOffset := int(offset - db.syncedStringBytes)
 	if pOffset >= 0 && pOffset+int(length) <= len(db.pendingStringPool) {
-		return string(db.pendingStringPool[pOffset : pOffset+int(length)])
+		return string(db.pendingStringPool[pOffset : pOffset+int(length)]), nil
 	}
-	// Fallback directly to mmap memory if bounds match mmap
-	absOffset := int(db.Header.StringOffset) + int(offset)
-	if absOffset+int(length) <= len(db.mmapData) {
-		return string(db.mmapData[absOffset : absOffset+int(length)])
-	}
-	return ""
+	return "", fmt.Errorf("%w: word offset %d length %d exceeds string pool bounds", ErrCorruptRecord, offset, length)
 }
 
 // ExecuteGraphChain runs multi-step recursive reasoning entirely in-storage.

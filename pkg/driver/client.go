@@ -77,9 +77,9 @@ type Client struct {
 //     "anchordb://./data"
 //     "./data/plant_iot.anchordb"
 func Connect(dsn string, opts ...Option) (*Client, error) {
-	cfg := defaultClientConfig()
-	for _, opt := range opts {
-		opt(&cfg)
+	cfg, err := resolveClientConfig(opts)
+	if err != nil {
+		return nil, err
 	}
 
 	dsn = strings.TrimSpace(dsn)
@@ -218,9 +218,9 @@ func Connect(dsn string, opts ...Option) (*Client, error) {
 // It runs the full engine runtime (WAL, file locking, multi-model routing, worker pool,
 // and optional background sync/scheduler) directly in-process with zero network overhead.
 func OpenEmbedded(dataDir string, opts ...Option) (*Client, error) {
-	cfg := defaultClientConfig()
-	for _, opt := range opts {
-		opt(&cfg)
+	cfg, err := resolveClientConfig(opts)
+	if err != nil {
+		return nil, err
 	}
 	backend, err := newEmbeddedBackend(dataDir, cfg)
 	if err != nil {
@@ -251,9 +251,9 @@ func OpenLocal(filePath string) (*Client, error) {
 
 // ConnectRemote connects to a running AnchorDB engine server over HTTP/REST.
 func ConnectRemote(baseURL string, opts ...Option) (*Client, error) {
-	cfg := defaultClientConfig()
-	for _, opt := range opts {
-		opt(&cfg)
+	cfg, err := resolveClientConfig(opts)
+	if err != nil {
+		return nil, err
 	}
 	backend, err := newRemoteBackend(baseURL, cfg)
 	if err != nil {
@@ -271,12 +271,12 @@ func ConnectRemote(baseURL string, opts ...Option) (*Client, error) {
 
 // ConnectWire connects to an AnchorDB engine server over the AnchorWire binary TCP protocol.
 func ConnectWire(addr string, opts ...Option) (*Client, error) {
-	cfg := defaultClientConfig()
-	for _, opt := range opts {
-		opt(&cfg)
+	cfg, err := resolveClientConfig(opts)
+	if err != nil {
+		return nil, err
 	}
 
-	raw := addr
+	raw := strings.TrimSpace(addr)
 	if strings.HasPrefix(raw, "wire://") {
 		raw = strings.TrimPrefix(raw, "wire://")
 	} else if strings.HasPrefix(raw, "tcp://") {
@@ -298,13 +298,29 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 			}
 		}
 		q := u.Query()
-		if tok := q.Get("token"); tok != "" {
+		for k := range q {
+			switch k {
+			case "token", "model", "pacing", "target", "pool":
+			default:
+				return nil, fmt.Errorf("unknown wire DSN query parameter %q", k)
+			}
+		}
+		if q.Has("token") {
+			tok := q.Get("token")
+			if tok == "" {
+				return nil, fmt.Errorf("invalid wire DSN token: cannot be empty")
+			}
 			cfg.token = tok
 		}
-		if mdl := q.Get("model"); mdl != "" {
+		if q.Has("model") {
+			mdl := q.Get("model")
+			if strings.TrimSpace(mdl) == "" {
+				return nil, fmt.Errorf("invalid wire DSN model: cannot be empty")
+			}
 			cfg.model = mdl
 		}
-		if p := q.Get("pacing"); p != "" {
+		if q.Has("pacing") {
+			p := q.Get("pacing")
 			switch strings.ToLower(p) {
 			case "true", "1":
 				cfg.adaptivePacing = true
@@ -314,14 +330,16 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 				return nil, fmt.Errorf("invalid wire DSN pacing value %q", p)
 			}
 		}
-		if tgt := q.Get("target"); tgt != "" {
+		if q.Has("target") {
+			tgt := q.Get("target")
 			n, err := strconv.ParseUint(tgt, 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid wire DSN target value %q: %w", tgt, err)
+			if err != nil || n == 0 {
+				return nil, fmt.Errorf("invalid wire DSN target value %q: must be positive uint32", tgt)
 			}
 			cfg.targetRecords = uint32(n)
 		}
-		if poolStr := q.Get("pool"); poolStr != "" {
+		if q.Has("pool") {
+			poolStr := q.Get("pool")
 			n, err := strconv.Atoi(poolStr)
 			if err != nil || n <= 0 {
 				return nil, fmt.Errorf("invalid wire DSN pool size %q: must be positive integer", poolStr)
@@ -333,6 +351,9 @@ func ConnectWire(addr string, opts ...Option) (*Client, error) {
 			cfg.model = pathModel
 		}
 		raw = u.Host
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("invalid wire DSN %q: missing host address", addr)
 	}
 
 	backend, err := newWireBackend(raw, cfg)
@@ -398,12 +419,24 @@ func (c *Client) ListPartitions(ctx context.Context) ([]PartitionMeta, error) {
 
 // InspectPartition inspects an archived partition file through the engine runtime without exposing raw file descriptors.
 func (c *Client) InspectPartition(ctx context.Context, partitionFile, recordName string, limit int) (*PartitionInspectResult, error) {
-	return c.backend.InspectPartition(ctx, c.model, partitionFile, recordName, limit)
+	return c.backend.InspectPartitionWithOptions(ctx, c.model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+		Limit:         limit,
+	})
+}
+
+// InspectPartitionWithOptions inspects an archived partition with optional filtering, projection, pagination, and in-storage computations.
+func (c *Client) InspectPartitionWithOptions(ctx context.Context, opts PartitionInspectOptions) (*PartitionInspectResult, error) {
+	return c.backend.InspectPartitionWithOptions(ctx, c.model, opts)
 }
 
 // InspectPartitionRecord retrieves a single record from an archived partition file through the engine.
 func (c *Client) InspectPartitionRecord(ctx context.Context, partitionFile, recordName string) (*EntityResult, error) {
-	res, err := c.backend.InspectPartition(ctx, c.model, partitionFile, recordName, 0)
+	res, err := c.backend.InspectPartitionWithOptions(ctx, c.model, PartitionInspectOptions{
+		PartitionFile: partitionFile,
+		RecordName:    recordName,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -617,13 +650,23 @@ func FormatDate(epochDays float32) string {
 }
 
 // AddDays creates an in-storage operator to add N days to a date field.
-func AddDays(field string, days float32) storage.ComputeOp {
+func AddDays(field string, days float64) storage.ComputeOp {
 	return storage.OpAddDays{Field: field, Days: days}
 }
 
 // SubtractDays creates an in-storage operator to subtract N days from a date field.
-func SubtractDays(field string, days float32) storage.ComputeOp {
+func SubtractDays(field string, days float64) storage.ComputeOp {
 	return storage.OpSubtractDays{Field: field, Days: days}
+}
+
+// DateInt converts a "YYYY-MM-DD" string to exact 64-bit Epoch Days.
+func DateInt(dateStr string) (int64, error) {
+	return storage.ParseDateInt(dateStr)
+}
+
+// FormatDateInt converts 64-bit Epoch Days back to a "YYYY-MM-DD" string.
+func FormatDateInt(epochDays int64) string {
+	return storage.FormatDateInt(epochDays)
 }
 
 // DaysBetween creates an in-storage operator to calculate days between fieldA and fieldB.
@@ -956,8 +999,12 @@ func toFilterConditionValue(v any) (v32 float32, v64 float64, vInt64 int64, vUin
 		u := uint64(val)
 		return float32(val), float64(val), int64(val), u, storage.AttrTypeUint64, true, nil
 	case string:
-		if d, err := storage.ParseDate(val); err == nil {
-			return d, float64(d), int64(d), uint64(d), storage.AttrTypeFloat32, false, nil
+		if d, err := storage.ParseDateInt(val); err == nil {
+			var u uint64
+			if d >= 0 {
+				u = uint64(d)
+			}
+			return float32(d), float64(d), d, u, storage.AttrTypeInt64, true, nil
 		}
 		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
 			var u uint64
@@ -1129,12 +1176,20 @@ func (b *ListBuilder) Compute(field string, op storage.ComputeOp) *ListBuilder {
 
 // Limit sets maximum number of records to retrieve.
 func (b *ListBuilder) Limit(limit int) *ListBuilder {
+	if limit < 0 {
+		b.err = fmt.Errorf("driver: limit %d cannot be negative", limit)
+		return b
+	}
 	b.limit = limit
 	return b
 }
 
 // Offset sets number of records to skip.
 func (b *ListBuilder) Offset(offset int) *ListBuilder {
+	if offset < 0 {
+		b.err = fmt.Errorf("driver: offset %d cannot be negative", offset)
+		return b
+	}
 	b.offset = offset
 	return b
 }
@@ -1142,7 +1197,12 @@ func (b *ListBuilder) Offset(offset int) *ListBuilder {
 // Page configures pagination with 1-based page index and pageSize.
 func (b *ListBuilder) Page(page, pageSize int) *ListBuilder {
 	if page < 1 {
-		page = 1
+		b.err = fmt.Errorf("driver: page %d must be >= 1", page)
+		return b
+	}
+	if pageSize <= 0 {
+		b.err = fmt.Errorf("driver: pageSize %d must be > 0", pageSize)
+		return b
 	}
 	b.limit = pageSize
 	b.offset = (page - 1) * pageSize
@@ -1256,12 +1316,20 @@ func (b *UpdateBuilder) Set(field string, op storage.ComputeOp) *UpdateBuilder {
 
 // Limit bounds the maximum number of records to update.
 func (b *UpdateBuilder) Limit(limit int) *UpdateBuilder {
+	if limit < 0 {
+		b.err = fmt.Errorf("driver: update limit %d cannot be negative", limit)
+		return b
+	}
 	b.limit = limit
 	return b
 }
 
 // Offset sets the offset index to start updating matching records.
 func (b *UpdateBuilder) Offset(offset int) *UpdateBuilder {
+	if offset < 0 {
+		b.err = fmt.Errorf("driver: update offset %d cannot be negative", offset)
+		return b
+	}
 	b.offset = offset
 	return b
 }

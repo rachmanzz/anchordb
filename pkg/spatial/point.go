@@ -1,6 +1,12 @@
 package spatial
 
-import "math"
+import (
+	"errors"
+	"math"
+)
+
+// ErrInvalidVector is returned when a vector has zero length or non-finite components.
+var ErrInvalidVector = errors.New("spatial: cannot normalize zero, NaN, or non-finite vector")
 
 // Point2D represents a 2D coordinate in semantic space.
 type Point2D struct {
@@ -36,19 +42,27 @@ func (p Point2D) Mul(s float32) Point2D {
 }
 
 // Normalize normalizes vector to unit length (length = 1.0).
-func (p Point2D) Normalize() Point2D {
+// Returns ErrInvalidVector when the vector is zero, NaN, or non-finite.
+func (p Point2D) Normalize() (Point2D, error) {
 	x, y := float64(p.X), float64(p.Y)
+	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+		return Point2D{}, ErrInvalidVector
+	}
 	l := math.Hypot(x, y)
 	if l == 0 || math.IsNaN(l) {
-		return Point2D{X: 1, Y: 0}
+		return Point2D{}, ErrInvalidVector
 	}
 	if math.IsInf(l, 0) {
 		x *= 0.5
 		y *= 0.5
 		l = math.Hypot(x, y)
 		if l == 0 || math.IsNaN(l) || math.IsInf(l, 0) {
-			return Point2D{X: 1, Y: 0}
+			return Point2D{}, ErrInvalidVector
 		}
 	}
-	return Point2D{X: float32(x / l), Y: float32(y / l)}
+	nx, ny := float32(x/l), float32(y/l)
+	if math.IsNaN(float64(nx)) || math.IsNaN(float64(ny)) || math.IsInf(float64(nx), 0) || math.IsInf(float64(ny), 0) || (nx == 0 && ny == 0) {
+		return Point2D{}, ErrInvalidVector
+	}
+	return Point2D{X: nx, Y: ny}, nil
 }

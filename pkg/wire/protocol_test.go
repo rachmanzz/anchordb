@@ -77,7 +77,10 @@ func TestWire_SavePayload(t *testing.T) {
 		Roles: &[4]float32{0.5, 0.5, 0.1, 0.1},
 	}
 
-	encoded := EncodeSavePayload(item)
+	encoded, err := EncodeSavePayload(item)
+	if err != nil {
+		t.Fatalf("EncodeSavePayload failed: %v", err)
+	}
 	decoded, err := DecodeSavePayload(encoded)
 	if err != nil {
 		t.Fatalf("DecodeSavePayload failed: %v", err)
@@ -111,7 +114,10 @@ func TestWire_SaveBatchPayload(t *testing.T) {
 		},
 	}
 
-	encoded := EncodeSaveBatchPayload(records)
+	encoded, err := EncodeSaveBatchPayload(records)
+	if err != nil {
+		t.Fatalf("EncodeSaveBatchPayload failed: %v", err)
+	}
 	decoded, err := DecodeSaveBatchPayload(encoded)
 	if err != nil {
 		t.Fatalf("DecodeSaveBatchPayload failed: %v", err)
@@ -127,7 +133,10 @@ func TestWire_SaveBatchPayload(t *testing.T) {
 
 func TestWire_EdgePayload(t *testing.T) {
 	action, src, rel, tgt, weight := "add", "node_a", "connects_to", "node_b", float32(0.85)
-	encoded := EncodeEdgePayload(action, src, rel, tgt, weight)
+	encoded, err := EncodeEdgePayload(action, src, rel, tgt, weight)
+	if err != nil {
+		t.Fatalf("EncodeEdgePayload failed: %v", err)
+	}
 
 	dAct, dSrc, dRel, dTgt, dWeight, err := DecodeEdgePayload(encoded)
 	if err != nil {
@@ -143,7 +152,10 @@ func TestWire_CausalPayload(t *testing.T) {
 	rel := "routes"
 	limitK := 10
 
-	encoded := EncodeCausalPayload(seeds, rel, limitK)
+	encoded, err := EncodeCausalPayload(seeds, rel, limitK)
+	if err != nil {
+		t.Fatalf("EncodeCausalPayload failed: %v", err)
+	}
 	dSeeds, dRel, dK, err := DecodeCausalPayload(encoded)
 	if err != nil {
 		t.Fatalf("DecodeCausalPayload failed: %v", err)
@@ -156,7 +168,10 @@ func TestWire_CausalPayload(t *testing.T) {
 		{Word: "sku_1", Score: 0.95},
 		{Word: "sku_2", Score: 0.45},
 	}
-	resBytes := EncodeCausalResultPayload(results)
+	resBytes, err := EncodeCausalResultPayload(results)
+	if err != nil {
+		t.Fatalf("EncodeCausalResultPayload failed: %v", err)
+	}
 	dResults, err := DecodeCausalResultPayload(resBytes)
 	if err != nil {
 		t.Fatalf("DecodeCausalResultPayload failed: %v", err)
@@ -222,7 +237,10 @@ func TestWire_GetRequestPayload(t *testing.T) {
 			"speed": storage.OpDivide{FieldA: "distance", FieldB: "duration"},
 		},
 	}
-	encoded := EncodeGetRequest(req)
+	encoded, err := EncodeGetRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeGetRequest failed: %v", err)
+	}
 	dReq, err := DecodeGetRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeGetRequest failed: %v", err)
@@ -249,7 +267,10 @@ func TestWire_ListRequestPayload(t *testing.T) {
 			"revenue": storage.OpMultiply{FieldA: "price", FieldB: "stock"},
 		},
 	}
-	encoded := EncodeListRequest(req)
+	encoded, err := EncodeListRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeListRequest failed: %v", err)
+	}
 	dReq, err := DecodeListRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeListRequest failed: %v", err)
@@ -275,7 +296,10 @@ func TestWire_ListRequestPayload(t *testing.T) {
 			},
 		},
 	}
-	respBytes := EncodeListResponse(resp)
+	respBytes, err := EncodeListResponse(resp)
+	if err != nil {
+		t.Fatalf("EncodeListResponse failed: %v", err)
+	}
 	dResp, err := DecodeListResponse(respBytes)
 	if err != nil {
 		t.Fatalf("DecodeListResponse failed: %v", err)
@@ -307,7 +331,10 @@ func TestWire_ListResponsePayload_Typed(t *testing.T) {
 			},
 		},
 	}
-	respBytes := EncodeListResponse(resp)
+	respBytes, err := EncodeListResponse(resp)
+	if err != nil {
+		t.Fatalf("EncodeListResponse failed: %v", err)
+	}
 	dResp, err := DecodeListResponse(respBytes)
 	if err != nil {
 		t.Fatalf("DecodeListResponse failed: %v", err)
@@ -359,7 +386,10 @@ func TestWire_FilterCondition_64BitExact(t *testing.T) {
 		ValueHighInt64: largeInt,
 		ValType:        storage.AttrTypeInt64,
 	}
-	buf := appendFilterCondition(nil, condInt)
+	buf, err := appendFilterCondition(nil, condInt)
+	if err != nil {
+		t.Fatalf("appendFilterCondition failed: %v", err)
+	}
 	dCondInt, _, err := readFilterCondition(buf, 0)
 	if err != nil {
 		t.Fatalf("readFilterCondition failed: %v", err)
@@ -375,7 +405,10 @@ func TestWire_FilterCondition_64BitExact(t *testing.T) {
 		ValueHighUint64: largeUint,
 		ValType:         storage.AttrTypeUint64,
 	}
-	bufUint := appendFilterCondition(nil, condUint)
+	bufUint, err := appendFilterCondition(nil, condUint)
+	if err != nil {
+		t.Fatalf("appendFilterCondition uint failed: %v", err)
+	}
 	dCondUint, _, err := readFilterCondition(bufUint, 0)
 	if err != nil {
 		t.Fatalf("readFilterCondition uint failed: %v", err)
@@ -397,7 +430,10 @@ func TestWire_UpdateRequestPayload(t *testing.T) {
 			"points": storage.OpAdd{FieldA: "points", FieldB: "bonus"},
 		},
 	}
-	encoded := EncodeUpdateRequest(req)
+	encoded, err := EncodeUpdateRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeUpdateRequest failed: %v", err)
+	}
 	dReq, err := DecodeUpdateRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeUpdateRequest failed: %v", err)
@@ -421,7 +457,10 @@ func TestWire_GraphPayload(t *testing.T) {
 		OrderMode: uint8(storage.OrderByScoreDesc),
 		BeamWidth: 0.75,
 	}
-	encoded := EncodeGraphRequest(req)
+	encoded, err := EncodeGraphRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeGraphRequest failed: %v", err)
+	}
 	dReq, err := DecodeGraphRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeGraphRequest failed: %v", err)
@@ -436,7 +475,10 @@ func TestWire_GraphPayload(t *testing.T) {
 			{Word: "tgt_1", Score: 0.9, T: 1.2, DistSqPerp: 0.05, Coord: spatial.Point2D{X: 3.0, Y: 4.0}},
 		},
 	}
-	respBytes := EncodeGraphResponsePayload(resp)
+	respBytes, err := EncodeGraphResponsePayload(resp)
+	if err != nil {
+		t.Fatalf("EncodeGraphResponsePayload failed: %v", err)
+	}
 	dResp, err := DecodeGraphResponsePayload(respBytes)
 	if err != nil {
 		t.Fatalf("DecodeGraphResponsePayload failed: %v", err)
@@ -453,7 +495,10 @@ func TestWire_GraphChainPayload(t *testing.T) {
 		LimitK:        3,
 		BeamWidth:     0.5,
 	}
-	encoded := EncodeGraphChainRequest(req)
+	encoded, err := EncodeGraphChainRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeGraphChainRequest failed: %v", err)
+	}
 	dReq, err := DecodeGraphChainRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeGraphChainRequest failed: %v", err)
@@ -465,13 +510,19 @@ func TestWire_GraphChainPayload(t *testing.T) {
 
 func TestWire_SchemaPayload(t *testing.T) {
 	schemaJSON := `{"price":"float","quantity":"int"}`
-	encoded := EncodeAttachSchemaPayload(schemaJSON)
+	encoded, err := EncodeAttachSchemaPayload(schemaJSON)
+	if err != nil {
+		t.Fatalf("EncodeAttachSchemaPayload failed: %v", err)
+	}
 	dSchema, err := DecodeAttachSchemaPayload(encoded)
 	if err != nil || dSchema != schemaJSON {
 		t.Fatalf("unexpected attach schema payload: got %q, want %q", dSchema, schemaJSON)
 	}
 
-	getEncoded := EncodeGetSchemaPayload(schemaJSON)
+	getEncoded, err := EncodeGetSchemaPayload(schemaJSON)
+	if err != nil {
+		t.Fatalf("EncodeGetSchemaPayload failed: %v", err)
+	}
 	dGetSchema, err := DecodeGetSchemaPayload(getEncoded)
 	if err != nil || dGetSchema != schemaJSON {
 		t.Fatalf("unexpected get schema payload: got %q, want %q", dGetSchema, schemaJSON)
@@ -484,7 +535,10 @@ func TestWire_MathPayload(t *testing.T) {
 		Words:  []string{"cluster_node"},
 		LimitK: 10,
 	}
-	encoded := EncodeMathRequest(req)
+	encoded, err := EncodeMathRequest(req)
+	if err != nil {
+		t.Fatalf("EncodeMathRequest failed: %v", err)
+	}
 	dReq, err := DecodeMathRequest(encoded)
 	if err != nil {
 		t.Fatalf("DecodeMathRequest failed: %v", err)
@@ -501,7 +555,10 @@ func TestWire_MathPayload(t *testing.T) {
 			{Word: "neighbor_1", Score: 0.88, T: 0.5, DistSqPerp: 0.1, Coord: spatial.Point2D{X: 11, Y: 21}},
 		},
 	}
-	respBytes := EncodeMathResponse(resp)
+	respBytes, err := EncodeMathResponse(resp)
+	if err != nil {
+		t.Fatalf("EncodeMathResponse failed: %v", err)
+	}
 	dResp, err := DecodeMathResponse(respBytes)
 	if err != nil {
 		t.Fatalf("DecodeMathResponse failed: %v", err)
@@ -521,7 +578,10 @@ func TestWire_ResetModelPayload(t *testing.T) {
 
 func TestWire_EdgeWithDirectionPayload(t *testing.T) {
 	dir := spatial.Point2D{X: 0, Y: -1}
-	encoded := EncodeEdgePayloadWithDirection("set_relation", "", "down", "", 0, &dir)
+	encoded, err := EncodeEdgePayloadWithDirection("set_relation", "", "down", "", 0, &dir)
+	if err != nil {
+		t.Fatalf("EncodeEdgePayloadWithDirection failed: %v", err)
+	}
 	act, src, rel, tgt, w, dDir, err := DecodeEdgePayloadWithDirection(encoded)
 	if err != nil {
 		t.Fatalf("DecodeEdgePayloadWithDirection failed: %v", err)
@@ -545,7 +605,7 @@ func TestWire_DecodeListResponse_BoundsAndTypeSafety(t *testing.T) {
 	}
 
 	// 2. Reject invalid AttrType in typed list item
-	validResp := EncodeListResponse(ListResponse{
+	validResp, err := EncodeListResponse(ListResponse{
 		TotalCount: 1,
 		Items: []storage.EntityRecord{
 			{
@@ -555,6 +615,9 @@ func TestWire_DecodeListResponse_BoundsAndTypeSafety(t *testing.T) {
 			},
 		},
 	})
+	if err != nil {
+		t.Fatalf("EncodeListResponse failed: %v", err)
+	}
 	corrupted := append([]byte(nil), validResp...)
 	// Offset: 9 (header) + 2+4 ("rec1") + 1 (op) + 2 (rawCount) + 2+1 ("k") = 21 -> attrType byte
 	corrupted[21] = 99
@@ -578,7 +641,10 @@ func TestWire_DecodeListResponse_BoundsAndTypeSafety(t *testing.T) {
 			},
 		},
 	}
-	reqBytes := EncodeListRequest(listReq)
+	reqBytes, err := EncodeListRequest(listReq)
+	if err != nil {
+		t.Fatalf("EncodeListRequest failed: %v", err)
+	}
 	decodedReq, err := DecodeListRequest(reqBytes)
 	if err != nil {
 		t.Fatalf("DecodeListRequest failed: %v", err)
@@ -630,26 +696,85 @@ func TestWire_DecoderRejectsInflatedCounts(t *testing.T) {
 		t.Fatalf("expected DecodeGetResultPayload to reject inflated attrCount")
 	}
 
-	// Unknown edge action string encodes 0xFF and must be rejected on decode.
-	badActionEdge := EncodeEdgePayload("delete", "a", "r", "b", 1.0)
-	if _, _, _, _, _, _, err := DecodeEdgePayloadWithDirection(badActionEdge); err == nil {
-		t.Fatalf("expected DecodeEdgePayloadWithDirection to reject unknown action encoded from 'delete'")
+	// Unknown edge action string must fail closed during encoding.
+	if _, err := EncodeEdgePayload("delete", "a", "r", "b", 1.0); err == nil {
+		t.Fatalf("expected EncodeEdgePayload to reject unknown action 'delete'")
 	}
 
 	// DecodeGetRequest / DecodeListRequest / DecodeUpdateRequest reject truncated trailing count headers.
-	getTrunc := append(EncodeGetPayload("rec1"), 0x01)
+	getNamePayload, err := EncodeGetPayload("rec1")
+	if err != nil {
+		t.Fatalf("EncodeGetPayload failed: %v", err)
+	}
+	getTrunc := append(getNamePayload, 0x01)
 	if _, err := DecodeGetRequest(getTrunc); err == nil {
 		t.Fatalf("expected DecodeGetRequest to reject truncated select count")
 	}
-	listBase := EncodeListRequest(ListRequest{Limit: 10})
+	listBase, err := EncodeListRequest(ListRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("EncodeListRequest failed: %v", err)
+	}
 	if _, err := DecodeListRequest(listBase[:len(listBase)-1]); err == nil {
 		t.Fatalf("expected DecodeListRequest to reject truncated compute count")
 	}
 	if _, err := DecodeListRequest(append(listBase, 0x01)); err == nil {
 		t.Fatalf("expected DecodeListRequest to reject trailing unparsed bytes")
 	}
-	updBase := EncodeUpdateRequest(UpdateRequest{Limit: 5})
+	updBase, err := EncodeUpdateRequest(UpdateRequest{Limit: 5})
+	if err != nil {
+		t.Fatalf("EncodeUpdateRequest failed: %v", err)
+	}
 	if _, err := DecodeUpdateRequest(updBase[:len(updBase)-1]); err == nil {
 		t.Fatalf("expected DecodeUpdateRequest to reject truncated mutation count")
+	}
+}
+
+func TestWire_EDF11_EDF15_EDF16_ProtocolContracts(t *testing.T) {
+	// Unknown ComputeOp fails closed instead of emitting tag 0.
+	if _, err := EncodeGetRequest(GetRequest{
+		Name:         "rec1",
+		Computations: map[string]storage.ComputeOp{"bad": nil},
+	}); err == nil {
+		t.Fatal("expected EncodeGetRequest to reject nil/unknown ComputeOp")
+	}
+
+	// Unknown AttrType in EncodeListResponse fails closed instead of coercing to float32.
+	if _, err := EncodeListResponse(ListResponse{
+		TotalCount: 1,
+		Items: []storage.EntityRecord{{
+			Name:  "rec1",
+			Attrs: []storage.AttrEntry{{Key: "k", Type: storage.AttrType(99)}},
+		}},
+	}); err == nil {
+		t.Fatal("expected EncodeListResponse to reject unknown AttrType 99")
+	}
+
+	// OpAddDays encodes full 64-bit precision.
+	const hugeDays = 1000000000.5
+	reqBytes, err := EncodeGetRequest(GetRequest{
+		Name:         "rec1",
+		Computations: map[string]storage.ComputeOp{"d": storage.OpAddDays{Field: "dt", Days: hugeDays}},
+	})
+	if err != nil {
+		t.Fatalf("EncodeGetRequest failed: %v", err)
+	}
+	decodedReq, err := DecodeGetRequest(reqBytes)
+	if err != nil {
+		t.Fatalf("DecodeGetRequest failed: %v", err)
+	}
+	addOp, ok := decodedReq.Computations["d"].(storage.OpAddDays)
+	if !ok || addOp.Days != hugeDays {
+		t.Fatalf("expected 64-bit OpAddDays.Days=%v, got %#v", hugeDays, decodedReq.Computations["d"])
+	}
+
+	// SaveBatchResponse roundtrips server-generated record names cleanly.
+	namesIn := []string{"uuid-1", "uuid-2", "uuid-3"}
+	respBytes, err := EncodeSaveBatchResponse(namesIn)
+	if err != nil {
+		t.Fatalf("EncodeSaveBatchResponse failed: %v", err)
+	}
+	namesOut, err := DecodeSaveBatchResponse(respBytes)
+	if err != nil || len(namesOut) != 3 || namesOut[1] != "uuid-2" {
+		t.Fatalf("unexpected SaveBatchResponse roundtrip: %v, err=%v", namesOut, err)
 	}
 }

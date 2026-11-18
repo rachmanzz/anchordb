@@ -571,17 +571,17 @@ func TestRemoteDriver_SaveTypedAndGetTyped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTyped failed: %v", err)
 	}
-	v, ok := cr.GetInt("big_counter")
-	if !ok || v != largeInt {
-		t.Fatalf("expected big_counter %d, got %d (ok=%v)", largeInt, v, ok)
+	v, ok, err := cr.GetInt("big_counter")
+	if err != nil || !ok || v != largeInt {
+		t.Fatalf("expected big_counter %d, got %d (ok=%v, err=%v)", largeInt, v, ok, err)
 	}
-	u, ok := cr.GetUint("big_uid")
-	if !ok || u != largeUint {
-		t.Fatalf("expected big_uid %d, got %d (ok=%v)", largeUint, u, ok)
+	u, ok, err := cr.GetUint("big_uid")
+	if err != nil || !ok || u != largeUint {
+		t.Fatalf("expected big_uid %d, got %d (ok=%v, err=%v)", largeUint, u, ok, err)
 	}
-	f, ok := cr.GetFloat64("precise_val")
-	if !ok || f != preciseFloat {
-		t.Fatalf("expected precise_val %f, got %f (ok=%v)", preciseFloat, f, ok)
+	f, ok, err := cr.GetFloat64("precise_val")
+	if err != nil || !ok || f != preciseFloat {
+		t.Fatalf("expected precise_val %f, got %f (ok=%v, err=%v)", preciseFloat, f, ok, err)
 	}
 
 	// Test List and Where with 64-bit filter over remote HTTP

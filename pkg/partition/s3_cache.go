@@ -91,6 +91,12 @@ func NewS3PartitionCacheWithOptions(cacheDir string, opts S3CacheOptions) (*S3Pa
 	if cacheDir == "" {
 		return nil, errors.New("s3 cache directory cannot be empty")
 	}
+	if opts.MaxOpenHandles < 0 {
+		return nil, fmt.Errorf("s3 cache MaxOpenHandles must not be negative, got %d", opts.MaxOpenHandles)
+	}
+	if opts.TTL < 0 {
+		return nil, fmt.Errorf("s3 cache TTL must not be negative, got %v", opts.TTL)
+	}
 	if err := os.MkdirAll(cacheDir, 0o750); err != nil {
 		return nil, fmt.Errorf("failed creating s3 cache directory: %w", err)
 	}
@@ -99,7 +105,7 @@ func NewS3PartitionCacheWithOptions(cacheDir string, opts S3CacheOptions) (*S3Pa
 		maxBytes = defaultS3CacheMaxBytes
 	}
 	maxHandles := opts.MaxOpenHandles
-	if maxHandles <= 0 {
+	if maxHandles == 0 {
 		maxHandles = defaultS3CacheMaxOpenHandles
 	}
 	c := &S3PartitionCache{
@@ -110,17 +116,19 @@ func NewS3PartitionCacheWithOptions(cacheDir string, opts S3CacheOptions) (*S3Pa
 		entries:        make(map[string]*cacheEntry),
 		flights:        make(map[string]*flightCall),
 	}
-	c.scanExistingLocked()
+	if err := c.scanExistingLocked(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
-func (c *S3PartitionCache) scanExistingLocked() {
+func (c *S3PartitionCache) scanExistingLocked() error {
 	dirEntries, err := os.ReadDir(c.cacheDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("[S3_CACHE] Failed reading cache directory %s: %v", c.cacheDir, err)
+		if os.IsNotExist(err) {
+			return nil
 		}
-		return
+		return fmt.Errorf("s3 cache read dir %s: %w", c.cacheDir, err)
 	}
 	for _, de := range dirEntries {
 		if de.IsDir() || !strings.HasSuffix(de.Name(), ".anchordb") {
@@ -128,8 +136,7 @@ func (c *S3PartitionCache) scanExistingLocked() {
 		}
 		info, err := de.Info()
 		if err != nil {
-			log.Printf("[S3_CACHE] Failed stating cached partition %s: %v", de.Name(), err)
-			continue
+			return fmt.Errorf("s3 cache stat entry %s: %w", de.Name(), err)
 		}
 		if info.Size() <= 0 {
 			continue
@@ -145,6 +152,7 @@ func (c *S3PartitionCache) scanExistingLocked() {
 		}
 		c.totalBytes += info.Size()
 	}
+	return nil
 }
 
 // CacheDir returns the underlying directory on disk.
@@ -173,10 +181,12 @@ func removePartitionFiles(path string) {
 	if path == "" {
 		return
 	}
-	_ = os.Remove(path)
-	_ = os.Remove(path + ".schema")
-	_ = os.Remove(path + ".wal")
-	_ = os.Remove(path + ".lock")
+	for _, suffix := range []string{"", ".schema", ".wal", ".lock"} {
+		target := path + suffix
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			log.Printf("[S3_CACHE] warning: failed removing %s: %v", target, err)
+		}
+	}
 }
 
 func (c *S3PartitionCache) isFresh(entry *cacheEntry, now time.Time) bool {
@@ -307,7 +317,9 @@ func (c *S3PartitionCache) ensurePartitionPinned(ctx context.Context, sink *S3Si
 
 		if staleHandle != nil {
 			if staleHandle.db != nil {
-				_ = staleHandle.db.Close()
+				if err := staleHandle.db.Close(); err != nil {
+					log.Printf("[S3_CACHE] warning: close stale db %s: %v", staleHandle.path, err)
+				}
 			}
 			if staleHandle.path != "" && staleHandle.path != targetPath {
 				removePartitionFiles(staleHandle.path)
@@ -315,7 +327,9 @@ func (c *S3PartitionCache) ensurePartitionPinned(ctx context.Context, sink *S3Si
 		}
 		for _, h := range toClose {
 			if h.db != nil {
-				_ = h.db.Close()
+				if err := h.db.Close(); err != nil {
+					log.Printf("[S3_CACHE] warning: close evicted db %s: %v", h.path, err)
+				}
 			}
 			removePartitionFiles(h.path)
 		}
@@ -587,11 +601,33 @@ func (c *S3PartitionCache) releaseHandle(entry *cacheEntry, h *cacheHandle) {
 	}
 	c.mu.Unlock()
 	if closeSuperseded && h.db != nil {
-		_ = h.db.Close()
+		if err := h.db.Close(); err != nil {
+			log.Printf("[S3_CACHE] warning: close superseded db %s: %v", h.path, err)
+		}
 		if removeSupersededPath != "" {
 			removePartitionFiles(removeSupersededPath)
 		}
 	}
+}
+
+// PartitionInspectQuery defines filtering, projection, compute, and pagination parameters for cold partition inspect.
+type PartitionInspectQuery struct {
+	RecordName   string
+	Limit        int
+	Offset       int
+	Filters      []storage.FilterCondition
+	Select       []string
+	Computations map[string]storage.ComputeOp
+}
+
+// RunOnPartition executes fn against an opened, handle-pinned S3 partition DB.
+func (c *S3PartitionCache) RunOnPartition(ctx context.Context, sink *S3Sink, keyOrFilename string, fn func(db *storage.AnchorDB) error) error {
+	entry, h, err := c.acquireHandle(ctx, sink, keyOrFilename)
+	if err != nil {
+		return err
+	}
+	defer c.releaseHandle(entry, h)
+	return fn(h.db)
 }
 
 // Close releases all open cached partition database handles.
@@ -641,25 +677,60 @@ func (c *S3PartitionCache) InspectPartitionTyped(ctx context.Context, sink *S3Si
 
 // InspectPartitionTypedWithHasMore fetches and queries an S3 partition file returning records plus pagination hasMore.
 func (c *S3PartitionCache) InspectPartitionTypedWithHasMore(ctx context.Context, sink *S3Sink, keyOrFilename, recordName string, limit int) ([]RecordDTO, bool, map[string]float32, []storage.AttrEntry, error) {
+	return c.InspectPartitionQuery(ctx, sink, keyOrFilename, PartitionInspectQuery{
+		RecordName: recordName,
+		Limit:      limit,
+	})
+}
+
+// InspectPartitionQuery fetches and queries an S3 partition with full filter/offset/select/compute support.
+func (c *S3PartitionCache) InspectPartitionQuery(ctx context.Context, sink *S3Sink, keyOrFilename string, q PartitionInspectQuery) ([]RecordDTO, bool, map[string]float32, []storage.AttrEntry, error) {
+	if q.Limit < 0 || q.Limit > 1000 {
+		return nil, false, nil, nil, fmt.Errorf("invalid inspect limit %d: must be within [0, 1000]", q.Limit)
+	}
+	if q.Offset < 0 {
+		return nil, false, nil, nil, fmt.Errorf("invalid inspect offset %d: must be non-negative", q.Offset)
+	}
 	entry, h, err := c.acquireHandle(ctx, sink, keyOrFilename)
 	if err != nil {
 		return nil, false, nil, nil, err
 	}
 	defer c.releaseHandle(entry, h)
 
-	if recordName != "" {
-		cr, err := h.db.GetRecordTyped(recordName)
-		if err != nil {
-			return nil, false, nil, nil, fmt.Errorf("record %q not found in partition: %w", recordName, err)
+	if q.RecordName != "" {
+		var cr storage.CompactRecord
+		if len(q.Computations) > 0 || len(q.Select) > 0 {
+			cr, err = h.db.GetRecordTypedWithCompute(q.RecordName, q.Computations, q.Select...)
+		} else {
+			cr, err = h.db.GetRecordTyped(q.RecordName)
 		}
-		return nil, false, cr.ToMap(), cr.ExpandAttrs(), nil
+		if err != nil {
+			return nil, false, nil, nil, fmt.Errorf("record %q not found in partition: %w", q.RecordName, err)
+		}
+		props, err := cr.ToMap()
+		if err != nil {
+			return nil, false, nil, nil, err
+		}
+		attrs, err := cr.ExpandAttrs()
+		if err != nil {
+			return nil, false, nil, nil, err
+		}
+		return nil, false, props, attrs, nil
 	}
 
-	if limit <= 0 || limit > 1000 {
+	limit := q.Limit
+	if limit == 0 {
 		limit = 50
 	}
 
-	records, hasMore, err := h.db.ListRecordsWithPaging(storage.QueryOptions{Limit: limit})
+	records, hasMore, err := h.db.ListRecordsWithPaging(storage.QueryOptions{
+		Context:      ctx,
+		Filters:      q.Filters,
+		Select:       q.Select,
+		Computations: q.Computations,
+		Limit:        limit,
+		Offset:       q.Offset,
+	})
 	if err != nil {
 		return nil, false, nil, nil, fmt.Errorf("failed listing records in partition: %w", err)
 	}

@@ -408,17 +408,17 @@ func TestServer_AnchorWire_TypedAttributes(t *testing.T) {
 		t.Fatalf("GetTyped via wire failed: %v", err)
 	}
 
-	if val, ok := cr.GetInt("big_int"); !ok || val != exactInt64 {
-		t.Fatalf("GetInt expected %d, got %d (ok=%v)", exactInt64, val, ok)
+	if val, ok, err := cr.GetInt("big_int"); err != nil || !ok || val != exactInt64 {
+		t.Fatalf("GetInt expected %d, got %d (ok=%v, err=%v)", exactInt64, val, ok, err)
 	}
-	if val, ok := cr.GetUint("big_uint"); !ok || val != exactUint64 {
-		t.Fatalf("GetUint expected %d, got %d (ok=%v)", exactUint64, val, ok)
+	if val, ok, err := cr.GetUint("big_uint"); err != nil || !ok || val != exactUint64 {
+		t.Fatalf("GetUint expected %d, got %d (ok=%v, err=%v)", exactUint64, val, ok, err)
 	}
-	if val, ok := cr.GetFloat64("big_f64"); !ok || val != exactFloat64 {
-		t.Fatalf("GetFloat64 expected %f, got %f (ok=%v)", exactFloat64, val, ok)
+	if val, ok, err := cr.GetFloat64("big_f64"); err != nil || !ok || val != exactFloat64 {
+		t.Fatalf("GetFloat64 expected %f, got %f (ok=%v, err=%v)", exactFloat64, val, ok, err)
 	}
-	if val, ok := cr.Get("standard_f32"); !ok || val != 42.5 {
-		t.Fatalf("Get expected 42.5, got %f (ok=%v)", val, ok)
+	if val, ok, err := cr.Get("standard_f32"); err != nil || !ok || val != 42.5 {
+		t.Fatalf("Get expected 42.5, got %f (ok=%v, err=%v)", val, ok, err)
 	}
 
 	// 2. Backward compatibility: standard Get().Execute() still retrieves float32 representations

@@ -4,6 +4,8 @@ package partition
 import (
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -20,7 +22,7 @@ var ErrPartitionConflict = errors.New("partition records changed before archival
 type PartitionPolicy struct {
 	ModelName     string        // e.g. "logs" or "transactions"
 	DateField     string        // e.g. "date" or "timestamp"
-	RetentionDays float32       // e.g. 180 (6 months)
+	RetentionDays float64       // e.g. 180 (6 months)
 	Sink          PartitionSink // LocalDiskSink or S3Sink
 	FileFormat    string        // e.g. "{date}_{uuid}.anchordb"
 	PruneHotDB    bool          // If true, deletes archived records from active hot database
@@ -42,8 +44,8 @@ type PartitionResult struct {
 	DurationMs     float64   `json:"duration_ms"`
 	PartitionFile  string    `json:"partition_file,omitempty"`
 	RecordNames    []string  `json:"record_names,omitempty"`
-	MinDate        float32   `json:"min_date,omitempty"`
-	MaxDate        float32   `json:"max_date,omitempty"`
+	MinDate        float64   `json:"min_date,omitempty"`
+	MaxDate        float64   `json:"max_date,omitempty"`
 	HasMore        bool      `json:"has_more,omitempty"`
 }
 
@@ -54,7 +56,10 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	if policy.DateField == "" {
 		policy.DateField = "date"
 	}
-	if policy.RetentionDays <= 0 {
+	if math.IsNaN(policy.RetentionDays) || math.IsInf(policy.RetentionDays, 0) || policy.RetentionDays < 0 {
+		return nil, fmt.Errorf("invalid retention_days %v: must be finite and non-negative", policy.RetentionDays)
+	}
+	if policy.RetentionDays == 0 {
 		policy.RetentionDays = 180 // Default 6 months
 	}
 	if policy.Sink == nil {
@@ -62,9 +67,9 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	// 1. Calculate cutoff epoch days (e.g. today - 180 days)
-	nowDays := float32(time.Now().Unix() / 86400)
+	nowDays := float64(time.Now().Unix() / 86400)
 	cutoffDays := nowDays - policy.RetentionDays
-	cutoffDateStr := storage.FormatDate(cutoffDays)
+	cutoffDateStr := storage.FormatDateInt(int64(math.Round(cutoffDays)))
 
 	const maxPartitionBatch = 1000000
 	// Select and transition candidates while holding the same database write
@@ -88,10 +93,16 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	}
 
 	archivedNames := make([]string, len(records))
-	var minDate, maxDate float32
+	var minDate, maxDate float64
 	for i, r := range records {
 		archivedNames[i] = r.Name
-		val := r.Props[policy.DateField]
+		val := float64(r.Props[policy.DateField])
+		for _, a := range r.Attrs {
+			if a.Key == policy.DateField {
+				val = a.Float64()
+				break
+			}
+		}
 		if i == 0 || val < minDate {
 			minDate = val
 		}
@@ -117,7 +128,11 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	if err != nil {
 		return nil, rollback(err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if rmErr := os.RemoveAll(tempDir); rmErr != nil {
+			log.Printf("[PARTITION] warning: failed removing temp dir %s: %v", tempDir, rmErr)
+		}
+	}()
 
 	tempDBPath := filepath.Join(tempDir, partitionFilename)
 	partDB, err := storage.OpenWithOptions(tempDBPath, storage.Options{
@@ -126,10 +141,15 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 	if err != nil {
 		return nil, rollback(fmt.Errorf("failed creating partition database: %w", err))
 	}
+	closePartDBOnErr := func(baseErr error) error {
+		if cErr := partDB.Close(); cErr != nil {
+			return fmt.Errorf("%w (also failed closing temp partition db: %v)", baseErr, cErr)
+		}
+		return baseErr
+	}
 	if schema, hasSchema := db.GetSchema(); hasSchema {
 		if sErr := partDB.AttachSchema(schema); sErr != nil {
-			_ = partDB.Close()
-			return nil, rollback(fmt.Errorf("failed attaching schema to partition database: %w", sErr))
+			return nil, rollback(closePartDBOnErr(fmt.Errorf("failed attaching schema to partition database: %w", sErr)))
 		}
 	}
 
@@ -140,16 +160,32 @@ func ExecutePartition(db *storage.AnchorDB, policy PartitionPolicy) (*PartitionR
 			Operation: storage.OpStatusActive,
 			Props:     r.Props,
 			Attrs:     r.Attrs,
+			Coord:     r.Coord,
+			Roles:     r.Roles,
 		}
 	}
 	if _, saveErr := partDB.SaveRecordsBatch(batchItems); saveErr != nil {
-		_ = partDB.Close()
-		return nil, rollback(fmt.Errorf("failed writing batch records to partition: %w", saveErr))
+		return nil, rollback(closePartDBOnErr(fmt.Errorf("failed writing batch records to partition: %w", saveErr)))
+	}
+	if partEdges, eErr := db.ExportPartitionEdges(archivedNames); eErr != nil {
+		return nil, rollback(closePartDBOnErr(fmt.Errorf("failed exporting partition edges: %w", eErr)))
+	} else if len(partEdges) > 0 {
+		if addErr := partDB.AddEdgesBatch(partEdges); addErr != nil {
+			return nil, rollback(closePartDBOnErr(fmt.Errorf("failed archiving partition edges: %w", addErr)))
+		}
+	}
+	if rels, rErr := db.ExportRelations(); rErr != nil {
+		return nil, rollback(closePartDBOnErr(fmt.Errorf("failed exporting partition relations: %w", rErr)))
+	} else {
+		for relName, vec := range rels {
+			if sErr := partDB.SetRelation(relName, vec); sErr != nil {
+				return nil, rollback(closePartDBOnErr(fmt.Errorf("failed archiving partition relation %q: %w", relName, sErr)))
+			}
+		}
 	}
 
 	if err := partDB.Sync(); err != nil {
-		_ = partDB.Close()
-		return nil, rollback(fmt.Errorf("failed syncing partition database: %w", err))
+		return nil, rollback(closePartDBOnErr(fmt.Errorf("failed syncing partition database: %w", err)))
 	}
 	if err := partDB.Close(); err != nil {
 		return nil, rollback(fmt.Errorf("failed closing partition database: %w", err))

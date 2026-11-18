@@ -210,7 +210,10 @@ func TestRoastV17_NoBuf1CollisionAndSeqMismatchClosesAndTLS(t *testing.T) {
 		longNodeID += "x"
 		sess = jm.GenerateSessionKey(longNodeID)
 	}
-	payload := EncodeAuthResponse(sess)
+	payload, err := EncodeAuthResponse(sess)
+	if err != nil {
+		t.Fatalf("EncodeAuthResponse failed: %v", err)
+	}
 	if payload[0] != StructuredRespMagic || payload[1] != 0x01 {
 		t.Fatalf("expected payload[0]=0xAB and payload[1]=0x01 for len=%d", len(sess))
 	}
@@ -218,7 +221,10 @@ func TestRoastV17_NoBuf1CollisionAndSeqMismatchClosesAndTLS(t *testing.T) {
 	if err != nil || got != sess {
 		t.Fatalf("DecodeAuthResponse failed for len=%d: got len=%d err=%v", len(sess), len(got), err)
 	}
-	rotPayload := EncodeRotationStagedResponse("ok")
+	rotPayload, err := EncodeRotationStagedResponse("ok")
+	if err != nil {
+		t.Fatalf("EncodeRotationStagedResponse failed: %v", err)
+	}
 	if rotPayload[0] != StructuredRotationRespMagic {
 		t.Fatalf("expected StructuredRotationRespMagic, got 0x%02X", rotPayload[0])
 	}

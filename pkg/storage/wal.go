@@ -123,8 +123,12 @@ func OpenWALWithOptions(path string, opts WALOptions) (*WALManager, error) {
 		syncMode: opts.SyncMode,
 	}
 	if opts.SyncMode == SyncInterval {
+		if opts.SyncInterval < 0 {
+			_ = f.Close()
+			return nil, fmt.Errorf("wal SyncInterval must be non-negative, got %v", opts.SyncInterval)
+		}
 		w.syncInterval = opts.SyncInterval
-		if w.syncInterval <= 0 {
+		if w.syncInterval == 0 {
 			w.syncInterval = 200 * time.Millisecond
 		}
 		w.stopSync = make(chan struct{})
@@ -329,7 +333,10 @@ func encodeWALSave(name string, cr CompactRecord) ([]byte, error) {
 		}
 	}
 
-	attrs := cr.expandAttrs()
+	attrs, err := cr.expandAttrs()
+	if err != nil {
+		return nil, fmt.Errorf("wal expand attrs for %q: %w", name, err)
+	}
 	payloadLen := 2 + len(nameBytes) + 1 + 2
 	for _, attr := range attrs {
 		if attr.Type > AttrTypeFloat64 {

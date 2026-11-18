@@ -38,24 +38,24 @@ func TestTypedNumeric_IntegerPrecisionLossPrevention(t *testing.T) {
 	cr = cr.Set("ratio", 0.85)
 
 	// Verify exact integer retrieval from in-memory Attrs
-	cVal, ok := cr.GetInt("counter")
-	if !ok || cVal != exactLargeInt {
-		t.Fatalf("expected counter %d, got %d (ok=%v)", exactLargeInt, cVal, ok)
+	cVal, ok, err := cr.GetInt("counter")
+	if err != nil || !ok || cVal != exactLargeInt {
+		t.Fatalf("expected counter %d, got %d (ok=%v, err=%v)", exactLargeInt, cVal, ok, err)
 	}
 
-	tsVal, ok := cr.GetInt("timestamp")
-	if !ok || tsVal != exactTimestamp {
-		t.Fatalf("expected timestamp %d, got %d (ok=%v)", exactTimestamp, tsVal, ok)
+	tsVal, ok, err := cr.GetInt("timestamp")
+	if err != nil || !ok || tsVal != exactTimestamp {
+		t.Fatalf("expected timestamp %d, got %d (ok=%v, err=%v)", exactTimestamp, tsVal, ok, err)
 	}
 
-	uidVal, ok := cr.GetUint("uid")
-	if !ok || uidVal != exactLargeUint {
-		t.Fatalf("expected uid %d, got %d (ok=%v)", exactLargeUint, uidVal, ok)
+	uidVal, ok, err := cr.GetUint("uid")
+	if err != nil || !ok || uidVal != exactLargeUint {
+		t.Fatalf("expected uid %d, got %d (ok=%v, err=%v)", exactLargeUint, uidVal, ok, err)
 	}
 
-	rVal, ok := cr.Get("ratio")
-	if !ok || rVal != 0.85 {
-		t.Fatalf("expected ratio 0.85, got %f (ok=%v)", rVal, ok)
+	rVal, ok, err := cr.Get("ratio")
+	if err != nil || !ok || rVal != 0.85 {
+		t.Fatalf("expected ratio 0.85, got %f (ok=%v, err=%v)", rVal, ok, err)
 	}
 }
 
@@ -97,19 +97,19 @@ func TestTypedNumeric_DiskPersistenceAndMmap(t *testing.T) {
 		t.Fatalf("get record typed: %v", err)
 	}
 
-	vVal, ok := rec.GetInt("views")
-	if !ok || vVal != exactLargeInt {
-		t.Fatalf("mmap read views expected %d, got %d", exactLargeInt, vVal)
+	vVal, ok, err := rec.GetInt("views")
+	if err != nil || !ok || vVal != exactLargeInt {
+		t.Fatalf("mmap read views expected %d, got %d (err=%v)", exactLargeInt, vVal, err)
 	}
 
-	uVal, ok := rec.GetUint("user_id")
-	if !ok || uVal != exactUint {
-		t.Fatalf("mmap read user_id expected %d, got %d", exactUint, uVal)
+	uVal, ok, err := rec.GetUint("user_id")
+	if err != nil || !ok || uVal != exactUint {
+		t.Fatalf("mmap read user_id expected %d, got %d (err=%v)", exactUint, uVal, err)
 	}
 
-	sVal, ok := rec.Get("score")
-	if !ok || sVal != 99.5 {
-		t.Fatalf("mmap read score expected 99.5, got %f", sVal)
+	sVal, ok, err := rec.Get("score")
+	if err != nil || !ok || sVal != 99.5 {
+		t.Fatalf("mmap read score expected 99.5, got %f (err=%v)", sVal, err)
 	}
 
 	if err := db.Close(); err != nil {
@@ -128,19 +128,19 @@ func TestTypedNumeric_DiskPersistenceAndMmap(t *testing.T) {
 		t.Fatalf("reopened get record typed: %v", err)
 	}
 
-	vVal2, ok := rec2.GetInt("views")
-	if !ok || vVal2 != exactLargeInt {
-		t.Fatalf("reopened views expected %d, got %d", exactLargeInt, vVal2)
+	vVal2, ok, err := rec2.GetInt("views")
+	if err != nil || !ok || vVal2 != exactLargeInt {
+		t.Fatalf("reopened views expected %d, got %d (err=%v)", exactLargeInt, vVal2, err)
 	}
 
-	uVal2, ok := rec2.GetUint("user_id")
-	if !ok || uVal2 != exactUint {
-		t.Fatalf("reopened user_id expected %d, got %d", exactUint, uVal2)
+	uVal2, ok, err := rec2.GetUint("user_id")
+	if err != nil || !ok || uVal2 != exactUint {
+		t.Fatalf("reopened user_id expected %d, got %d (err=%v)", exactUint, uVal2, err)
 	}
 
-	sVal2, ok := rec2.Get("score")
-	if !ok || sVal2 != 99.5 {
-		t.Fatalf("reopened score expected 99.5, got %f", sVal2)
+	sVal2, ok, err := rec2.Get("score")
+	if err != nil || !ok || sVal2 != 99.5 {
+		t.Fatalf("reopened score expected 99.5, got %f (err=%v)", sVal2, err)
 	}
 }
 
@@ -185,14 +185,14 @@ func TestTypedNumeric_WALCrashRecovery(t *testing.T) {
 		t.Fatalf("get recovered record: %v", err)
 	}
 
-	fVal, ok := rec.GetInt("followers")
-	if !ok || fVal != exactLargeInt {
-		t.Fatalf("recovered followers expected %d, got %d", exactLargeInt, fVal)
+	fVal, ok, err := rec.GetInt("followers")
+	if err != nil || !ok || fVal != exactLargeInt {
+		t.Fatalf("recovered followers expected %d, got %d (err=%v)", exactLargeInt, fVal, err)
 	}
 
-	cVal, ok := rec.GetUint("channel_id")
-	if !ok || cVal != exactUint {
-		t.Fatalf("recovered channel_id expected %d, got %d", exactUint, cVal)
+	cVal, ok, err := rec.GetUint("channel_id")
+	if err != nil || !ok || cVal != exactUint {
+		t.Fatalf("recovered channel_id expected %d, got %d (err=%v)", exactUint, cVal, err)
 	}
 }
 
@@ -233,22 +233,36 @@ func TestTypedNumeric_LegacyV3BackwardCompatibility(t *testing.T) {
 	nameBytes := []byte(name)
 	lBuf[0] = byte(len(nameBytes))
 	lBuf[1] = 0
-	f.Write(lBuf[:])
-	f.Write(nameBytes)
-	f.Write([]byte{OpStatusActive})
+	if _, err := f.Write(lBuf[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(nameBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{OpStatusActive}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Attr count = 1 (legacy, no RawTypedFlag)
 	lBuf[0] = 1
 	lBuf[1] = 0
-	f.Write(lBuf[:])
+	if _, err := f.Write(lBuf[:]); err != nil {
+		t.Fatal(err)
+	}
 
 	kBytes := []byte("legacy_score")
 	lBuf[0] = byte(len(kBytes))
 	lBuf[1] = 0
-	f.Write(lBuf[:])
-	f.Write(kBytes)
+	if _, err := f.Write(lBuf[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(kBytes); err != nil {
+		t.Fatal(err)
+	}
 	binary.LittleEndian.PutUint32(vBuf[:], math.Float32bits(42.5))
-	f.Write(vBuf[:])
+	if _, err := f.Write(vBuf[:]); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := f.Sync(); err != nil {
 		t.Fatal(err)
@@ -266,9 +280,9 @@ func TestTypedNumeric_LegacyV3BackwardCompatibility(t *testing.T) {
 		t.Fatalf("failed to get legacy record: %v", err)
 	}
 
-	val, ok := rec.Get("legacy_score")
-	if !ok || val != 42.5 {
-		t.Fatalf("expected legacy score 42.5, got %f (ok=%v)", val, ok)
+	val, ok, err := rec.Get("legacy_score")
+	if err != nil || !ok || val != 42.5 {
+		t.Fatalf("expected legacy score 42.5, got %f (ok=%v, err=%v)", val, ok, err)
 	}
 
 	// Now sync - it should cleanly upgrade file to DBVersion 4
@@ -294,15 +308,15 @@ func TestTypedNumeric_CrossConversionPrecision(t *testing.T) {
 	cr = cr.SetInt("i_as_u", exactLargeInt)
 
 	// Cross-read u_as_i with GetInt()
-	iVal, ok := cr.GetInt("u_as_i")
-	if !ok || iVal != int64(exactLargeUint) {
-		t.Fatalf("expected cross-conversion GetInt to yield %d, got %d", int64(exactLargeUint), iVal)
+	iVal, ok, err := cr.GetInt("u_as_i")
+	if err != nil || !ok || iVal != int64(exactLargeUint) {
+		t.Fatalf("expected cross-conversion GetInt to yield %d, got %d (err=%v)", int64(exactLargeUint), iVal, err)
 	}
 
 	// Cross-read i_as_u with GetUint()
-	uVal, ok := cr.GetUint("i_as_u")
-	if !ok || uVal != uint64(exactLargeInt) {
-		t.Fatalf("expected cross-conversion GetUint to yield %d, got %d", uint64(exactLargeInt), uVal)
+	uVal, ok, err := cr.GetUint("i_as_u")
+	if err != nil || !ok || uVal != uint64(exactLargeInt) {
+		t.Fatalf("expected cross-conversion GetUint to yield %d, got %d (err=%v)", uint64(exactLargeInt), uVal, err)
 	}
 }
 
@@ -335,9 +349,9 @@ func TestTypedNumeric_KeyDeduplication(t *testing.T) {
 		t.Fatalf("expected exactly 2 attributes after deduplication, got %d", rec.AttrCount())
 	}
 
-	viewsVal, ok := rec.GetInt("views")
-	if !ok || viewsVal != 999 {
-		t.Fatalf("expected last-write-wins value 999, got %d", viewsVal)
+	viewsVal, ok, err := rec.GetInt("views")
+	if err != nil || !ok || viewsVal != 999 {
+		t.Fatalf("expected last-write-wins value 999, got %d (err=%v)", viewsVal, err)
 	}
 }
 
@@ -423,7 +437,7 @@ func TestTypedNumeric_ZeroAllocForEach(t *testing.T) {
 	// Verify zero allocations in ForEachAttrTyped
 	allocsTyped := testing.AllocsPerRun(100, func() {
 		count := 0
-		rec.ForEachAttrTyped(func(attr AttrEntry) bool {
+		_ = rec.ForEachAttrTyped(func(attr AttrEntry) bool {
 			count++
 			return true
 		})
@@ -435,7 +449,7 @@ func TestTypedNumeric_ZeroAllocForEach(t *testing.T) {
 	// Verify zero allocations in ForEachAttr
 	allocsFloat := testing.AllocsPerRun(100, func() {
 		count := 0
-		rec.ForEachAttr(func(k string, v float32) bool {
+		_ = rec.ForEachAttr(func(k string, v float32) bool {
 			count++
 			return true
 		})
@@ -462,32 +476,40 @@ func TestTypedNumeric_CorruptTypeTagFailClosed(t *testing.T) {
 		EntityCount:  1,
 		EntityOffset: HeaderSize,
 	}
+	mustWrite := func(b []byte) {
+		t.Helper()
+		if _, err := f.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var hBuf [HeaderSize]byte
 	hdr.Encode(hBuf[:])
-	f.Write(hBuf[:])
+	mustWrite(hBuf[:])
 
 	// Write entity with invalid type tag 0xFF
 	var lBuf [2]byte
 	name := "corrupt_node"
 	nameBytes := []byte(name)
 	binary.LittleEndian.PutUint16(lBuf[:], uint16(len(nameBytes)))
-	f.Write(lBuf[:])
-	f.Write(nameBytes)
-	f.Write([]byte{OpStatusActive})
+	mustWrite(lBuf[:])
+	mustWrite(nameBytes)
+	mustWrite([]byte{OpStatusActive})
 
 	// attrCount with RawTypedFlag set
 	binary.LittleEndian.PutUint16(lBuf[:], 1|RawTypedFlag)
-	f.Write(lBuf[:])
+	mustWrite(lBuf[:])
 
 	// Invalid type tag 0x7F
-	f.Write([]byte{0x7F})
+	mustWrite([]byte{0x7F})
 	kBytes := []byte("field1")
 	binary.LittleEndian.PutUint16(lBuf[:], uint16(len(kBytes)))
-	f.Write(lBuf[:])
-	f.Write(kBytes)
-	f.Write([]byte{0, 0, 0, 0}) // 4 bytes dummy
+	mustWrite(lBuf[:])
+	mustWrite(kBytes)
+	mustWrite([]byte{0, 0, 0, 0}) // 4 bytes dummy
 
-	f.Sync()
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
 	f.Close()
 
 	// Opening must detect invalid attribute type tag and fail closed
@@ -537,11 +559,11 @@ func TestTypedNumeric_GetRecordTypedSurvivesSyncAndClose(t *testing.T) {
 	}
 
 	// Accessing rec after munmap must not SIGSEGV and must return exact values
-	if v, ok := rec.GetInt("counter"); !ok || v != exactCounter {
-		t.Fatalf("expected counter=%d after Close, got %d (ok=%v)", exactCounter, v, ok)
+	if v, ok, err := rec.GetInt("counter"); err != nil || !ok || v != exactCounter {
+		t.Fatalf("expected counter=%d after Close, got %d (ok=%v, err=%v)", exactCounter, v, ok, err)
 	}
-	if u, ok := rec.GetUint("uid"); !ok || u != 18_446_744_073_709_551_615 {
-		t.Fatalf("expected uid=max_uint64 after Close, got %d (ok=%v)", u, ok)
+	if u, ok, err := rec.GetUint("uid"); err != nil || !ok || u != 18_446_744_073_709_551_615 {
+		t.Fatalf("expected uid=max_uint64 after Close, got %d (ok=%v, err=%v)", u, ok, err)
 	}
 }
 
@@ -554,11 +576,11 @@ func TestTypedNumeric_SetAttrCopyOnWrite(t *testing.T) {
 	}
 	mutated := orig.SetInt("views", 999)
 
-	if v, _ := orig.GetInt("views"); v != 100 {
-		t.Fatalf("SetInt mutated original CompactRecord in-place: got %d, want 100", v)
+	if v, _, err := orig.GetInt("views"); err != nil || v != 100 {
+		t.Fatalf("SetInt mutated original CompactRecord in-place: got %d (err=%v), want 100", v, err)
 	}
-	if v, _ := mutated.GetInt("views"); v != 999 {
-		t.Fatalf("expected mutated views=999, got %d", v)
+	if v, _, err := mutated.GetInt("views"); err != nil || v != 999 {
+		t.Fatalf("expected mutated views=999, got %d (err=%v)", v, err)
 	}
 }
 
@@ -583,8 +605,8 @@ func TestTypedNumeric_StructLiteralNormalizationAndInvalidType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fv, ok := rec.Get(" omitted_val"); !ok || fv != 4200 {
-		t.Fatalf("expected normalized float32 Value=4200 before Sync, got %v (ok=%v)", fv, ok)
+	if fv, ok, gErr := rec.Get(" omitted_val"); gErr != nil || !ok || fv != 4200 {
+		t.Fatalf("expected normalized float32 Value=4200 before Sync, got %v (ok=%v, err=%v)", fv, ok, gErr)
 	}
 
 	// 2. Invalid AttrType must fail cleanly without panicking in WAL
@@ -680,13 +702,13 @@ func TestTypedNumeric_Float64PrecisionAndMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get record typed: %v", err)
 	}
-	lf, ok := rec.GetFloat64("large_f64")
-	if !ok || lf != exactFloat64 {
-		t.Fatalf("in-memory large_f64 expected %f, got %f (ok=%v)", exactFloat64, lf, ok)
+	lf, ok, err := rec.GetFloat64("large_f64")
+	if err != nil || !ok || lf != exactFloat64 {
+		t.Fatalf("in-memory large_f64 expected %f, got %f (ok=%v, err=%v)", exactFloat64, lf, ok, err)
 	}
-	sf, ok := rec.GetFloat64("small_f64")
-	if !ok || sf != smallFloat64 {
-		t.Fatalf("in-memory small_f64 expected %f, got %f (ok=%v)", smallFloat64, sf, ok)
+	sf, ok, err := rec.GetFloat64("small_f64")
+	if err != nil || !ok || sf != smallFloat64 {
+		t.Fatalf("in-memory small_f64 expected %f, got %f (ok=%v, err=%v)", smallFloat64, sf, ok, err)
 	}
 
 	// 2. Sync to disk & verify mmap read
@@ -707,13 +729,13 @@ func TestTypedNumeric_Float64PrecisionAndMmap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopened get record typed: %v", err)
 	}
-	lf2, ok := rec2.GetFloat64("large_f64")
-	if !ok || lf2 != exactFloat64 {
-		t.Fatalf("mmap large_f64 expected %f, got %f (ok=%v)", exactFloat64, lf2, ok)
+	lf2, ok, err := rec2.GetFloat64("large_f64")
+	if err != nil || !ok || lf2 != exactFloat64 {
+		t.Fatalf("mmap large_f64 expected %f, got %f (ok=%v, err=%v)", exactFloat64, lf2, ok, err)
 	}
-	sf2, ok := rec2.GetFloat64("small_f64")
-	if !ok || sf2 != smallFloat64 {
-		t.Fatalf("mmap small_f64 expected %f, got %f (ok=%v)", smallFloat64, sf2, ok)
+	sf2, ok, err := rec2.GetFloat64("small_f64")
+	if err != nil || !ok || sf2 != smallFloat64 {
+		t.Fatalf("mmap small_f64 expected %f, got %f (ok=%v, err=%v)", smallFloat64, sf2, ok, err)
 	}
 }
 
@@ -748,9 +770,9 @@ func TestTypedNumeric_Float64WALRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get recovered record: %v", err)
 	}
-	val, ok := rec.GetFloat64("metric")
-	if !ok || val != exactF64 {
-		t.Fatalf("recovered f64 expected %f, got %f (ok=%v)", exactF64, val, ok)
+	val, ok, err := rec.GetFloat64("metric")
+	if err != nil || !ok || val != exactF64 {
+		t.Fatalf("recovered f64 expected %f, got %f (ok=%v, err=%v)", exactF64, val, ok, err)
 	}
 }
 
@@ -781,10 +803,10 @@ func TestTypedNumeric_Float64MixedArithmetic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	interest, ok := res.GetFloat64("interest")
+	interest, ok, err := res.GetFloat64("interest")
 	expectedInterest := float64(bigInt) * 0.05
-	if !ok || interest != expectedInterest {
-		t.Fatalf("expected interest %f, got %f (ok=%v)", expectedInterest, interest, ok)
+	if err != nil || !ok || interest != expectedInterest {
+		t.Fatalf("expected interest %f, got %f (ok=%v, err=%v)", expectedInterest, interest, ok, err)
 	}
 }
 
@@ -876,19 +898,19 @@ func TestAuditPhase2_ExactInt64ArithmeticAndFloat32SchemaUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cAttr, ok := cr.GetTyped("counter")
-	if !ok || cAttr.Type != AttrTypeInt64 || cAttr.Int64() != startCounter+1 {
-		t.Fatalf("expected AttrTypeInt64(%d), got type=%d val=%d", startCounter+1, cAttr.Type, cAttr.Int64())
+	cAttr, ok, err := cr.GetTyped("counter")
+	if err != nil || !ok || cAttr.Type != AttrTypeInt64 || cAttr.Int64() != startCounter+1 {
+		t.Fatalf("expected AttrTypeInt64(%d), got type=%d val=%d (err=%v)", startCounter+1, cAttr.Type, cAttr.Int64(), err)
 	}
 
-	vAttr, ok := cr.GetTyped("voltage")
-	if !ok || vAttr.Type != AttrTypeFloat32 || vAttr.Float32() != float32(12.0+0.1) {
-		t.Fatalf("expected AttrTypeFloat32(12.1), got type=%d val=%f", vAttr.Type, vAttr.Float32())
+	vAttr, ok, err := cr.GetTyped("voltage")
+	if err != nil || !ok || vAttr.Type != AttrTypeFloat32 || vAttr.Float32() != float32(12.0+0.1) {
+		t.Fatalf("expected AttrTypeFloat32(12.1), got type=%d val=%f (err=%v)", vAttr.Type, vAttr.Float32(), err)
 	}
 
-	uAttr, ok := cr.GetTyped("uid")
-	if !ok || uAttr.Type != AttrTypeUint64 || uAttr.Uint64() != startUID+5 {
-		t.Fatalf("expected AttrTypeUint64(%d), got type=%d val=%d", startUID+5, uAttr.Type, uAttr.Uint64())
+	uAttr, ok, err := cr.GetTyped("uid")
+	if err != nil || !ok || uAttr.Type != AttrTypeUint64 || uAttr.Uint64() != startUID+5 {
+		t.Fatalf("expected AttrTypeUint64(%d), got type=%d val=%d (err=%v)", startUID+5, uAttr.Type, uAttr.Uint64(), err)
 	}
 }
 
@@ -898,11 +920,14 @@ func TestAuditPhase2_ExpandAttrsImmutabilityAndDeterministicCompute(t *testing.T
 		NewFloat64Attr("b", 20.5),
 	})
 
-	expanded := cr.ExpandAttrs()
+	expanded, err := cr.ExpandAttrs()
+	if err != nil {
+		t.Fatal(err)
+	}
 	expanded[0].IntVal = 99999
 
-	if v, _ := cr.GetInt("a"); v != 10 {
-		t.Fatalf("ExpandAttrs mutated original CompactRecord: got %d, want 10", v)
+	if v, _, err := cr.GetInt("a"); err != nil || v != 10 {
+		t.Fatalf("ExpandAttrs mutated original CompactRecord: got %d, want 10 (err=%v)", v, err)
 	}
 
 	dir := t.TempDir()
@@ -929,7 +954,10 @@ func TestAuditPhase2_ExpandAttrsImmutabilityAndDeterministicCompute(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstAttrs := first.ExpandAttrs()
+	firstAttrs, err := first.ExpandAttrs()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(firstAttrs) != 4 {
 		t.Fatalf("expected 4 attrs, got %d", len(firstAttrs))
 	}

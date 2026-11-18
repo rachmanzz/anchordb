@@ -9,11 +9,19 @@ type Ray struct {
 }
 
 // NewRay creates a new Ray with guaranteed normalized direction.
-func NewRay(origin, direction Point2D) Ray {
+// Returns ErrInvalidVector when origin is non-finite or direction cannot be normalized.
+func NewRay(origin, direction Point2D) (Ray, error) {
+	if math.IsNaN(float64(origin.X)) || math.IsInf(float64(origin.X), 0) || math.IsNaN(float64(origin.Y)) || math.IsInf(float64(origin.Y), 0) {
+		return Ray{}, ErrInvalidVector
+	}
+	normDir, err := direction.Normalize()
+	if err != nil {
+		return Ray{}, err
+	}
 	return Ray{
 		Origin:    origin,
-		Direction: direction.Normalize(),
-	}
+		Direction: normDir,
+	}, nil
 }
 
 // Project projects a target point onto the ray.

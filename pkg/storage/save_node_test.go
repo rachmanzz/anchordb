@@ -87,8 +87,9 @@ func TestOpenRecoversCombinedSaveNodeFrame(t *testing.T) {
 	}
 	defer recovered.Close()
 	idx, exists := recovered.Lexicon["placed"]
-	if !exists || recovered.getNode(idx).X != coord.X || recovered.getNode(idx).Y != coord.Y {
-		t.Fatalf("recovered node missing or misplaced: exists=%v", exists)
+	nodeRec, nErr := recovered.getNode(idx)
+	if !exists || nErr != nil || nodeRec.X != coord.X || nodeRec.Y != coord.Y {
+		t.Fatalf("recovered node missing or misplaced: exists=%v err=%v", exists, nErr)
 	}
 	props, err := recovered.GetRecord("placed")
 	if err != nil || props["score"] != 9 {

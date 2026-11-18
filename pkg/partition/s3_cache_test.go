@@ -124,8 +124,8 @@ func TestS3PartitionCache_SingleflightConcurrentHandlesAndEviction(t *testing.T)
 	if err != nil {
 		t.Fatalf("GetRecordTyped: %v", err)
 	}
-	if v, ok := cr.GetFloat64("val"); !ok || v != 123.4567890123 {
-		t.Fatalf("unexpected GetRecordTyped value: %v (%v)", v, ok)
+	if v, ok, err := cr.GetFloat64("val"); err != nil || !ok || v != 123.4567890123 {
+		t.Fatalf("unexpected GetRecordTyped value: %v (%v, err=%v)", v, ok, err)
 	}
 
 	// 3. Different prefix with same basename ("part.anchordb") does not collide and triggers LRU eviction of partA.
@@ -268,9 +268,9 @@ func TestS3PartitionCache_CancelOneWaiterAndActiveTTLRefresh(t *testing.T) {
 		cache.releaseHandle(entry1, h1)
 		t.Fatalf("GetRecordTyped across active TTL refresh failed: %v", err)
 	}
-	if v, ok := cr2.GetFloat64("val"); !ok || v != 2.0 {
+	if v, ok, err := cr2.GetFloat64("val"); err != nil || !ok || v != 2.0 {
 		cache.releaseHandle(entry1, h1)
-		t.Fatalf("expected refreshed v2 value 2.0, got %v (%v)", v, ok)
+		t.Fatalf("expected refreshed v2 value 2.0, got %v (%v, err=%v)", v, ok, err)
 	}
 	cache.releaseHandle(entry1, h1)
 }

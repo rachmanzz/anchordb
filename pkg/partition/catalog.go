@@ -21,8 +21,8 @@ type CatalogEntry struct {
 	SinkType       string             `json:"sink_type"` // "local" or "s3"
 	RecordCount    int                `json:"record_count"`
 	CutoffDate     string             `json:"cutoff_date"`
-	MinDate        float32            `json:"min_date"`
-	MaxDate        float32            `json:"max_date"`
+	MinDate        float64            `json:"min_date"`
+	MaxDate        float64            `json:"max_date"`
 	RecordNames    []string           `json:"record_names,omitempty"`
 	CreatedAt      time.Time          `json:"created_at"`
 	SizeBytes      int64              `json:"size_bytes"`

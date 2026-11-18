@@ -205,19 +205,19 @@ func (m *wirePartitionTestBackend) GetPartitionCatalog(_ string) ([]wire.Partiti
 	return nil, nil
 }
 
-func (m *wirePartitionTestBackend) InspectPartition(fileOrLoc, _ string, limit int) (wire.PartitionInspectWireResponse, error) {
+func (m *wirePartitionTestBackend) InspectPartition(req wire.PartitionInspectWireRequest) (wire.PartitionInspectWireResponse, error) {
 	all := []wire.PartitionRecordWireItem{
 		{Name: "r1"},
 		{Name: "r2"},
 		{Name: "r3"},
 	}
 	hasMore := false
-	if limit > 0 && limit < len(all) {
+	if req.Limit > 0 && req.Limit < len(all) {
 		hasMore = true
-		all = all[:limit]
+		all = all[:req.Limit]
 	}
 	return wire.PartitionInspectWireResponse{
-		PartitionFile: fileOrLoc,
+		PartitionFile: req.PartitionFile,
 		Records:       all,
 		HasMore:       hasMore,
 	}, nil
@@ -271,9 +271,14 @@ func TestConnectWire_RejectsInvalidQueryParams(t *testing.T) {
 		"wire://127.0.0.1:7448?pool=0",
 		"wire://127.0.0.1:7448?pool=abc",
 		"wire://127.0.0.1:7448?pacing=maybe",
+		"wire://127.0.0.1:7448?unknown=1",
+		"wire://?pool=1",
 	} {
 		if _, err := ConnectWire(dsn); err == nil {
-			t.Fatalf("expected ConnectWire(%q) to fail on invalid query param", dsn)
+			t.Fatalf("expected ConnectWire(%q) to fail on invalid DSN", dsn)
 		}
+	}
+	if _, err := ConnectWire("wire://127.0.0.1:7448", WithPoolSize(0)); err == nil {
+		t.Fatal("expected ConnectWire with WithPoolSize(0) to return config error")
 	}
 }

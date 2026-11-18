@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -38,7 +39,10 @@ func TestStructuredAuth_EncodeDecode(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded := EncodeStructuredAuth(tc.req)
+			encoded, err := EncodeStructuredAuth(tc.req)
+			if err != nil {
+				t.Fatalf("EncodeStructuredAuth failed: %v", err)
+			}
 			if len(encoded) == 0 {
 				t.Fatalf("encoded payload is empty")
 			}
@@ -65,7 +69,10 @@ func TestStructuredAuth_EncodeDecode(t *testing.T) {
 }
 
 func TestStructuredAuth_LegacyFallback(t *testing.T) {
-	legacyPayload := EncodeAuthPayload("legacy-secret-token")
+	legacyPayload, err := EncodeAuthPayload("legacy-secret-token")
+	if err != nil {
+		t.Fatalf("EncodeAuthPayload failed: %v", err)
+	}
 	decoded, err := DecodeStructuredAuth(legacyPayload)
 	if err != nil {
 		t.Fatalf("DecodeStructuredAuth failed on legacy payload: %v", err)
@@ -99,7 +106,10 @@ func TestStructuredAuth_Malformed(t *testing.T) {
 
 func TestAuthResponse_EncodeDecode(t *testing.T) {
 	sessionKey := "SESS.cluster-01.node-abc.1234.5678"
-	encoded := EncodeAuthResponse(sessionKey)
+	encoded, err := EncodeAuthResponse(sessionKey)
+	if err != nil {
+		t.Fatalf("EncodeAuthResponse failed: %v", err)
+	}
 	if len(encoded) == 0 || encoded[0] != StructuredRespMagic {
 		t.Fatalf("expected StructuredRespMagic (0xAB), got 0x%02X", encoded[0])
 	}
@@ -110,6 +120,11 @@ func TestAuthResponse_EncodeDecode(t *testing.T) {
 	}
 	if decoded != sessionKey {
 		t.Errorf("decoded session key mismatch: got %q, want %q", decoded, sessionKey)
+	}
+
+	// Trailing garbage must be rejected
+	if _, err := DecodeAuthResponse(append(encoded, 0x99)); err != ErrMalformedAuthResponse {
+		t.Errorf("expected ErrMalformedAuthResponse on trailing bytes, got %v", err)
 	}
 
 	// Malformed response
@@ -128,7 +143,10 @@ func TestStructuredAuth_RoundtripBuffer(t *testing.T) {
 		Credential: "secret-handshake",
 	}
 
-	buf := EncodeStructuredAuth(req)
+	buf, err := EncodeStructuredAuth(req)
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuth failed: %v", err)
+	}
 	reader := bytes.NewReader(buf)
 	readBuf := make([]byte, reader.Len())
 	_, _ = reader.Read(readBuf)
@@ -142,44 +160,54 @@ func TestStructuredAuth_RoundtripBuffer(t *testing.T) {
 	}
 }
 
-func TestStructuredAuth_LargeFieldsClamping(t *testing.T) {
+func TestStructuredAuth_RejectsOversizedFields(t *testing.T) {
 	hugeNodeID := string(make([]byte, 70000))
 	hugeCred := string(make([]byte, 80000))
-	req := AuthRequest{
+	if _, err := EncodeStructuredAuth(AuthRequest{
 		Type:       AuthTypeSession,
 		NodeID:     hugeNodeID,
+		Credential: "ok",
+	}); !errors.Is(err, ErrPayloadOverflow) {
+		t.Fatalf("expected ErrPayloadOverflow for oversized NodeID, got %v", err)
+	}
+	if _, err := EncodeStructuredAuth(AuthRequest{
+		Type:       AuthTypeSession,
+		NodeID:     "ok",
 		Credential: hugeCred,
+	}); !errors.Is(err, ErrPayloadOverflow) {
+		t.Fatalf("expected ErrPayloadOverflow for oversized Credential, got %v", err)
 	}
-
-	encoded := EncodeStructuredAuth(req)
-	decoded, err := DecodeStructuredAuth(encoded)
-	if err != nil {
-		t.Fatalf("failed to decode clamped auth: %v", err)
+	if _, err := EncodeAuthResponse(hugeCred); !errors.Is(err, ErrPayloadOverflow) {
+		t.Fatalf("expected ErrPayloadOverflow for oversized session key, got %v", err)
 	}
-
-	// Should be clamped to 65535 without panics or corrupt buffer
-	if len(decoded.NodeID) != 65535 {
-		t.Errorf("expected nodeID clamped to 65535, got %d", len(decoded.NodeID))
-	}
-	if len(decoded.Credential) != 65535 {
-		t.Errorf("expected credential clamped to 65535, got %d", len(decoded.Credential))
+	if _, err := EncodeRotationStagedResponse(hugeCred); !errors.Is(err, ErrPayloadOverflow) {
+		t.Fatalf("expected ErrPayloadOverflow for oversized rotation message, got %v", err)
 	}
 }
 
 func TestStructuredAuth_Helpers(t *testing.T) {
-	pBuf := EncodeStructuredAuthPairing("node-p")
+	pBuf, err := EncodeStructuredAuthPairing("node-p")
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthPairing failed: %v", err)
+	}
 	pReq, err := DecodeStructuredAuth(pBuf)
 	if err != nil || pReq.Type != AuthTypePairing || pReq.NodeID != "node-p" {
 		t.Fatalf("unexpected pairing decoded: %+v, err: %v", pReq, err)
 	}
 
-	oBuf := EncodeStructuredAuthOTK("node-o", "otk-123")
+	oBuf, err := EncodeStructuredAuthOTK("node-o", "otk-123")
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthOTK failed: %v", err)
+	}
 	oReq, err := DecodeStructuredAuth(oBuf)
 	if err != nil || oReq.Type != AuthTypeOTK || oReq.NodeID != "node-o" || oReq.Credential != "otk-123" {
 		t.Fatalf("unexpected otk decoded: %+v, err: %v", oReq, err)
 	}
 
-	sBuf := EncodeStructuredAuthSession("node-s", "sess-key-xyz")
+	sBuf, err := EncodeStructuredAuthSession("node-s", "sess-key-xyz")
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthSession failed: %v", err)
+	}
 	sReq, err := DecodeStructuredAuth(sBuf)
 	if err != nil || sReq.Type != AuthTypeSession || sReq.NodeID != "node-s" || sReq.Credential != "sess-key-xyz" {
 		t.Fatalf("unexpected session decoded: %+v, err: %v", sReq, err)
@@ -191,7 +219,10 @@ func TestStructuredAuth_StagedReauth(t *testing.T) {
 	val := [32]byte{0xAA, 0xBB, 0xCC, 0xDD}
 	nextComm := [32]byte{0x11, 0x22, 0x33, 0x44}
 
-	buf := EncodeStructuredAuthStagedReauth(nodeID, val, nextComm)
+	buf, err := EncodeStructuredAuthStagedReauth(nodeID, val, nextComm)
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthStagedReauth failed: %v", err)
+	}
 	req, err := DecodeStructuredAuth(buf)
 	if err != nil {
 		t.Fatalf("failed to decode StagedReauth: %v", err)
@@ -209,13 +240,19 @@ func TestStructuredAuth_StagedReauth(t *testing.T) {
 	if req.NextCommitment != nextComm {
 		t.Errorf("nextCommitment mismatch: got %x, want %x", req.NextCommitment, nextComm)
 	}
+	if _, err := DecodeStructuredAuth(append(buf, 0x01)); err != ErrMalformedAuthRequest {
+		t.Errorf("expected ErrMalformedAuthRequest on trailing bytes in StagedReauth, got %v", err)
+	}
 }
 
 func TestStructuredAuth_WithCommitment(t *testing.T) {
 	comm := [32]byte{0xDE, 0xAD, 0xBE, 0xEF}
 
 	// 1. Pairing with Commitment
-	pBuf := EncodeStructuredAuthPairingWithCommitment("node-comm-p", comm)
+	pBuf, err := EncodeStructuredAuthPairingWithCommitment("node-comm-p", comm)
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthPairingWithCommitment failed: %v", err)
+	}
 	pReq, err := DecodeStructuredAuth(pBuf)
 	if err != nil {
 		t.Fatalf("failed to decode pairing with commitment: %v", err)
@@ -225,7 +262,10 @@ func TestStructuredAuth_WithCommitment(t *testing.T) {
 	}
 
 	// 2. OTK with Commitment
-	oBuf := EncodeStructuredAuthOTKWithCommitment("node-comm-o", "otk-token-99", comm)
+	oBuf, err := EncodeStructuredAuthOTKWithCommitment("node-comm-o", "otk-token-99", comm)
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthOTKWithCommitment failed: %v", err)
+	}
 	oReq, err := DecodeStructuredAuth(oBuf)
 	if err != nil {
 		t.Fatalf("failed to decode OTK with commitment: %v", err)
@@ -237,7 +277,10 @@ func TestStructuredAuth_WithCommitment(t *testing.T) {
 
 func TestRotationStagedResponse_EncodeDecode(t *testing.T) {
 	msg := "Commitment staged successfully"
-	buf := EncodeRotationStagedResponse(msg)
+	buf, err := EncodeRotationStagedResponse(msg)
+	if err != nil {
+		t.Fatalf("EncodeRotationStagedResponse failed: %v", err)
+	}
 
 	subCode, gotMsg, err := DecodeRotationStagedResponse(buf)
 	if err != nil {
@@ -249,11 +292,17 @@ func TestRotationStagedResponse_EncodeDecode(t *testing.T) {
 	if gotMsg != msg {
 		t.Errorf("message mismatch: got %q, want %q", gotMsg, msg)
 	}
+	if _, _, err := DecodeRotationStagedResponse(append(buf, 0x01)); err != ErrMalformedAuthResponse {
+		t.Errorf("expected ErrMalformedAuthResponse on trailing bytes, got %v", err)
+	}
 }
 
 func TestStructuredAuth_RejectsMalformedCommitmentAndLegacyStrip(t *testing.T) {
 	comm := [32]byte{0x01, 0x02, 0x03}
-	valid := EncodeStructuredAuthPairingWithCommitment("node-a", comm)
+	valid, err := EncodeStructuredAuthPairingWithCommitment("node-a", comm)
+	if err != nil {
+		t.Fatalf("EncodeStructuredAuthPairingWithCommitment failed: %v", err)
+	}
 	// Truncate the trailing commitment block by 4 bytes; must fail rather than silently drop.
 	truncated := valid[:len(valid)-4]
 	if _, err := DecodeStructuredAuth(truncated); err != ErrMalformedAuthRequest {

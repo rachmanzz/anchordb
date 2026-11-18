@@ -198,8 +198,11 @@ func TestCommitmentStore_FailedPersistRollsBackMemory(t *testing.T) {
 		t.Fatalf("expected ErrCorruptCommitmentFile on 0-byte file, got %v", err)
 	}
 
-	// Unknown edge action code in wire payload must error instead of decoding as "add".
-	badEdge := EncodeEdgePayload("add", "a", "r", "b", 1)
+	// Corrupt valid edge action code in wire payload; must error instead of decoding as "add".
+	badEdge, err := EncodeEdgePayload("add", "a", "r", "b", 1)
+	if err != nil {
+		t.Fatalf("EncodeEdgePayload failed: %v", err)
+	}
 	badEdge[0] = 99
 	if _, _, _, _, _, _, err := DecodeEdgePayloadWithDirection(badEdge); err == nil {
 		t.Fatal("expected DecodeEdgePayloadWithDirection to reject unknown action code 99")

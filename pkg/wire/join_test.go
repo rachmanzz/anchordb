@@ -1,7 +1,10 @@
 package wire
 
 import (
+	"crypto/sha256"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -307,4 +310,72 @@ func TestJoinManager_InvalidCIDRAndNonIPFailsClosed(t *testing.T) {
 	if err == nil || code != ErrCodeIPNotAllowed {
 		t.Fatalf("expected ErrCodeIPNotAllowed for unparsable remote IP, got code=%d err=%v", code, err)
 	}
+}
+
+func TestJoinManager_ConcurrentHandleStructuredAuthAndSetCommitmentStore(t *testing.T) {
+	tmpDir := t.TempDir()
+	cs1, err := OpenCommitmentStore(filepath.Join(tmpDir, "c1.bin"))
+	if err != nil {
+		t.Fatalf("OpenCommitmentStore c1: %v", err)
+	}
+	cs2, err := OpenCommitmentStore(filepath.Join(tmpDir, "c2.bin"))
+	if err != nil {
+		t.Fatalf("OpenCommitmentStore c2: %v", err)
+	}
+
+	jm := NewJoinManager(JoinConfig{
+		GatewayMode: true,
+		ClusterID:   "concurrent-auth-cluster",
+	})
+	jm.SetCommitmentStore(cs1)
+
+	const workers = 8
+	const iters = 16
+	tokens := make([][]string, workers)
+	for w := 0; w < workers; w++ {
+		tokens[w] = make([]string, iters)
+		for i := 0; i < iters; i++ {
+			tok, gErr := jm.GenerateOTK("CONNECTOR", 1, 5*time.Minute)
+			if gErr != nil {
+				t.Fatalf("GenerateOTK: %v", gErr)
+			}
+			tokens[w][i] = tok
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if i%2 == 0 {
+				jm.SetCommitmentStore(cs2)
+			} else {
+				jm.SetCommitmentStore(cs1)
+			}
+		}
+	}()
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				nodeID := "node-" + string(rune('a'+wid)) + "-" + string(rune('0'+(i%10)))
+				v := sha256.Sum256([]byte(nodeID))
+				_, code, aErr := jm.HandleStructuredAuth(AuthRequest{
+					Type:              AuthTypeOTK,
+					NodeID:            nodeID,
+					Credential:        tokens[wid][i],
+					HasCommitment:     true,
+					InitialCommitment: v,
+				}, mockAddr{ipStr: "127.0.0.1:4444"})
+				if aErr != nil && code != ErrCodeUnauthorized {
+					t.Errorf("unexpected HandleStructuredAuth error: code=%d err=%v", code, aErr)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
 }

@@ -55,8 +55,8 @@ func TestRoastV12_PinnedModelNotEvictedAboveCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRecordTyped on pinned db1 failed: %v", err)
 	}
-	if v, ok := cr.Get("v"); !ok || v != 7 {
-		t.Fatalf("unexpected value on pinned db1: (%v, %v)", v, ok)
+	if v, ok, err := cr.Get("v"); err != nil || !ok || v != 7 {
+		t.Fatalf("unexpected value on pinned db1: (%v, %v, err=%v)", v, ok, err)
 	}
 }
 
@@ -105,11 +105,11 @@ func TestRoastV21_FlagFalseOverridesEnvAndSyncJSONAndSaveSchema(t *testing.T) {
 	if err := fs.Parse([]string{"-cron-enabled=false", "-gateway-mode=false", "-shutdown-timeout=5s"}); err != nil {
 		t.Fatalf("fs.Parse: %v", err)
 	}
-	if resolveBoolFlagIn(fs, "cron-enabled", *cronFlag, "ANCHORDB_CRON_ENABLED", true) {
-		t.Fatal("expected -cron-enabled=false to override ANCHORDB_CRON_ENABLED=true")
+	if v, err := resolveBoolFlagIn(fs, "cron-enabled", *cronFlag, "ANCHORDB_CRON_ENABLED", true); err != nil || v {
+		t.Fatalf("expected -cron-enabled=false to override ANCHORDB_CRON_ENABLED=true, got (%v, %v)", v, err)
 	}
-	if resolveBoolFlagIn(fs, "gateway-mode", *gwFlag, "ANCHORDB_GATEWAY_MODE", false) {
-		t.Fatal("expected -gateway-mode=false to override ANCHORDB_GATEWAY_MODE=true")
+	if v, err := resolveBoolFlagIn(fs, "gateway-mode", *gwFlag, "ANCHORDB_GATEWAY_MODE", false); err != nil || v {
+		t.Fatalf("expected -gateway-mode=false to override ANCHORDB_GATEWAY_MODE=true, got (%v, %v)", v, err)
 	}
 	d, err := resolveDurationFlagIn(fs, "shutdown-timeout", *durFlag, "ANCHORDB_SHUTDOWN_TIMEOUT", 25*time.Second, false)
 	if err != nil || d != 5*time.Second {

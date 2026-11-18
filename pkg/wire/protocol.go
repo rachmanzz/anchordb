@@ -194,7 +194,19 @@ func WriteFrame(w io.Writer, f Frame) error {
 
 // --- PAYLOAD SERIALIZATION HELPERS -------------------------------------------
 
-func appendString(buf []byte, s string) []byte {
+func appendStringChecked(buf []byte, s string, label string) ([]byte, error) {
+	l := len(s)
+	if l > math.MaxUint16 {
+		return nil, fmt.Errorf("%w: %s length %d exceeds max uint16 (%d)", ErrPayloadOverflow, label, l, math.MaxUint16)
+	}
+	var lenBytes [2]byte
+	binary.LittleEndian.PutUint16(lenBytes[:], uint16(l))
+	buf = append(buf, lenBytes[:]...)
+	return append(buf, s...), nil
+}
+
+// appendStringClamped is reserved for best-effort diagnostic messages inside EncodeErrorPayload.
+func appendStringClamped(buf []byte, s string) []byte {
 	l := len(s)
 	if l > math.MaxUint16 {
 		l = math.MaxUint16
@@ -204,6 +216,13 @@ func appendString(buf []byte, s string) []byte {
 	binary.LittleEndian.PutUint16(lenBytes[:], uint16(l))
 	buf = append(buf, lenBytes[:]...)
 	return append(buf, s...)
+}
+
+func checkUint16Count(count, max int, label string) (uint16, error) {
+	if count < 0 || count > max {
+		return 0, fmt.Errorf("%w: %s count %d exceeds limit %d", ErrPayloadOverflow, label, count, max)
+	}
+	return uint16(count), nil
 }
 
 func readString(data []byte, offset int) (string, int, error) {
@@ -228,8 +247,8 @@ func validateWireCount(count, remaining, minElemBytes int, label string) error {
 }
 
 // EncodeAuthPayload encodes auth token
-func EncodeAuthPayload(token string) []byte {
-	return appendString(nil, token)
+func EncodeAuthPayload(token string) ([]byte, error) {
+	return appendStringChecked(nil, token, "auth token")
 }
 
 // DecodeAuthPayload decodes legacy static string auth tokens.
@@ -247,37 +266,60 @@ func DecodeAuthPayload(data []byte) (string, error) {
 		}
 		return req.Credential, nil
 	}
-	token, _, err := readString(data, 0)
-	return token, err
+	token, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in auth payload")
+	}
+	return token, nil
 }
 
 // EncodeSelectModelPayload encodes model name
-func EncodeSelectModelPayload(model string) []byte {
-	return appendString(nil, model)
+func EncodeSelectModelPayload(model string) ([]byte, error) {
+	return appendStringChecked(nil, model, "model name")
 }
 
 // DecodeSelectModelPayload decodes model name
 func DecodeSelectModelPayload(data []byte) (string, error) {
-	model, _, err := readString(data, 0)
-	return model, err
+	model, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in select model payload")
+	}
+	return model, nil
 }
 
 // EncodeSavePayload serializes an entity record for OpSave
-func EncodeSavePayload(item storage.BatchRecordItem) []byte {
-	buf := appendString(nil, item.Name)
+func EncodeSavePayload(item storage.BatchRecordItem) ([]byte, error) {
+	buf, err := appendStringChecked(nil, item.Name, "record name")
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, item.Operation)
 
 	var countBytes [2]byte
 	if len(item.Attrs) > 0 {
-		attrSlice := item.Attrs
-		if len(attrSlice) > storage.MaxAttrCount {
-			attrSlice = attrSlice[:storage.MaxAttrCount]
+		cnt, err := checkUint16Count(len(item.Attrs), storage.MaxAttrCount, "save attributes")
+		if err != nil {
+			return nil, err
 		}
-		binary.LittleEndian.PutUint16(countBytes[:], uint16(len(attrSlice))|storage.RawTypedFlag)
+		binary.LittleEndian.PutUint16(countBytes[:], cnt|storage.RawTypedFlag)
 		buf = append(buf, countBytes[:]...)
-		for _, a := range attrSlice {
+		for _, a := range item.Attrs {
+			switch a.Type {
+			case storage.AttrTypeFloat32, storage.AttrTypeInt64, storage.AttrTypeUint64, storage.AttrTypeFloat64:
+			default:
+				return nil, fmt.Errorf("invalid attribute type %d", a.Type)
+			}
 			buf = append(buf, byte(a.Type))
-			buf = appendString(buf, a.Key)
+			buf, err = appendStringChecked(buf, a.Key, "attribute key")
+			if err != nil {
+				return nil, err
+			}
 			if a.Type == storage.AttrTypeInt64 || a.Type == storage.AttrTypeUint64 || a.Type == storage.AttrTypeFloat64 {
 				var valBytes [8]byte
 				binary.LittleEndian.PutUint64(valBytes[:], uint64(a.IntVal))
@@ -289,20 +331,21 @@ func EncodeSavePayload(item storage.BatchRecordItem) []byte {
 			}
 		}
 	} else {
-		propCount := min(len(item.Props), storage.MaxAttrCount)
-		binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
+		cnt, err := checkUint16Count(len(item.Props), storage.MaxAttrCount, "save properties")
+		if err != nil {
+			return nil, err
+		}
+		binary.LittleEndian.PutUint16(countBytes[:], cnt)
 		buf = append(buf, countBytes[:]...)
 
-		written := 0
 		for k, v := range item.Props {
-			if written >= propCount {
-				break
+			buf, err = appendStringChecked(buf, k, "property key")
+			if err != nil {
+				return nil, err
 			}
-			buf = appendString(buf, k)
 			var valBytes [4]byte
 			binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
 			buf = append(buf, valBytes[:]...)
-			written++
 		}
 	}
 
@@ -328,7 +371,7 @@ func EncodeSavePayload(item storage.BatchRecordItem) []byte {
 		buf = append(buf, 0) // no node
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeSavePayload deserializes an entity record from OpSave
@@ -436,38 +479,55 @@ func DecodeSavePayload(data []byte) (storage.BatchRecordItem, error) {
 		Attrs:     attrs,
 	}
 
-	if offset < len(data) && data[offset] == 1 {
-		offset++
-		if offset+24 > len(data) {
-			return storage.BatchRecordItem{}, errors.New("truncated geometry bytes")
+	if offset < len(data) {
+		switch data[offset] {
+		case 0:
+			offset++
+		case 1:
+			offset++
+			if offset+24 > len(data) {
+				return storage.BatchRecordItem{}, errors.New("truncated geometry bytes")
+			}
+			coordX := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			coordY := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+			var roles [4]float32
+			for r := 0; r < 4; r++ {
+				roles[r] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset+8+r*4 : offset+12+r*4]))
+			}
+			item.Coord = &spatial.Point2D{X: coordX, Y: coordY}
+			item.Roles = &roles
+			offset += 24
+		default:
+			return storage.BatchRecordItem{}, fmt.Errorf("invalid geometry presence flag %d", data[offset])
 		}
-		coordX := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
-		coordY := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
-		var roles [4]float32
-		for r := 0; r < 4; r++ {
-			roles[r] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset+8+r*4 : offset+12+r*4]))
-		}
-		item.Coord = &spatial.Point2D{X: coordX, Y: coordY}
-		item.Roles = &roles
+	}
+	if offset != len(data) {
+		return storage.BatchRecordItem{}, errors.New("trailing bytes in save payload")
 	}
 
 	return item, nil
 }
 
 // EncodeSaveBatchPayload serializes multiple records for OpSaveBatch
-func EncodeSaveBatchPayload(records []storage.BatchRecordItem) []byte {
+func EncodeSaveBatchPayload(records []storage.BatchRecordItem) ([]byte, error) {
+	if uint64(len(records)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: save batch count %d exceeds max uint32", ErrPayloadOverflow, len(records))
+	}
 	var countBytes [4]byte
 	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(records)))
 	buf := append([]byte(nil), countBytes[:]...)
 
-	for _, rec := range records {
-		recBytes := EncodeSavePayload(rec)
+	for i, rec := range records {
+		recBytes, err := EncodeSavePayload(rec)
+		if err != nil {
+			return nil, fmt.Errorf("batch record %d: %w", i, err)
+		}
 		var lenBytes [4]byte
 		binary.LittleEndian.PutUint32(lenBytes[:], uint32(len(recBytes)))
 		buf = append(buf, lenBytes[:]...)
 		buf = append(buf, recBytes...)
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeSaveBatchPayload deserializes multiple records from OpSaveBatch
@@ -498,7 +558,53 @@ func DecodeSaveBatchPayload(data []byte) ([]storage.BatchRecordItem, error) {
 		offset += recLen
 		records = append(records, rec)
 	}
+	if offset != len(data) {
+		return nil, errors.New("trailing bytes in save batch payload")
+	}
 	return records, nil
+}
+
+// EncodeSaveBatchResponse serializes effective record names returned by OpSaveBatch.
+func EncodeSaveBatchResponse(names []string) ([]byte, error) {
+	if uint64(len(names)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: save batch response count %d exceeds max uint32", ErrPayloadOverflow, len(names))
+	}
+	var countBytes [4]byte
+	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(names)))
+	buf := append([]byte(nil), countBytes[:]...)
+	for _, name := range names {
+		var err error
+		buf, err = appendStringChecked(buf, name, "saved record name")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+// DecodeSaveBatchResponse deserializes effective record names returned by OpSaveBatch.
+func DecodeSaveBatchResponse(data []byte) ([]string, error) {
+	if len(data) < 4 {
+		return nil, errors.New("truncated save batch response count")
+	}
+	count := int(binary.LittleEndian.Uint32(data[0:4]))
+	offset := 4
+	if err := validateWireCount(count, len(data)-offset, 2, "save batch names"); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		name, nextOffset, err := readString(data, offset)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		offset = nextOffset
+	}
+	if offset != len(data) {
+		return nil, errors.New("trailing bytes in save batch response")
+	}
+	return names, nil
 }
 
 // GetRequest specifies a get query with optional field projection and computations.
@@ -509,25 +615,45 @@ type GetRequest struct {
 }
 
 // EncodeGetRequest serializes GetRequest for OpGet.
-func EncodeGetRequest(req GetRequest) []byte {
-	buf := appendString(nil, req.Name)
+func EncodeGetRequest(req GetRequest) ([]byte, error) {
+	buf, err := appendStringChecked(nil, req.Name, "record name")
+	if err != nil {
+		return nil, err
+	}
 	if len(req.Select) == 0 && len(req.Computations) == 0 {
-		return buf
+		return buf, nil
+	}
+	selCount, err := checkUint16Count(len(req.Select), math.MaxUint16, "get select fields")
+	if err != nil {
+		return nil, err
 	}
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Select)))
+	binary.LittleEndian.PutUint16(countBytes[:], selCount)
 	buf = append(buf, countBytes[:]...)
 	for _, s := range req.Select {
-		buf = appendString(buf, s)
+		buf, err = appendStringChecked(buf, s, "select field")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Computations)))
+	compCount, err := checkUint16Count(len(req.Computations), math.MaxUint16, "get computations")
+	if err != nil {
+		return nil, err
+	}
+	binary.LittleEndian.PutUint16(countBytes[:], compCount)
 	buf = append(buf, countBytes[:]...)
 	for k, comp := range req.Computations {
-		buf = appendString(buf, k)
-		buf = appendComputeOp(buf, comp)
+		buf, err = appendStringChecked(buf, k, "computation key")
+		if err != nil {
+			return nil, err
+		}
+		buf, err = appendComputeOp(buf, comp)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return buf
+	return buf, nil
 }
 
 func readOptionalComputeOps(data []byte, offset int, label string) (map[string]storage.ComputeOp, int, error) {
@@ -601,52 +727,67 @@ func DecodeGetRequest(data []byte) (GetRequest, error) {
 }
 
 // EncodeGetPayload serializes record name for OpGet
-func EncodeGetPayload(name string) []byte {
-	return appendString(nil, name)
+func EncodeGetPayload(name string) ([]byte, error) {
+	return appendStringChecked(nil, name, "record name")
 }
 
 // DecodeGetPayload deserializes record name from OpGet
 func DecodeGetPayload(data []byte) (string, error) {
-	name, _, err := readString(data, 0)
-	return name, err
+	name, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in get payload")
+	}
+	return name, nil
 }
 
 // EncodeGetResultPayload serializes properties for OpGetResponse
-func EncodeGetResultPayload(opStatus uint8, props map[string]float32) []byte {
+func EncodeGetResultPayload(opStatus uint8, props map[string]float32) ([]byte, error) {
+	cnt, err := checkUint16Count(len(props), storage.MaxAttrCount, "get result properties")
+	if err != nil {
+		return nil, err
+	}
 	buf := []byte{opStatus}
 	var countBytes [2]byte
-	propCount := min(len(props), storage.MaxAttrCount)
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
+	binary.LittleEndian.PutUint16(countBytes[:], cnt)
 	buf = append(buf, countBytes[:]...)
 
-	written := 0
 	for k, v := range props {
-		if written >= propCount {
-			break
+		buf, err = appendStringChecked(buf, k, "property key")
+		if err != nil {
+			return nil, err
 		}
-		buf = appendString(buf, k)
 		var valBytes [4]byte
 		binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
 		buf = append(buf, valBytes[:]...)
-		written++
 	}
-	return buf
+	return buf, nil
 }
 
 // EncodeGetResultTypedPayload serializes typed properties for OpGetResponse
-func EncodeGetResultTypedPayload(opStatus uint8, attrs []storage.AttrEntry) []byte {
+func EncodeGetResultTypedPayload(opStatus uint8, attrs []storage.AttrEntry) ([]byte, error) {
+	cnt, err := checkUint16Count(len(attrs), storage.MaxAttrCount, "get result attributes")
+	if err != nil {
+		return nil, err
+	}
 	buf := []byte{opStatus}
 	var countBytes [2]byte
-	attrSlice := attrs
-	if len(attrSlice) > storage.MaxAttrCount {
-		attrSlice = attrSlice[:storage.MaxAttrCount]
-	}
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(attrSlice))|storage.RawTypedFlag)
+	binary.LittleEndian.PutUint16(countBytes[:], cnt|storage.RawTypedFlag)
 	buf = append(buf, countBytes[:]...)
 
-	for _, a := range attrSlice {
+	for _, a := range attrs {
+		switch a.Type {
+		case storage.AttrTypeFloat32, storage.AttrTypeInt64, storage.AttrTypeUint64, storage.AttrTypeFloat64:
+		default:
+			return nil, fmt.Errorf("invalid attribute type %d", a.Type)
+		}
 		buf = append(buf, byte(a.Type))
-		buf = appendString(buf, a.Key)
+		buf, err = appendStringChecked(buf, a.Key, "attribute key")
+		if err != nil {
+			return nil, err
+		}
 		if a.Type == storage.AttrTypeInt64 || a.Type == storage.AttrTypeUint64 || a.Type == storage.AttrTypeFloat64 {
 			var valBytes [8]byte
 			binary.LittleEndian.PutUint64(valBytes[:], uint64(a.IntVal))
@@ -657,7 +798,7 @@ func EncodeGetResultTypedPayload(opStatus uint8, attrs []storage.AttrEntry) []by
 			buf = append(buf, valBytes[:]...)
 		}
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeGetResultPayload deserializes properties from OpGetResponse
@@ -670,6 +811,13 @@ func DecodeGetResultPayload(data []byte) (uint8, map[string]float32, error) {
 	isTyped := (rawCount & storage.RawTypedFlag) != 0
 	attrCount := int(rawCount & ^storage.RawTypedFlag)
 	offset := 3
+	minAttrBytes := 6
+	if isTyped {
+		minAttrBytes = 7
+	}
+	if err := validateWireCount(attrCount, len(data)-offset, minAttrBytes, "get result attributes"); err != nil {
+		return 0, nil, err
+	}
 
 	props := make(map[string]float32, attrCount)
 	if isTyped {
@@ -731,6 +879,9 @@ func DecodeGetResultPayload(data []byte) (uint8, map[string]float32, error) {
 			offset += 4
 			props[key] = val
 		}
+	}
+	if offset != len(data) {
+		return 0, nil, errors.New("trailing bytes in get result payload")
 	}
 	return opStatus, props, nil
 }
@@ -814,12 +965,14 @@ func DecodeGetResultTypedPayload(data []byte) (uint8, []storage.AttrEntry, error
 			attrs = append(attrs, storage.NewFloat32Attr(key, val))
 		}
 	}
+	if offset != len(data) {
+		return 0, nil, errors.New("trailing bytes in get result payload")
+	}
 	return opStatus, attrs, nil
 }
 
 // EncodeEdgePayloadWithDirection serializes edge mutation or relation vector configuration for OpEdge.
-// Unknown action strings encode byte 0xFF so decoders reject them instead of coercing to "add".
-func EncodeEdgePayloadWithDirection(action, source, relation, target string, weight float32, direction *spatial.Point2D) []byte {
+func EncodeEdgePayloadWithDirection(action, source, relation, target string, weight float32, direction *spatial.Point2D) ([]byte, error) {
 	var actByte byte
 	switch action {
 	case "add":
@@ -829,12 +982,22 @@ func EncodeEdgePayloadWithDirection(action, source, relation, target string, wei
 	case "set_relation":
 		actByte = 2
 	default:
-		actByte = 0xFF
+		return nil, fmt.Errorf("unknown edge action %q", action)
 	}
 	buf := []byte{actByte}
-	buf = appendString(buf, source)
-	buf = appendString(buf, relation)
-	buf = appendString(buf, target)
+	var err error
+	buf, err = appendStringChecked(buf, source, "edge source")
+	if err != nil {
+		return nil, err
+	}
+	buf, err = appendStringChecked(buf, relation, "edge relation")
+	if err != nil {
+		return nil, err
+	}
+	buf, err = appendStringChecked(buf, target, "edge target")
+	if err != nil {
+		return nil, err
+	}
 	var wBytes [4]byte
 	binary.LittleEndian.PutUint32(wBytes[:], math.Float32bits(weight))
 	buf = append(buf, wBytes[:]...)
@@ -844,11 +1007,11 @@ func EncodeEdgePayloadWithDirection(action, source, relation, target string, wei
 		binary.LittleEndian.PutUint32(dirBytes[4:8], math.Float32bits(direction.Y))
 		buf = append(buf, dirBytes[:]...)
 	}
-	return buf
+	return buf, nil
 }
 
 // EncodeEdgePayload serializes edge data for OpEdge
-func EncodeEdgePayload(action, source, relation, target string, weight float32) []byte {
+func EncodeEdgePayload(action, source, relation, target string, weight float32) ([]byte, error) {
 	return EncodeEdgePayloadWithDirection(action, source, relation, target, weight, nil)
 }
 
@@ -886,8 +1049,8 @@ func DecodeEdgePayloadWithDirection(data []byte) (action, source, relation, targ
 	weight = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	offset += 4
 	if rem := len(data) - offset; rem > 0 {
-		if rem < 8 {
-			return "", "", "", "", 0, nil, errors.New("truncated edge direction vector")
+		if rem != 8 {
+			return "", "", "", "", 0, nil, errors.New("invalid edge direction trailing bytes")
 		}
 		dx := math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
 		dy := math.Float32frombits(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
@@ -903,18 +1066,28 @@ func DecodeEdgePayload(data []byte) (action, source, relation, target string, we
 }
 
 // EncodeCausalPayload serializes causal query input
-func EncodeCausalPayload(seeds []string, relation string, limitK int) []byte {
+func EncodeCausalPayload(seeds []string, relation string, limitK int) ([]byte, error) {
+	seedCount, err := checkUint16Count(len(seeds), math.MaxUint16, "causal seeds")
+	if err != nil {
+		return nil, err
+	}
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(seeds)))
+	binary.LittleEndian.PutUint16(countBytes[:], seedCount)
 	buf := append([]byte(nil), countBytes[:]...)
 	for _, seed := range seeds {
-		buf = appendString(buf, seed)
+		buf, err = appendStringChecked(buf, seed, "causal seed")
+		if err != nil {
+			return nil, err
+		}
 	}
-	buf = appendString(buf, relation)
+	buf, err = appendStringChecked(buf, relation, "causal relation")
+	if err != nil {
+		return nil, err
+	}
 	var kBytes [4]byte
 	binary.LittleEndian.PutUint32(kBytes[:], uint32(limitK))
 	buf = append(buf, kBytes[:]...)
-	return buf
+	return buf, nil
 }
 
 // DecodeCausalPayload deserializes causal query input
@@ -941,31 +1114,48 @@ func DecodeCausalPayload(data []byte) (seeds []string, relation string, limitK i
 	if err != nil {
 		return nil, "", 0, err
 	}
-	if offset+4 > len(data) {
-		return nil, "", 0, errors.New("truncated limitK")
+	if offset+4 != len(data) {
+		if offset+4 > len(data) {
+			return nil, "", 0, errors.New("truncated limitK")
+		}
+		return nil, "", 0, errors.New("trailing bytes in causal payload")
 	}
 	limitK = int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	return seeds, relation, limitK, nil
 }
 
 // EncodeCausalChainPayload serializes multi-hop causal chain query input.
-func EncodeCausalChainPayload(seeds []string, relations []string, limitK int) []byte {
+func EncodeCausalChainPayload(seeds []string, relations []string, limitK int) ([]byte, error) {
+	seedCount, err := checkUint16Count(len(seeds), math.MaxUint16, "causal chain seeds")
+	if err != nil {
+		return nil, err
+	}
+	relCount, err := checkUint16Count(len(relations), math.MaxUint16, "causal chain relations")
+	if err != nil {
+		return nil, err
+	}
 	var buf []byte
 	var b [2]byte
-	binary.LittleEndian.PutUint16(b[:], uint16(len(seeds)))
+	binary.LittleEndian.PutUint16(b[:], seedCount)
 	buf = append(buf, b[:]...)
 	for _, s := range seeds {
-		buf = appendString(buf, s)
+		buf, err = appendStringChecked(buf, s, "causal chain seed")
+		if err != nil {
+			return nil, err
+		}
 	}
-	binary.LittleEndian.PutUint16(b[:], uint16(len(relations)))
+	binary.LittleEndian.PutUint16(b[:], relCount)
 	buf = append(buf, b[:]...)
 	for _, rel := range relations {
-		buf = appendString(buf, rel)
+		buf, err = appendStringChecked(buf, rel, "causal chain relation")
+		if err != nil {
+			return nil, err
+		}
 	}
 	var kb [4]byte
 	binary.LittleEndian.PutUint32(kb[:], uint32(limitK))
 	buf = append(buf, kb[:]...)
-	return buf
+	return buf, nil
 }
 
 // DecodeCausalChainPayload deserializes multi-hop causal chain query input.
@@ -1004,26 +1194,36 @@ func DecodeCausalChainPayload(data []byte) (seeds []string, relations []string, 
 		offset = nextOffset
 		relations = append(relations, rel)
 	}
-	if offset+4 > len(data) {
-		return nil, nil, 0, errors.New("truncated causal chain limitK")
+	if offset+4 != len(data) {
+		if offset+4 > len(data) {
+			return nil, nil, 0, errors.New("truncated causal chain limitK")
+		}
+		return nil, nil, 0, errors.New("trailing bytes in causal chain payload")
 	}
 	limitK = int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 	return seeds, relations, limitK, nil
 }
 
 // EncodeCausalResultPayload serializes causal results
-func EncodeCausalResultPayload(results []storage.CausalResult) []byte {
+func EncodeCausalResultPayload(results []storage.CausalResult) ([]byte, error) {
+	if uint64(len(results)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: causal result count %d exceeds max uint32", ErrPayloadOverflow, len(results))
+	}
 	var countBytes [4]byte
 	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(results)))
 	buf := append([]byte(nil), countBytes[:]...)
 
 	for _, r := range results {
-		buf = appendString(buf, r.Word)
+		var err error
+		buf, err = appendStringChecked(buf, r.Word, "causal result word")
+		if err != nil {
+			return nil, err
+		}
 		var scoreBytes [4]byte
 		binary.LittleEndian.PutUint32(scoreBytes[:], math.Float32bits(r.Score))
 		buf = append(buf, scoreBytes[:]...)
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeCausalResultPayload deserializes causal results
@@ -1054,18 +1254,27 @@ func DecodeCausalResultPayload(data []byte) ([]storage.CausalResult, error) {
 			Score: score,
 		})
 	}
+	if offset != len(data) {
+		return nil, errors.New("trailing bytes in causal result payload")
+	}
 	return results, nil
 }
 
 // EncodeOKPayload serializes standard success message
-func EncodeOKPayload(message string) []byte {
-	return appendString(nil, message)
+func EncodeOKPayload(message string) ([]byte, error) {
+	return appendStringChecked(nil, message, "ok message")
 }
 
 // DecodeOKPayload deserializes standard success message
 func DecodeOKPayload(data []byte) (string, error) {
-	msg, _, err := readString(data, 0)
-	return msg, err
+	msg, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in ok payload")
+	}
+	return msg, nil
 }
 
 // EncodeErrorPayload serializes error code and message
@@ -1073,7 +1282,7 @@ func EncodeErrorPayload(code uint16, message string) []byte {
 	var codeBytes [2]byte
 	binary.LittleEndian.PutUint16(codeBytes[:], code)
 	buf := append([]byte(nil), codeBytes[:]...)
-	return appendString(buf, message)
+	return appendStringClamped(buf, message)
 }
 
 // DecodeErrorPayload deserializes error code and message
@@ -1082,8 +1291,14 @@ func DecodeErrorPayload(data []byte) (uint16, string, error) {
 		return 0, "", errors.New("truncated error payload")
 	}
 	code := binary.LittleEndian.Uint16(data[0:2])
-	msg, _, err := readString(data, 2)
-	return code, msg, err
+	msg, offset, err := readString(data, 2)
+	if err != nil {
+		return 0, "", err
+	}
+	if offset != len(data) {
+		return 0, "", errors.New("trailing bytes in error payload")
+	}
+	return code, msg, nil
 }
 
 // MemoryNegotiationRequest represents client's estimated ingestion workload.
@@ -1113,8 +1328,8 @@ func EncodeMemoryNegotiationRequest(req MemoryNegotiationRequest) []byte {
 
 // DecodeMemoryNegotiationRequest deserializes client's memory request.
 func DecodeMemoryNegotiationRequest(data []byte) (MemoryNegotiationRequest, error) {
-	if len(data) < 12 {
-		return MemoryNegotiationRequest{}, errors.New("truncated memory negotiation request")
+	if len(data) != 12 {
+		return MemoryNegotiationRequest{}, errors.New("invalid memory negotiation request length")
 	}
 	return MemoryNegotiationRequest{
 		TargetRecords:            binary.LittleEndian.Uint32(data[0:4]),
@@ -1136,8 +1351,8 @@ func EncodeMemoryNegotiationResponse(resp MemoryNegotiationResponse) []byte {
 
 // DecodeMemoryNegotiationResponse deserializes server's pacing strategy.
 func DecodeMemoryNegotiationResponse(data []byte) (MemoryNegotiationResponse, error) {
-	if len(data) < 18 {
-		return MemoryNegotiationResponse{}, errors.New("truncated memory negotiation response")
+	if len(data) != 18 {
+		return MemoryNegotiationResponse{}, errors.New("invalid memory negotiation response length")
 	}
 	return MemoryNegotiationResponse{
 		Status:             data[0],
@@ -1158,11 +1373,18 @@ const (
 	filterUintInt64Marker = "\x05"
 )
 
-func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
-	buf = appendString(buf, f.Field)
+func appendFilterCondition(buf []byte, f storage.FilterCondition) ([]byte, error) {
+	var err error
+	buf, err = appendStringChecked(buf, f.Field, "filter field")
+	if err != nil {
+		return nil, err
+	}
 	if f.HasHighType && f.ValHighType != f.ValType {
 		if f.ValType == storage.AttrTypeInt64 && f.ValHighType == storage.AttrTypeUint64 {
-			buf = appendString(buf, filterIntUint64Marker+f.Operator)
+			buf, err = appendStringChecked(buf, filterIntUint64Marker+f.Operator, "filter operator")
+			if err != nil {
+				return nil, err
+			}
 			var valBytes [24]byte
 			v32 := f.Value
 			if v32 == 0 && f.ValueInt64 != 0 {
@@ -1176,10 +1398,13 @@ func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 			binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
 			binary.LittleEndian.PutUint64(valBytes[8:16], uint64(f.ValueInt64))
 			binary.LittleEndian.PutUint64(valBytes[16:24], f.ValueHighUint64)
-			return append(buf, valBytes[:]...)
+			return append(buf, valBytes[:]...), nil
 		}
 		if f.ValType == storage.AttrTypeUint64 && f.ValHighType == storage.AttrTypeInt64 {
-			buf = appendString(buf, filterUintInt64Marker+f.Operator)
+			buf, err = appendStringChecked(buf, filterUintInt64Marker+f.Operator, "filter operator")
+			if err != nil {
+				return nil, err
+			}
 			var valBytes [24]byte
 			v32 := f.Value
 			if v32 == 0 && f.ValueUint64 != 0 {
@@ -1193,11 +1418,14 @@ func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 			binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
 			binary.LittleEndian.PutUint64(valBytes[8:16], f.ValueUint64)
 			binary.LittleEndian.PutUint64(valBytes[16:24], uint64(f.ValueHighInt64))
-			return append(buf, valBytes[:]...)
+			return append(buf, valBytes[:]...), nil
 		}
 	}
 	if f.ValType == storage.AttrTypeInt64 {
-		buf = appendString(buf, filterInt64Marker+f.Operator)
+		buf, err = appendStringChecked(buf, filterInt64Marker+f.Operator, "filter operator")
+		if err != nil {
+			return nil, err
+		}
 		var valBytes [24]byte
 		v32 := f.Value
 		if v32 == 0 && f.ValueInt64 != 0 {
@@ -1211,10 +1439,13 @@ func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
 		binary.LittleEndian.PutUint64(valBytes[8:16], uint64(f.ValueInt64))
 		binary.LittleEndian.PutUint64(valBytes[16:24], uint64(f.ValueHighInt64))
-		return append(buf, valBytes[:]...)
+		return append(buf, valBytes[:]...), nil
 	}
 	if f.ValType == storage.AttrTypeUint64 {
-		buf = appendString(buf, filterUint64Marker+f.Operator)
+		buf, err = appendStringChecked(buf, filterUint64Marker+f.Operator, "filter operator")
+		if err != nil {
+			return nil, err
+		}
 		var valBytes [24]byte
 		v32 := f.Value
 		if v32 == 0 && f.ValueUint64 != 0 {
@@ -1228,10 +1459,13 @@ func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
 		binary.LittleEndian.PutUint64(valBytes[8:16], f.ValueUint64)
 		binary.LittleEndian.PutUint64(valBytes[16:24], f.ValueHighUint64)
-		return append(buf, valBytes[:]...)
+		return append(buf, valBytes[:]...), nil
 	}
 	if f.HasFloat64 {
-		buf = appendString(buf, filterFloat64Marker+f.Operator)
+		buf, err = appendStringChecked(buf, filterFloat64Marker+f.Operator, "filter operator")
+		if err != nil {
+			return nil, err
+		}
 		var valBytes [24]byte
 		v32 := f.Value
 		if v32 == 0 && f.Value64 != 0 {
@@ -1245,13 +1479,16 @@ func appendFilterCondition(buf []byte, f storage.FilterCondition) []byte {
 		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(vh32))
 		binary.LittleEndian.PutUint64(valBytes[8:16], math.Float64bits(f.Value64))
 		binary.LittleEndian.PutUint64(valBytes[16:24], math.Float64bits(f.ValueHigh64))
-		return append(buf, valBytes[:]...)
+		return append(buf, valBytes[:]...), nil
 	}
-	buf = appendString(buf, f.Operator)
+	buf, err = appendStringChecked(buf, f.Operator, "filter operator")
+	if err != nil {
+		return nil, err
+	}
 	var valBytes [8]byte
 	binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(f.Value))
 	binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(f.ValueHigh))
-	return append(buf, valBytes[:]...)
+	return append(buf, valBytes[:]...), nil
 }
 
 func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int, error) {
@@ -1392,47 +1629,68 @@ func readFilterCondition(data []byte, offset int) (storage.FilterCondition, int,
 	}, nextOffset + 8, nil
 }
 
-func appendComputeOp(buf []byte, op storage.ComputeOp) []byte {
+func appendComputeOp(buf []byte, op storage.ComputeOp) ([]byte, error) {
+	var err error
 	switch v := op.(type) {
 	case storage.OpDivide:
 		buf = append(buf, 1)
-		buf = appendString(buf, v.FieldA)
-		buf = appendString(buf, v.FieldB)
+		buf, err = appendStringChecked(buf, v.FieldA, "compute fieldA")
+		if err != nil {
+			return nil, err
+		}
+		return appendStringChecked(buf, v.FieldB, "compute fieldB")
 	case storage.OpMultiply:
 		buf = append(buf, 2)
-		buf = appendString(buf, v.FieldA)
-		buf = appendString(buf, v.FieldB)
+		buf, err = appendStringChecked(buf, v.FieldA, "compute fieldA")
+		if err != nil {
+			return nil, err
+		}
+		return appendStringChecked(buf, v.FieldB, "compute fieldB")
 	case storage.OpAdd:
 		buf = append(buf, 3)
-		buf = appendString(buf, v.FieldA)
-		buf = appendString(buf, v.FieldB)
+		buf, err = appendStringChecked(buf, v.FieldA, "compute fieldA")
+		if err != nil {
+			return nil, err
+		}
+		return appendStringChecked(buf, v.FieldB, "compute fieldB")
 	case storage.OpSubtract:
 		buf = append(buf, 4)
-		buf = appendString(buf, v.FieldA)
-		buf = appendString(buf, v.FieldB)
+		buf, err = appendStringChecked(buf, v.FieldA, "compute fieldA")
+		if err != nil {
+			return nil, err
+		}
+		return appendStringChecked(buf, v.FieldB, "compute fieldB")
 	case storage.OpAddDays:
 		buf = append(buf, 5)
-		buf = appendString(buf, v.Field)
-		var b [4]byte
-		binary.LittleEndian.PutUint32(b[:], math.Float32bits(v.Days))
-		buf = append(buf, b[:]...)
+		buf, err = appendStringChecked(buf, v.Field, "compute field")
+		if err != nil {
+			return nil, err
+		}
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], math.Float64bits(v.Days))
+		return append(buf, b[:]...), nil
 	case storage.OpSubtractDays:
 		buf = append(buf, 6)
-		buf = appendString(buf, v.Field)
-		var b [4]byte
-		binary.LittleEndian.PutUint32(b[:], math.Float32bits(v.Days))
-		buf = append(buf, b[:]...)
+		buf, err = appendStringChecked(buf, v.Field, "compute field")
+		if err != nil {
+			return nil, err
+		}
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], math.Float64bits(v.Days))
+		return append(buf, b[:]...), nil
 	case storage.OpDaysBetween:
 		buf = append(buf, 7)
-		buf = appendString(buf, v.FieldA)
-		buf = appendString(buf, v.FieldB)
+		buf, err = appendStringChecked(buf, v.FieldA, "compute fieldA")
+		if err != nil {
+			return nil, err
+		}
+		return appendStringChecked(buf, v.FieldB, "compute fieldB")
 	case storage.OpAssign:
 		buf = append(buf, 8)
-		buf = appendString(buf, v.Value)
+		return appendStringChecked(buf, v.Value, "compute assign value")
 	default:
-		buf = append(buf, 0)
+		return nil, fmt.Errorf("unsupported compute op %T", op)
 	}
-	return buf
 }
 
 func readComputeOp(data []byte, offset int) (storage.ComputeOp, int, error) {
@@ -1487,21 +1745,21 @@ func readComputeOp(data []byte, offset int) (storage.ComputeOp, int, error) {
 		if err != nil {
 			return nil, offset, err
 		}
-		if nextOffset+4 > len(data) {
+		if nextOffset+8 > len(data) {
 			return nil, offset, errors.New("truncated days")
 		}
-		days := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
-		return storage.OpAddDays{Field: field, Days: days}, nextOffset + 4, nil
+		days := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset : nextOffset+8]))
+		return storage.OpAddDays{Field: field, Days: days}, nextOffset + 8, nil
 	case 6:
 		field, nextOffset, err := readString(data, offset)
 		if err != nil {
 			return nil, offset, err
 		}
-		if nextOffset+4 > len(data) {
+		if nextOffset+8 > len(data) {
 			return nil, offset, errors.New("truncated days")
 		}
-		days := math.Float32frombits(binary.LittleEndian.Uint32(data[nextOffset : nextOffset+4]))
-		return storage.OpSubtractDays{Field: field, Days: days}, nextOffset + 4, nil
+		days := math.Float64frombits(binary.LittleEndian.Uint64(data[nextOffset : nextOffset+8]))
+		return storage.OpSubtractDays{Field: field, Days: days}, nextOffset + 8, nil
 	case 7:
 		fA, nextOffset, err := readString(data, offset)
 		if err != nil {
@@ -1545,7 +1803,23 @@ type ListResponse struct {
 }
 
 // EncodeListRequest serializes ListRequest into wire bytes.
-func EncodeListRequest(req ListRequest) []byte {
+func EncodeListRequest(req ListRequest) ([]byte, error) {
+	if len(req.AllowedOperations) > math.MaxUint8 {
+		return nil, fmt.Errorf("%w: allowed operations count %d exceeds max %d", ErrPayloadOverflow, len(req.AllowedOperations), math.MaxUint8)
+	}
+	selCount, err := checkUint16Count(len(req.Select), math.MaxUint16, "list select fields")
+	if err != nil {
+		return nil, err
+	}
+	filterCount, err := checkUint16Count(len(req.Filters), math.MaxUint16, "list filters")
+	if err != nil {
+		return nil, err
+	}
+	compCount, err := checkUint16Count(len(req.Computations), math.MaxUint16, "list computations")
+	if err != nil {
+		return nil, err
+	}
+
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(req.Limit))
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(req.Offset))
@@ -1566,26 +1840,38 @@ func EncodeListRequest(req ListRequest) []byte {
 	buf = append(buf, req.AllowedOperations...)
 
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Select)))
+	binary.LittleEndian.PutUint16(countBytes[:], selCount)
 	buf = append(buf, countBytes[:]...)
 	for _, s := range req.Select {
-		buf = appendString(buf, s)
+		buf, err = appendStringChecked(buf, s, "select field")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Filters)))
+	binary.LittleEndian.PutUint16(countBytes[:], filterCount)
 	buf = append(buf, countBytes[:]...)
 	for _, f := range req.Filters {
-		buf = appendFilterCondition(buf, f)
+		buf, err = appendFilterCondition(buf, f)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Computations)))
+	binary.LittleEndian.PutUint16(countBytes[:], compCount)
 	buf = append(buf, countBytes[:]...)
 	for k, comp := range req.Computations {
-		buf = appendString(buf, k)
-		buf = appendComputeOp(buf, comp)
+		buf, err = appendStringChecked(buf, k, "computation key")
+		if err != nil {
+			return nil, err
+		}
+		buf, err = appendComputeOp(buf, comp)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeListRequest deserializes ListRequest from wire bytes.
@@ -1647,6 +1933,9 @@ func DecodeListRequest(data []byte) (ListRequest, error) {
 	}
 	filterCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 	offset += 2
+	if err := validateWireCount(filterCount, len(data)-offset, 12, "list filters"); err != nil {
+		return ListRequest{}, err
+	}
 	for i := 0; i < filterCount; i++ {
 		fc, nextOffset, err := readFilterCondition(data, offset)
 		if err != nil {
@@ -1666,7 +1955,10 @@ func DecodeListRequest(data []byte) (ListRequest, error) {
 }
 
 // EncodeListResponse serializes ListResponse into wire bytes.
-func EncodeListResponse(resp ListResponse) []byte {
+func EncodeListResponse(resp ListResponse) ([]byte, error) {
+	if uint64(len(resp.Items)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: list items count %d exceeds max uint32", ErrPayloadOverflow, len(resp.Items))
+	}
 	buf := make([]byte, 9)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(resp.TotalCount))
 	if resp.HasMore {
@@ -1677,18 +1969,25 @@ func EncodeListResponse(resp ListResponse) []byte {
 	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(resp.Items)))
 
 	for _, item := range resp.Items {
-		buf = appendString(buf, item.Name)
+		var err error
+		buf, err = appendStringChecked(buf, item.Name, "list item name")
+		if err != nil {
+			return nil, err
+		}
 		buf = append(buf, item.Operation)
 		if len(item.Attrs) > 0 {
-			attrSlice := item.Attrs
-			if len(attrSlice) > storage.MaxAttrCount {
-				attrSlice = attrSlice[:storage.MaxAttrCount]
+			cnt, err := checkUint16Count(len(item.Attrs), storage.MaxAttrCount, "list item attributes")
+			if err != nil {
+				return nil, err
 			}
 			var countBytes [2]byte
-			binary.LittleEndian.PutUint16(countBytes[:], storage.RawTypedFlag|uint16(len(attrSlice)))
+			binary.LittleEndian.PutUint16(countBytes[:], storage.RawTypedFlag|cnt)
 			buf = append(buf, countBytes[:]...)
-			for _, attr := range attrSlice {
-				buf = appendString(buf, attr.Key)
+			for _, attr := range item.Attrs {
+				buf, err = appendStringChecked(buf, attr.Key, "list attr key")
+				if err != nil {
+					return nil, err
+				}
 				buf = append(buf, byte(attr.Type))
 				var valBytes [8]byte
 				switch attr.Type {
@@ -1701,32 +2000,30 @@ func EncodeListResponse(resp ListResponse) []byte {
 				case storage.AttrTypeUint64:
 					binary.LittleEndian.PutUint64(valBytes[:], attr.Uint64())
 				default:
-					binary.LittleEndian.PutUint32(valBytes[:4], math.Float32bits(attr.Value))
+					return nil, fmt.Errorf("invalid attribute type %d", attr.Type)
 				}
 				buf = append(buf, valBytes[:]...)
 			}
 		} else {
-			propCount := len(item.Props)
-			if propCount > storage.MaxAttrCount {
-				propCount = storage.MaxAttrCount
+			cnt, err := checkUint16Count(len(item.Props), storage.MaxAttrCount, "list item properties")
+			if err != nil {
+				return nil, err
 			}
 			var countBytes [2]byte
-			binary.LittleEndian.PutUint16(countBytes[:], uint16(propCount))
+			binary.LittleEndian.PutUint16(countBytes[:], cnt)
 			buf = append(buf, countBytes[:]...)
-			written := 0
 			for k, v := range item.Props {
-				if written >= propCount {
-					break
+				buf, err = appendStringChecked(buf, k, "list prop key")
+				if err != nil {
+					return nil, err
 				}
-				buf = appendString(buf, k)
 				var valBytes [4]byte
 				binary.LittleEndian.PutUint32(valBytes[:], math.Float32bits(v))
 				buf = append(buf, valBytes[:]...)
-				written++
 			}
 		}
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeListResponse deserializes ListResponse from wire bytes.
@@ -1844,6 +2141,10 @@ func DecodeListResponse(data []byte) (ListResponse, error) {
 		}
 	}
 
+	if offset != len(data) {
+		return ListResponse{}, errors.New("trailing bytes in list response")
+	}
+
 	return resp, nil
 }
 
@@ -1859,7 +2160,19 @@ type UpdateRequest struct {
 }
 
 // EncodeUpdateRequest serializes UpdateRequest into wire bytes.
-func EncodeUpdateRequest(req UpdateRequest) []byte {
+func EncodeUpdateRequest(req UpdateRequest) ([]byte, error) {
+	if uint64(len(req.TargetEntities)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: update target entities count %d exceeds max uint32", ErrPayloadOverflow, len(req.TargetEntities))
+	}
+	filterCount, err := checkUint16Count(len(req.Filters), math.MaxUint16, "update filters")
+	if err != nil {
+		return nil, err
+	}
+	mutCount, err := checkUint16Count(len(req.Mutations), math.MaxUint16, "update mutations")
+	if err != nil {
+		return nil, err
+	}
+
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(req.Limit))
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(req.Offset))
@@ -1868,24 +2181,36 @@ func EncodeUpdateRequest(req UpdateRequest) []byte {
 	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(req.TargetEntities)))
 	buf = append(buf, countBytes[:]...)
 	for _, e := range req.TargetEntities {
-		buf = appendString(buf, e)
+		buf, err = appendStringChecked(buf, e, "target entity")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var count16 [2]byte
-	binary.LittleEndian.PutUint16(count16[:], uint16(len(req.Filters)))
+	binary.LittleEndian.PutUint16(count16[:], filterCount)
 	buf = append(buf, count16[:]...)
 	for _, f := range req.Filters {
-		buf = appendFilterCondition(buf, f)
+		buf, err = appendFilterCondition(buf, f)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	binary.LittleEndian.PutUint16(count16[:], uint16(len(req.Mutations)))
+	binary.LittleEndian.PutUint16(count16[:], mutCount)
 	buf = append(buf, count16[:]...)
 	for k, m := range req.Mutations {
-		buf = appendString(buf, k)
-		buf = appendComputeOp(buf, m)
+		buf, err = appendStringChecked(buf, k, "mutation field")
+		if err != nil {
+			return nil, err
+		}
+		buf, err = appendComputeOp(buf, m)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return buf
+	return buf, nil
 }
 
 // DecodeUpdateRequest deserializes UpdateRequest from wire bytes.
@@ -1899,6 +2224,9 @@ func DecodeUpdateRequest(data []byte) (UpdateRequest, error) {
 	}
 	targetCount := int(binary.LittleEndian.Uint32(data[8:12]))
 	offset := 12
+	if err := validateWireCount(targetCount, len(data)-offset, 2, "update targets"); err != nil {
+		return UpdateRequest{}, err
+	}
 
 	for i := 0; i < targetCount; i++ {
 		ent, nextOffset, err := readString(data, offset)
@@ -1914,6 +2242,9 @@ func DecodeUpdateRequest(data []byte) (UpdateRequest, error) {
 	}
 	filterCount := int(binary.LittleEndian.Uint16(data[offset : offset+2]))
 	offset += 2
+	if err := validateWireCount(filterCount, len(data)-offset, 12, "update filters"); err != nil {
+		return UpdateRequest{}, err
+	}
 	for i := 0; i < filterCount; i++ {
 		fc, nextOffset, err := readFilterCondition(data, offset)
 		if err != nil {
@@ -1941,8 +2272,8 @@ func EncodeUpdateResponse(count int) []byte {
 
 // DecodeUpdateResponse deserializes the updated count.
 func DecodeUpdateResponse(data []byte) (int, error) {
-	if len(data) < 4 {
-		return 0, errors.New("truncated update response")
+	if len(data) != 4 {
+		return 0, errors.New("invalid update response length")
 	}
 	return int(binary.LittleEndian.Uint32(data[0:4])), nil
 }
@@ -1965,8 +2296,15 @@ type GraphResponsePayload struct {
 }
 
 // EncodeGraphRequest serializes GraphRequest.
-func EncodeGraphRequest(req GraphRequest) []byte {
-	buf := appendString(nil, req.Relation)
+func EncodeGraphRequest(req GraphRequest) ([]byte, error) {
+	inCount, err := checkUint16Count(len(req.Inputs), math.MaxUint16, "graph inputs")
+	if err != nil {
+		return nil, err
+	}
+	buf, err := appendStringChecked(nil, req.Relation, "graph relation")
+	if err != nil {
+		return nil, err
+	}
 	var b [9]byte
 	binary.LittleEndian.PutUint32(b[0:4], uint32(req.LimitK))
 	b[4] = req.OrderMode
@@ -1974,12 +2312,15 @@ func EncodeGraphRequest(req GraphRequest) []byte {
 	buf = append(buf, b[:]...)
 
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Inputs)))
+	binary.LittleEndian.PutUint16(countBytes[:], inCount)
 	buf = append(buf, countBytes[:]...)
 	for _, in := range req.Inputs {
-		buf = appendString(buf, in)
+		buf, err = appendStringChecked(buf, in, "graph input")
+		if err != nil {
+			return nil, err
+		}
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeGraphRequest deserializes GraphRequest.
@@ -2010,6 +2351,9 @@ func DecodeGraphRequest(data []byte) (GraphRequest, error) {
 		offset = nextOffset
 	}
 
+	if offset != len(data) {
+		return GraphRequest{}, errors.New("trailing bytes in graph request")
+	}
 	return GraphRequest{
 		Inputs:    inputs,
 		Relation:  rel,
@@ -2020,7 +2364,10 @@ func DecodeGraphRequest(data []byte) (GraphRequest, error) {
 }
 
 // EncodeGraphResponsePayload serializes GraphResponsePayload.
-func EncodeGraphResponsePayload(resp GraphResponsePayload) []byte {
+func EncodeGraphResponsePayload(resp GraphResponsePayload) ([]byte, error) {
+	if uint64(len(resp.Results)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: graph result count %d exceeds max uint32", ErrPayloadOverflow, len(resp.Results))
+	}
 	var b [8]byte
 	binary.LittleEndian.PutUint32(b[0:4], math.Float32bits(resp.Anchor.X))
 	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(resp.Anchor.Y))
@@ -2031,7 +2378,11 @@ func EncodeGraphResponsePayload(resp GraphResponsePayload) []byte {
 	buf = append(buf, countBytes[:]...)
 
 	for _, r := range resp.Results {
-		buf = appendString(buf, r.Word)
+		var err error
+		buf, err = appendStringChecked(buf, r.Word, "graph result word")
+		if err != nil {
+			return nil, err
+		}
 		var valBytes [20]byte
 		binary.LittleEndian.PutUint32(valBytes[0:4], math.Float32bits(r.Score))
 		binary.LittleEndian.PutUint32(valBytes[4:8], math.Float32bits(r.T))
@@ -2040,7 +2391,7 @@ func EncodeGraphResponsePayload(resp GraphResponsePayload) []byte {
 		binary.LittleEndian.PutUint32(valBytes[16:20], math.Float32bits(r.Coord.Y))
 		buf = append(buf, valBytes[:]...)
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeGraphResponsePayload deserializes GraphResponsePayload.
@@ -2083,6 +2434,10 @@ func DecodeGraphResponsePayload(data []byte) (GraphResponsePayload, error) {
 		})
 	}
 
+	if offset != len(data) {
+		return GraphResponsePayload{}, errors.New("trailing bytes in graph response")
+	}
+
 	return GraphResponsePayload{Anchor: anchor, Results: results}, nil
 }
 
@@ -2095,25 +2450,39 @@ type GraphChainRequest struct {
 }
 
 // EncodeGraphChainRequest serializes GraphChainRequest.
-func EncodeGraphChainRequest(req GraphChainRequest) []byte {
+func EncodeGraphChainRequest(req GraphChainRequest) ([]byte, error) {
+	inCount, err := checkUint16Count(len(req.Inputs), math.MaxUint16, "graph chain inputs")
+	if err != nil {
+		return nil, err
+	}
+	relCount, err := checkUint16Count(len(req.RelationChain), math.MaxUint16, "graph chain relations")
+	if err != nil {
+		return nil, err
+	}
 	var b [8]byte
 	binary.LittleEndian.PutUint32(b[0:4], uint32(req.LimitK))
 	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(req.BeamWidth))
 	buf := append([]byte(nil), b[:]...)
 
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Inputs)))
+	binary.LittleEndian.PutUint16(countBytes[:], inCount)
 	buf = append(buf, countBytes[:]...)
 	for _, in := range req.Inputs {
-		buf = appendString(buf, in)
+		buf, err = appendStringChecked(buf, in, "graph chain input")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.RelationChain)))
+	binary.LittleEndian.PutUint16(countBytes[:], relCount)
 	buf = append(buf, countBytes[:]...)
 	for _, rel := range req.RelationChain {
-		buf = appendString(buf, rel)
+		buf, err = appendStringChecked(buf, rel, "graph chain relation")
+		if err != nil {
+			return nil, err
+		}
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeGraphChainRequest deserializes GraphChainRequest.
@@ -2158,6 +2527,10 @@ func DecodeGraphChainRequest(data []byte) (GraphChainRequest, error) {
 		offset = nextOffset
 	}
 
+	if offset != len(data) {
+		return GraphChainRequest{}, errors.New("trailing bytes in graph chain request")
+	}
+
 	return GraphChainRequest{
 		Inputs:        inputs,
 		RelationChain: relations,
@@ -2169,25 +2542,37 @@ func DecodeGraphChainRequest(data []byte) (GraphChainRequest, error) {
 // --- SCHEMA CODECS ---
 
 // EncodeAttachSchemaPayload serializes a raw schema definition string.
-func EncodeAttachSchemaPayload(schemaJSON string) []byte {
-	return appendString(nil, schemaJSON)
+func EncodeAttachSchemaPayload(schemaJSON string) ([]byte, error) {
+	return appendStringChecked(nil, schemaJSON, "schema JSON")
 }
 
 // DecodeAttachSchemaPayload deserializes a raw schema definition string.
 func DecodeAttachSchemaPayload(data []byte) (string, error) {
-	s, _, err := readString(data, 0)
-	return s, err
+	s, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in attach schema payload")
+	}
+	return s, nil
 }
 
 // EncodeGetSchemaPayload encodes schema response string.
-func EncodeGetSchemaPayload(schemaJSON string) []byte {
-	return appendString(nil, schemaJSON)
+func EncodeGetSchemaPayload(schemaJSON string) ([]byte, error) {
+	return appendStringChecked(nil, schemaJSON, "schema JSON")
 }
 
 // DecodeGetSchemaPayload decodes schema response string.
 func DecodeGetSchemaPayload(data []byte) (string, error) {
-	s, _, err := readString(data, 0)
-	return s, err
+	s, offset, err := readString(data, 0)
+	if err != nil {
+		return "", err
+	}
+	if offset != len(data) {
+		return "", errors.New("trailing bytes in get schema payload")
+	}
+	return s, nil
 }
 
 // --- MATH CODECS ---
@@ -2208,19 +2593,29 @@ type MathResponse struct {
 }
 
 // EncodeMathRequest serializes MathRequest.
-func EncodeMathRequest(req MathRequest) []byte {
-	buf := appendString(nil, req.Op)
+func EncodeMathRequest(req MathRequest) ([]byte, error) {
+	wordCount, err := checkUint16Count(len(req.Words), math.MaxUint16, "math request words")
+	if err != nil {
+		return nil, err
+	}
+	buf, err := appendStringChecked(nil, req.Op, "math op")
+	if err != nil {
+		return nil, err
+	}
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], uint32(req.LimitK))
 	buf = append(buf, b[:]...)
 
 	var countBytes [2]byte
-	binary.LittleEndian.PutUint16(countBytes[:], uint16(len(req.Words)))
+	binary.LittleEndian.PutUint16(countBytes[:], wordCount)
 	buf = append(buf, countBytes[:]...)
 	for _, w := range req.Words {
-		buf = appendString(buf, w)
+		buf, err = appendStringChecked(buf, w, "math word")
+		if err != nil {
+			return nil, err
+		}
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeMathRequest deserializes MathRequest.
@@ -2249,11 +2644,18 @@ func DecodeMathRequest(data []byte) (MathRequest, error) {
 		offset = nextOffset
 	}
 
+	if offset != len(data) {
+		return MathRequest{}, errors.New("trailing bytes in math request")
+	}
+
 	return MathRequest{Op: op, Words: words, LimitK: limitK}, nil
 }
 
 // EncodeMathResponse serializes MathResponse.
-func EncodeMathResponse(resp MathResponse) []byte {
+func EncodeMathResponse(resp MathResponse) ([]byte, error) {
+	if uint64(len(resp.Neighbors)) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: math neighbor count %d exceeds max uint32", ErrPayloadOverflow, len(resp.Neighbors))
+	}
 	var b [28]byte
 	binary.LittleEndian.PutUint32(b[0:4], math.Float32bits(resp.Value))
 	binary.LittleEndian.PutUint32(b[4:8], math.Float32bits(resp.Coord.X))
@@ -2267,7 +2669,11 @@ func EncodeMathResponse(resp MathResponse) []byte {
 	binary.LittleEndian.PutUint32(countBytes[:], uint32(len(resp.Neighbors)))
 	buf = append(buf, countBytes[:]...)
 	for _, n := range resp.Neighbors {
-		buf = appendString(buf, n.Word)
+		var err error
+		buf, err = appendStringChecked(buf, n.Word, "math neighbor word")
+		if err != nil {
+			return nil, err
+		}
 		var nb [20]byte
 		binary.LittleEndian.PutUint32(nb[0:4], math.Float32bits(n.Score))
 		binary.LittleEndian.PutUint32(nb[4:8], math.Float32bits(n.T))
@@ -2276,7 +2682,7 @@ func EncodeMathResponse(resp MathResponse) []byte {
 		binary.LittleEndian.PutUint32(nb[16:20], math.Float32bits(n.Coord.Y))
 		buf = append(buf, nb[:]...)
 	}
-	return buf
+	return buf, nil
 }
 
 // DecodeMathResponse deserializes MathResponse.
@@ -2324,6 +2730,10 @@ func DecodeMathResponse(data []byte) (MathResponse, error) {
 		})
 	}
 
+	if offset != len(data) {
+		return MathResponse{}, errors.New("trailing bytes in math response")
+	}
+
 	return MathResponse{
 		Value:     val,
 		Coord:     coord,
@@ -2344,8 +2754,8 @@ func EncodeResetModelPayload(confirm bool) []byte {
 
 // DecodeResetModelPayload decodes the confirm flag for OpResetModel.
 func DecodeResetModelPayload(data []byte) (bool, error) {
-	if len(data) < 1 {
-		return false, errors.New("truncated reset model payload")
+	if len(data) != 1 {
+		return false, errors.New("invalid reset model payload length")
 	}
 	return data[0] == 1, nil
 }
@@ -2361,8 +2771,8 @@ type PartitionCatalogItemDTO struct {
 	SinkType       string    `json:"sink_type"`
 	RecordCount    int       `json:"record_count"`
 	CutoffDate     string    `json:"cutoff_date"`
-	MinDate        float32   `json:"min_date"`
-	MaxDate        float32   `json:"max_date"`
+	MinDate        float64   `json:"min_date"`
+	MaxDate        float64   `json:"max_date"`
 	CreatedAt      time.Time `json:"created_at"`
 	SizeBytes      int64     `json:"size_bytes"`
 }
@@ -2393,9 +2803,25 @@ func DecodePartitionCatalogResponse(data []byte) ([]PartitionCatalogItemDTO, err
 
 // PartitionInspectWireRequest represents parameters for OpPartitionInspect.
 type PartitionInspectWireRequest struct {
-	PartitionFile string `json:"partition_file"`
-	RecordName    string `json:"record_name,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
+	Model         string                       `json:"model,omitempty"`
+	PartitionFile string                       `json:"partition_file"`
+	RecordName    string                       `json:"record_name,omitempty"`
+	Limit         int                          `json:"limit,omitempty"`
+	Offset        int                          `json:"offset,omitempty"`
+	Filters       []storage.FilterCondition    `json:"filters,omitempty"`
+	Select        []string                     `json:"select,omitempty"`
+	Computations  map[string]storage.ComputeOp `json:"-"`
+}
+
+type partitionInspectWireEnvelope struct {
+	Model            string                    `json:"model,omitempty"`
+	PartitionFile    string                    `json:"partition_file"`
+	RecordName       string                    `json:"record_name,omitempty"`
+	Limit            int                       `json:"limit,omitempty"`
+	Offset           int                       `json:"offset,omitempty"`
+	Filters          []storage.FilterCondition `json:"filters,omitempty"`
+	Select           []string                  `json:"select,omitempty"`
+	ComputationsWire []byte                    `json:"computations_wire,omitempty"`
 }
 
 // PartitionRecordWireItem holds a record in an inspected partition.
@@ -2417,14 +2843,59 @@ type PartitionInspectWireResponse struct {
 
 // EncodePartitionInspectRequest encodes request for OpPartitionInspect.
 func EncodePartitionInspectRequest(req PartitionInspectWireRequest) ([]byte, error) {
-	return json.Marshal(req)
+	env := partitionInspectWireEnvelope{
+		Model:         req.Model,
+		PartitionFile: req.PartitionFile,
+		RecordName:    req.RecordName,
+		Limit:         req.Limit,
+		Offset:        req.Offset,
+		Filters:       req.Filters,
+		Select:        req.Select,
+	}
+	if len(req.Computations) > 0 {
+		compCount, err := checkUint16Count(len(req.Computations), math.MaxUint16, "partition inspect computations")
+		if err != nil {
+			return nil, err
+		}
+		var countBytes [2]byte
+		binary.LittleEndian.PutUint16(countBytes[:], compCount)
+		buf := append([]byte(nil), countBytes[:]...)
+		for k, op := range req.Computations {
+			buf, err = appendStringChecked(buf, k, "computation key")
+			if err != nil {
+				return nil, err
+			}
+			buf, err = appendComputeOp(buf, op)
+			if err != nil {
+				return nil, err
+			}
+		}
+		env.ComputationsWire = buf
+	}
+	return json.Marshal(env)
 }
 
 // DecodePartitionInspectRequest decodes request for OpPartitionInspect.
 func DecodePartitionInspectRequest(data []byte) (PartitionInspectWireRequest, error) {
-	var req PartitionInspectWireRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return req, fmt.Errorf("failed decoding partition inspect request: %w", err)
+	var env partitionInspectWireEnvelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return PartitionInspectWireRequest{}, fmt.Errorf("failed decoding partition inspect request: %w", err)
+	}
+	req := PartitionInspectWireRequest{
+		Model:         env.Model,
+		PartitionFile: env.PartitionFile,
+		RecordName:    env.RecordName,
+		Limit:         env.Limit,
+		Offset:        env.Offset,
+		Filters:       env.Filters,
+		Select:        env.Select,
+	}
+	if len(env.ComputationsWire) > 0 {
+		ops, _, err := readOptionalComputeOps(env.ComputationsWire, 0, "partition inspect computations")
+		if err != nil {
+			return PartitionInspectWireRequest{}, fmt.Errorf("failed decoding partition inspect computations: %w", err)
+		}
+		req.Computations = ops
 	}
 	return req, nil
 }

@@ -615,7 +615,11 @@ func TestWire_NoJoinManagerAuthAndGroupCommitNodeEntityStore(t *testing.T) {
 		Name:  "spatial-node-empty-props",
 		Coord: &spatial.Point2D{X: 3.5, Y: -2.0},
 	}
-	if _, err := c2.call(OpSave, EncodeSavePayload(item)); err != nil {
+	payload, err := EncodeSavePayload(item)
+	if err != nil {
+		t.Fatalf("EncodeSavePayload: %v", err)
+	}
+	if _, err := c2.call(OpSave, payload); err != nil {
 		t.Fatalf("OpSave spatial node: %v", err)
 	}
 	if _, _, err := c2.Get("spatial-node-empty-props"); err != nil {

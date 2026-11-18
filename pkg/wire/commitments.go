@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -188,6 +189,9 @@ func (cs *CommitmentStore) RegisterInitialNew(nodeID string, commitment [32]byte
 	if nodeID == "" {
 		return errors.New("wire: node id cannot be empty")
 	}
+	if len(nodeID) > math.MaxUint16 {
+		return fmt.Errorf("%w: node id length %d exceeds max %d", ErrPayloadOverflow, len(nodeID), math.MaxUint16)
+	}
 
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -208,6 +212,9 @@ func (cs *CommitmentStore) RegisterInitialNew(nodeID string, commitment [32]byte
 func (cs *CommitmentStore) RegisterInitial(nodeID string, commitment [32]byte) error {
 	if nodeID == "" {
 		return errors.New("wire: node id cannot be empty")
+	}
+	if len(nodeID) > math.MaxUint16 {
+		return fmt.Errorf("%w: node id length %d exceeds max %d", ErrPayloadOverflow, len(nodeID), math.MaxUint16)
 	}
 
 	cs.mu.Lock()

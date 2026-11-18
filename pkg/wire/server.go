@@ -69,7 +69,21 @@ type ColdTierBackend interface {
 // PartitionBackend defines AnchorWire handler interfaces for catalog and direct inspection.
 type PartitionBackend interface {
 	GetPartitionCatalog(model string) ([]PartitionCatalogItemDTO, error)
-	InspectPartition(fileOrLoc, recordName string, limit int) (PartitionInspectWireResponse, error)
+	InspectPartition(req PartitionInspectWireRequest) (PartitionInspectWireResponse, error)
+}
+
+// ColdOperationsBackend optionally extends Backend with cold-tier query and
+// mutation fallback when records, graph edges, math vectors, or schemas live
+// only in archived partitions.
+type ColdOperationsBackend interface {
+	ListColdRecords(model string, opts storage.QueryOptions) ([]storage.EntityRecord, bool, error)
+	UpdateColdRecords(model string, opts storage.UpdateOptions) (int, error)
+	ExecuteColdGraph(ctx context.Context, model string, req GraphRequest) ([]storage.GraphQueryResult, spatial.Point2D, error)
+	ExecuteColdGraphChain(ctx context.Context, model string, req GraphChainRequest) ([]storage.GraphQueryResult, error)
+	ExecuteColdCausal(ctx context.Context, model string, seeds []string, relation string, limitK int) ([]storage.CausalResult, error)
+	ExecuteColdCausalChain(ctx context.Context, model string, seeds []string, relations []string, limitK int) ([]storage.CausalResult, error)
+	ExecuteColdMath(model string, req MathRequest) (MathResponse, error)
+	GetColdSchema(model string) (storage.ModelSchema, bool, error)
 }
 
 type saveJob struct {
@@ -100,6 +114,7 @@ type Server struct {
 	joinManager       *JoinManager
 	gatewayMode       bool
 	tlsConfig         *tls.Config
+	rateLimiter       interface{ Allow(ip string) bool }
 	l                 net.Listener
 	mu                sync.Mutex
 	conns             map[net.Conn]struct{}
@@ -185,6 +200,13 @@ func (s *Server) SetTLSConfig(cfg *tls.Config) {
 	}
 }
 
+// SetRateLimiter attaches an optional per-IP connection rate limiter to the wire server.
+func (s *Server) SetRateLimiter(rl interface{ Allow(ip string) bool }) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rateLimiter = rl
+}
+
 // Serve accepts incoming AnchorWire TCP (or TLS if configured) connections.
 func (s *Server) Serve(l net.Listener) error {
 	s.mu.Lock()
@@ -216,9 +238,26 @@ func (s *Server) Serve(l net.Listener) error {
 			s.mu.Unlock()
 			return nil
 		}
+		rl := s.rateLimiter
 		sem := s.connSem
 		readTimeout := s.readTimeout
 		writeTimeout := s.writeTimeout
+		if rl != nil {
+			ip := ""
+			if conn.RemoteAddr() != nil {
+				host, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String())
+				if splitErr == nil {
+					ip = host
+				} else {
+					ip = conn.RemoteAddr().String()
+				}
+			}
+			if !rl.Allow(ip) {
+				_ = conn.Close()
+				s.mu.Unlock()
+				continue
+			}
+		}
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -236,6 +275,13 @@ func (s *Server) Serve(l net.Listener) error {
 			s.handleConn(c, rt, wt)
 		}(conn, sem, readTimeout, writeTimeout)
 	}
+}
+
+// IsClosed reports whether the AnchorWire server has been closed.
+func (s *Server) IsClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // Close gracefully terminates the server and closes all active connections within the default timeout.
@@ -375,6 +421,25 @@ func saveSingleGroupJob(db *storage.AnchorDB, j *saveJob) {
 	}
 }
 
+func setEncodedOK(resp *Frame, payload []byte, err error) {
+	if err != nil {
+		resp.OpCode = OpResponseError
+		resp.Payload = EncodeErrorPayload(500, err.Error())
+		return
+	}
+	resp.OpCode = OpResponseOK
+	resp.Payload = payload
+}
+
+func isPerItemValidationError(err error) bool {
+	return errors.Is(err, storage.ErrMissingRequiredField) ||
+		errors.Is(err, storage.ErrUnknownField) ||
+		errors.Is(err, storage.ErrInvalidFieldType) ||
+		errors.Is(err, storage.ErrSchemaMismatch) ||
+		errors.Is(err, storage.ErrRecordLocked) ||
+		errors.Is(err, storage.ErrRecordNotFound)
+}
+
 func (s *Server) acquireModel(name string) (*storage.AnchorDB, func(), error) {
 	if lb, ok := s.backend.(LeaseBackend); ok {
 		return lb.AcquireModel(name)
@@ -434,7 +499,7 @@ func (s *Server) processSaveBatch(batch []*saveJob) {
 
 			names, bErr := db.SaveRecordsBatch(items)
 			if bErr != nil {
-				if errors.Is(bErr, storage.ErrDatabaseClosed) {
+				if !isPerItemValidationError(bErr) {
 					for _, j := range jobs {
 						j.err = bErr
 						close(j.done)
@@ -544,7 +609,7 @@ func (s *Server) processEdgeBatch(batch []*edgeJob) {
 
 			bErr := db.AddEdgesBatch(items)
 			if bErr != nil {
-				if errors.Is(bErr, storage.ErrDatabaseClosed) {
+				if !isPerItemValidationError(bErr) {
 					for _, j := range jobs {
 						j.err = bErr
 						close(j.done)
@@ -685,16 +750,18 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 						return
 					}
 					authenticated = true
-					resp.OpCode = OpResponseOK
 					if authReq.Type == AuthTypeStagedReauth {
 						authenticatedNodeID = authReq.NodeID
 						stagedPendingConfirm = true
 						stagedCommitment = authReq.NextCommitment
-						resp.Payload = EncodeRotationStagedResponse("Commitment staged successfully")
+						p, encErr := EncodeRotationStagedResponse("Commitment staged successfully")
+						setEncodedOK(&resp, p, encErr)
 					} else if sessKey != "" {
-						resp.Payload = EncodeAuthResponse(sessKey)
+						p, encErr := EncodeAuthResponse(sessKey)
+						setEncodedOK(&resp, p, encErr)
 					} else {
-						resp.Payload = EncodeOKPayload("authenticated")
+						p, encErr := EncodeOKPayload("authenticated")
+						setEncodedOK(&resp, p, encErr)
 					}
 				} else {
 					if authReq.Type != AuthTypeStatic {
@@ -705,8 +772,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					}
 					if s.backend.Authenticate(authReq.Credential) {
 						authenticated = true
-						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeOKPayload("authenticated")
+						p, encErr := EncodeOKPayload("authenticated")
+						setEncodedOK(&resp, p, encErr)
 					} else {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(ErrCodeUnauthorized, "unauthorized: invalid credentials")
@@ -755,12 +822,12 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					return
 				}
 				authenticated = true
-				resp.OpCode = OpResponseOK
-				resp.Payload = EncodeOKPayload("authenticated")
+				p, encErr := EncodeOKPayload("authenticated")
+				setEncodedOK(&resp, p, encErr)
 			} else if s.backend.Authenticate(token) {
 				authenticated = true
-				resp.OpCode = OpResponseOK
-				resp.Payload = EncodeOKPayload("authenticated")
+				p, encErr := EncodeOKPayload("authenticated")
+				setEncodedOK(&resp, p, encErr)
 			} else {
 				resp.OpCode = OpResponseError
 				resp.Payload = EncodeErrorPayload(401, "unauthorized: invalid token")
@@ -789,8 +856,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 				resp.Payload = EncodeErrorPayload(400, "invalid model name")
 			} else {
 				currentModel = model
-				resp.OpCode = OpResponseOK
-				resp.Payload = EncodeOKPayload("model selected: " + currentModel)
+				p, encErr := EncodeOKPayload("model selected: " + currentModel)
+				setEncodedOK(&resp, p, encErr)
 			}
 			if err := writeResp(resp); err != nil {
 				return
@@ -902,7 +969,10 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(501, "partition inspect backend not supported")
 				} else {
-					inspectResp, iErr := pb.InspectPartition(inspectReq.PartitionFile, inspectReq.RecordName, inspectReq.Limit)
+					if inspectReq.Model == "" {
+						inspectReq.Model = currentModel
+					}
+					inspectResp, iErr := pb.InspectPartition(inspectReq)
 					if iErr != nil {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(500, iErr.Error())
@@ -966,8 +1036,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 								resp.Payload = EncodeErrorPayload(wireErrorCode(job.err), job.err.Error())
 							}
 						} else {
-							resp.OpCode = OpResponseOK
-							resp.Payload = EncodeOKPayload(job.savedName)
+							p, encErr := EncodeOKPayload(job.savedName)
+							setEncodedOK(&resp, p, encErr)
 						}
 					case <-s.saveCommitterDone:
 						resp.OpCode = OpResponseError
@@ -1012,8 +1082,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
 					system.RecordMutation(uint64(len(items)))
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", len(names)))
+					p, encErr := EncodeSaveBatchResponse(names)
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpGet:
@@ -1032,7 +1102,7 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					cr, cErr := db.GetRecordTypedWithCompute(getReq.Name, getReq.Computations, getReq.Select...)
 					if cErr == nil {
 						op = cr.Operation
-						attrs = cr.ExpandAttrs()
+						attrs, err = cr.ExpandAttrs()
 						isTyped = true
 					} else {
 						err = cErr
@@ -1041,7 +1111,7 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					cr, cErr := db.GetRecordTyped(getReq.Name)
 					if cErr == nil {
 						op = cr.Operation
-						attrs = cr.ExpandAttrs()
+						attrs, err = cr.ExpandAttrs()
 						isTyped = true
 					} else {
 						err = cErr
@@ -1054,9 +1124,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					if cb, ok := s.backend.(ColdTierBackend); ok {
 						cr, coldErr := cb.GetColdRecordTyped(currentModel, getReq.Name, getReq.Computations, getReq.Select)
 						if coldErr == nil {
-							err = nil
 							op = cr.Operation
-							attrs = cr.ExpandAttrs()
+							attrs, err = cr.ExpandAttrs()
 							isTyped = true
 							resp.Flags |= FlagColdTier
 						} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
@@ -1065,9 +1134,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					} else if ttb, ok := s.backend.(TypedTieredBackend); ok {
 						cr, coldErr := ttb.GetRecordTypedWithComputeTiered(currentModel, getReq.Name, getReq.Computations, getReq.Select)
 						if coldErr == nil {
-							err = nil
 							op = cr.Operation
-							attrs = cr.ExpandAttrs()
+							attrs, err = cr.ExpandAttrs()
 							isTyped = true
 							resp.Flags |= FlagColdTier
 						} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
@@ -1093,12 +1161,14 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
+					var p []byte
+					var encErr error
 					if isTyped {
-						resp.Payload = EncodeGetResultTypedPayload(op, attrs)
+						p, encErr = EncodeGetResultTypedPayload(op, attrs)
 					} else {
-						resp.Payload = EncodeGetResultPayload(op, props)
+						p, encErr = EncodeGetResultPayload(op, props)
 					}
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpEdge:
@@ -1156,8 +1226,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(code, err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload(fmt.Sprintf("%d", db.EdgeCount()))
+					p, encErr := EncodeOKPayload(fmt.Sprintf("%d", db.EdgeCount()))
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpCausal:
@@ -1168,12 +1238,24 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					break
 				}
 				results, err := db.ExecuteCausalStep(connCtx, seeds, rel, limitK)
+				if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldRes, coldErr := coldOps.ExecuteColdCausal(connCtx, currentModel, seeds, rel, limitK)
+						if coldErr == nil && len(coldRes) > 0 {
+							results = coldRes
+							err = nil
+							resp.Flags |= FlagColdTier
+						} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+							err = coldErr
+						}
+					}
+				}
 				if err != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeCausalResultPayload(results)
+					p, encErr := EncodeCausalResultPayload(results)
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpCausalChain:
@@ -1184,6 +1266,18 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					break
 				}
 				results, err := db.ExecuteCausalChain(connCtx, seeds, relations, limitK)
+				if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldRes, coldErr := coldOps.ExecuteColdCausalChain(connCtx, currentModel, seeds, relations, limitK)
+						if coldErr == nil && len(coldRes) > 0 {
+							results = coldRes
+							err = nil
+							resp.Flags |= FlagColdTier
+						} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+							err = coldErr
+						}
+					}
+				}
 				if err != nil {
 					code := wireErrorCode(err)
 					if code == 500 {
@@ -1192,8 +1286,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(code, err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeCausalResultPayload(results)
+					p, encErr := EncodeCausalResultPayload(results)
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpSync:
@@ -1201,8 +1295,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload("synced")
+					p, encErr := EncodeOKPayload("synced")
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpList:
@@ -1224,16 +1318,28 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					Computations:         listReq.Computations,
 				}
 				items, hasMore, err := db.ListRecordsWithPaging(opts)
+				if err == nil && len(items) == 0 {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldItems, coldHasMore, coldErr := coldOps.ListColdRecords(currentModel, opts)
+						if coldErr != nil {
+							err = coldErr
+						} else if len(coldItems) > 0 {
+							items = coldItems
+							hasMore = coldHasMore
+							resp.Flags |= FlagColdTier
+						}
+					}
+				}
 				if err != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeListResponse(ListResponse{
+					p, encErr := EncodeListResponse(ListResponse{
 						TotalCount: len(items),
 						HasMore:    hasMore,
 						Items:      items,
 					})
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpUpdate:
@@ -1252,6 +1358,17 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					Mutations:      upReq.Mutations,
 				}
 				updatedCount, err := db.UpdateRecords(opts)
+				if err == nil && updatedCount == 0 {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldUpdated, coldErr := coldOps.UpdateColdRecords(currentModel, opts)
+						if coldErr != nil {
+							err = coldErr
+						} else if coldUpdated > 0 {
+							updatedCount = coldUpdated
+							resp.Flags |= FlagColdTier
+						}
+					}
+				}
 				if err != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
@@ -1271,15 +1388,28 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					break
 				}
 				results, anchor, err := db.ExecuteGraphStepWithOptions(gReq.Inputs, gReq.Relation, gReq.LimitK, storage.OrderByMode(gReq.OrderMode), gReq.BeamWidth)
+				if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldRes, coldAnchor, coldErr := coldOps.ExecuteColdGraph(connCtx, currentModel, gReq)
+						if coldErr == nil && len(coldRes) > 0 {
+							results = coldRes
+							anchor = coldAnchor
+							err = nil
+							resp.Flags |= FlagColdTier
+						} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+							err = coldErr
+						}
+					}
+				}
 				if err != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
+					p, encErr := EncodeGraphResponsePayload(GraphResponsePayload{
 						Anchor:  anchor,
 						Results: results,
 					})
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpGraphChain:
@@ -1290,14 +1420,26 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					break
 				}
 				results, err := db.ExecuteGraphChainWithOptions(cReq.Inputs, cReq.RelationChain, cReq.LimitK, cReq.BeamWidth)
+				if (err == nil && len(results) == 0) || (err != nil && errors.Is(err, storage.ErrRecordNotFound)) {
+					if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+						coldRes, coldErr := coldOps.ExecuteColdGraphChain(connCtx, currentModel, cReq)
+						if coldErr == nil && len(coldRes) > 0 {
+							results = coldRes
+							err = nil
+							resp.Flags |= FlagColdTier
+						} else if coldErr != nil && !errors.Is(coldErr, storage.ErrRecordNotFound) {
+							err = coldErr
+						}
+					}
+				}
 				if err != nil {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeGraphResponsePayload(GraphResponsePayload{
+					p, encErr := EncodeGraphResponsePayload(GraphResponsePayload{
 						Results: results,
 					})
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpAttachSchema:
@@ -1317,12 +1459,25 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(400, err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload("schema attached")
+					p, encErr := EncodeOKPayload("schema attached")
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpGetSchema:
 				ms, ok := db.GetSchema()
+				if !ok {
+					if coldOps, hasCold := s.backend.(ColdOperationsBackend); hasCold {
+						if coldMS, coldOK, coldErr := coldOps.GetColdSchema(currentModel); coldErr != nil {
+							resp.OpCode = OpResponseError
+							resp.Payload = EncodeErrorPayload(wireErrorCode(coldErr), coldErr.Error())
+							break
+						} else if coldOK {
+							ms = coldMS
+							ok = true
+							resp.Flags |= FlagColdTier
+						}
+					}
+				}
 				if !ok {
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(404, "no schema attached to model")
@@ -1330,8 +1485,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(500, fmt.Sprintf("failed to marshal schema: %v", mErr))
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeGetSchemaPayload(string(data))
+					p, encErr := EncodeGetSchemaPayload(string(data))
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			case OpMath:
@@ -1348,6 +1503,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					}
 					return code
 				}
+				var mathResp MathResponse
+				var err error
 				switch mReq.Op {
 				case "distance":
 					if len(mReq.Words) < 2 {
@@ -1355,54 +1512,47 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 						resp.Payload = EncodeErrorPayload(400, "distance requires 2 words")
 						break
 					}
-					dist, err := db.CalculateDistance(mReq.Words[0], mReq.Words[1])
-					if err != nil {
-						resp.OpCode = OpResponseError
-						resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
-					} else {
-						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeMathResponse(MathResponse{Value: dist})
-					}
+					mathResp.Value, err = db.CalculateDistance(mReq.Words[0], mReq.Words[1])
 				case "centroid":
-					coord, roles, err := db.CalculateCentroid(mReq.Words)
-					if err != nil {
-						resp.OpCode = OpResponseError
-						resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
-					} else {
-						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeMathResponse(MathResponse{Coord: coord, Roles: roles})
-					}
+					mathResp.Coord, mathResp.Roles, err = db.CalculateCentroid(mReq.Words)
 				case "cosine_similarity":
 					if len(mReq.Words) < 2 {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(400, "cosine_similarity requires 2 words")
 						break
 					}
-					sim, err := db.CalculateCosineSimilarity(mReq.Words[0], mReq.Words[1])
-					if err != nil {
-						resp.OpCode = OpResponseError
-						resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
-					} else {
-						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeMathResponse(MathResponse{Value: sim})
-					}
+					mathResp.Value, err = db.CalculateCosineSimilarity(mReq.Words[0], mReq.Words[1])
 				case "nearest":
 					if len(mReq.Words) < 1 {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(400, "nearest requires 1 word")
 						break
 					}
-					neighbors, err := db.FindNearestNeighbors(mReq.Words[0], mReq.LimitK)
+					mathResp.Neighbors, err = db.FindNearestNeighbors(mReq.Words[0], mReq.LimitK)
+				default:
+					resp.OpCode = OpResponseError
+					resp.Payload = EncodeErrorPayload(400, "unsupported math op: "+mReq.Op)
+				}
+				if resp.OpCode != OpResponseError {
+					if err != nil && errors.Is(err, storage.ErrRecordNotFound) {
+						if coldOps, ok := s.backend.(ColdOperationsBackend); ok {
+							coldMath, coldErr := coldOps.ExecuteColdMath(currentModel, mReq)
+							if coldErr == nil {
+								mathResp = coldMath
+								err = nil
+								resp.Flags |= FlagColdTier
+							} else if !errors.Is(coldErr, storage.ErrRecordNotFound) {
+								err = coldErr
+							}
+						}
+					}
 					if err != nil {
 						resp.OpCode = OpResponseError
 						resp.Payload = EncodeErrorPayload(mathErrCode(err), err.Error())
 					} else {
-						resp.OpCode = OpResponseOK
-						resp.Payload = EncodeMathResponse(MathResponse{Neighbors: neighbors})
+						p, encErr := EncodeMathResponse(mathResp)
+						setEncodedOK(&resp, p, encErr)
 					}
-				default:
-					resp.OpCode = OpResponseError
-					resp.Payload = EncodeErrorPayload(400, "unsupported math op: "+mReq.Op)
 				}
 
 			case OpResetModel:
@@ -1421,8 +1571,8 @@ func (s *Server) handleConn(conn net.Conn, readTimeout, writeTimeout time.Durati
 					resp.OpCode = OpResponseError
 					resp.Payload = EncodeErrorPayload(wireErrorCode(err), err.Error())
 				} else {
-					resp.OpCode = OpResponseOK
-					resp.Payload = EncodeOKPayload("schema reset")
+					p, encErr := EncodeOKPayload("schema reset")
+					setEncodedOK(&resp, p, encErr)
 				}
 
 			default:

@@ -57,9 +57,9 @@ func TestSync_ConcurrentDeletePreservesEntityMapping(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRecordTyped(%s): %v", name, err)
 		}
-		got, ok := cr.GetInt("id")
-		if !ok || got != int64(i) {
-			t.Fatalf("entity %s mapped to wrong value: got %d (%v), want %d", name, got, ok, i)
+		got, ok, err := cr.GetInt("id")
+		if err != nil || !ok || got != int64(i) {
+			t.Fatalf("entity %s mapped to wrong value: got %d (ok=%v, err=%v), want %d", name, got, ok, err, i)
 		}
 	}
 }
@@ -204,9 +204,9 @@ func TestFilterAndCompute_MixedFloatAndUint64Precision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRecordTypedWithCompute: %v", err)
 	}
-	attr, ok := got.GetTyped("u2")
-	if !ok || attr.Type != AttrTypeUint64 || attr.Uint64() != 15 {
-		t.Fatalf("expected uint64 exact result 15, got %+v (ok=%v)", attr, ok)
+	attr, ok, err := got.GetTyped("u2")
+	if err != nil || !ok || attr.Type != AttrTypeUint64 || attr.Uint64() != 15 {
+		t.Fatalf("expected uint64 exact result 15, got %+v (ok=%v, err=%v)", attr, ok, err)
 	}
 }
 
