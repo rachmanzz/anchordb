@@ -190,13 +190,10 @@ Supported `op` values:
 - `centroid`: Centroid coordinate and semantic role vector of one or more spatial nodes (`words: ["nodeA", "nodeB", ...]`).
 - `cosine_similarity`: Cosine similarity between 4D semantic role vectors of two nodes (`words: ["nodeA", "nodeB"]`).
 - `nearest`: Nearest neighbor search for a given spatial node (`words: ["nodeA"]`, `limit_k: 5`).
-- `haversine` *(Next release)*: Great-circle distance in kilometers using the WGS84 spherical Earth model (R = 6371.0 km, where X = Longitude, Y = Latitude) between two spatial nodes (`words: ["nodeA", "nodeB"]`).
-- `stats` *(Next release)*: Single-pass statistical aggregates (`count`, `sum`, `min`, `max`, `mean`, `variance`, `std_dev`) for a specified numeric field using Welford's algorithm (`field: "fieldname"`).
+- `haversine`: Great-circle distance in kilometers using the WGS84 spherical Earth model (R = 6371.0 km, where X = Longitude, Y = Latitude) between two spatial nodes (`words: ["nodeA", "nodeB"]`).
+- `stats`: Single-pass statistical aggregates (`count`, `sum`, `min`, `max`, `mean`, `variance`, `std_dev`) for a specified numeric field using Welford's algorithm (`field: "fieldname"`).
 
-> [!NOTE]
-> The `haversine` and `stats` operations on `POST /v1/math` are scheduled for the **next release**.
-
-**Request Payload (Haversine Distance - Next Release)**:
+**Request Payload (Haversine Distance)**:
 ```json
 {
   "model": "airports",
@@ -213,7 +210,7 @@ Supported `op` values:
 }
 ```
 
-**Request Payload (In-Storage Statistics - Next Release)**:
+**Request Payload (In-Storage Statistics)**:
 ```json
 {
   "model": "telemetry",
@@ -318,9 +315,9 @@ Lists `.anchordb` partition files directly from an S3 bucket or prefix.
 **Request Payload**:
 ```json
 {
-  "endpoint": "https://s3.us-east-1.amazonaws.com",
-  "bucket": "my-archive-bucket",
-  "prefix": "anchordb/partitions/"
+  "s3_endpoint": "https://s3.us-east-1.amazonaws.com",
+  "s3_bucket": "my-archive-bucket",
+  "s3_prefix": "anchordb/partitions/"
 }
 ```
 
@@ -328,7 +325,11 @@ Lists `.anchordb` partition files directly from an S3 bucket or prefix.
 ```json
 {
   "success": true,
-  "objects": [
+  "endpoint": "https://s3.us-east-1.amazonaws.com",
+  "bucket": "my-archive-bucket",
+  "prefix": "anchordb/partitions/",
+  "count": 1,
+  "partitions": [
     {
       "key": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
       "size_bytes": 145020,
@@ -339,13 +340,13 @@ Lists `.anchordb` partition files directly from an S3 bucket or prefix.
 ```
 
 ### `POST /v1/partition/s3/inspect`
-Inspects records inside an archived partition stored in S3 directly in-memory without downloading to local disk storage.
+Inspects records inside an archived partition stored in S3 using the server's bounded local S3 partition cache (`S3PartitionCache`).
 
 **Request Payload (Inspect Record)**:
 ```json
 {
-  "endpoint": "https://s3.us-east-1.amazonaws.com",
-  "bucket": "my-archive-bucket",
+  "s3_endpoint": "https://s3.us-east-1.amazonaws.com",
+  "s3_bucket": "my-archive-bucket",
   "partition_file": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
   "name": "tx_old_1092"
 }
@@ -355,7 +356,7 @@ Inspects records inside an archived partition stored in S3 directly in-memory wi
 ```json
 {
   "success": true,
-  "partition_file": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
+  "target": "anchordb/partitions/2026-10-16_transactions_part1.anchordb",
   "name": "tx_old_1092",
   "props": {
     "amount": 250.0,
@@ -371,9 +372,10 @@ Retrieves the manifest of registered partition files and their date ranges.
 ```json
 {
   "success": true,
-  "model": "transactions",
-  "items": [
+  "count": 1,
+  "partitions": [
     {
+      "id": "2026-10-16_transactions_part1.anchordb",
       "partition_file": "2026-10-16_transactions_part1.anchordb",
       "model": "transactions",
       "record_count": 500,
@@ -401,9 +403,13 @@ Discovers which partition file contains a specific historical record.
 ```json
 {
   "success": true,
-  "name": "tx_old_1092",
   "model": "transactions",
-  "partition_file": "2026-10-16_transactions_part1.anchordb"
+  "name": "tx_old_1092",
+  "partition": {
+    "id": "2026-10-16_transactions_part1.anchordb",
+    "model": "transactions",
+    "partition_file": "2026-10-16_transactions_part1.anchordb"
+  }
 }
 ```
 

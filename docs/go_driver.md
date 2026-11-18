@@ -66,7 +66,6 @@ For embedded applications, command-line utilities, or local unit tests that do n
 client, err := driver.OpenEmbedded("./data",
     driver.WithModel("plant_iot"),
     driver.WithSyncInterval(5 * time.Second),
-    driver.WithWorkerConcurrency(4),
 )
 if err != nil {
     log.Fatalf("failed to initialize embedded engine: %v", err)

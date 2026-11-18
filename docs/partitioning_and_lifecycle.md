@@ -121,7 +121,7 @@ curl -X POST http://localhost:7447/v1/partition/inspect \
 
 ### Direct S3 Cold Partition Inspection
 
-AnchorDB supports inspecting archived partition files stored in S3 or MinIO **directly in-memory without downloading to local disk**:
+AnchorDB supports inspecting archived partition files stored in S3 or MinIO via its bounded local partition cache (`S3PartitionCache`):
 
 ```bash
 # 1. List partition objects in S3
@@ -129,18 +129,18 @@ curl -X POST http://localhost:7447/v1/partition/s3/list \
   -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "endpoint": "https://s3.us-east-1.amazonaws.com",
-    "bucket": "my-archive-bucket",
-    "prefix": "anchordb/partitions/"
+    "s3_endpoint": "https://s3.us-east-1.amazonaws.com",
+    "s3_bucket": "my-archive-bucket",
+    "s3_prefix": "anchordb/partitions/"
   }'
 
-# 2. Inspect record directly from S3 (streamed into RAM buffer)
+# 2. Inspect record from S3 partition (fetched via bounded local S3PartitionCache)
 curl -X POST http://localhost:7447/v1/partition/s3/inspect \
   -H "Authorization: Bearer $ANCHORDB_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "endpoint": "https://s3.us-east-1.amazonaws.com",
-    "bucket": "my-archive-bucket",
+    "s3_endpoint": "https://s3.us-east-1.amazonaws.com",
+    "s3_bucket": "my-archive-bucket",
     "partition_file": "anchordb/partitions/2026-10-16_part1.anchordb",
     "name": "sensor_archive_old_1"
   }'

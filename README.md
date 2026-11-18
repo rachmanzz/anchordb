@@ -13,11 +13,11 @@ AnchorDB is an embedded and network-accessible database engine written in Go. It
 
 - **Memory-Mapped Storage (`mmap`)**: Uses shared memory mapping for reading and writing records directly, with atomic snapshot synchronization to disk.
 - **In-Storage Computations**: Evaluates arithmetic expressions (`+`, `-`, `*`, `/`) and date math (epoch day arithmetic) directly during read queries or batch updates, avoiding the round-trip overhead of external compute layers.
-- **In-Storage Basic Statistics** *(Next Release)*: Evaluates single-pass statistical summaries (`Count`, `Sum`, `Min`, `Max`, `Mean`, `Variance`, `StdDev`) powered by B.P. Welford's algorithm, avoiding numerical cancellation without multi-pass memory overhead.
+- **In-Storage Basic Statistics**: Evaluates single-pass statistical summaries (`Count`, `Sum`, `Min`, `Max`, `Mean`, `Variance`, `StdDev`) powered by B.P. Welford's algorithm, avoiding numerical cancellation without multi-pass memory overhead.
 - **Compact Record Storage**: Key-value entity attributes are stored using contiguous binary structures and interned attribute names to reduce heap allocations and memory usage.
 - **Spatial & Causal Graph Capabilities**:
   - **2D Spatial Index**: Grid-based indexing supporting directional ray-casting, barycenter computation, and nearest-neighbor search.
-  - **Computational Geometry & Geofencing** *(Next Release)*: `Box2D` AABB bounding box, `Polygon2D` ray-casting geofencing, zero-sqrt radius filtering (`WithinRadius`), spherical Earth geodesics (`HaversineDistanceKM`), and compass forward azimuth (`InitialBearing`).
+  - **Computational Geometry & Geofencing**: `Box2D` AABB bounding box, `Polygon2D` ray-casting geofencing, zero-sqrt radius filtering (`WithinRadius`), spherical Earth geodesics (`HaversineDistanceKM`), and compass forward azimuth (`InitialBearing`).
   - **Causal Graph**: Directed, weighted edges (`source --relation--> target`) with support for single-step lookups and multi-hop causal chain traversal.
 - **Crash Durability & WAL**: Write-Ahead Logging with CRC32 frame checksums, automatic recovery on startup, and configurable sync modes (`always`, `interval`, `none`).
 - **Data Lifecycle & Archival**:
@@ -346,10 +346,7 @@ chain, _ := client.CausalChain([]string{"fuel_shortage"}, []string{"causes", "ca
 // Returns: [{"Word": "economic_crisis", "Score": ...}]
 ```
 
-### 6. Computational Geometry & Geofencing (Next Release)
-
-> [!NOTE]
-> The computational geometry package (`pkg/spatial`) and in-storage geometry query methods are scheduled for the **next release**.
+### 6. Computational Geometry & Geofencing
 
 ```go
 import "github.com/rachmanzz/anchordb/pkg/spatial"
@@ -376,10 +373,7 @@ nodesInGeofence, _ := db.FindNodesInPolygon(polygon, 50)
 nodesInProximity, _ := db.FindNodesInRadius(p1, 5.0, 10)
 ```
 
-### 7. In-Storage Basic Statistics (Next Release)
-
-> [!NOTE]
-> Single-pass statistical computations (`db.ComputeStats`, `db.ComputeStatsWithOptions`) are scheduled for the **next release**.
+### 7. In-Storage Basic Statistics
 
 ```go
 import "github.com/rachmanzz/anchordb/pkg/storage"

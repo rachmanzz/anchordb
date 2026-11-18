@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (Breaking API & Contract Semantics)
+- **`pkg/wire` strict encoders/decoders**: `Encode*` payload builders now return `([]byte, error)` (rejecting oversized slices/strings with `ErrPayloadOverflow` instead of truncating) and `Decode*` functions reject trailing bytes, invalid action codes, and inflated pre-allocation counts.
+- **`pkg/spatial` strict zero-vector validation**: `Point2D.Normalize()` now returns `(Point2D, error)` (`ErrInvalidVector`) instead of falling back to `(1, 0)`, and `NewRay` / `Ray.Normalize` return `(Ray, error)` (`ErrInvalidVector`).
+- **`pkg/driver` 64-bit date compute parity**: `AddDays` and `SubtractDays` accept `float64` instead of `float32`; `ResolveOptions` rejects invalid options (`WithModel("")`, `WithTimeout(<=0)`, `WithPoolSize(<=0)`).
+- **Strict negative-vs-zero validation**: HTTP handlers and driver queries (`/v1/list`, `/v1/partition/run`, `/v1/collector/run`, `/v1/graph`, `/v1/math`) now reject negative bounds (`limit`, `offset`, `retention_days`, `max_batch`, `limit_k`, `beam_width`) with HTTP `400` / error, while `0` continues to apply endpoint defaults.
+- **`pkg/worker` memory admission default**: `Pool.EnforceMemory` is enabled by default (`true`) unless explicitly disabled via `DisableMemoryEnforcement` (`-worker-enforce-memory` flag default updated to `true`).
+- **S3 partition run parity**: `PartitionRunRequest` adds `s3_region` and falls back to server `s3Default*` settings; `POST /v1/partition/run` and `POST /v1/collector/run` validate `model` with `sanitizeModelName` before async dispatch.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added
