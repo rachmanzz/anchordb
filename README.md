@@ -103,11 +103,11 @@ Pre-built native packages are published on [GitHub Releases](https://github.com/
 
 ```bash
 # Ubuntu / Debian (.deb)
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.0_amd64.deb
-sudo dpkg -i anchordb_0.2.0_amd64.deb
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.1_amd64.deb
+sudo dpkg -i anchordb_0.2.1_amd64.deb
 
 # RHEL / CentOS / Fedora (.rpm)
-sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.0_amd64.rpm
+sudo rpm -ivh https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.1_amd64.rpm
 ```
 
 Verify service status:
@@ -155,7 +155,7 @@ services:
 To connect your Go application to AnchorDB or embed the engine:
 
 ```bash
-go get github.com/rachmanzz/anchordb/pkg/driver@v0.2.0
+go get github.com/rachmanzz/anchordb/pkg/driver@v0.2.1
 ```
 
 ### 4. Standalone Binaries (Linux & macOS)
@@ -163,15 +163,15 @@ go get github.com/rachmanzz/anchordb/pkg/driver@v0.2.0
 Download universal pre-compiled archives (`.tar.gz`) for Linux or macOS from [GitHub Releases](https://github.com/rachmanzz/anchordb/releases):
 
 ```bash
-wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.0_linux_amd64.tar.gz
-tar -xzf anchordb_0.2.0_linux_amd64.tar.gz
+wget https://github.com/rachmanzz/anchordb/releases/latest/download/anchordb_0.2.1_linux_amd64.tar.gz
+tar -xzf anchordb_0.2.1_linux_amd64.tar.gz
 export ANCHORDB_AUTH_TOKEN="your-secure-token"
 ./anchordb-server -wire-port 7448 -data-dir ./data
 ```
 
 ### 5. Building from Source
 
-Prerequisites: Go 1.26 or newer (toolchain `go1.27.2+` recommended).
+Prerequisites: Go 1.26 or newer (toolchain `go1.27.4+` recommended).
 
 ```bash
 git clone https://github.com/rachmanzz/anchordb.git

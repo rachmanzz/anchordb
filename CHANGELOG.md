@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-18
+
+### Security & Dependencies
+- Bump Go toolchain to `1.27.4` in `go.mod` and CI to include standard-library fixes for `GO-2026-6809` (`crypto/x509`) and `GO-2026-6859` (`net/http`).
+- Pin `govulncheck@v1.10.0` in `.github/workflows/ci.yml` for reproducible vulnerability scans.
+
+### Documentation
+- Align `docs/` (`storage_and_durability.md`, `in_storage_compute.md`, `go_driver.md`, `anchorwire.md`, `rest_api.md`, `background_subsystems.md`) with `v0.2.0` contracts (`DBVersion = 4`, `SaveTyped`/`GetTyped`, `OpCausalChain`, full cold-tier fallback, `s3_region`, negative-bound rejections, and default memory admission control).
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
