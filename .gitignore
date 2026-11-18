@@ -29,3 +29,7 @@ Thumbs.db
 # Local knowledge base (all contents ignored without exception)
 .knowledges/
 .knowledges/**
+
+# Local agent rules and skills
+.agents/
+AGENTS.md
