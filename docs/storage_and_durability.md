@@ -14,7 +14,7 @@ The file begins with a 64-byte fixed-size header:
 | Offset (Bytes) | Size (Bytes) | Field | Description |
 | :---: | :---: | :--- | :--- |
 | `0..3` | 4 | Magic | Format identifier (`"ANCH"`) |
-| `4..7` | 4 | Version | Database format version (`3`) |
+| `4..7` | 4 | Version | Database format version (`DBVersion = 4`; readers accept `1..4`) |
 | `8..15` | 8 | Node Count | Total number of spatial nodes |
 | `16..17` | 2 | Grid Cells X | Spatial grid width |
 | `18..19` | 2 | Grid Cells Y | Spatial grid height |
@@ -25,7 +25,7 @@ The file begins with a 64-byte fixed-size header:
 | `52..59` | 8 | Entity Offset | Byte offset of entity attributes |
 | `60..63` | 4 | Reserved | Padding |
 
-Version 3 stores the optional causal-edge section after the entity section; its offset is not a header field.
+Version 3 stores the optional causal-edge section after the entity section; its offset is not a header field. Version 4 (`DBVersion = 4`) introduces typed numeric attributes (`float32`, `int64`, `uint64`, `float64`) encoded with `RawTypedFlag`, while keeping full read compatibility with v1–v3 files.
 
 ### Record Layout
 * **Spatial Nodes (40 Bytes Fixed)**:

@@ -60,7 +60,7 @@ The worker pool provides bounded, non-blocking asynchronous task execution for h
 ### Key Capabilities
 1. **Bounded Queue & Fast Failure**: Tasks are queued in a bounded Go channel. If the queue fills up, new submissions fail fast with `ErrQueueFull` (`HTTP 503` or `429`) rather than consuming unbounded memory.
 2. **Fixed Concurrency**: Limits concurrent worker goroutines (`ANCHORDB_WORKER_CONCURRENCY`, default `CPU * 2`) to prevent CPU exhaustion.
-3. **Memory Pressure Admission**: When enabled (`ANCHORDB_WORKER_ENFORCE_MEMORY=true`), task submissions are rejected if total memory usage exceeds the configured threshold (`ANCHORDB_WORKER_MEMORY_THRESHOLD`, e.g., 85%).
+3. **Memory Pressure Admission**: Enabled by default (`-worker-enforce-memory=true` / `ANCHORDB_WORKER_ENFORCE_MEMORY=true`); task submissions are rejected if total memory usage exceeds the configured threshold (`ANCHORDB_WORKER_MEMORY_THRESHOLD`, e.g., 85%) unless explicitly disabled.
 4. **Scoped Task Cancellation**: Tasks can be canceled before execution by Job ID (`job_id`), Target Model (`model`), or Global Drain (`{"all": true}`).
 5. **Panic Recovery**: Worker loops isolate panics in user tasks or completion callbacks, converting failures to logged error events without crashing the pool.
 

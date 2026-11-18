@@ -172,6 +172,30 @@ autoID, err := client.SaveAutoID(map[string]float32{
 })
 ```
 
+### Typed 64-Bit Records (`SaveTyped`, `GetTyped`, `EntityResult`)
+When exact 64-bit integer or double-precision values are required (beyond `float32`'s 24-bit significand), use the typed APIs (`storage.AttrEntry`) and typed getters (`GetInt`, `GetUint`, `GetFloat64`, `GetDate`). Date compute helpers (`driver.AddDays`, `driver.SubtractDays`) also accept `float64` offsets:
+
+```go
+_, err = client.SaveTyped("ledger_1", []storage.AttrEntry{
+    storage.NewInt64Attr("balance_cents", 9007199254740993),
+    storage.NewUint64Attr("seq", 18446744073709551610),
+    storage.NewDateAttr("settled_on", 20740),
+})
+
+// Exact raw record inspection
+cr, err := client.GetTyped("ledger_1")
+seq, ok, err := cr.GetUint("seq")
+
+// Or typed projection/compute via GetBuilder
+res, err := client.Get("ledger_1").
+    Compute("due_on", driver.AddDays("settled_on", 30)).
+    Execute(ctx)
+balance := res.GetInt("balance_cents")
+dueDate := res.GetDate("due_on")
+```
+
+> **Spatial Vector Validation**: In `pkg/spatial`, `Point2D.Normalize()`, `NewRay()`, and `Ray.Normalize()` return `spatial.ErrInvalidVector` on zero-length, `NaN`, or `Inf` vectors instead of falling back to `(1, 0)`.
+
 ### In-Storage Computations (`GetBuilder`)
 AnchorDB computes derived attributes on-the-fly inside the database without copying or parsing entire records:
 

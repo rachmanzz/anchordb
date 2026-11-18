@@ -83,11 +83,13 @@ AnchorWire supports record saves and batches, `Get`/`List`/`Update` builders, gr
 
 ## Cold Storage & Partition Operations on AnchorWire
 
-AnchorWire extends beyond active memory-mapped operations to support cold partition discovery and inspection:
+AnchorWire extends beyond active memory-mapped operations to support multi-hop causal traversal, cold-tier fallback, and partition inspection:
 
+* **`OpCausalChain` (`0x1E`)**: Executes multi-hop causal chain queries in a single RPC round-trip (`client.CausalChain`).
 * **`OpPartitionCatalog` (`0x20`)**: Retrieves the metadata manifest of archived partitions for a given model or all models, including file size, creation timestamp, and date range bounds.
-* **`OpPartitionInspect` (`0x21`)**: Safely inspects a specific archived record or lists sample records directly from an archived `.anchordb` partition file.
-* **Transparent Cold-Tier Query**: When executing `OpGet`, if the record has been pruned from the hot database, AnchorWire automatically searches cold tier storage. The response header carries `FlagColdTier = 0x08`, allowing the client to know whether data came from hot memory or cold archive.
+* **`OpPartitionInspect` (`0x21`)**: Safely inspects a specific archived record or filters/paginates records (`HasMore`) directly from an archived `.anchordb` partition file.
+* **Transparent Cold-Tier Fallback (`FlagColdTier = 0x08`)**: When hot records have been archived and pruned, AnchorWire transparently falls back to cold tier storage across `OpGet`, `OpList`, `OpUpdate`, `OpGraph`, `OpGraphChain`, `OpCausal`, `OpCausalChain`, `OpMath`, and `OpGetSchema`. Responses served from cold archives carry `FlagColdTier = 0x08`.
+* **Framing & Admission Limits**: Authenticated frames are bounded to `64 MiB` (`MaxPayloadSize`) and pre-auth frames to `64 KiB` (`MaxPreAuthPayloadSize`); oversized encoders return `ErrPayloadOverflow`. Write RPCs under critical memory pressure (`>= 93%`) return Wire error code `507` (Insufficient Storage).
 
 ## Operations that use HTTP
 

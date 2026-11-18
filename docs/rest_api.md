@@ -30,7 +30,14 @@ Returns server operational health. Unauthenticated requests receive basic status
 }
 ```
 
-With a valid bearer token, the response also includes `uptime_seconds`, `port`, `loaded_models`, `memory`, and `background`.
+With a valid bearer token, the response also includes `uptime_seconds`, `port`, `loaded_models`, `memory`, and `background`. `/health` returns `503 Service Unavailable` when draining during graceful shutdown, when the Wire server is closed, or when process memory usage reaches `>= 93%` of its limit.
+
+### Status Codes & Admission Control
+* **`400 Bad Request`**: Malformed JSON, invalid model names (validated by `sanitizeModelName` before sync/async dispatch), or negative bounds (`limit`, `offset`, `retention_days`, `max_batch`, `limit_k`, `beam_width`; `0` selects endpoint defaults).
+* **`413 Payload Too Large`**: Request bodies exceeding `10 MiB` (`http.MaxBytesReader`).
+* **`422 Unprocessable Entity`**: In-storage computation errors (`ErrComputeFailed`, `ErrIntegerOverflow`, division by zero).
+* **`503 Service Unavailable`**: Database closed or worker pool unavailable/draining.
+* **`507 Insufficient Storage`**: Write admission control rejection on `/v1/save`, `/v1/save_batch`, `/v1/update`, and `/v1/edge` when memory usage reaches `>= 93%` (with background auto-sync triggered at `>= 88%`).
 
 ### `GET /metrics`
 Exports metrics formatted for Prometheus scrapers:
@@ -258,7 +265,7 @@ Archives historical records older than the retention threshold.
 }
 ```
 
-For a local sink, `target_path` must resolve inside the configured data directory; omit it to use the default `partitions` subdirectory.
+For a local sink, `target_path` must resolve inside the configured data directory; omit it to use the default `partitions` subdirectory. For `"sink_type": "s3"`, optional fields `s3_endpoint`, `s3_bucket`, `s3_prefix`, `s3_region`, `s3_access_key`, and `s3_secret_key` override server-configured `ServerConfig.S3Default*` defaults (falling back to bucket `"anchordb-archive"`, prefix `"partitions"`, and region `"us-east-1"` when unset). Negative `retention_days` or invalid `model` names fail with `400 Bad Request` prior to async dispatch.
 
 ### `GET /v1/partition/list`
 Lists available archived partition files in the partition storage directory.
