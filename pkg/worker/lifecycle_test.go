@@ -71,11 +71,12 @@ func TestFallbackRecoversTask(t *testing.T) {
 	if atomic.LoadInt32(&fallbackHit) != 1 {
 		t.Fatalf("expected fallback hit once, got %d", atomic.LoadInt32(&fallbackHit))
 	}
-	if atomic.LoadInt32(&success) != 1 {
-		t.Fatalf("expected OnSuccess once (via fallback), got %d", atomic.LoadInt32(&success))
+	if atomic.LoadInt32(&success) != 0 {
+		t.Fatalf("OnSuccess must not fire when primary fails and fallback recovers, got %d", atomic.LoadInt32(&success))
 	}
-	if pool.Stats().Completed != 1 {
-		t.Fatalf("fallback-recovered task should count as completed")
+	st := pool.Stats()
+	if st.FallbackSuccesses != 1 || st.Completed != 0 {
+		t.Fatalf("fallback-recovered task must increment FallbackSuccesses without masking Completed, got %+v", st)
 	}
 }
 
@@ -330,6 +331,7 @@ func TestCancelByModelAndID(t *testing.T) {
 	)
 
 	// Queue 1 task with specific ID "target-task-id"
+	var taskCCanceled int32
 	_ = pool.Dispatch(context.Background(), "jobC_specific",
 		func(context.Context) error {
 			atomic.AddInt32(&taskCExecuted, 1)
@@ -337,6 +339,11 @@ func TestCancelByModelAndID(t *testing.T) {
 		},
 		WithID("target-task-id"),
 		WithModel("modelC"),
+		WithOnError(func(_ context.Context, err error) {
+			if errors.Is(err, ErrCanceled) {
+				atomic.AddInt32(&taskCCanceled, 1)
+			}
+		}),
 	)
 
 	if pool.Queued() != 4 {
@@ -352,7 +359,27 @@ func TestCancelByModelAndID(t *testing.T) {
 		t.Fatalf("expected 2 OnError(ErrCanceled) for modelA, got %d", atomic.LoadInt32(&modelACanceled))
 	}
 
-	// Unblock worker and let remaining modelB and modelC tasks execute
+	// Cancel specific task by ID and verify edge cases
+	if pool.CancelByID("") {
+		t.Fatalf("expected CancelByID(\"\") to return false")
+	}
+	if pool.CancelByID("non-existent-id") {
+		t.Fatalf("expected CancelByID(\"non-existent-id\") to return false")
+	}
+	if !pool.CancelByID("target-task-id") {
+		t.Fatalf("expected CancelByID(\"target-task-id\") to return true")
+	}
+	if pool.CancelByID("target-task-id") {
+		t.Fatalf("expected duplicate CancelByID(\"target-task-id\") to return false")
+	}
+	if atomic.LoadInt32(&taskCCanceled) != 1 {
+		t.Fatalf("expected 1 OnError(ErrCanceled) for target-task-id, got %d", atomic.LoadInt32(&taskCCanceled))
+	}
+	if pool.Queued() != 1 {
+		t.Fatalf("expected 1 queued task remaining (modelB), got %d", pool.Queued())
+	}
+
+	// Unblock worker and let remaining modelB task execute
 	close(release)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -362,8 +389,8 @@ func TestCancelByModelAndID(t *testing.T) {
 	if atomic.LoadInt32(&modelBExecuted) != 1 {
 		t.Fatalf("expected modelB job to execute successfully, got %d", atomic.LoadInt32(&modelBExecuted))
 	}
-	if atomic.LoadInt32(&taskCExecuted) != 1 {
-		t.Fatalf("expected modelC job to execute successfully, got %d", atomic.LoadInt32(&taskCExecuted))
+	if atomic.LoadInt32(&taskCExecuted) != 0 {
+		t.Fatalf("expected canceled target-task-id not to execute, got %d", atomic.LoadInt32(&taskCExecuted))
 	}
 }
 

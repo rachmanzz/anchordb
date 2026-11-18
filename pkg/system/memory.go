@@ -206,6 +206,7 @@ type MemoryHeadroom struct {
 	UsedPercent    uint8  `json:"used_percent"`
 	HeadroomBytes  uint64 `json:"headroom_bytes"`
 	CgroupLimited  bool   `json:"cgroup_limited"`
+	LimitKnown     bool   `json:"limit_known"`
 	Source         string `json:"source"`
 }
 
@@ -372,7 +373,7 @@ func computeMemoryHeadroom() MemoryHeadroom {
 				}
 			}
 		}
-		if hostTotal > 0 && hostAvailable > 0 {
+		if hostTotal > 0 {
 			hasHostInfo = true
 		}
 	}
@@ -383,7 +384,12 @@ func computeMemoryHeadroom() MemoryHeadroom {
 
 	// 3. Synthesize effective memory headroom
 	if hasHostInfo {
-		hostUsed := hostTotal - hostAvailable
+		var hostUsed uint64
+		if hostTotal > hostAvailable {
+			hostUsed = hostTotal - hostAvailable
+		} else {
+			hostAvailable = hostTotal
+		}
 		hostUsedPct := uint8((hostUsed * 100) / hostTotal)
 
 		if cgroupLimit > 0 && hasCgroupUsed {
@@ -414,6 +420,7 @@ func computeMemoryHeadroom() MemoryHeadroom {
 				UsedPercent:    effectiveUsedPct,
 				HeadroomBytes:  effectiveHeadroom,
 				CgroupLimited:  true,
+				LimitKnown:     true,
 				Source:         "cgroup+proc/meminfo",
 			}
 		}
@@ -424,6 +431,7 @@ func computeMemoryHeadroom() MemoryHeadroom {
 			UsedPercent:    hostUsedPct,
 			HeadroomBytes:  hostAvailable,
 			CgroupLimited:  false,
+			LimitKnown:     true,
 			Source:         "proc/meminfo",
 		}
 	}
@@ -444,6 +452,7 @@ func computeMemoryHeadroom() MemoryHeadroom {
 			UsedPercent:    usedPct,
 			HeadroomBytes:  avail,
 			CgroupLimited:  true,
+			LimitKnown:     true,
 			Source:         "cgroup",
 		}
 	}
@@ -467,18 +476,21 @@ func computeMemoryHeadroom() MemoryHeadroom {
 			UsedPercent:    usedPct,
 			HeadroomBytes:  avail,
 			CgroupLimited:  cgroupLimit > 0,
+			LimitKnown:     true,
 			Source:         "runtime.GOMEMLIMIT",
 		}
 	}
 
-	// Safe conservative fallback
+	// No measurable host, cgroup, or GOMEMLIMIT ceiling exists; report LimitKnown=false
+	// without fabricating a synthetic percentage.
 	return MemoryHeadroom{
-		TotalBytes:     m.Sys * 2,
+		TotalBytes:     m.Sys,
 		AvailableBytes: m.Sys,
-		UsedPercent:    50,
+		UsedPercent:    0,
 		HeadroomBytes:  m.Sys,
 		CgroupLimited:  false,
-		Source:         "runtime.SysFallback",
+		LimitKnown:     false,
+		Source:         "runtime.Unknown",
 	}
 }
 

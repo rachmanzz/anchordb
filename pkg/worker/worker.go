@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/rachmanzz/anchordb/pkg/system"
 )
 
 // ErrQueueFull is returned when the worker pool queue is full
@@ -67,7 +69,7 @@ func DefaultConfig() Config {
 		Concurrency:     concurrency,
 		QueueSize:       1000,
 		ShutdownTimeout: 5 * time.Second,
-		EnforceMemory:   false,
+		EnforceMemory:   true,
 		MaxMemoryBytes:  0,
 		MemoryThreshold: 0.85,
 	}
@@ -118,14 +120,17 @@ type Task struct {
 	// RetryBackoffJitter adds random jitter up to this amount to backoff
 	RetryBackoffJitter time.Duration
 
-	// OnSuccess is called once if execution eventually succeeds
+	// OnSuccess is called once if primary execution succeeds
 	OnSuccess func(ctx context.Context)
 
-	// OnError is called on final failure
+	// OnError is called on final failure (or cancellation)
 	OnError func(ctx context.Context, err error)
 
-	// Fallback is called if all attempts fail; if returns nil -> treated as SUCCESS
+	// Fallback is called if all attempts fail; if returns nil -> recorded under FallbackSuccesses
 	Fallback func(ctx context.Context, err error) error
+
+	// OnFallback is called when primary execution failed and Fallback recovered with nil error
+	OnFallback func(ctx context.Context, primaryErr error)
 }
 
 // Option is a functional option to configure Task
@@ -134,9 +139,6 @@ type Option func(*Task)
 // WithRetry sets retry count and base backoff
 func WithRetry(count int, backoff time.Duration) Option {
 	return func(t *Task) {
-		if count < 0 {
-			count = 0
-		}
 		t.RetryCount = count
 		t.RetryBackoffBase = backoff
 	}
@@ -170,6 +172,13 @@ func WithFallback(fn func(ctx context.Context, err error) error) Option {
 	}
 }
 
+// WithOnFallback registers callback invoked when primary attempts fail and Fallback recovers.
+func WithOnFallback(fn func(ctx context.Context, primaryErr error)) Option {
+	return func(t *Task) {
+		t.OnFallback = fn
+	}
+}
+
 // WithContext sets per-task context
 func WithContext(ctx context.Context) Option {
 	return func(t *Task) {
@@ -195,12 +204,17 @@ type jobItem struct {
 	task Task
 }
 
-// Pool manages concurrent background job execution using pure Go standard library channels
+// Pool manages concurrent background job execution using pure Go synchronization primitives
 type Pool struct {
 	cfg               Config
-	lifecycleMu       sync.Mutex   // serializes Start/Shutdown (and restart)
-	chanMu            sync.RWMutex // guards taskCh/quitCh/forceCtx/forceCancel/taskClosed/quitClosed
-	taskCh            chan jobItem
+	cfgErr            error
+	lifecycleMu       sync.Mutex // serializes Start/Shutdown (and restart)
+	cancelMu          sync.Mutex // serializes CancelMatching without blocking queueMu during predicates
+	queueMu           sync.Mutex // guards queue/reservedSlots/drainCh/quitCh/forceCtx/forceCancel/taskClosed/quitClosed
+	queue             []jobItem
+	reservedSlots     int
+	queueNotify       chan struct{}
+	drainCh           chan struct{}
 	quitCh            chan struct{}
 	forceCtx          context.Context
 	forceCancel       context.CancelFunc
@@ -252,29 +266,46 @@ func (p *Pool) resetPending() {
 
 // NewPool initializes a pure Go worker pool instance
 func NewPool(cfg Config) *Pool {
-	if cfg.Concurrency <= 0 {
+	var errs []string
+	if cfg.Concurrency < 0 {
+		errs = append(errs, fmt.Sprintf("concurrency %d must be non-negative", cfg.Concurrency))
+	} else if cfg.Concurrency == 0 {
 		cfg.Concurrency = runtime.NumCPU() * 2
 		if cfg.Concurrency < 2 {
 			cfg.Concurrency = 2
 		}
 	}
-	if cfg.QueueSize <= 0 {
+	if cfg.QueueSize < 0 {
+		errs = append(errs, fmt.Sprintf("queue_size %d must be non-negative", cfg.QueueSize))
+	} else if cfg.QueueSize == 0 {
 		cfg.QueueSize = 1000
 	}
-	if cfg.ShutdownTimeout <= 0 {
+	if cfg.ShutdownTimeout < 0 {
+		errs = append(errs, fmt.Sprintf("shutdown_timeout %v must be non-negative", cfg.ShutdownTimeout))
+	} else if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
 	}
-	if cfg.MemoryThreshold <= 0 {
+	if math.IsNaN(cfg.MemoryThreshold) || cfg.MemoryThreshold < 0 || cfg.MemoryThreshold > 1 {
+		errs = append(errs, fmt.Sprintf("memory_threshold %v must be within (0, 1]", cfg.MemoryThreshold))
+	} else if cfg.MemoryThreshold == 0 {
 		cfg.MemoryThreshold = 0.85
 	}
-	if cfg.MemoryThreshold > 1 {
-		cfg.MemoryThreshold = 1
+	if cfg.MaxMemoryBytes < 0 {
+		errs = append(errs, fmt.Sprintf("max_memory_bytes %d must be non-negative", cfg.MaxMemoryBytes))
+	}
+
+	var cfgErr error
+	if len(errs) > 0 {
+		cfgErr = fmt.Errorf("worker: invalid config: %s", strings.Join(errs, "; "))
 	}
 
 	forceCtx, forceCancel := context.WithCancel(context.Background())
 	return &Pool{
 		cfg:         cfg,
-		taskCh:      make(chan jobItem, cfg.QueueSize),
+		cfgErr:      cfgErr,
+		queue:       make([]jobItem, 0),
+		queueNotify: make(chan struct{}, 1),
+		drainCh:     make(chan struct{}),
 		quitCh:      make(chan struct{}),
 		forceCtx:    forceCtx,
 		forceCancel: forceCancel,
@@ -361,21 +392,35 @@ func readProcRSS() (uint64, bool) {
 	return pages * uint64(os.Getpagesize()), true
 }
 
+func (p *Pool) effectiveMemoryLimit() int64 {
+	if p.cfg.MaxMemoryBytes > 0 {
+		return p.cfg.MaxMemoryBytes
+	}
+	if limit := debug.SetMemoryLimit(-1); limit > 0 && limit < math.MaxInt64 {
+		return limit
+	}
+	if cgroupLimit, err := system.DetectCgroupMemoryLimit(); err == nil && cgroupLimit > 0 {
+		return cgroupLimit
+	}
+	return math.MaxInt64
+}
+
 func (p *Pool) checkMemory() error {
 	if !p.cfg.EnforceMemory {
 		return nil
 	}
-	limit := p.cfg.MaxMemoryBytes
-	if limit <= 0 {
-		limit = debug.SetMemoryLimit(-1)
+	limit := p.effectiveMemoryLimit()
+	if limit > 0 && limit < math.MaxInt64 {
+		usage, _ := processMemoryUsage()
+		thresh := float64(limit) * p.cfg.MemoryThreshold
+		if float64(usage) >= thresh {
+			return ErrMemoryFull
+		}
+		return nil
 	}
-	if limit <= 0 || limit == math.MaxInt64 {
-		return nil // unlimited
-	}
-
-	usage, _ := processMemoryUsage()
-	thresh := float64(limit) * p.cfg.MemoryThreshold
-	if float64(usage) >= thresh {
+	// No process/cgroup memory limit configured; enforce emergency host headroom guard
+	// only when host limit is measurably known and critically saturated.
+	if h := system.GetMemoryHeadroom(); h.LimitKnown && h.UsedPercent >= 93 && float64(h.UsedPercent) >= p.cfg.MemoryThreshold*100 {
 		return ErrMemoryFull
 	}
 	return nil
@@ -401,9 +446,12 @@ func (p *Pool) Start() {
 	}
 }
 
-// StartWithError boots worker goroutines and returns ErrPoolStartBlocked if the
-// pool cannot safely restart after a forced shutdown.
+// StartWithError boots worker goroutines and returns an error if the config is
+// invalid or the pool cannot safely restart after a forced shutdown.
 func (p *Pool) StartWithError() error {
+	if p.cfgErr != nil {
+		return p.cfgErr
+	}
 	if !p.cfg.Enabled {
 		return nil
 	}
@@ -416,16 +464,18 @@ func (p *Pool) StartWithError() error {
 		if p.forced.Load() {
 			return ErrPoolStartBlocked
 		}
-		p.chanMu.Lock()
+		p.queueMu.Lock()
 		if p.forceCancel != nil {
 			p.forceCancel()
 		}
 		p.forceCtx, p.forceCancel = context.WithCancel(context.Background())
-		p.taskCh = make(chan jobItem, p.cfg.QueueSize)
+		p.queue = make([]jobItem, 0)
+		p.reservedSlots = 0
+		p.drainCh = make(chan struct{})
 		p.quitCh = make(chan struct{})
 		p.taskClosed = false
 		p.quitClosed = false
-		p.chanMu.Unlock()
+		p.queueMu.Unlock()
 		p.stopped.Store(false)
 		p.resetPending()
 		p.inflight.Store(0)
@@ -433,17 +483,17 @@ func (p *Pool) StartWithError() error {
 	p.draining.Store(false)
 	p.running.Store(true)
 
-	p.chanMu.RLock()
-	taskCh, quitCh, forceCtx := p.taskCh, p.quitCh, p.forceCtx
-	p.chanMu.RUnlock()
+	p.queueMu.Lock()
+	drainCh, quitCh, notifyCh, forceCtx := p.drainCh, p.quitCh, p.queueNotify, p.forceCtx
+	p.queueMu.Unlock()
 	for i := 0; i < p.cfg.Concurrency; i++ {
 		p.wg.Add(1)
-		go p.workerLoop(taskCh, quitCh, forceCtx)
+		go p.workerLoop(drainCh, quitCh, notifyCh, forceCtx)
 	}
 	return nil
 }
 
-func (p *Pool) workerLoop(taskCh <-chan jobItem, quitCh <-chan struct{}, forceCtx context.Context) {
+func (p *Pool) workerLoop(drainCh <-chan struct{}, quitCh <-chan struct{}, notifyCh <-chan struct{}, forceCtx context.Context) {
 	defer p.wg.Done()
 	for {
 		// Prioritize quitCh so force-shutdown never keeps dequeuing buffered tasks.
@@ -452,17 +502,40 @@ func (p *Pool) workerLoop(taskCh <-chan jobItem, quitCh <-chan struct{}, forceCt
 			return
 		default:
 		}
-		select {
-		case <-quitCh:
-			return
-		case job, ok := <-taskCh:
-			if !ok {
-				return
+
+		p.queueMu.Lock()
+		if len(p.queue) > 0 {
+			job := p.queue[0]
+			p.queue[0] = jobItem{}
+			p.queue = p.queue[1:]
+			if len(p.queue) == 0 {
+				p.queue = p.queue[:0]
 			}
+			if len(p.queue) > 0 {
+				select {
+				case p.queueNotify <- struct{}{}:
+				default:
+				}
+			}
+			p.queueMu.Unlock()
+
 			p.inflight.Add(1)
 			p.executeJob(job.task, quitCh, forceCtx)
 			p.inflight.Add(-1)
 			p.decPending()
+			continue
+		}
+		closed := p.taskClosed
+		p.queueMu.Unlock()
+		if closed {
+			return
+		}
+
+		select {
+		case <-quitCh:
+			return
+		case <-drainCh:
+		case <-notifyCh:
 		}
 	}
 }
@@ -563,16 +636,15 @@ FINAL:
 			fbErr = t.Fallback(ctx, finalErr)
 		}()
 		if fbErr == nil {
-			p.completed.Add(1)
 			p.fallbackSuccesses.Add(1)
-			if t.OnSuccess != nil {
+			if t.OnFallback != nil {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("[WORKER] OnSuccess panic on task %q (via fallback): %v", t.Name, r)
+							log.Printf("[WORKER] OnFallback panic on task %q: %v", t.Name, r)
 						}
 					}()
-					t.OnSuccess(ctx)
+					t.OnFallback(ctx, finalErr)
 				}()
 			}
 			return
@@ -594,7 +666,7 @@ FINAL:
 	log.Printf("[WORKER] Task %q FAILED (all attempts): %v (duration: %v)", t.Name, finalErr, time.Since(start))
 }
 
-// Dispatch submits an async task to the worker pool. If pool is disabled or not running, runs synchronously.
+// Dispatch submits an async task to the worker pool. Returns ErrWorkerUnavailable if disabled or not running.
 func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Context) error, opts ...Option) error {
 	task := Task{
 		Name: name,
@@ -606,29 +678,31 @@ func (p *Pool) Dispatch(ctx context.Context, name string, fn func(ctx context.Co
 			o(&task)
 		}
 	}
-	return p.dispatchTask(task, true)
+	return p.dispatchTask(task)
 }
 
 // DispatchAsync enqueues a task without falling back to synchronous execution.
-// Use this when the caller promises that work will run in the background.
 func (p *Pool) DispatchAsync(ctx context.Context, name string, fn func(ctx context.Context) error, opts ...Option) error {
-	task := Task{Name: name, Fn: fn, Ctx: ctx}
-	for _, o := range opts {
-		if o != nil {
-			o(&task)
-		}
-	}
-	return p.dispatchTask(task, false)
+	return p.Dispatch(ctx, name, fn, opts...)
 }
 
 // DispatchTask submits a Task to the worker pool.
 func (p *Pool) DispatchTask(t Task) error {
-	return p.dispatchTask(t, true)
+	return p.dispatchTask(t)
 }
 
-func (p *Pool) dispatchTask(t Task, allowSync bool) error {
+func (p *Pool) dispatchTask(t Task) error {
+	if p.cfgErr != nil {
+		return p.cfgErr
+	}
 	if t.Fn == nil {
 		return errors.New("task function is nil")
+	}
+	if t.RetryCount < 0 {
+		return fmt.Errorf("worker: negative retry count %d for task %q", t.RetryCount, t.Name)
+	}
+	if t.RetryBackoffBase < 0 || t.RetryBackoffJitter < 0 {
+		return fmt.Errorf("worker: negative retry backoff/jitter for task %q", t.Name)
 	}
 	if p.draining.Load() {
 		p.failed.Add(1)
@@ -647,166 +721,49 @@ func (p *Pool) dispatchTask(t Task, allowSync bool) error {
 		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, err)
 	}
 	if !p.cfg.Enabled || !p.running.Load() {
-		if !allowSync {
-			return ErrWorkerUnavailable
-		}
+		p.failed.Add(1)
 		if p.forced.Load() {
-			p.failed.Add(1)
 			return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrPoolStartBlocked)
 		}
-		p.executeJobSync(t)
-		return nil
+		return ErrWorkerUnavailable
 	}
 
 	p.incPending()
 	item := jobItem{task: t}
 
-	// Hold the read lock across the non-blocking send so Shutdown cannot close
-	// the channel in between (which would panic on send-to-closed). The closed /
-	// draining state MUST be re-checked under this lock: the checks above are
-	// only a fast path and race with Shutdown (TOCTOU).
-	p.chanMu.RLock()
-	defer p.chanMu.RUnlock()
-
+	p.queueMu.Lock()
 	if p.taskClosed || p.draining.Load() {
+		p.queueMu.Unlock()
 		p.decPending()
 		p.failed.Add(1)
 		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
 	}
 	if !p.cfg.Enabled || !p.running.Load() {
+		p.queueMu.Unlock()
 		p.decPending()
 		p.failed.Add(1)
-		if !allowSync {
-			return ErrWorkerUnavailable
-		}
-		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrDraining)
+		return ErrWorkerUnavailable
 	}
 	if err := ctx.Err(); err != nil {
+		p.queueMu.Unlock()
 		p.decPending()
 		p.failed.Add(1)
 		return err
 	}
-
-	select {
-	case p.taskCh <- item:
-		p.dispatched.Add(1)
-		return nil
-	case <-ctx.Done():
-		p.decPending()
-		p.failed.Add(1)
-		return ctx.Err()
-	default:
+	if len(p.queue)+p.reservedSlots >= p.cfg.QueueSize {
+		p.queueMu.Unlock()
 		p.decPending()
 		p.failed.Add(1)
 		return fmt.Errorf("failed to dispatch task %q: %w", t.Name, ErrQueueFull)
 	}
-}
-
-func (p *Pool) executeJobSync(t Task) {
-	start := time.Now()
-	ctx := t.Ctx
-	if ctx == nil {
-		ctx = context.Background()
+	p.queue = append(p.queue, item)
+	p.dispatched.Add(1)
+	select {
+	case p.queueNotify <- struct{}{}:
+	default:
 	}
-
-	var lastErr error
-	attempts := 1 + t.RetryCount
-	for i := 0; i < attempts; i++ {
-		var err error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic: %v", r)
-				}
-			}()
-			err = t.Fn(ctx)
-		}()
-		if err == nil {
-			p.completed.Add(1)
-			if t.OnSuccess != nil {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							log.Printf("[WORKER] OnSuccess panic on task %q: %v", t.Name, r)
-						}
-					}()
-					t.OnSuccess(ctx)
-				}()
-			}
-			return
-		}
-		lastErr = err
-		if i < attempts-1 {
-			if cErr := ctx.Err(); cErr != nil {
-				lastErr = cErr
-				goto FINALSYNC
-			}
-			p.retries.Add(1)
-			d := t.RetryBackoffBase
-			if d > 0 && t.RetryBackoffJitter > 0 {
-				j := time.Duration(rand.Int63n(int64(t.RetryBackoffJitter)))
-				d += j
-			}
-			if d > 0 {
-				timer := time.NewTimer(d)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					lastErr = ctx.Err()
-					goto FINALSYNC
-				case <-timer.C:
-				}
-			}
-			log.Printf("[WORKER] Task %q FAILED (sync, attempt %d/%d): %v; retrying...", t.Name, i+1, attempts, err)
-			continue
-		}
-		break
-	}
-
-FINALSYNC:
-	var finalErr = lastErr
-	if finalErr == nil {
-		finalErr = errors.New("unknown error")
-	}
-	if t.Fallback != nil {
-		var fbErr error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					fbErr = fmt.Errorf("fallback panic: %v", r)
-				}
-			}()
-			fbErr = t.Fallback(ctx, finalErr)
-		}()
-		if fbErr == nil {
-			p.completed.Add(1)
-			p.fallbackSuccesses.Add(1)
-			if t.OnSuccess != nil {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							log.Printf("[WORKER] OnSuccess panic on task %q (via fallback): %v", t.Name, r)
-						}
-					}()
-					t.OnSuccess(ctx)
-				}()
-			}
-			return
-		}
-		finalErr = fbErr
-	}
-	p.failed.Add(1)
-	if t.OnError != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[WORKER] OnError panic on task %q: %v", t.Name, r)
-				}
-			}()
-			t.OnError(ctx, finalErr)
-		}()
-	}
-	log.Printf("[WORKER] Task %q FAILED (sync, all attempts): %v (duration: %v)", t.Name, finalErr, time.Since(start))
+	p.queueMu.Unlock()
+	return nil
 }
 
 // Stats returns a telemetry snapshot of the worker pool
@@ -818,18 +775,20 @@ func (p *Pool) Stats() PoolStats {
 
 // StatsFromMemStats builds PoolStats using an already-sampled runtime.MemStats.
 func (p *Pool) StatsFromMemStats(m runtime.MemStats) PoolStats {
-	limit := p.cfg.MaxMemoryBytes
-	if limit <= 0 {
-		limit = debug.SetMemoryLimit(-1)
-	}
+	limit := p.effectiveMemoryLimit()
 
 	thresh := float64(limit)
-	if limit > 0 {
+	if limit > 0 && limit < math.MaxInt64 {
 		thresh = float64(limit) * p.cfg.MemoryThreshold
 	}
 
 	usage, source := processMemoryUsage()
-	pressure := limit > 0 && int64(usage) >= int64(thresh)
+	pressure := limit > 0 && limit < math.MaxInt64 && float64(usage) >= thresh
+	if !pressure && limit == math.MaxInt64 {
+		if h := system.GetMemoryHeadroom(); h.LimitKnown && h.UsedPercent >= 93 && float64(h.UsedPercent) >= p.cfg.MemoryThreshold*100 {
+			pressure = true
+		}
+	}
 
 	return PoolStats{
 		Enabled:           p.cfg.Enabled,
@@ -860,9 +819,9 @@ func (p *Pool) InFlight() int64 { return p.inflight.Load() }
 
 // Queued returns the number of tasks waiting in the queue.
 func (p *Pool) Queued() int {
-	p.chanMu.RLock()
-	defer p.chanMu.RUnlock()
-	return len(p.taskCh)
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
+	return len(p.queue)
 }
 
 // Draining reports whether the pool has stopped accepting new tasks.
@@ -917,25 +876,29 @@ func (p *Pool) SafeCancel() int {
 	return p.CancelMatching(func(_ Task) bool { return true })
 }
 
-// CancelMatching drains queued tasks matching the predicate. Non-matching tasks
-// are safely preserved in the queue in their relative order.
+// CancelMatching drains queued tasks matching the predicate without holding
+// queue locks while predicate executes. Non-matching tasks preserve relative FIFO order.
 func (p *Pool) CancelMatching(predicate func(t Task) bool) int {
 	if predicate == nil {
 		return 0
 	}
-	p.chanMu.Lock()
-	// Once shutdown closes the channel, workers own draining its remaining
-	// buffered jobs. Do not consume jobs that cannot be safely requeued.
-	if p.taskClosed {
-		p.chanMu.Unlock()
+	p.cancelMu.Lock()
+	p.queueMu.Lock()
+	if p.taskClosed || len(p.queue) == 0 {
+		p.queueMu.Unlock()
+		p.cancelMu.Unlock()
 		return 0
 	}
 
-	taskCh := p.taskCh
-	var kept []jobItem
+	batch := p.queue
+	p.queue = make([]jobItem, 0, cap(batch))
+	p.reservedSlots = len(batch)
+	p.queueMu.Unlock()
+
+	kept := make([]jobItem, 0, len(batch))
 	var canceled []jobItem
 	var predPanic any
-	hasPanic := false
+	var hasPanic bool
 	evalPredicate := func(t Task) (matched bool, recovered any, panicked bool) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -946,43 +909,35 @@ func (p *Pool) CancelMatching(predicate func(t Task) bool) int {
 		return predicate(t), nil, false
 	}
 
-	for {
-		select {
-		case job, ok := <-taskCh:
-			if !ok {
-				// taskClosed is changed under chanMu, so a closed channel here is
-				// an invariant violation. Keep every removed job accounted for.
-				canceled = append(canceled, kept...)
-				kept = nil
-				goto DONE
-			}
-			matched, rec, panicked := evalPredicate(job.task)
-			if panicked {
-				// Keep the remaining queue intact and unlock before propagating panic.
-				kept = append(kept, job)
-				predPanic = rec
-				hasPanic = true
-				goto DONE
-			}
-			if matched {
-				canceled = append(canceled, job)
-			} else {
-				kept = append(kept, job)
-			}
-		default:
-			goto DONE
+	for i, job := range batch {
+		matched, rec, panicked := evalPredicate(job.task)
+		if panicked {
+			kept = append(kept, batch[i:]...)
+			predPanic = rec
+			hasPanic = true
+			break
+		}
+		if matched {
+			canceled = append(canceled, job)
+		} else {
+			kept = append(kept, job)
 		}
 	}
 
-DONE:
-	for _, job := range kept {
-		// Reinsert while still holding chanMu, before producers can enqueue more.
-		taskCh <- job
+	p.queueMu.Lock()
+	p.reservedSlots = 0
+	if p.taskClosed && p.quitClosed {
+		canceled = append(canceled, kept...)
+	} else if len(kept) > 0 {
+		p.queue = append(kept, p.queue...)
+		select {
+		case p.queueNotify <- struct{}{}:
+		default:
+		}
 	}
-	p.chanMu.Unlock()
+	p.queueMu.Unlock()
+	p.cancelMu.Unlock()
 
-	// User callbacks may dispatch more work or acquire pool locks. Invoke only
-	// after releasing chanMu to avoid callback-induced deadlocks.
 	for _, job := range canceled {
 		p.canceled.Add(1)
 		p.decPending()
@@ -1047,13 +1002,13 @@ func (p *Pool) Shutdown() error {
 	}
 	p.draining.Store(true)
 
-	// Close the task channel: workers finish buffered jobs, then exit on !ok.
-	p.chanMu.Lock()
+	// Close drainCh so workers finish queued jobs, then exit.
+	p.queueMu.Lock()
 	if !p.taskClosed {
-		close(p.taskCh)
 		p.taskClosed = true
+		close(p.drainCh)
 	}
-	p.chanMu.Unlock()
+	p.queueMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -1067,9 +1022,7 @@ func (p *Pool) Shutdown() error {
 		p.forced.Store(false)
 		return nil
 	case <-time.After(p.cfg.ShutdownTimeout):
-		// Force workers out: cancel active task contexts, abort retry backoff,
-		// and unblock workerLoop selects.
-		p.chanMu.Lock()
+		p.queueMu.Lock()
 		if !p.quitClosed {
 			close(p.quitCh)
 			p.quitClosed = true
@@ -1077,30 +1030,29 @@ func (p *Pool) Shutdown() error {
 		if p.forceCancel != nil {
 			p.forceCancel()
 		}
-		taskCh := p.taskCh
-		p.chanMu.Unlock()
+		p.queueMu.Unlock()
 
-		select {
-		case <-done:
-			// All worker goroutines have exited; account for any buffered tasks
-			// left unconsumed in closed taskCh so pending stays consistent.
-			for job := range taskCh {
+		drainLeftover := func() {
+			p.queueMu.Lock()
+			leftover := p.queue
+			p.queue = nil
+			p.queueMu.Unlock()
+			for _, job := range leftover {
 				p.canceled.Add(1)
 				p.decPending()
 				p.reportCanceled(job.task)
 			}
+		}
+
+		select {
+		case <-done:
+			drainLeftover()
 			p.stopped.Store(true)
 			p.forced.Store(false)
 			log.Println("[WORKER] Shutdown finished after forced signal (some tasks may be truncated).")
 			return nil
 		case <-time.After(p.cfg.ShutdownTimeout):
-			// Drain any unconsumed queued tasks left in closed taskCh so pending
-			// counters and cancellation callbacks stay consistent.
-			for job := range taskCh {
-				p.canceled.Add(1)
-				p.decPending()
-				p.reportCanceled(job.task)
-			}
+			drainLeftover()
 			p.stopped.Store(true)
 			p.forced.Store(true)
 			log.Println("[WORKER] Shutdown exceeded timeout; a task ignored cancellation. Pool marked forcibly stopped.")

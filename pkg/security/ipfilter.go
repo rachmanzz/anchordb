@@ -252,10 +252,17 @@ func (f *IPFilter) Middleware(next http.Handler) http.Handler {
 		clientIP := f.ExtractClientIP(r)
 		if !f.IsAllowed(clientIP) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]string{
+			payload, err := json.Marshal(map[string]string{
 				"error": fmt.Sprintf("Forbidden: client IP %s is not allowed by AnchorDB whitelist", clientIP),
 			})
+			if err != nil {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusForbidden)
+			if _, wErr := w.Write(payload); wErr != nil {
+				log.Printf("[IPFILTER] failed to write 403 response for %s: %v", clientIP, wErr)
+			}
 			return
 		}
 		next.ServeHTTP(w, r)

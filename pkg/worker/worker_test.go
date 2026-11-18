@@ -74,44 +74,108 @@ func TestWorkerPoolDisabled(t *testing.T) {
 		atomic.AddInt32(&syncExecuted, 1)
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Dispatch on disabled pool failed: %v", err)
+	if !errors.Is(err, ErrWorkerUnavailable) {
+		t.Fatalf("expected ErrWorkerUnavailable on disabled pool, got %v", err)
 	}
-
-	if atomic.LoadInt32(&syncExecuted) != 1 {
-		t.Fatalf("expected sync execution when disabled, got %d", atomic.LoadInt32(&syncExecuted))
+	if atomic.LoadInt32(&syncExecuted) != 0 {
+		t.Fatalf("expected no silent sync execution when disabled, got %d", atomic.LoadInt32(&syncExecuted))
 	}
 
 	_ = pool.Shutdown()
 }
 
-func TestWorkerPool_FallbackCounterAndSyncCtxAdmission(t *testing.T) {
+func TestWorkerPool_FallbackCounterAndCanceledDispatch(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.Enabled = false
+	cfg.Concurrency = 1
+	cfg.QueueSize = 8
 	pool := NewPool(cfg)
+	pool.Start()
+	defer func() { _ = pool.Shutdown() }()
 
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	ran := false
-	err := pool.Dispatch(canceledCtx, "canceled_sync", func(_ context.Context) error {
+	err := pool.Dispatch(canceledCtx, "canceled_job", func(_ context.Context) error {
 		ran = true
 		return nil
 	})
 	if !errors.Is(err, context.Canceled) || ran {
-		t.Fatalf("expected Dispatch on canceled ctx to fail before sync execution (ran=%v, err=%v)", ran, err)
+		t.Fatalf("expected Dispatch on canceled ctx to fail before execution (ran=%v, err=%v)", ran, err)
 	}
 
-	if err := pool.Dispatch(context.Background(), "fallback_sync", func(_ context.Context) error {
+	var fallbackHookCalled int32
+	if err := pool.Dispatch(context.Background(), "fallback_job", func(_ context.Context) error {
 		return errors.New("primary failed")
 	}, WithFallback(func(_ context.Context, _ error) error {
 		return nil
+	}), WithOnFallback(func(_ context.Context, primaryErr error) {
+		if primaryErr != nil {
+			atomic.AddInt32(&fallbackHookCalled, 1)
+		}
 	})); err != nil {
-		t.Fatalf("expected sync fallback dispatch nil, got %v", err)
+		t.Fatalf("expected dispatch nil, got %v", err)
+	}
+
+	if err := pool.WaitIdle(context.Background()); err != nil {
+		t.Fatalf("WaitIdle: %v", err)
 	}
 
 	stats := pool.Stats()
-	if stats.FallbackSuccesses != 1 || stats.Failed != 1 || stats.Completed != 1 {
-		t.Fatalf("expected FallbackSuccesses=1 Failed=1 Completed=1, got %+v", stats)
+	if stats.FallbackSuccesses != 1 || stats.Failed != 1 || stats.Completed != 0 {
+		t.Fatalf("expected FallbackSuccesses=1 Failed=1 Completed=0, got %+v", stats)
 	}
+	if atomic.LoadInt32(&fallbackHookCalled) != 1 {
+		t.Fatalf("expected OnFallback called once, got %d", atomic.LoadInt32(&fallbackHookCalled))
+	}
+}
+
+func TestCancelMatching_PredicateCanAccessPoolWithoutDeadlock(t *testing.T) {
+	cfg := DefaultConfig()
+	if !cfg.EnforceMemory {
+		t.Fatal("expected DefaultConfig().EnforceMemory to be true")
+	}
+	cfg.Concurrency = 1
+	cfg.QueueSize = 8
+	p := NewPool(cfg)
+	p.Start()
+	defer func() { _ = p.Shutdown() }()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := p.Dispatch(context.Background(), "blocker", func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatalf("dispatch blocker: %v", err)
+	}
+	<-started
+
+	if err := p.Dispatch(context.Background(), "target", func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("dispatch target: %v", err)
+	}
+
+	predDone := make(chan int, 1)
+	go func() {
+		predDone <- p.CancelMatching(func(task Task) bool {
+			_ = p.Queued()
+			if task.Name == "target" {
+				_ = p.Dispatch(context.Background(), "reentrant", func(context.Context) error { return nil })
+				return true
+			}
+			return false
+		})
+	}()
+
+	select {
+	case n := <-predDone:
+		if n != 1 {
+			t.Fatalf("expected 1 canceled task, got %d", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelMatching deadlocked when predicate accessed Queued/Dispatch")
+	}
+	close(release)
+	_ = p.WaitIdle(context.Background())
 }

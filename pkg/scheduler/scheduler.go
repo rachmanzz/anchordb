@@ -48,6 +48,12 @@ type ScheduledTask interface {
 	Execute(ctx context.Context) error
 }
 
+// ScheduledTaskErrorHandler is an optional lifecycle hook interface for scheduled tasks.
+type ScheduledTaskErrorHandler interface {
+	OnError(ctx context.Context, err error)
+	OnFail(ctx context.Context, err error)
+}
+
 // TaskInfo represents public serializable task status.
 type TaskInfo struct {
 	Name        string    `json:"name"`
@@ -139,6 +145,20 @@ func (t *registeredTask) execute(ctx context.Context) (err error) {
 		t.lastStatus = "Success"
 	}
 	t.mu.Unlock()
+
+	if err != nil {
+		if handler, ok := t.task.(ScheduledTaskErrorHandler); ok {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[SCHEDULER] Task %q error hook PANIC: %v", t.name, r)
+					}
+				}()
+				handler.OnError(ctx, err)
+				handler.OnFail(ctx, err)
+			}()
+		}
+	}
 	return err
 }
 
@@ -489,10 +509,12 @@ func (s *InternalScheduler) runTaskLoop(rs *runState, task *registeredTask) {
 		if task.running.CompareAndSwap(false, true) {
 			if timeout := time.Duration(s.timeoutNs.Load()); timeout > 0 {
 				cctx, cancel := context.WithTimeout(rs.ctx, timeout)
-				_ = task.execute(cctx)
+				if execErr := task.execute(cctx); execErr != nil {
+					log.Printf("[SCHEDULER] Scheduled run %q completed with error: %v", task.name, execErr)
+				}
 				cancel()
-			} else {
-				_ = task.execute(rs.ctx)
+			} else if execErr := task.execute(rs.ctx); execErr != nil {
+				log.Printf("[SCHEDULER] Scheduled run %q completed with error: %v", task.name, execErr)
 			}
 			task.running.Store(false)
 		} else {
